@@ -1,6 +1,19 @@
+use anyhow::Result;
 use lang_c::driver::{parse, Config};
 
-fn main() {
+mod cli;
+
+fn main() -> Result<()> {
+    let args = cli::parse_args()?;
+
     let config = Config::default();
-    println!("{:#?}", parse(&config, "test.c"));
+    let ast = match parse(&config, &args.input) {
+        Ok(ast) => ast,
+        Err(e) => {
+            eprintln!("Error parsing {}\n{}", args.input.display(), e);
+            std::process::exit(1);
+        }
+    };
+
+    Ok(())
 }
