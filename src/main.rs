@@ -15,5 +15,9 @@ fn main() -> Result<()> {
         }
     };
 
+    if args.dump_ast {
+        println!("{:#?}", ast);
+    }
+
     Ok(())
 }
