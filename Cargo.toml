@@ -8,3 +8,6 @@ edition = "2021"
 anyhow = "1.0"
 lang-c = "^0.15"
 pico-args = { version = "^0.5", features = ["eq-separator", "combined-flags"] }
+cranelift = "^0.94"
+cranelift-module = "^0.94"
+cranelift-object = "^0.94"

@@ -7,6 +7,7 @@ FLAGS:
 OPTIONS:
   -o <file>             Place the output into <file>.
   --dump-ast            Dump the AST after parsing.
+  --dump-ir             Dump the IR after lowering.
 ARGS:
   <FILE>
 ";
@@ -16,6 +17,7 @@ pub struct AppArgs {
     pub input: std::path::PathBuf,
     pub output: Option<std::path::PathBuf>,
     pub dump_ast: bool,
+    pub dump_ir: bool,
 }
 
 pub fn parse_args() -> Result<AppArgs, pico_args::Error> {
@@ -28,6 +30,7 @@ pub fn parse_args() -> Result<AppArgs, pico_args::Error> {
     }
 
     let args = AppArgs {
+        dump_ir: pargs.contains("--dump-ir"),
         dump_ast: pargs.contains("--dump-ast"),
         output: pargs.opt_value_from_os_str("--output", parse_path)?,
         input: pargs.free_from_str()?,
