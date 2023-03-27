@@ -35,7 +35,7 @@ pub fn parse_args() -> Result<AppArgs, pico_args::Error> {
         dump_ir: pargs.contains("--dump-ir"),
         dump_ast: pargs.contains("--dump-ast"),
         output: pargs
-            .opt_value_from_os_str("--output", parse_path)?
+            .opt_value_from_os_str("-o", parse_path)?
             .unwrap_or_else(|| PathBuf::from_str("./a.out").unwrap()),
         input: pargs.free_from_str()?,
     };

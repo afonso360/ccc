@@ -1,5 +1,3 @@
-use std::{path::PathBuf, str::FromStr};
-
 use anyhow::Result;
 use cranelift::{codegen::Context, prelude::settings};
 use cranelift_module::{default_libcall_names, Linkage, Module};
