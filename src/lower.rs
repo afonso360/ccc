@@ -21,11 +21,6 @@ pub struct AstLowerer {
 
 impl AstLowerer {
     pub fn new(ast: Parse) -> Result<Self> {
-        // let flag_builder = settings::builder();
-        // let isa_builder = cranelift::codegen::isa::lookup_by_name("x86_64-unknown-linux-gnu")?;
-        // let isa = isa_builder.finish(settings::Flags::new(flag_builder))?;
-        // let module = ObjectModule::new(ObjectBuilder::new(isa, "foo", default_libcall_names())?);
-
         Ok(Self { ast })
     }
 

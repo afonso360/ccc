@@ -1,3 +1,5 @@
+use std::{path::PathBuf, str::FromStr};
+
 const HELP: &str = "\
 ccc
 USAGE:
@@ -14,8 +16,8 @@ ARGS:
 
 #[derive(Debug)]
 pub struct AppArgs {
-    pub input: std::path::PathBuf,
-    pub output: Option<std::path::PathBuf>,
+    pub input: PathBuf,
+    pub output: PathBuf,
     pub dump_ast: bool,
     pub dump_ir: bool,
 }
@@ -32,7 +34,9 @@ pub fn parse_args() -> Result<AppArgs, pico_args::Error> {
     let args = AppArgs {
         dump_ir: pargs.contains("--dump-ir"),
         dump_ast: pargs.contains("--dump-ast"),
-        output: pargs.opt_value_from_os_str("--output", parse_path)?,
+        output: pargs
+            .opt_value_from_os_str("--output", parse_path)?
+            .unwrap_or_else(|| PathBuf::from_str("./a.out").unwrap()),
         input: pargs.free_from_str()?,
     };
 

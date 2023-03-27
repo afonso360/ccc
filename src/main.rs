@@ -1,4 +1,9 @@
+use std::{path::PathBuf, str::FromStr};
+
 use anyhow::Result;
+use cranelift::{codegen::Context, prelude::settings};
+use cranelift_module::{default_libcall_names, Linkage, Module};
+use cranelift_object::{ObjectBuilder, ObjectModule};
 use lang_c::driver::{parse, Config};
 use lower::AstLowerer;
 
@@ -35,6 +40,21 @@ fn main() -> Result<()> {
             println!("{:#?}", func);
         }
     }
+
+    let flag_builder = settings::builder();
+    let isa_builder = cranelift::codegen::isa::lookup_by_name("x86_64-unknown-linux-gnu")?;
+    let isa = isa_builder.finish(settings::Flags::new(flag_builder))?;
+    let mut module = ObjectModule::new(ObjectBuilder::new(isa, "foo", default_libcall_names())?);
+
+    for func in ir {
+        let func_id = module.declare_function("main", Linkage::Local, &func.signature)?;
+        let mut ctx = Context::for_function(func);
+        module.define_function(func_id, &mut ctx)?;
+    }
+
+    let obj = module.finish();
+    let bytes = obj.emit()?;
+    std::fs::write(args.output, bytes)?;
 
     Ok(())
 }
