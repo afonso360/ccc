@@ -52,7 +52,11 @@ fn main() -> Result<()> {
 
     let obj = module.finish();
     let bytes = obj.emit()?;
-    std::fs::write(args.output, bytes)?;
+    std::fs::write(&args.output, bytes)?;
+
+    // Mark the binary as executable
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&args.output, std::fs::Permissions::from_mode(0o755))?;
 
     Ok(())
 }
