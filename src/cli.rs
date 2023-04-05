@@ -14,7 +14,7 @@ ARGS:
   <FILE>
 ";
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct AppArgs {
     pub input: PathBuf,
     pub output: PathBuf,

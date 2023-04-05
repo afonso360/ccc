@@ -5,13 +5,18 @@ edition = "2021"
 build = "build.rs"
 
 [dependencies]
+clang = { version = "2.0", features = ["clang_10_0"] }
 anyhow = "1.0"
-lang-c = "^0.15"
 pico-args = { version = "^0.5", features = ["eq-separator", "combined-flags"] }
 cranelift = "^0.94"
 cranelift-module = "^0.94"
 cranelift-object = "^0.94"
+target-lexicon = "^0.12"
 
 [dev-dependencies]
 assert_cmd = "2.0"
 tempfile = "3.5"
+
+[features]
+default = []
+static = ["clang/static"]
