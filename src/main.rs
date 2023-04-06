@@ -1,8 +1,6 @@
 use anyhow::Result;
-use clang::{Clang, EntityVisitResult, Index};
-use cranelift::{codegen::Context, prelude::settings};
-use cranelift_module::{default_libcall_names, Linkage, Module};
-use cranelift_object::{ObjectBuilder, ObjectModule};
+use clang::{Clang, Index};
+use std::fs;
 
 use crate::compiler::Compiler;
 
@@ -49,14 +47,14 @@ fn main() -> Result<()> {
     let module = compiler.finish();
     let obj = module.finish();
     let bytes = obj.emit()?;
-    std::fs::write(&args.output, bytes)?;
+    fs::write(&args.output, bytes)?;
 
     // Mark the binary as executable
     // TODO: Do we need something like this on Windows?
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&args.output, std::fs::Permissions::from_mode(0o755))?;
+        fs::set_permissions(&args.output, std::fs::Permissions::from_mode(0o755))?;
     }
 
     Ok(())
