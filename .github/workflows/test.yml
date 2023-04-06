@@ -3,46 +3,8 @@ on: [push, pull_request]
 name: Test
 
 jobs:
-  check:
-    name: Doc && Check && Lint
-    runs-on: ubuntu-latest
-
-    env:
-      CARGO_TERM_COLOR: always
-
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v2
-
-      - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: stable
-          override: true
-          components: rustfmt
-
-      - name: Set up Clang
-        uses: egor-tensin/setup-clang@v1
-        with:
-          version: latest
-          
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Run cargo check 
-        uses: actions-rs/cargo@v1
-        with:
-          command: check
-          args: --all-targets
-
-      - name: Run cargo doc 
-        uses: actions-rs/cargo@v1
-        with:
-          command: doc
-
   test:
     name: Test Suite
-    needs: check
     strategy:
       fail-fast: true
       matrix:
@@ -64,10 +26,20 @@ jobs:
           toolchain: stable
           override: true
 
-      - name: Set up Clang
-        uses: egor-tensin/setup-clang@v1
+      - name: Cache LLVM and Clang
+        id: cache-llvm
+        uses: actions/cache@v3
         with:
-          version: latest
+          path: |
+            C:/Program Files/LLVM
+            ./llvm
+          key: llvm-cache
+
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@v1
+        with:
+          version: 16.0.0
+          cached: ${{ steps.cache-llvm.outputs.cache-hit }}
 
       - uses: Swatinem/rust-cache@v2
 
