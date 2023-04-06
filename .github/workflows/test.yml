@@ -48,6 +48,10 @@ jobs:
           version: ${{ matrix.llvm }}
           cached: ${{ steps.cache-llvm.outputs.cache-hit }}
 
+      - name: Install Ncurses
+        run: sudo apt-get install -y libncurses5-dev
+        if: matrix.os == 'ubuntu-latest'
+
       - name: Set LIBCLANG_PATH
         run: echo "LIBCLANG_PATH=$((gcm clang).source -replace "clang.exe")" >> $env:GITHUB_ENV
         if: matrix.os == 'windows-latest'
