@@ -52,8 +52,12 @@ fn main() -> Result<()> {
     std::fs::write(&args.output, bytes)?;
 
     // Mark the binary as executable
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&args.output, std::fs::Permissions::from_mode(0o755))?;
+    // TODO: Do we need something like this on Windows?
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&args.output, std::fs::Permissions::from_mode(0o755))?;
+    }
 
     Ok(())
 }
