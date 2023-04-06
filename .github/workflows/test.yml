@@ -10,11 +10,11 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            llvm: "16.0.0"
+            llvm: "15.0"
           - os: macos-latest
-            llvm: "15.0.7"
+            llvm: "15.0"
           - os: windows-latest
-            llvm: "15.0.7"
+            llvm: "15.0"
 
         
     runs-on: ${{ matrix.os }}
