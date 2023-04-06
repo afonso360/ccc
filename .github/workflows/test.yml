@@ -10,14 +10,11 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            env:
-              LLVM_VERSION: 16.0.0
+            llvm: "16.0.0"
           - os: macos-latest
-            env:
-              LLVM_VERSION: 15.0.7
+            llvm: "15.0.7"
           - os: windows-latest
-            env:
-              LLVM_VERSION: 15.0.7
+            llvm: "15.0.7"
 
         
     runs-on: ${{ matrix.os }}
@@ -43,17 +40,17 @@ jobs:
           path: |
             C:/Program Files/LLVM
             ./llvm
-          key: llvm-cache-${{ matrix.config.env.LLVM_VERSION }}-${{ matrix.config.os }}
+          key: llvm-cache-${{ matrix.llvm }}-${{ matrix.os }}
 
       - name: Install LLVM and Clang
         uses: KyleMayes/install-llvm-action@v1
         with:
-          version: ${{ matrix.config.env.LLVM_VERSION }}
+          version: ${{ matrix.llvm }}
           cached: ${{ steps.cache-llvm.outputs.cache-hit }}
 
       - name: Set LIBCLANG_PATH
         run: echo "LIBCLANG_PATH=$((gcm clang).source -replace "clang.exe")" >> $env:GITHUB_ENV
-        if: matrix.config.os == 'windows-latest'
+        if: matrix.os == 'windows-latest'
 
       - uses: Swatinem/rust-cache@v2
 
