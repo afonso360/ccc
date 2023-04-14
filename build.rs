@@ -11,6 +11,7 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=testsuite");
     let out_dir = PathBuf::from(
         env::var_os("OUT_DIR").expect("The OUT_DIR environment variable must be set"),
     );

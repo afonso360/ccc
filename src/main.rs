@@ -3,10 +3,11 @@ use clang::{Clang, Index};
 use std::{fs, str::FromStr};
 use target_lexicon::Triple;
 
-use crate::compiler::Compiler;
+use crate::tu_compiler::TUCompiler;
 
 mod cli;
-mod compiler;
+mod func;
+mod tu_compiler;
 
 fn parse_triple(triple: &str) -> Result<Triple, target_lexicon::ParseError> {
     let cleantriple = if triple.contains("msvc") {
@@ -69,7 +70,8 @@ fn main() -> Result<()> {
     //     EntityVisitResult::Recurse
     // });
 
-    let compiler = Compiler::new(args.clone(), tu, triple);
+    let mut compiler = TUCompiler::new(args.clone(), triple);
+    compiler.translate(tu)?;
 
     let module = compiler.finish();
     let obj = module.finish();
