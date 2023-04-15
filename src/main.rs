@@ -123,7 +123,16 @@ pub fn link(obj_file: &Path, triple: &Triple, args: &AppArgs) -> Result<()> {
     //     cmd.arg("--target").arg(triple.to_string());
     // }
 
+    // Link against libc
+    if cfg!(windows) {
+        cmd.arg("libcmt.lib");
+    } else {
+        cmd.arg("-lc");
+    }
+
     cmd.arg(&obj_file);
+
+    dbg!(&cmd);
 
     let link_status = cmd.status()?;
     if !link_status.success() {
