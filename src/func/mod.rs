@@ -6,6 +6,7 @@ use cranelift::{
         *,
     },
 };
+use cranelift_module::Linkage;
 use target_lexicon::Triple;
 
 use crate::tu_compiler::CompileResult;
@@ -24,7 +25,7 @@ pub struct FuncSignature<'tu> {
 }
 
 impl<'tu> FuncSignature<'tu> {
-    pub fn to_cranelift_sig(&self) -> Signature {
+    pub fn cranelift_sig(&self) -> Signature {
         let mut sig = Signature::new(self.calling_conv);
 
         for arg in &self.args {
@@ -35,6 +36,20 @@ impl<'tu> FuncSignature<'tu> {
             .push(AbiParam::new(self.ret_ty.get_cranelift_type()));
 
         sig
+    }
+
+    // TODO: Maybe this should be a trait on clang::Linkage?
+    pub fn cranelift_linkage(&self) -> Linkage {
+        match self.linkage {
+            // The AST entity has automatic storage (e.g., variables or parameters).
+            clang::Linkage::Automatic => Linkage::Local,
+            // The AST entity is a static variable or static function.
+            clang::Linkage::Internal => Linkage::Local,
+            // The AST entity has external linkage.
+            clang::Linkage::External => Linkage::Export,
+            // The AST entity has external linkage and lives in a C++ anonymous namespace.
+            clang::Linkage::UniqueExternal => Linkage::Export,
+        }
     }
 }
 
@@ -97,7 +112,7 @@ impl<'tu> FuncCompiler<'tu> {
         let mut builder = FunctionBuilder::new(&mut function, &mut fn_builder_ctx);
 
         builder.func.name = UserFuncName::user(0, 0);
-        builder.func.signature = self.parse_signature(&func)?.to_cranelift_sig();
+        builder.func.signature = self.parse_signature(&func)?.cranelift_sig();
 
         let block0 = builder.create_block();
         builder.append_block_params_for_function_params(block0);

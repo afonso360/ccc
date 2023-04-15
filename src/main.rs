@@ -2,6 +2,7 @@ use anyhow::Result;
 use clang::{Clang, Index};
 use std::{fs, str::FromStr};
 use target_lexicon::Triple;
+use tempfile::tempfile;
 
 use crate::tu_compiler::TUCompiler;
 
@@ -57,6 +58,7 @@ fn main() -> Result<()> {
 
     let target = tu.get_target();
     let triple = parse_triple(&target.triple).expect("Invalid triple");
+    dbg!(&triple);
 
     // TODO: Print Diagnostics
 
@@ -76,15 +78,29 @@ fn main() -> Result<()> {
     let module = compiler.finish();
     let obj = module.finish();
     let bytes = obj.emit()?;
-    fs::write(&args.output, bytes)?;
 
-    // Mark the binary as executable
-    // TODO: Do we need something like this on Windows?
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&args.output, std::fs::Permissions::from_mode(0o755))?;
+    // Write the prelinking file to temp file
+    let outfile = tempfile::NamedTempFile::new()?;
+    let (_, tmppath) = outfile.keep()?;
+    fs::write(&tmppath, bytes)?;
+
+    // Link the final binary
+    let mut cmd = std::process::Command::new("cc");
+    cmd.arg("-o").arg(&args.output).arg(&tmppath).arg("-lc");
+    let link_status = cmd.status()?;
+
+    fs::remove_file(tmppath)?;
+    if !link_status.success() {
+        std::process::exit(1);
     }
 
     Ok(())
 }
+
+// // Mark the binary as executable
+// // TODO: Do we need something like this on Windows?
+// #[cfg(unix)]
+// {
+//     use std::os::unix::fs::PermissionsExt;
+//     fs::set_permissions(&args.output, std::fs::Permissions::from_mode(0o755))?;
+// }

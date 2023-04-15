@@ -12,10 +12,10 @@ cranelift = "^0.94"
 cranelift-module = "^0.94"
 cranelift-object = "^0.94"
 target-lexicon = "^0.12"
+tempfile = "3.5"
 
 [dev-dependencies]
 assert_cmd = "2.0"
-tempfile = "3.5"
 
 [features]
 default = []
