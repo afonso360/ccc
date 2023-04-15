@@ -1,9 +1,11 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use clang::{Clang, Index};
+use std::path::Path;
 use std::{fs, str::FromStr};
 use target_lexicon::Triple;
 use tempfile::tempfile;
 
+use crate::cli::AppArgs;
 use crate::tu_compiler::TUCompiler;
 
 mod cli;
@@ -58,7 +60,6 @@ fn main() -> Result<()> {
 
     let target = tu.get_target();
     let triple = parse_triple(&target.triple).expect("Invalid triple");
-    dbg!(&triple);
 
     // TODO: Print Diagnostics
 
@@ -85,22 +86,38 @@ fn main() -> Result<()> {
     fs::write(&tmppath, bytes)?;
 
     // Link the final binary
-    let mut cmd = std::process::Command::new("cc");
-    cmd.arg("-o").arg(&args.output).arg(&tmppath).arg("-lc");
-    let link_status = cmd.status()?;
+    let link_res = link(tmppath.as_path(), &args);
 
     fs::remove_file(tmppath)?;
-    if !link_status.success() {
-        std::process::exit(1);
-    }
 
-    Ok(())
+    link_res
 }
 
-// // Mark the binary as executable
-// // TODO: Do we need something like this on Windows?
-// #[cfg(unix)]
-// {
-//     use std::os::unix::fs::PermissionsExt;
-//     fs::set_permissions(&args.output, std::fs::Permissions::from_mode(0o755))?;
-// }
+pub fn link(obj_file: &Path, args: &AppArgs) -> Result<()> {
+    use std::io::{Error, ErrorKind};
+    use std::process::Command;
+
+    // link the .o file using host linker
+
+    let linker = if cfg!(windows) { "link.exe" } else { "cc" };
+    let mut cmd = std::process::Command::new(linker);
+
+    if cfg!(windows) {
+        cmd.arg("/NOLOGO");
+    }
+
+    if cfg!(windows) {
+        cmd.arg("/OUT:").arg(&args.output);
+    } else {
+        cmd.arg("-o").arg(&args.output);
+    }
+
+    cmd.arg(&obj_file).arg("-lc");
+
+    let link_status = cmd.status()?;
+    if !link_status.success() {
+        Err(anyhow!("Linking failed: {}", link_status))
+    } else {
+        Ok(())
+    }
+}
