@@ -123,7 +123,7 @@ pub fn link(obj_file: &Path, triple: &Triple, args: &AppArgs) -> Result<()> {
     //     cmd.arg("--target").arg(triple.to_string());
     // }
 
-    cmd.arg(&obj_file).arg("-lc");
+    cmd.arg(&obj_file);
 
     let link_status = cmd.status()?;
     if !link_status.success() {
