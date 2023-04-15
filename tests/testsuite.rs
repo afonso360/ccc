@@ -40,7 +40,7 @@ fn assert_compiles(path: &Path) {
 
     let mut cmd = Command::cargo_bin(env!("CARGO_PKG_NAME")).unwrap();
     cmd.arg(path)
-        .arg("-O")
+        .arg("-o")
         .arg(outfile.path())
         .assert()
         .success();
