@@ -10,6 +10,7 @@ OPTIONS:
   -o <file>             Place the output into <file>.
   --dump-ast            Dump the AST after parsing.
   --dump-ir             Dump the IR after lowering.
+  --target <triple>     Target triple.
 ARGS:
   <FILE>
 ";
@@ -20,6 +21,7 @@ pub struct AppArgs {
     pub output: PathBuf,
     pub dump_ast: bool,
     pub dump_ir: bool,
+    pub target: Option<String>,
 }
 
 pub fn parse_args() -> Result<AppArgs, pico_args::Error> {
@@ -34,6 +36,7 @@ pub fn parse_args() -> Result<AppArgs, pico_args::Error> {
     let args = AppArgs {
         dump_ir: pargs.contains("--dump-ir"),
         dump_ast: pargs.contains("--dump-ast"),
+        target: pargs.opt_value_from_str("--target")?,
         output: pargs
             .opt_value_from_os_str("-o", parse_path)?
             .unwrap_or_else(|| PathBuf::from_str("./a.out").unwrap()),

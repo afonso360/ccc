@@ -58,8 +58,15 @@ fn main() -> Result<()> {
         }
     };
 
-    let target = tu.get_target();
-    let triple = parse_triple(&target.triple).expect("Invalid triple");
+    let triple = args
+        .target
+        .clone()
+        .map(|target| parse_triple(&target))
+        .unwrap_or_else(|| {
+            let target = tu.get_target();
+            parse_triple(&target.triple)
+        })?;
+    dbg!(&triple);
 
     // TODO: Print Diagnostics
 
@@ -73,7 +80,7 @@ fn main() -> Result<()> {
     //     EntityVisitResult::Recurse
     // });
 
-    let mut compiler = TUCompiler::new(args.clone(), triple);
+    let mut compiler = TUCompiler::new(args.clone(), triple.clone());
     compiler.translate(tu)?;
 
     let module = compiler.finish();
@@ -86,14 +93,14 @@ fn main() -> Result<()> {
     fs::write(&tmppath, bytes)?;
 
     // Link the final binary
-    let link_res = link(tmppath.as_path(), &args);
+    let link_res = link(tmppath.as_path(), &triple, &args);
 
     fs::remove_file(tmppath)?;
 
     link_res
 }
 
-pub fn link(obj_file: &Path, args: &AppArgs) -> Result<()> {
+pub fn link(obj_file: &Path, triple: &Triple, args: &AppArgs) -> Result<()> {
     use std::io::{Error, ErrorKind};
     use std::process::Command;
 
@@ -111,6 +118,10 @@ pub fn link(obj_file: &Path, args: &AppArgs) -> Result<()> {
     } else {
         cmd.arg("-o").arg(&args.output);
     }
+
+    // if !cfg!(windows) {
+    //     cmd.arg("--target").arg(triple.to_string());
+    // }
 
     cmd.arg(&obj_file).arg("-lc");
 
