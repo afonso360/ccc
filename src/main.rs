@@ -110,9 +110,8 @@ pub fn link(obj_file: &Path, triple: &Triple, args: &AppArgs) -> Result<()> {
     // }
 
     // Link against libc
-    if cfg!(windows) {
-        cmd.arg("libcmt.lib");
-    } else {
+    if !cfg!(windows) {
+        // cmd.arg("libcmt.lib");
         cmd.arg("-lc");
     }
 
