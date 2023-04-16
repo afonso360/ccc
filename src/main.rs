@@ -83,10 +83,16 @@ fn main() -> Result<()> {
 
     // Write the prelinking file to temp file
     let outfile = tempfile::NamedTempFile::new()?;
-    fs::write(outfile.path(), bytes)?;
+    // fs::write(outfile.path(), bytes)?;
+    let (_, tmppath) = outfile.keep()?;
+    fs::write(&tmppath, bytes)?;
 
     // Link the final binary
-    link(outfile.path(), &triple, &args)
+    let link_res = link(tmppath.as_path(), &triple, &args);
+
+    fs::remove_file(tmppath)?;
+
+    link_res
 }
 
 pub fn link(obj_file: &Path, triple: &Triple, args: &AppArgs) -> Result<()> {
