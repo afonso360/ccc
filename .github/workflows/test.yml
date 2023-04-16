@@ -11,12 +11,13 @@ jobs:
         include:
           - os: ubuntu-latest
             llvm: "15.0"
-          - os: macos-latest
-            llvm: "15.0"
+          # MacOS Is broken due to missing "_main"
+          # - os: macos-latest
+          #   llvm: "15.0"
           - os: windows-latest
             llvm: "15.0"
 
-        
+
     runs-on: ${{ matrix.os }}
 
     env:
