@@ -57,6 +57,11 @@ jobs:
         run: echo "LIBCLANG_PATH=$((gcm clang).source -replace "clang.exe")" >> $env:GITHUB_ENV
         if: matrix.os == 'windows-latest'
 
+      - name: Enable MSVC Dev Commands
+        id: msvc-dev-cmd
+        uses: ilammy/msvc-dev-cmd@v1
+        if: matrix.os == 'windows-latest'
+
       - uses: Swatinem/rust-cache@v2
 
       - name: Run cargo test
