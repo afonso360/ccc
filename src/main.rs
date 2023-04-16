@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use clang::{Clang, Index};
+use std::io::Write;
 use std::path::Path;
 use std::{fs, str::FromStr};
 use target_lexicon::Triple;
@@ -82,10 +83,12 @@ fn main() -> Result<()> {
     let bytes = obj.emit()?;
 
     // Write the prelinking file to temp file
-    let outfile = tempfile::NamedTempFile::new()?;
-    // fs::write(outfile.path(), bytes)?;
-    let (_, tmppath) = outfile.keep()?;
-    fs::write(&tmppath, bytes)?;
+    let tmppath = {
+        let outfile = tempfile::NamedTempFile::new()?;
+        let (mut file, tmppath) = outfile.keep()?;
+        file.write_all(&bytes)?;
+        tmppath
+    };
 
     // Link the final binary
     let link_res = link(tmppath.as_path(), &triple, &args);
