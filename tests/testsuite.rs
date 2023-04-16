@@ -37,13 +37,14 @@ fn run_test(path: &str) -> Result<(), io::Error> {
 
 fn assert_compiles(path: &Path) {
     let outfile = tempfile::NamedTempFile::new().unwrap();
+    let (_, outfile) = outfile.keep().unwrap();
 
     let mut cmd = Command::cargo_bin(env!("CARGO_PKG_NAME")).unwrap();
-    cmd.arg(path)
-        .arg("-o")
-        .arg(outfile.path())
-        .assert()
-        .success();
+    cmd.arg(path).arg("-o").arg(&outfile).assert().success();
+
+    // TODO: This leaks the file if the command fails.... not ideal
+    // Delete the output file
+    std::fs::remove_file(&outfile).unwrap();
 }
 
 fn assert_runs(path: &Path) {
