@@ -93,6 +93,7 @@ dependencies = [
  "cranelift-module",
  "cranelift-object",
  "pico-args",
+ "quickscope",
  "target-lexicon",
  "tempfile",
 ]
@@ -451,6 +452,16 @@ checksum = "368ba315fb8c5052ab692e68a0eefec6ec57b23a36959c14496f0b0df2c0cecf"
 dependencies = [
  "predicates-core",
  "termtree",
+]
+
+[[package]]
+name = "quickscope"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d47bcfc3e13850589cf9338a02b6dfb5aebb3748a0f93a392e8df91d6193b6b"
+dependencies = [
+ "indexmap",
+ "smallvec",
 ]
 
 [[package]]

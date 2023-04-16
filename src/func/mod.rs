@@ -3,10 +3,11 @@ use cranelift::{
     codegen::ir::{Function, UserFuncName},
     prelude::{
         isa::{CallConv, TargetIsa},
-        *,
+        Variable, *,
     },
 };
 use cranelift_module::Linkage;
+use quickscope::ScopeMap;
 use target_lexicon::Triple;
 
 use crate::tu_compiler::CompileResult;
@@ -29,11 +30,11 @@ impl<'tu> FuncSignature<'tu> {
         let mut sig = Signature::new(self.calling_conv);
 
         for arg in &self.args {
-            sig.params.push(AbiParam::new(arg.get_cranelift_type()));
+            sig.params.push(AbiParam::new(arg.cranelift_type()));
         }
 
         sig.returns
-            .push(AbiParam::new(self.ret_ty.get_cranelift_type()));
+            .push(AbiParam::new(self.ret_ty.cranelift_type()));
 
         sig
     }
@@ -53,17 +54,29 @@ impl<'tu> FuncSignature<'tu> {
     }
 }
 
+#[derive(Debug, PartialEq, Clone)]
+pub struct ASTVariable<'tu> {
+    pub name: String,
+    pub ty: clang::Type<'tu>,
+    pub var: Variable,
+}
+
 pub struct FuncCompiler<'tu> {
     triple: &'tu Triple,
     isa: &'tu dyn TargetIsa,
+    variables: ScopeMap<String, ASTVariable<'tu>>,
 }
 
 impl<'tu> FuncCompiler<'tu> {
     pub fn new(triple: &'tu Triple, isa: &'tu dyn TargetIsa) -> Self {
-        Self { triple, isa }
+        Self {
+            triple,
+            isa,
+            variables: ScopeMap::new(),
+        }
     }
 
-    pub fn parse_signature(&self, func: &'tu clang::Entity) -> CompileResult<FuncSignature> {
+    pub fn parse_signature<'a>(&self, func: &'a clang::Entity) -> CompileResult<FuncSignature<'a>> {
         debug_assert_eq!(func.get_kind(), EntityKind::FunctionDecl);
 
         let ret_ty = func.get_result_type().unwrap();
@@ -89,22 +102,32 @@ impl<'tu> FuncCompiler<'tu> {
         })
     }
 
-    pub fn visit_children<F>(&mut self, entity: &clang::Entity, mut cb: F) -> CompileResult<()>
+    pub fn visit_children<F>(&mut self, entity: &clang::Entity<'tu>, mut cb: F) -> CompileResult<()>
     where
-        F: FnMut(&mut Self, clang::Entity, clang::Entity) -> CompileResult<EntityVisitResult>,
+        F: FnMut(
+            &mut Self,
+            clang::Entity<'tu>,
+            clang::Entity<'tu>,
+        ) -> CompileResult<EntityVisitResult>,
     {
         let mut res = Ok(());
-        entity.visit_children(|child, parent| match cb(self, child, parent) {
-            Ok(res) => res,
-            Err(e) => {
-                res = Err(e);
-                EntityVisitResult::Break
+        entity.visit_children(|child, parent| {
+            if child.is_unexposed() {
+                return EntityVisitResult::Recurse;
+            }
+
+            match cb(self, child, parent) {
+                Ok(res) => res,
+                Err(e) => {
+                    res = Err(e);
+                    EntityVisitResult::Break
+                }
             }
         });
         res
     }
 
-    pub fn compile(mut self, func: clang::Entity) -> CompileResult<Function> {
+    pub fn compile(mut self, func: clang::Entity<'tu>) -> CompileResult<Function> {
         debug_assert_eq!(func.get_kind(), EntityKind::FunctionDecl);
 
         let mut function = Function::new();
@@ -140,7 +163,7 @@ impl<'tu> FuncCompiler<'tu> {
     pub fn compile_compund_stmt(
         &mut self,
         builder: &mut FunctionBuilder,
-        stmt: clang::Entity,
+        stmt: clang::Entity<'tu>,
     ) -> CompileResult<()> {
         debug_assert_eq!(stmt.get_kind(), EntityKind::CompoundStmt);
 
@@ -155,8 +178,60 @@ impl<'tu> FuncCompiler<'tu> {
                 EntityKind::ReturnStmt => {
                     compiler.compile_return_stmt(builder, child)?;
                 }
+                EntityKind::DeclStmt => {
+                    compiler.compile_decl_stmt(builder, child)?;
+                }
                 e => unimplemented!("Invalid Entity at translate {:?}", e),
             }
+            Ok(EntityVisitResult::Continue)
+        })?;
+
+        Ok(())
+    }
+
+    pub fn compile_decl_stmt(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        stmt: clang::Entity<'tu>,
+    ) -> CompileResult<()> {
+        debug_assert_eq!(stmt.get_kind(), EntityKind::DeclStmt);
+
+        self.visit_children(&stmt, |compiler, child, _| {
+            match child.get_kind() {
+                EntityKind::VarDecl => {
+                    compiler.compile_var_decl(builder, child)?;
+                }
+                e => unimplemented!("Invalid Entity at translate {:?}", e),
+            }
+            Ok(EntityVisitResult::Continue)
+        })?;
+
+        Ok(())
+    }
+
+    pub fn compile_var_decl(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        stmt: clang::Entity<'tu>,
+    ) -> CompileResult<()> {
+        debug_assert_eq!(stmt.get_kind(), EntityKind::VarDecl);
+
+        let ty = stmt.get_type().unwrap();
+        let name = stmt.get_mangled_name().unwrap();
+        let var = Variable::new(self.variables.len());
+
+        builder.declare_var(var, ty.cranelift_type());
+        let zero = self.create_zero_for_type(builder, ty);
+        builder.def_var(var, zero);
+
+        self.variables
+            .define(name.clone(), ASTVariable { name, ty, var });
+
+        self.visit_children(&stmt, |compiler, child, _| {
+            let val = compiler.compile_expr_stmt(builder, child)?;
+            // TODO: Check Type and cast?
+            builder.def_var(var, val);
+
             Ok(EntityVisitResult::Continue)
         })?;
 
@@ -166,7 +241,7 @@ impl<'tu> FuncCompiler<'tu> {
     pub fn compile_return_stmt(
         &mut self,
         builder: &mut FunctionBuilder,
-        stmt: clang::Entity,
+        stmt: clang::Entity<'tu>,
     ) -> CompileResult<()> {
         debug_assert_eq!(stmt.get_kind(), EntityKind::ReturnStmt);
 
@@ -185,13 +260,36 @@ impl<'tu> FuncCompiler<'tu> {
         builder: &mut FunctionBuilder,
         stmt: clang::Entity,
     ) -> CompileResult<Value> {
-        let val = stmt.evaluate().unwrap();
-        let ty = stmt.get_type().unwrap();
-        match (ty.get_kind(), val) {
-            (TypeKind::Int, EvaluationResult::SignedInteger(i)) => {
-                Ok(builder.ins().iconst(ty.get_cranelift_type(), i))
+        match stmt.get_kind() {
+            // DeclRefExpr is just a variable reference
+            EntityKind::DeclRefExpr => {
+                let def = stmt.get_definition().unwrap();
+                let name = def.get_mangled_name().unwrap();
+                let var = self.variables.get(&name).expect("Unknown Variable");
+                Ok(builder.use_var(var.var))
             }
-            (tk, val) => unimplemented!("Invalid Entity at translate ({:?} {:?})", tk, val),
+            kind => {
+                let val = stmt.evaluate().unwrap();
+                let ty = stmt.get_type().unwrap();
+                match (ty.get_kind(), val) {
+                    (TypeKind::Int, EvaluationResult::SignedInteger(i)) => {
+                        Ok(builder.ins().iconst(ty.cranelift_type(), i))
+                    }
+                    (tk, val) => unimplemented!("Invalid Entity at translate ({:?} {:?})", tk, val),
+                }
+            }
+        }
+    }
+}
+
+impl<'tu> FuncCompiler<'tu> {
+    fn create_zero_for_type(&self, builder: &mut FunctionBuilder, ty: clang::Type) -> Value {
+        match ty.get_kind() {
+            TypeKind::Int => builder.ins().iconst(ty.cranelift_type(), 0),
+            TypeKind::Float => builder.ins().f32const(0.0),
+            TypeKind::Double => builder.ins().f64const(0.0),
+            TypeKind::Void => builder.ins().iconst(ty.cranelift_type(), 0),
+            tk => unimplemented!("Invalid Entity at translate {:?}", tk),
         }
     }
 }
