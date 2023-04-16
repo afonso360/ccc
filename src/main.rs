@@ -11,6 +11,7 @@ use crate::tu_compiler::TUCompiler;
 mod cli;
 mod func;
 mod tu_compiler;
+mod utils;
 
 fn parse_triple(triple: &str) -> Result<Triple, target_lexicon::ParseError> {
     let cleantriple = if triple.contains("msvc") {
@@ -70,15 +71,9 @@ fn main() -> Result<()> {
 
     // TODO: Print Diagnostics
 
-    // TODO: Utils dumpast
-    // if args.dump_ast {
-    //     println!("{:#?}", ast);
-    // }
-
-    // tu.get_entity().visit_children(|entity, parent| {
-    //     println!("Hello, {:?}, {:?}", entity, parent);
-    //     EntityVisitResult::Recurse
-    // });
+    if args.dump_ast {
+        utils::ast_dump::dump_ast(&args);
+    }
 
     let mut compiler = TUCompiler::new(args.clone(), triple.clone());
     compiler.translate(tu)?;
