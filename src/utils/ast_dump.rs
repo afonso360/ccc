@@ -8,6 +8,7 @@ pub fn dump_ast(args: &AppArgs) {
     cmd.arg("-Xclang")
         .arg("-ast-dump")
         .arg("-fsyntax-only")
+        .arg("-fcolor-diagnostics")
         .arg(&args.input);
     println!("// Running: {:?}", cmd);
 
