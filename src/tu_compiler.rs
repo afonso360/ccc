@@ -1,8 +1,7 @@
-use std::borrow::BorrowMut;
 use std::sync::Arc;
 
 use clang::{Entity, EntityKind, EntityVisitResult, TranslationUnit};
-use cranelift::codegen::{self, Context};
+use cranelift::codegen::Context;
 use cranelift::prelude::{
     isa::TargetIsa,
     settings::{self, Flags},

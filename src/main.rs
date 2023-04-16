@@ -3,7 +3,6 @@ use clang::{Clang, Index};
 use std::path::Path;
 use std::{fs, str::FromStr};
 use target_lexicon::Triple;
-use tempfile::tempfile;
 
 use crate::cli::AppArgs;
 use crate::tu_compiler::TUCompiler;
@@ -84,21 +83,13 @@ fn main() -> Result<()> {
 
     // Write the prelinking file to temp file
     let outfile = tempfile::NamedTempFile::new()?;
-    let (_, tmppath) = outfile.keep()?;
-    fs::write(&tmppath, bytes)?;
+    fs::write(outfile.path(), bytes)?;
 
     // Link the final binary
-    let link_res = link(tmppath.as_path(), &triple, &args);
-
-    fs::remove_file(tmppath)?;
-
-    link_res
+    link(outfile.path(), &triple, &args)
 }
 
 pub fn link(obj_file: &Path, triple: &Triple, args: &AppArgs) -> Result<()> {
-    use std::io::{Error, ErrorKind};
-    use std::process::Command;
-
     // link the .o file using host linker
 
     let linker = if cfg!(windows) { "link.exe" } else { "cc" };
