@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use ccc_pp::{PpToken, PpTokenKind};
+use ccc_pp::{PpToken, PpTokenKind, decode_integer_constant};
 use ccc_session::Span;
 
 const MAX_EXPRESSION_DEPTH: usize = 64;
@@ -405,7 +405,7 @@ impl Parser<'_> {
         };
 
         Ok(FunctionDeclaration {
-            span: Span::new(result.span.file, result.span.start, end),
+            span: Span::with_origin(result.span.file, result.span.start, end, result.span.origin),
             result,
             name,
             name_span,
@@ -447,7 +447,7 @@ impl Parser<'_> {
             };
             let end = name_span.map_or(ty.span.end, |span| span.end);
             parameters.push(Parameter {
-                span: Span::new(ty.span.file, ty.span.start, end),
+                span: Span::with_origin(ty.span.file, ty.span.start, end, ty.span.origin),
                 name,
                 name_span,
                 ty,
@@ -492,7 +492,7 @@ impl Parser<'_> {
             .expect_punctuator(Punctuator::RightBrace, "expected `}`")?
             .span;
         Ok(Statement {
-            span: Span::new(start.file, start.start, end.end),
+            span: Span::with_origin(start.file, start.start, end.end, start.origin),
             kind: StatementKind::Compound(items),
         })
     }
@@ -510,7 +510,7 @@ impl Parser<'_> {
             .expect_punctuator(Punctuator::Semicolon, "expected `;` after declaration")?
             .span;
         Ok(LocalDeclaration {
-            span: Span::new(ty.span.file, ty.span.start, end.end),
+            span: Span::with_origin(ty.span.file, ty.span.start, end.end, ty.span.origin),
             name,
             name_span,
             initializer,
@@ -535,7 +535,12 @@ impl Parser<'_> {
                 .as_ref()
                 .map_or(then_statement.span.end, |statement| statement.span.end);
             return Ok(Statement {
-                span: Span::new(keyword.span.file, keyword.span.start, end),
+                span: Span::with_origin(
+                    keyword.span.file,
+                    keyword.span.start,
+                    end,
+                    keyword.span.origin,
+                ),
                 kind: StatementKind::If {
                     condition,
                     then_statement,
@@ -549,7 +554,12 @@ impl Parser<'_> {
             self.expect_punctuator(Punctuator::RightParen, "expected `)` after condition")?;
             let body = Box::new(self.statement()?);
             return Ok(Statement {
-                span: Span::new(keyword.span.file, keyword.span.start, body.span.end),
+                span: Span::with_origin(
+                    keyword.span.file,
+                    keyword.span.start,
+                    body.span.end,
+                    keyword.span.origin,
+                ),
                 kind: StatementKind::While { condition, body },
             });
         }
@@ -563,7 +573,12 @@ impl Parser<'_> {
                 .expect_punctuator(Punctuator::Semicolon, "expected `;` after return value")?
                 .span;
             return Ok(Statement {
-                span: Span::new(keyword.span.file, keyword.span.start, end.end),
+                span: Span::with_origin(
+                    keyword.span.file,
+                    keyword.span.start,
+                    end.end,
+                    keyword.span.origin,
+                ),
                 kind: StatementKind::Return(value),
             });
         }
@@ -579,7 +594,7 @@ impl Parser<'_> {
             .expect_punctuator(Punctuator::Semicolon, "expected `;` after expression")?
             .span;
         Ok(Statement {
-            span: Span::new(start.file, start.start, end.end),
+            span: Span::with_origin(start.file, start.start, end.end, start.origin),
             kind: StatementKind::Expression(Some(expression)),
         })
     }
@@ -701,7 +716,12 @@ impl Parser<'_> {
             let operator_span = self.tokens[self.position - 1].span;
             let operand = self.nested_expression(Self::unary_expression)?;
             return Ok(Expression {
-                span: Span::new(operator_span.file, operator_span.start, operand.span.end),
+                span: Span::with_origin(
+                    operator_span.file,
+                    operator_span.start,
+                    operand.span.end,
+                    operator_span.origin,
+                ),
                 kind: ExpressionKind::Unary {
                     operator,
                     operand: Box::new(operand),
@@ -728,7 +748,7 @@ impl Parser<'_> {
                 .span;
             let start = expression.span;
             expression = Expression {
-                span: Span::new(start.file, start.start, end.end),
+                span: Span::with_origin(start.file, start.start, end.end, start.origin),
                 kind: ExpressionKind::Call {
                     callee: Box::new(expression),
                     arguments,
@@ -772,7 +792,12 @@ impl Parser<'_> {
                 let end = self
                     .expect_punctuator(Punctuator::RightParen, "expected `)`")?
                     .span;
-                expression.span = Span::new(token.span.file, token.span.start, end.end);
+                expression.span = Span::with_origin(
+                    token.span.file,
+                    token.span.start,
+                    end.end,
+                    token.span.origin,
+                );
                 Ok(expression)
             }
             _ => Err(self.error_at(
@@ -852,7 +877,12 @@ impl Parser<'_> {
                 self.current().map_or_else(
                     || {
                         let last = self.tokens.last().expect("an expression has a token");
-                        Span::new(last.span.file, last.span.end, last.span.end)
+                        Span::with_origin(
+                            last.span.file,
+                            last.span.end,
+                            last.span.end,
+                            last.span.origin,
+                        )
                     },
                     |token| token.span,
                 ),
@@ -876,7 +906,14 @@ impl Parser<'_> {
         let span = self
             .tokens
             .last()
-            .map(|token| Span::new(token.span.file, token.span.end, token.span.end))
+            .map(|token| {
+                Span::with_origin(
+                    token.span.file,
+                    token.span.end,
+                    token.span.end,
+                    token.span.origin,
+                )
+            })
             .expect("the parser only asks for an EOF span after seeing a token");
         ParseError {
             code: "CCC1001",
@@ -899,42 +936,21 @@ impl Parser<'_> {
 }
 
 fn decode_integer(spelling: &str) -> Result<u64, String> {
-    let (radix, body) = if let Some(digits) = spelling
-        .strip_prefix("0x")
-        .or_else(|| spelling.strip_prefix("0X"))
-    {
-        (16, digits)
-    } else if spelling.len() > 1 && spelling.starts_with('0') {
-        (8, spelling)
-    } else {
-        (10, spelling)
-    };
-    let digit_end = body
-        .char_indices()
-        .take_while(|(_, character)| character.is_digit(radix))
-        .map(|(index, character)| index + character.len_utf8())
-        .last()
-        .unwrap_or(0);
-    let (digits, suffix) = body.split_at(digit_end);
-    if !suffix.is_empty()
-        && suffix
-            .chars()
-            .all(|character| matches!(character, 'u' | 'U' | 'l' | 'L'))
-    {
+    let decoded = decode_integer_constant(spelling).map_err(|error| error.message)?;
+    if decoded.suffix.unsigned || decoded.suffix.long_count != 0 {
         return Err(format!(
             "integer suffix in `{spelling}` requires unsupported integer-type semantics"
         ));
     }
-    if digits.is_empty() || !suffix.is_empty() {
-        return Err(format!("unsupported integer constant `{spelling}`"));
-    }
-    u64::from_str_radix(digits, radix)
+    decoded
+        .value
+        .try_into()
         .map_err(|_| format!("integer constant `{spelling}` is too large"))
 }
 
 fn joined_span(left: Span, right: Span) -> Span {
     debug_assert_eq!(left.file, right.file);
-    Span::new(left.file, left.start, right.end)
+    Span::with_origin(left.file, left.start, right.end, left.origin)
 }
 
 pub fn dump_ast(unit: &TranslationUnit) -> String {

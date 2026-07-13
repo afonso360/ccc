@@ -1,0 +1,10 @@
+#ifndef CCC_TEST_CONFIGURATION_H
+#define CCC_TEST_CONFIGURATION_H
+
+#if defined(CCC_TEST_OVERRIDE)
+#define BASE_VALUE CCC_TEST_OVERRIDE
+#else
+#define BASE_VALUE 40
+#endif
+
+#endif

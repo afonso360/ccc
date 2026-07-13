@@ -1,0 +1,13 @@
+format_version = 1
+name = "ccc-glibc-like-preprocessing-fixture"
+revision = 1
+origin = "original-project-test-data"
+license = "Apache-2.0 OR MIT"
+entrypoint = "glibc-like/probe.c"
+compatibility_profile = "gcc-4.2.1"
+expected_files = [
+    "glibc-like/features.h",
+    "glibc-like/probe.c",
+    "glibc-like/sys/cdefs.h",
+    "glibc-like/sys/types.h",
+]

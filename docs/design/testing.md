@@ -10,6 +10,19 @@ Correctness is checked at each explicit compiler boundary and at binary interfac
 - **Compile-fail tests:** stable diagnostic codes, primary spans, macro/include provenance, and essential wording; incidental formatting is normalized.
 - **Object/disassembly tests:** sections, symbols, visibility, relocations, TLS, DWARF, calling-sequence details, PIE/PIC behavior, and generated bridges.
 
+Preprocessor fixtures separately cover normalization, object-like and
+function-like macros, conditionals, computed includes, include ordering,
+pragmas, predefined macros, dependency output, linemarkers, and provenance.
+Focused regressions cover UTF-8 literal scanning, prefixed character values,
+catch-all preprocessing tokens, directive comments spanning physical lines,
+direct and computed header predicates, terminating recursive inclusion, and
+identity-aware depth diagnostics.
+Inactive conditional groups are checked against a reference preprocessor for
+both valid skipped code and malformed preprocessing tokens. `#warning` tests
+pin warning promotion and message normalization. Linemarker tests cover entry,
+return, system-header state, `#line`, `-P`, and recompilation of emitted `.i`
+text.
+
 ## ABI oracle
 
 For every target:
@@ -43,6 +56,13 @@ Every enabled target has a required matrix entry. A target without an execution 
 ## Real-code corpus
 
 SQLite, Lua, zlib, musl, tcc, selected libc-header fixtures, c-testsuite, and GCC torture tests exercise drop-in compatibility. Each integration records the exact build command, enabled features, patches if any, expected exclusions, and whether success means preprocess, compile, link, or run. “Builds unmodified” is used only when no source or build-system patch is applied.
+
+The hosted-header preprocessing gate consists of a licensed, pinned fixture
+with deterministic goldens and a Linux-only smoke test against installed glibc
+feature, definition, and integer headers. The installed-header test records the
+toolchain and libc identity and asserts stable sentinel properties rather than
+snapshotting a mutable system header. Parsing that header is not implied by
+preprocessing success.
 
 Corpus pins encode capability dependencies. SQLite is pinned to ≥ 3.45, which removed core `long double` arithmetic — an earlier pin silently requires the f80 runtime on the primary target — and its gate runs the `veryquick` TCL set through `testfixture`, which needs a TCL development environment; the full suite and TH3 are out of scope. Lua's default GNU-profile build exercises `setjmp`/`longjmp` and computed-goto dispatch. musl feeds `$CC` assembly files.
 

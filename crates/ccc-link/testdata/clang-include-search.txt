@@ -1,0 +1,9 @@
+clang version 20.1.0
+ignoring nonexistent directory "/usr/include/x86_64-linux-gnu"
+#include "..." search starts here:
+#include <...> search starts here:
+ /opt/clang/lib/clang/20/include
+ /usr/local/include
+ /System/Library/Frameworks (framework directory)
+ /opt/clang/lib/clang/20/include
+End of search list.

@@ -509,7 +509,12 @@ fn signed_maximum(width: u8) -> u64 {
 }
 
 fn append_implicit_return(mut body: TypedStatement, function_span: Span) -> TypedStatement {
-    let end = Span::new(function_span.file, function_span.end, function_span.end);
+    let end = Span::with_origin(
+        function_span.file,
+        function_span.end,
+        function_span.end,
+        function_span.origin,
+    );
     let return_statement = TypedStatement {
         kind: TypedStatementKind::Return(TypedExpression {
             kind: TypedExpressionKind::Integer(0),

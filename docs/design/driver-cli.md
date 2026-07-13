@@ -8,6 +8,37 @@ The driver supports multiple C source, assembly (`.s`, and `.S` preprocessed fir
 
 Core options include `-x`, `-std=`, `-O`, `-g`, `-D`, `-U`, include/library paths, forced includes, dependency generation, response files, target/sysroot/toolchain selection, threading, PIC/PIE/shared/static selection, rpaths, and pass-through linker arguments.
 
+`-DNAME`, `-DNAME=value`, and function-like definitions such as
+`-D'F(x)=x'` use the same tokenization and definition checks as source
+`#define` directives. `-D` and `-U` are applied in command-line order.
+`-imacros` inputs are processed, in order, before the ordered `-include`
+inputs.
+
+Plain `-E` emits deterministic GCC-style linemarkers. The initial main-file
+marker has no entry flag; included-file entry, include return, and system-header
+state use flags `1`, `2`, and `3` respectively. Entry and return markers use
+the source spelling consistently, and logical locations changed by `#line` are
+reflected in subsequent markers. `-P` suppresses every linemarker. Textual
+output collapses ordinary whitespace without ever concatenating spellings into
+a different preprocessing token.
+
+Dependency options have the following driver contract:
+
+- `-M` and `-MM` select dependency-only output, imply `-E`, and suppress
+  warnings. Without `-MF`, the rule is written to stdout unless `-o` selects a
+  file. `-MF -` always selects stdout.
+- `-MD` and `-MMD` retain the selected compile or preprocess action and emit a
+  dependency file as a side effect. Without `-MF`, its name is derived from
+  `-o` or the input. With `-E` and no `-MF`, `-o` names the dependency output;
+  when `-MF` is present, `-o` remains the preprocessed-output destination.
+- `-MM` and `-MMD` exclude headers reached from system include entries or a
+  system-header region. `-MT`, `-MQ`, and `-MP` follow Make target, escaping,
+  and phony-rule semantics; each `-MP` phony rule is separated by a blank line.
+- `-MG` is recognized and rejected as unsupported rather than silently
+  changing missing-header errors.
+
+Dependency files are replaced atomically only after successful preprocessing.
+
 Build-system introspection is part of the compatible surface: `--version`, `-v`, `-dumpmachine`, `-dumpversion`, `-dM` with `-E`, `-print-prog-name=`, `-print-file-name=`, `-print-search-dirs`, and `-###` produce GCC-compatible output derived from the effective configuration and resolved toolchain. autotools, libtool, and CMake identify and probe compilers with these before compiling anything.
 
 `-S` means assemblable target output with the same symbols, relocatable expressions, visibility, and section semantics that assembling it would produce in object mode. Annotated disassembly is exposed separately as `--emit=asm`. If the selected backend cannot produce faithful assemblable output, `-S` is a clear unsupported-capability error; it never writes a disassembly file while claiming GCC-compatible `-S` behavior.
@@ -37,3 +68,8 @@ Before execution, the driver validates that every input object's architecture, o
 ## Observability
 
 `-E`, `--dump-pp-tokens`, `--dump-tokens`, `--dump-ast`, `--dump-typed-ast`, `--dump-ir`, `--dump-abi`, `--emit=clif`, `--emit=obj`, `--emit=asm`, `-###`, and `--print-effective-config` expose stable, deterministic representations suitable for snapshot tests. Dumps separate semantic content from unstable entity numbering and absolute temporary paths.
+
+`--dump-pp-tokens` shows the expanded preprocessing-token stream, including
+stable origin summaries. `--dump-tokens` shows the converted parser-token
+stream. `-dM -E` emits the final macro environment, including predefined
+macros, as `#define` directives.

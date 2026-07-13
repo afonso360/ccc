@@ -24,6 +24,13 @@ The `EffectiveCompilationConfig` type and per-target defaults are defined in `cc
 
 Target defaults remain immutable data; command-line flags produce a new effective value rather than mutating global target state. Predefined macros, builtin headers, layout, semantic analysis, ABI lowering, code generation, and linker flags are derived from this effective value. It is hashed into caches and recorded in object metadata needed for compatibility checks; each resolved tool is fingerprinted individually and hashes cover the phase-relevant subset, so compile-only outputs do not depend on linker identity.
 
+Target data layout is the source of truth for predefined type spellings,
+integer limits and widths, and `__SIZEOF_*__` values. The frontend combines
+those facts with the language and named compatibility profile once; the driver
+adds only compiler identity and capability-denial macros. Builtin headers and
+`-dM` consume that same final environment rather than maintaining parallel
+tables.
+
 ## Relocation and output models
 
 Executable, PIE, shared-library, and static-object modes select matching Cranelift relocation/code-model flags and linker-driver arguments. CCC never feeds non-PIC relocations into a driver invocation that defaults to PIE: an explicit non-PIE build passes the target driver's disable-PIE option, while a PIE build emits compatible code. Darwin shared output uses dylib conventions; ELF uses shared-object conventions.

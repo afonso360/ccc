@@ -19,7 +19,20 @@ There is no cross-target fallback to an unverified host `cc`.
 
 Resolution is phase-scoped: preprocessing and compilation require the sysroot/SDK and system include tree; assembling requires the assembler; linking requires the linker driver, CRT objects, and runtime libraries. A missing component is an error only when a selected phase needs it — `ccc -E` or `ccc -c` never fails for want of a linker.
 
+Resolution is requirements-scoped in the implementation: `-nostdinc` with no
+other system-dependent action does not probe for a system include tree, and a
+preprocess-only action never resolves a linker.
+
 The resolver probes and fingerprints the selected tools using machine-readable or stable driver queries where available: reported target, sysroot, search directories, startup objects, runtime-library paths, assembler/linker identity, PIE default, multilib selection, and builtin/system include directories. Probe results are cached by executable identity, version, target options, sysroot/SDK, and relevant environment. Missing or contradictory results are errors, not guessed paths.
+
+For GCC- and Clang-compatible drivers, preprocessing resolution separately
+probes the reported target, sysroot, and the delimited include-search listing
+from a no-code preprocessing invocation. The include-list parser is tested
+against recorded GCC and Clang output. A fingerprint covers the canonical
+driver path, version output, target options, sysroot, relevant environment,
+and normalized probe results. A Darwin development host cannot supply the
+Linux GNU system-header gate by fallback; local deterministic tests use
+`-nostdinc`, recorded probes, or a fake sysroot.
 
 Darwin requires a compatible Apple SDK, deployment target, and Apple-capable linker. Linux GNU and musl configurations resolve distinct CRTs, dynamic loaders, libraries, and header trees. `ccc-link` invokes the resolved target compiler driver for executable/shared linking, the resolved assembler for generated bridge/assembly files, and the resolved `ar`/`ranlib` pair (or a verified in-process archive writer) for static archives.
 

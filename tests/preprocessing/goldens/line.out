@@ -1,0 +1,2 @@
+int generated_value = 80;
+const char *generated_file = "generated.c";

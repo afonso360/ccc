@@ -123,5 +123,6 @@ fn execution_cases() -> &'static [(&'static str, i32)] {
         ("main_fallthrough.c", 0),
         ("unused_fallthrough_result.c", 7),
         ("minimum_signed_int.c", 1),
+        ("header_program.c", 42),
     ]
 }

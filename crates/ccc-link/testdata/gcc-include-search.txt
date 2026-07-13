@@ -1,0 +1,9 @@
+Using built-in specs.
+COLLECT_GCC=cc
+#include "..." search starts here:
+ /work/project/include
+#include <...> search starts here:
+ /usr/lib/gcc/x86_64-linux-gnu/14/include
+ =/usr/local/include
+ $SYSROOT/usr/include
+End of search list.

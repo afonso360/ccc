@@ -1,0 +1,4 @@
+int main(void) {
+const char *name = "answer";
+return ((40) + (2)) + (name[0] == 'a') - 1;
+}

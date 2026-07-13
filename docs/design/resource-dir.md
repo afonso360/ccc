@@ -22,9 +22,33 @@ Search lists are ordered directory entries with provenance and class, not a flat
 - angled include: the same without the including-file directory and `-iquote`;
 - Darwin framework entries from `-F`/`-iframework` participate according to the selected driver/SDK rules.
 
-`#include_next` resumes strictly after the directory entry that found the current header, even when another entry names the same physical directory. `__has_include` uses the same resolver transaction and does not mutate include state.
+`#include_next` and `__has_include_next` resume strictly after the directory
+entry that found the current header, even when another entry names the same
+physical directory. Header predicates use the same resolver transaction as
+directives and do not mutate include state. A direct quoted or angled
+predicate operand is resolved as written; a computed operand is macro-expanded
+and must then form exactly one valid header name.
 
-Header identity for `#pragma once` and cycle diagnostics uses stable filesystem identity (`device,inode` where available) with a normalized-realpath fallback. Diagnostics retain both the spelled and resolved path. Ordinary include guards remain macro semantics and do not depend on path canonicalization. The resolver handles symlinks, case sensitivity, missing files, permission errors, and include cycles deterministically.
+When an `#include` operand is not already a direct quoted or angled header
+name, its tokens are macro-expanded and the result must form exactly one valid
+header name. The same resolver handles direct includes, computed includes,
+`#include_next`, forced inputs, and `__has_include`; no caller reconstructs a
+parallel search algorithm.
+
+Header identity for `#pragma once` and cycle diagnostics uses stable filesystem
+identity (`device,inode` where available) with a normalized-realpath fallback.
+Diagnostics retain both the spelled and resolved path. Ordinary include guards
+and terminating recursive-inclusion idioms remain macro semantics: a repeated
+active identity is not rejected by itself. If recursion reaches the configured
+include-depth limit, the diagnostic reports the shortest repeated-identity
+cycle visible in the active stack. The resolver handles symlinks, case
+sensitivity, missing files, and permission errors deterministically.
+
+Each include occurrence records its parent, the search entry that found it,
+and whether it is a system header. `#pragma GCC system_header` changes the
+system-header state for subsequent tokens in the current occurrence. Origin
+records snapshot that state so warning suppression, linemarkers, and
+`-MM`/`-MMD` filtering cannot disagree.
 
 Controls:
 

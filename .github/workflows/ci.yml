@@ -18,4 +18,5 @@ jobs:
           components: clippy,rustfmt
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test -p ccc-driver --test preprocessing -- --show-output
       - run: cargo test --workspace --all-targets

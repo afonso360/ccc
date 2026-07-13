@@ -2,6 +2,21 @@
 
 CCC targets pragmatic C11 plus a documented GNU compatibility profile. Every accepted construct has defined behavior; syntax that is recognized only for header compatibility remains represented in the AST and produces a hard diagnostic if semantic or code-generation support is required.
 
+## Language modes
+
+The default language mode is `gnu11`. The initially supported explicit modes are
+`-std=gnu11` and `-std=c11`; other `-std=` values are rejected before reading an
+input. Both modes define `__STDC_VERSION__` as `201112L`. Strict `c11` also
+defines `__STRICT_ANSI__`. Trigraph replacement is enabled in strict `c11` and
+by an explicit `-trigraphs` option, and disabled in `gnu11`; a disabled
+trigraph that could change the program is covered by the `trigraphs` warning
+category.
+
+Input is UTF-8, with one optional leading UTF-8 byte-order mark. Universal
+character names permitted in C11 identifiers are accepted and canonicalized
+for identifier and macro-name equality while retaining their source spelling
+for diagnostics and preprocessing output.
+
 ## `long double`
 
 The default mode always preserves the selected target's C ABI, including representation, size, alignment, predefined macros, calling convention, and libc boundary behavior.
@@ -55,9 +70,23 @@ GNU spellings and capabilities are described by a versioned registry shared by t
 
 Layout, calling-convention, visibility, aliasing, section, TLS, cleanup, control-flow, vector, and code-generation attributes can never be classified as no-ops. Unknown attributes are preserved for diagnostics and rejected unless the standard explicitly permits them to be ignored and doing so is behavior-safe.
 
-`__has_attribute`, `__has_builtin`, `__has_feature`, and related predicates return true only for registry entries whose promised behavior is implemented for the current effective configuration. Parse-only support returns false. `__has_include` reports resolver results without opening a second, inconsistent search path.
+`__has_attribute`, `__has_builtin`, `__has_feature`, and related predicates
+return true only for registry entries whose promised behavior is implemented
+for the current effective configuration. Parse-only support returns false.
+`__has_include` and `__has_include_next` report resolver results without opening
+a second, inconsistent search path; direct header-name operands are preserved
+while computed operands use normal macro expansion.
 
 CCC always defines `__CCC__` and a CCC version tuple. `__GNUC__` and its version macros are defined only when a named GNU compatibility profile is active. Each profile has a checked manifest of the unguarded syntax and semantics that headers may infer from that GCC version; CCC does not raise the advertised version until the manifest passes on every target that exposes it.
+
+The manifest distinguishes claims needed to select a hosted header's
+preprocessing path from claims needed to compile the resulting declarations.
+A preprocessing-only invocation may use a checked header-selection manifest;
+an invocation that continues into parsing may consume hosted system headers
+only when the parser and semantic capability entries inferred by the same GNU
+version also pass. The exact advertised GCC version is data in the manifest,
+and changes to it require an audit of every version gate exercised by the
+pinned libc-header corpus.
 
 A GNU profile is not optional on hosted Linux targets. When `__GNUC__` is absent or ancient, glibc and musl headers take a fallback path that erases attributes and related keywords by macro (`sys/cdefs.h` defines `__attribute__(xyz)` to nothing), silently changing declarations, layout, and ABI — outside CCC's own no-silent-change machinery, because it happens by macro expansion inside libc. The apparently conservative option is the unsafe one. A hosted target's capability manifest therefore includes a minimum claimed GCC version, its header gates run with that profile active, and compiling against a hosted libc without an active GNU profile is refused rather than allowed to degrade silently.
 

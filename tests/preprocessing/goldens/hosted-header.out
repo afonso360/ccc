@@ -1,0 +1,4 @@
+typedef unsigned long int size_t;
+typedef long int ssize_t;
+extern ssize_t fixture_read(int, void *, size_t) __attribute__((__nothrow__));
+int hosted_header_preprocessing_sentinel;

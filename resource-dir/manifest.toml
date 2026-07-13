@@ -1,0 +1,30 @@
+format_version = 1
+compiler_version = "0.1.0"
+
+[headers]
+directory = "include"
+owned = ["stdalign.h", "stdbool.h", "stdnoreturn.h"]
+
+[hosted_header_profile]
+name = "gcc-4.2.1"
+version = "4.2.1"
+scope = "preprocessing"
+selection_gate = "__GNUC_PREREQ(4, 2)"
+rationale = "This conservative version selects established preprocessing declarations while avoiding header gates that infer newer GNU language features such as __VA_OPT__."
+capabilities = [
+    "computed-includes",
+    "function-like-macros",
+    "gcc-diagnostic-pragma",
+    "gcc-system-header-pragma",
+    "gnu-comma-elision",
+    "gnu-named-variadic-macros",
+    "include-next",
+    "line-control",
+    "object-like-macros",
+    "pragma-operator",
+    "token-pasting",
+    "token-stringification",
+    "variadic-macros",
+    "warning-directive",
+]
+declined_capabilities = ["va-opt"]

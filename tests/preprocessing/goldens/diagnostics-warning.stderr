@@ -1,0 +1,5 @@
+warning[CCC1315] [-Wcpp]: MESSAGE is intentionally not expanded
+ --> <repo>/tests/preprocessing/diagnostics/warning.c:2:1
+   |
+ 2 | #warning MESSAGE is intentionally not expanded
+   | ^

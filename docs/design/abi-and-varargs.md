@@ -28,7 +28,10 @@ Cranelift signatures do not currently express C variadic semantics. CCC therefor
 1. **Native capability:** a pinned Cranelift version can express the target's variadic call and callee-entry rules, including fixed-argument count and special registers.
 2. **Generated bridge:** `ccc-abi` emits a `VarArgBridgePlan`; `ccc-link` assembles a target-specific bridge object. A call bridge receives a callee address plus a packed argument/return area, reconstructs the psABI register and stack state, performs the call, and stores the return value. This uniform form supports both direct and indirect calls without smuggling the callee through a global or changing argument positions.
 
-No pinned Cranelift release currently provides the native capability, so until an upgrade passes the gates every variadic call and definition takes the bridge path — the bridges sit on the critical path of the first ABI milestone, not in a rarely exercised fallback corner.
+No pinned Cranelift release currently provides the native capability, so until
+an upgrade passes the gates every variadic call and definition takes the bridge
+path. The bridges are required for supported variadic ABI behavior, not a
+rarely exercised fallback corner.
 
 For SysV AMD64 the bridge sets `%al` to the required upper bound on used vector argument registers. For Darwin arm64 it places unnamed arguments according to Apple's stack rules. AArch64 Linux and RISC-V bridges follow their own psABI rules; no target inherits another target's workaround.
 
