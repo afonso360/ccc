@@ -1,0 +1,21 @@
+[package]
+name = "ccc-driver"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "ccc"
+path = "src/main.rs"
+
+[dependencies]
+ccc-diag = { path = "../ccc-diag" }
+ccc-pp = { path = "../ccc-pp" }
+ccc-session = { path = "../ccc-session" }
+ccc-syntax = { path = "../ccc-syntax" }
+ccc-target = { path = "../ccc-target" }
+object.workspace = true
+
+[lints]
+workspace = true

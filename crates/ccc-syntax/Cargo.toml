@@ -1,0 +1,13 @@
+[package]
+name = "ccc-syntax"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+ccc-pp = { path = "../ccc-pp" }
+ccc-session = { path = "../ccc-session" }
+
+[lints]
+workspace = true

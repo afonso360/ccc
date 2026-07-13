@@ -1,0 +1,12 @@
+[package]
+name = "ccc-pp"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+ccc-session = { path = "../ccc-session" }
+
+[lints]
+workspace = true
