@@ -5,5 +5,15 @@ license.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[dependencies]
+ccc-diag = { path = "../ccc-diag" }
+ccc-session = { path = "../ccc-session" }
+ccc-syntax = { path = "../ccc-syntax" }
+ccc-target = { path = "../ccc-target" }
+ccc-types = { path = "../ccc-types" }
+
+[dev-dependencies]
+ccc-pp = { path = "../ccc-pp" }
+
 [lints]
 workspace = true

@@ -5,5 +5,8 @@ license.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[dependencies]
+target-lexicon.workspace = true
+
 [lints]
 workspace = true

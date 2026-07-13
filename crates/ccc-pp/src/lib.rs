@@ -34,6 +34,7 @@ pub struct PpToken {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LexError {
+    pub code: &'static str,
     pub span: Span,
     pub message: String,
 }
@@ -74,6 +75,7 @@ pub fn lex(file: FileId, source: &str) -> Result<Vec<PpToken>, LexError> {
             }
             if index + 1 >= bytes.len() {
                 return Err(error(
+                    "CCC0001",
                     file,
                     start,
                     bytes.len(),
@@ -118,7 +120,13 @@ pub fn lex(file: FileId, source: &str) -> Result<Vec<PpToken>, LexError> {
                 }
             }
             if !terminated {
-                return Err(error(file, start, bytes.len(), "unterminated literal"));
+                return Err(error(
+                    "CCC0002",
+                    file,
+                    start,
+                    bytes.len(),
+                    "unterminated literal",
+                ));
             }
             if quote == b'\'' {
                 PpTokenKind::CharacterConstant
@@ -135,6 +143,7 @@ pub fn lex(file: FileId, source: &str) -> Result<Vec<PpToken>, LexError> {
                 .expect("index is in bounds")
                 .len_utf8();
             return Err(error(
+                "CCC0003",
                 file,
                 start,
                 start + character_length,
@@ -152,8 +161,9 @@ pub fn lex(file: FileId, source: &str) -> Result<Vec<PpToken>, LexError> {
     Ok(tokens)
 }
 
-fn error(file: FileId, start: usize, end: usize, message: &str) -> LexError {
+fn error(code: &'static str, file: FileId, start: usize, end: usize, message: &str) -> LexError {
     LexError {
+        code,
         span: Span::new(file, start, end),
         message: message.to_owned(),
     }
@@ -218,12 +228,9 @@ mod tests {
         let mut sources = SourceMap::new();
         let file = sources.add_file("test.c", "/*");
 
-        assert_eq!(
-            lex(file, sources.source(file).unwrap())
-                .unwrap_err()
-                .message,
-            "unterminated block comment"
-        );
+        let error = lex(file, sources.source(file).unwrap()).unwrap_err();
+        assert_eq!(error.code, "CCC0001");
+        assert_eq!(error.message, "unterminated block comment");
     }
 
     #[test]
@@ -234,5 +241,13 @@ mod tests {
         let spellings: Vec<_> = tokens.iter().map(|token| token.spelling.as_str()).collect();
 
         assert_eq!(spellings, ["1", "+", "2", "1", "-", "2", "1e+2", "0x1p-2"]);
+    }
+
+    #[test]
+    fn classifies_an_invalid_preprocessing_character() {
+        let mut sources = SourceMap::new();
+        let file = sources.add_file("test.c", "\\");
+        let error = lex(file, sources.source(file).unwrap()).unwrap_err();
+        assert_eq!(error.code, "CCC0003");
     }
 }

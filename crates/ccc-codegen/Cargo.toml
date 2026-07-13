@@ -5,5 +5,22 @@ license.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[dependencies]
+ccc-abi = { path = "../ccc-abi" }
+ccc-ir = { path = "../ccc-ir" }
+ccc-target = { path = "../ccc-target" }
+ccc-types = { path = "../ccc-types" }
+cranelift-codegen.workspace = true
+cranelift-frontend.workspace = true
+cranelift-module.workspace = true
+cranelift-object.workspace = true
+
+[dev-dependencies]
+ccc-pp = { path = "../ccc-pp" }
+ccc-sema = { path = "../ccc-sema" }
+ccc-session = { path = "../ccc-session" }
+ccc-syntax = { path = "../ccc-syntax" }
+object.workspace = true
+
 [lints]
 workspace = true

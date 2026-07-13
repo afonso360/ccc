@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use ccc_target::EffectiveCompilationConfig;
+
 /// A stable index into a [`SourceMap`].
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct FileId(u32);
@@ -132,6 +134,22 @@ impl fmt::Display for Span {
             "file#{}:{}..{}",
             self.file.0, self.start, self.end
         )
+    }
+}
+
+/// Per-compilation state shared by all compiler phases.
+#[derive(Debug, Default)]
+pub struct Session {
+    pub sources: SourceMap,
+    pub config: EffectiveCompilationConfig,
+}
+
+impl Session {
+    pub fn new(config: EffectiveCompilationConfig) -> Self {
+        Self {
+            sources: SourceMap::new(),
+            config,
+        }
     }
 }
 
