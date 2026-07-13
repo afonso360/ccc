@@ -1,0 +1,64 @@
+# Conformance policy
+
+CCC targets pragmatic C11 plus a documented GNU compatibility profile. Every accepted construct has defined behavior; syntax that is recognized only for header compatibility remains represented in the AST and produces a hard diagnostic if semantic or code-generation support is required.
+
+## `long double`
+
+The default mode always preserves the selected target's C ABI, including representation, size, alignment, predefined macros, calling convention, and libc boundary behavior.
+
+| Target                                                   | Native representation                                     | Required lowering                                                                                                                                        |
+| -------------------------------------------------------- | --------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `x86_64-unknown-linux-gnu` / musl                        | x87 extended precision, 80 value bits in a 16-byte object | Internal memory representation plus f80 helpers; assembly ABI bridges marshal x87 arguments/returns when Cranelift cannot express them.                  |
+| `aarch64-unknown-linux-gnu`, `riscv64-unknown-linux-gnu` | IEEE binary128                                            | Verified Cranelift `f128` storage/ABI support where available; otherwise an `i128`-bits representation with compiler-runtime arithmetic and ABI bridges. |
+| `aarch64-apple-darwin`                                   | IEEE binary64, identical to `double`                      | Native Cranelift `f64`.                                                                                                                                  |
+
+Declarations, `sizeof`, and `_Alignof` remain usable even when the selected backend lacks arithmetic or boundary support. Any literal conversion, arithmetic operation, call, return, or initializer that needs an unavailable capability is a hard, target-specific error. CCC must not substitute `double` implicitly.
+
+`-mlong-double-64` is an explicit compatibility mode, never the default on a target whose ABI uses f80 or binary128. In that mode the [`EffectiveCompilationConfig`](targets.md#effective-compilation-configuration) changes the representation coherently: size, alignment, `__SIZEOF_LONG_DOUBLE__`, every `__LDBL_*__` macro, `<float.h>`, and ABI lowering all describe binary64. The driver emits one prominent ABI-incompatibility warning unless explicitly silenced. Objects produced in this mode carry a mode identifier in CCC metadata so the linker can diagnose incompatible CCC objects.
+
+The runtime/helper and assembly-bridge availability is a target capability checked before code generation. Soft-float arithmetic alone is not considered ABI support.
+
+## `_Complex` and `_Imaginary`
+
+When complex arithmetic is not enabled for a target configuration, CCC defines `__STDC_NO_COMPLEX__` to `1`, does not claim the corresponding GNU capability, and diagnoses semantic use of `_Complex`, `_Imaginary`, or complex builtins. The parser still recognizes the syntax so the diagnostic is precise. `<complex.h>` either comes from a compatible libc that observes `__STDC_NO_COMPLEX__` or from a CCC wrapper that reports the unsupported capability; it must not expose declarations that would later miscompile.
+
+A conforming complex implementation represents values as typed real/imaginary pairs in CCC-IR, defines arithmetic and exceptional behavior, and supplies explicit per-target ABI plans. Merely accepting the keywords does not enable the capability.
+
+## Variable-length arrays
+
+C11 makes VLAs optional. While a target lacks the [dynamic-stack capability](cranelift-risks.md#dynamic-stack-capability-contract), its configuration defines `__STDC_NO_VLA__` to `1`, and a declaration whose storage requires runtime stack allocation is a hard capability diagnostic — documented conformance, not a deferred bug. Variably modified types remain representable in semantic analysis (runtime `sizeof`, pointers to VLA), matching the general parse-don't-claim policy. When the capability lands for a target, the macro is removed and the execution tests take over.
+
+## Effective implementation-defined behavior
+
+Implementation-defined answers are queried from one immutable effective configuration, not directly from a triple. It combines target defaults with language, ABI, code-generation, and toolchain options as specified in [Targets](targets.md#effective-compilation-configuration). It owns:
+
+- plain `char` signedness, including `-fsigned-char` / `-funsigned-char`;
+- integer widths and the underlying types of `size_t`, `ptrdiff_t`, `wchar_t`, `wint_t`, and `intmax_t`;
+- enum selection, including `-fshort-enums`;
+- bitfield and aggregate layout, packing pragmas, and packing/alignment flags;
+- signed representation, right-shift behavior, and out-of-range conversions;
+- `long double`, calling-convention, ISA, relocation, TLS, and code-model options;
+- every predefined macro and builtin-header value derived from those choices.
+
+Signed overflow is undefined by default. `-fwrapv` changes IR arithmetic to wrapping semantics; `-fno-strict-overflow` constrains optimizations without changing the abstract-machine result; either flag is rejected if its complete semantics are unavailable.
+
+Differential testing compares implementation-defined results only under an identical effective configuration.
+
+## GNU compatibility registry
+
+GNU spellings and capabilities are described by a versioned registry shared by the preprocessor, parser, semantic analysis, diagnostics, and driver. Every attribute, builtin, pragma, extension, and compatibility macro is in exactly one state:
+
+- **Implemented:** syntax and observable semantics are supported and tested.
+- **Behavior-compatible no-op:** ignoring it cannot affect layout, ABI, control flow, memory semantics, linking, or program output; the registry documents why.
+- **Parse-only:** retained in the AST for header parsing, but semantic use or code-generation reachability produces a hard diagnostic.
+- **Unsupported:** rejected at the point of use.
+
+Layout, calling-convention, visibility, aliasing, section, TLS, cleanup, control-flow, vector, and code-generation attributes can never be classified as no-ops. Unknown attributes are preserved for diagnostics and rejected unless the standard explicitly permits them to be ignored and doing so is behavior-safe.
+
+`__has_attribute`, `__has_builtin`, `__has_feature`, and related predicates return true only for registry entries whose promised behavior is implemented for the current effective configuration. Parse-only support returns false. `__has_include` reports resolver results without opening a second, inconsistent search path.
+
+CCC always defines `__CCC__` and a CCC version tuple. `__GNUC__` and its version macros are defined only when a named GNU compatibility profile is active. Each profile has a checked manifest of the unguarded syntax and semantics that headers may infer from that GCC version; CCC does not raise the advertised version until the manifest passes on every target that exposes it.
+
+A GNU profile is not optional on hosted Linux targets. When `__GNUC__` is absent or ancient, glibc and musl headers take a fallback path that erases attributes and related keywords by macro (`sys/cdefs.h` defines `__attribute__(xyz)` to nothing), silently changing declarations, layout, and ABI — outside CCC's own no-silent-change machinery, because it happens by macro expansion inside libc. The apparently conservative option is the unsafe one. A hosted target's capability manifest therefore includes a minimum claimed GCC version, its header gates run with that profile active, and compiling against a hosted libc without an active GNU profile is refused rather than allowed to degrade silently.
+
+Supported GNU syntax includes only registry entries with the state above. Inline assembly is represented with templates, operands, constraints, clobbers, volatility, and `asm goto` labels; code generation follows the bridge/whole-function rules in the [Cranelift risk register](cranelift-risks.md#risk-register). Assembly labels on declarations (`int f(void) __asm__("f_impl");`) are a separate registry capability from inline-assembly bodies: they change the linked symbol name, can never be no-ops, and glibc's `__REDIRECT` machinery makes them a requirement for hosted compiles.

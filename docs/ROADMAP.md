@@ -1,0 +1,21 @@
+# CCC delivery roadmap
+
+This document owns delivery order and acceptance gates. Feature semantics live in [`design/`](design/); changing delivery order must not change those contracts.
+
+- **M0 — Scaffolding.** _Exit:_ the workspace builds; `ccc -c empty.c` emits a valid empty object; [`ccc-diag`/`ccc-session`](design/diagnostics.md) render a span with a caret; `--dump-tokens` works on a trivial input; and the execution-test harness runs in CI. An empty translation unit is not linked as an executable because a normal system C runtime requires `main`.
+
+- **M1 — Walking skeleton (x86-64).** Minimal lex/parse/sema, first [CCC-IR](design/ccc-ir.md), and code generation for `int`, arithmetic, locals, `if`/`while`, `return`, and direct calls. _Exit:_ `int main(void){return 42;}` and a dozen small programs produce correct exit codes end-to-end; `--dump-ast`, `--dump-ir`, and `--emit=clif` all render.
+
+- **M2 — Preprocessor.** Acceptance slices: object-like macros; function-like macros including `#`, `##`, and variadic macros; include search; conditional directives; predefined and feature-test macros; pragmas; dependency files; and include/macro diagnostics. _Exit:_ each slice is snapshot-tested and a multi-file program with headers compiles. A curated libc-header fixture and at least one installed libc header must flow through preprocessing using the compatibility rules in [Conformance policy](design/conformance.md); parsing those headers is an M3 gate, because it needs the full declaration grammar and the parse-level GNU surface.
+
+- **M3 — Full type system.** Structs/unions, enums, bitfields, pointers/arrays/function pointers, operators and conversions, initializers, string literals, globals, linkage, and the remaining statements (`switch`, `for`, `do`, `goto` and labels, `break`/`continue`). _Exit:_ non-trivial single-file programs run; typed-AST snapshots are stable; `sizeof`, `_Alignof`, and `offsetof` agree with the [ABI oracle](design/testing.md#abi-oracle); and the M2 libc-header fixtures parse, which requires the parse-level GNU declaration surface (attributes, `__extension__`, `__restrict`, `__asm__` labels).
+
+- **M4 — ABI and variadics on SysV AMD64.** Implement the [ABI plans and variadic bridges](design/abi-and-varargs.md). _Exit:_ cross-linked ABI tests pass in both directions; a floating-point value survives a call to `printf`; and custom variadic functions round-trip integer, floating-point, pointer, and aggregate arguments through `va_arg`. Variadic calls and definitions are tested separately.
+
+- **M5 — Core C11 and supported GNU semantics.** `_Generic`, `_Static_assert`, `_Alignas`, `_Alignof`, `_Noreturn`, compound literals, flexible array members, supported dynamic-stack operations, statement expressions, computed goto, `__int128`, supported builtins, and supported inline assembly. _Exit:_ SQLite — pinned to ≥ 3.45, which removed core `long double` arithmetic; an earlier pin would silently pull the f80 runtime forward from M8 — compiles and passes the `veryquick` set of its TCL test suite on the primary target. Tracked conformance gaps remain explicit and must fail safely.
+
+- **M6 — Additional architectures.** AArch64 Linux, RISC-V64 Linux, and Darwin arm64 ABI support. _Exit:_ the applicable corpus and ABI oracle pass for every enabled target. Linux cross-target executables run under QEMU; Darwin executables run on native macOS CI, not QEMU.
+
+- **M7 — Drop-in hardening.** PIC/PIE/shared output, TLS, atomics, DWARF, archives, the returns-twice (`setjmp`/`longjmp`) capability profile, and the supported build-system flag surface. _Exit:_ Lua and zlib build unmodified through their own build systems with `CC=ccc` and pass their tests. Lua's default build exercises `setjmp`/`longjmp` error handling and, under the GNU profile, computed-goto dispatch from M5.
+
+- **M8 — Optimization and conformance work.** CCC-IR optimization, documented `-O` mappings, diagnostic-quality work, and implementation of selected conformance gaps. _Stretch:_ musl and tcc.
