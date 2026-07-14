@@ -7,6 +7,8 @@ version.workspace = true
 
 [dependencies]
 ccc-target = { path = "../ccc-target" }
+object.workspace = true
+sha2.workspace = true
 
 [lints]
 workspace = true

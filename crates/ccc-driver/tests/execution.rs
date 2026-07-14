@@ -47,7 +47,11 @@ fn empty_translation_unit_emits_a_valid_object() {
 fn execution_programs_emit_x86_64_objects() {
     use object::{Architecture, Object as _, ObjectSymbol as _};
 
-    for (name, _) in execution_cases() {
+    for case in execution_cases() {
+        if case.requires_bridge && !bridge_packaging_is_available() {
+            continue;
+        }
+        let name = case.source;
         let directory = test_directory(name);
         let output = directory.join("program.o");
         let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
@@ -76,7 +80,8 @@ fn execution_programs_emit_x86_64_objects() {
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
 fn execution_programs_produce_the_expected_exit_status() {
-    for (name, expected) in execution_cases() {
+    for case in execution_cases() {
+        let name = case.source;
         let directory = test_directory(name);
         let executable = directory.join("program");
         let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
@@ -90,53 +95,117 @@ fn execution_programs_produce_the_expected_exit_status() {
             "ccc failed for {name}: {}",
             String::from_utf8_lossy(&compilation.stderr)
         );
-        let execution = Command::new(&executable).output().unwrap();
+        let execution = Command::new(&executable)
+            .env("LC_ALL", "C")
+            .output()
+            .unwrap();
         assert_eq!(
             execution.status.code(),
-            Some(*expected),
+            Some(case.status),
             "wrong exit status for {name}; stderr: {}",
+            String::from_utf8_lossy(&execution.stderr)
+        );
+        assert_eq!(
+            execution.stdout,
+            case.stdout,
+            "wrong stdout for {name}: {}",
+            String::from_utf8_lossy(&execution.stdout)
+        );
+        assert_eq!(
+            execution.stderr,
+            case.stderr,
+            "wrong stderr for {name}: {}",
             String::from_utf8_lossy(&execution.stderr)
         );
         fs::remove_dir_all(directory).unwrap();
     }
 }
 
-fn execution_cases() -> &'static [(&'static str, i32)] {
-    &[
-        ("return_constant.c", 42),
-        ("arithmetic_precedence.c", 14),
-        ("unary_arithmetic.c", 3),
-        ("local_initializers.c", 42),
-        ("assignment.c", 42),
-        ("nested_scope.c", 7),
-        ("if_else.c", 11),
-        ("nested_conditionals.c", 25),
-        ("while_loop.c", 10),
-        ("while_assignment.c", 6),
-        ("comparisons.c", 63),
-        ("short_circuit.c", 40),
-        ("call_no_arguments.c", 17),
-        ("call_with_arguments.c", 42),
-        ("recursion.c", 120),
-        ("forward_declaration.c", 42),
-        ("external_call.c", 42),
-        ("main_fallthrough.c", 0),
-        ("unused_fallthrough_result.c", 7),
-        ("minimum_signed_int.c", 1),
-        ("header_program.c", 42),
-        ("integer_types.c", 41),
-        ("pointers_and_arrays.c", 42),
-        ("records_unions_enums.c", 43),
-        ("bitfields_and_packing.c", 44),
-        ("globals_and_static_initializers.c", 45),
-        ("string_literals.c", 46),
-        ("full_control_flow.c", 47),
-        ("indirect_calls.c", 48),
-        ("layout_operators.c", 49),
-        ("volatile_access.c", 50),
-        ("floating_point.c", 51),
-        ("operators_and_conversions.c", 52),
-        ("combined_language_features.c", 53),
-        ("semantic_regressions.c", 54),
-    ]
+#[cfg_attr(
+    not(all(target_arch = "x86_64", target_os = "linux")),
+    allow(dead_code)
+)]
+struct ExecutionExpectation {
+    source: &'static str,
+    status: i32,
+    stdout: &'static [u8],
+    stderr: &'static [u8],
+    requires_bridge: bool,
 }
+
+const fn exit_status(source: &'static str, status: i32) -> ExecutionExpectation {
+    ExecutionExpectation {
+        source,
+        status,
+        stdout: b"",
+        stderr: b"",
+        requires_bridge: false,
+    }
+}
+
+const fn bridged_exit_status(source: &'static str, status: i32) -> ExecutionExpectation {
+    ExecutionExpectation {
+        source,
+        status,
+        stdout: b"",
+        stderr: b"",
+        requires_bridge: true,
+    }
+}
+
+fn bridge_packaging_is_available() -> bool {
+    cfg!(all(target_arch = "x86_64", target_os = "linux")) || std::env::var_os("CCC_CC").is_some()
+}
+
+fn execution_cases() -> &'static [ExecutionExpectation] {
+    &EXECUTION_CASES
+}
+
+static EXECUTION_CASES: [ExecutionExpectation; 40] = [
+    exit_status("return_constant.c", 42),
+    exit_status("arithmetic_precedence.c", 14),
+    exit_status("unary_arithmetic.c", 3),
+    exit_status("local_initializers.c", 42),
+    exit_status("assignment.c", 42),
+    exit_status("nested_scope.c", 7),
+    exit_status("if_else.c", 11),
+    exit_status("nested_conditionals.c", 25),
+    exit_status("while_loop.c", 10),
+    exit_status("while_assignment.c", 6),
+    exit_status("comparisons.c", 63),
+    exit_status("short_circuit.c", 40),
+    exit_status("call_no_arguments.c", 17),
+    exit_status("call_with_arguments.c", 42),
+    exit_status("recursion.c", 120),
+    exit_status("forward_declaration.c", 42),
+    exit_status("external_call.c", 42),
+    exit_status("main_fallthrough.c", 0),
+    exit_status("unused_fallthrough_result.c", 7),
+    exit_status("minimum_signed_int.c", 1),
+    exit_status("header_program.c", 42),
+    exit_status("integer_types.c", 41),
+    exit_status("pointers_and_arrays.c", 42),
+    exit_status("records_unions_enums.c", 43),
+    exit_status("bitfields_and_packing.c", 44),
+    exit_status("globals_and_static_initializers.c", 45),
+    exit_status("string_literals.c", 46),
+    exit_status("full_control_flow.c", 47),
+    exit_status("indirect_calls.c", 48),
+    exit_status("layout_operators.c", 49),
+    exit_status("volatile_access.c", 50),
+    exit_status("floating_point.c", 51),
+    exit_status("operators_and_conversions.c", 52),
+    exit_status("combined_language_features.c", 53),
+    exit_status("semantic_regressions.c", 54),
+    exit_status("aggregate_calls.c", 63),
+    exit_status("aggregate_rvalue_arrays.c", 42),
+    exit_status("aggregate_rvalue_bitfield.c", 37),
+    bridged_exit_status("variadic_functions.c", 93),
+    ExecutionExpectation {
+        source: "variadic_printf.c",
+        status: 0,
+        stdout: b"ccc 7 2.5 ok\n",
+        stderr: b"",
+        requires_bridge: true,
+    },
+];

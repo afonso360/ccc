@@ -1,14 +1,15 @@
 use std::collections::{HashSet, VecDeque};
 
 use ccc_types::{
-    ArrayLength, BuiltinType, FunctionParameters, QualifiedType, TypeId, TypeKind, TypeStore,
+    ArrayLength, BuiltinType, FunctionParameters, QualifiedType, TargetBuiltinType, TypeId,
+    TypeKind, TypeQualifiers, TypeStore,
 };
 
 use super::{
-    BlockId, DataOrigin, FullEdge, FullFunction, FullInstruction, FullInstructionKind, FullModule,
-    FullTerminator, InitializerGraph, InitializerNodeId, InitializerNodeKind, InitializerPath,
-    IrError, MemoryAccess, RelocationKind, RelocationTarget, ScalarConversion, StorageLocation,
-    ValueId,
+    AggregateProjection, BlockId, DataOrigin, FullEdge, FullFunction, FullInstruction,
+    FullInstructionKind, FullModule, FullTerminator, InitializerGraph, InitializerNodeId,
+    InitializerNodeKind, InitializerPath, IrError, MemoryAccess, RelocationKind, RelocationTarget,
+    ScalarConversion, StorageLocation, ValueId,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -874,10 +875,14 @@ impl FunctionVerifier<'_> {
             } => {
                 verify_access(*access)?;
                 verify_bitfield(*descriptor)?;
-                if pointer_pointee(types, self.value_type(*address)?.ty).is_none() {
-                    return Err(IrError::verify("bitfield load address is not a pointer"));
+                let pointee = pointer_pointee(types, self.value_type(*address)?.ty)
+                    .ok_or_else(|| IrError::verify("bitfield load address is not a pointer"))?;
+                let result = require_result(result, instruction, "bitfield load")?;
+                if pointee.ty != result.ty {
+                    return Err(IrError::verify(
+                        "bitfield load result disagrees with its address pointee",
+                    ));
                 }
-                require_result(result, instruction, "bitfield load")?;
             }
             FullInstructionKind::BitfieldStore {
                 address,
@@ -964,15 +969,19 @@ impl FunctionVerifier<'_> {
                     *destination_object,
                     "aggregate copy destination",
                 )?;
-                require_address(
-                    types,
-                    self.value_type(*source)?,
-                    *source_object,
-                    "aggregate copy source",
-                )?;
+                let source_ty = self.value_type(*source)?;
+                if source_ty.ty == source_object.ty {
+                    if !self.is_owned_aggregate_value(*source)? {
+                        return Err(IrError::verify(
+                            "aggregate copy source is not owned aggregate storage",
+                        ));
+                    }
+                } else {
+                    require_address(types, source_ty, *source_object, "aggregate copy source")?;
+                }
             }
-            FullInstructionKind::AggregateValue {
-                address,
+            FullInstructionKind::AggregateSnapshot {
+                source,
                 object,
                 access,
             } => {
@@ -984,13 +993,114 @@ impl FunctionVerifier<'_> {
                 }
                 require_address(
                     types,
-                    self.value_type(*address)?,
+                    self.value_type(*source)?,
                     *object,
-                    "aggregate value",
+                    "aggregate snapshot",
                 )?;
-                let result = require_result(result, instruction, "aggregate value")?;
+                let result = require_result(result, instruction, "aggregate snapshot")?;
                 if result.ty != object.ty {
-                    return Err(IrError::verify("aggregate value result type is wrong"));
+                    return Err(IrError::verify("aggregate snapshot result type is wrong"));
+                }
+            }
+            FullInstructionKind::AggregateProject {
+                base,
+                aggregate,
+                projections,
+            } => {
+                if !is_aggregate(types, aggregate.ty) || self.value_type(*base)?.ty != aggregate.ty
+                {
+                    return Err(IrError::verify(
+                        "aggregate projection base disagrees with its aggregate type",
+                    ));
+                }
+                if !self.is_owned_aggregate_value(*base)? {
+                    return Err(IrError::verify(
+                        "aggregate projection base is not owned aggregate storage",
+                    ));
+                }
+                if projections.is_empty() {
+                    return Err(IrError::verify("aggregate projection path is empty"));
+                }
+                let mut projected = *aggregate;
+                let mut bitfield_anchor = None;
+                for (position, projection) in projections.iter().enumerate() {
+                    projected = match projection {
+                        AggregateProjection::Field {
+                            index,
+                            name,
+                            bitfield,
+                        } => {
+                            let Some(TypeKind::Record(record)) = types.try_kind(projected.ty)
+                            else {
+                                return Err(IrError::verify(
+                                    "aggregate field projection does not follow a record",
+                                ));
+                            };
+                            let field = types
+                                .record(*record)
+                                .and_then(|record| record.fields.as_ref())
+                                .and_then(|fields| fields.get(*index))
+                                .ok_or_else(|| {
+                                    IrError::verify(
+                                        "aggregate projection has an invalid field index",
+                                    )
+                                })?;
+                            if name
+                                .as_ref()
+                                .is_some_and(|name| field.name.as_ref() != Some(name))
+                            {
+                                return Err(IrError::verify(
+                                    "aggregate projection field name disagrees with its index",
+                                ));
+                            }
+                            if field.bitfield.is_some() != bitfield.is_some() {
+                                return Err(IrError::verify(
+                                    "aggregate projection does not preserve its bitfield descriptor",
+                                ));
+                            }
+                            if let Some(bitfield) = bitfield {
+                                verify_bitfield(*bitfield)?;
+                                if bitfield.field_index != *index {
+                                    return Err(IrError::verify(
+                                        "aggregate projection bitfield descriptor has the wrong field index",
+                                    ));
+                                }
+                                if position + 1 != projections.len() {
+                                    return Err(IrError::verify(
+                                        "bitfield must be the final aggregate projection",
+                                    ));
+                                }
+                                bitfield_anchor = Some(*bitfield);
+                            }
+                            QualifiedType::new(
+                                field.ty.ty,
+                                field.ty.qualifiers | projected.qualifiers,
+                            )
+                        }
+                        AggregateProjection::Index { index } => {
+                            let Some(TypeKind::Array(array)) = types.try_kind(projected.ty) else {
+                                return Err(IrError::verify(
+                                    "aggregate index projection does not follow an array",
+                                ));
+                            };
+                            if !types.is_integer(self.value_type(*index)?.ty) {
+                                return Err(IrError::verify(
+                                    "aggregate projection index is not an integer",
+                                ));
+                            }
+                            QualifiedType::new(
+                                array.element.ty,
+                                array.element.qualifiers | projected.qualifiers,
+                            )
+                        }
+                    };
+                }
+                require_pointer_result(types, result, projected, instruction)?;
+                if let Some(descriptor) = bitfield_anchor {
+                    let result = instruction
+                        .result
+                        .expect("aggregate projection result was required above");
+                    self.verify_bitfield_projection_consumer(result, descriptor)?;
                 }
             }
             FullInstructionKind::Convert {
@@ -1102,6 +1212,114 @@ impl FunctionVerifier<'_> {
                 )?;
                 self.verify_noreturn(block, position, effects.no_return)?;
             }
+            FullInstructionKind::VaStart {
+                list,
+                last_named_parameter,
+            } => {
+                require_no_result(result, instruction, "va_start")?;
+                self.verify_va_list_address(*list)?;
+                let signature = types
+                    .function_signature(self.function.signature)
+                    .ok_or_else(|| IrError::verify("function signature is not a function type"))?;
+                if !signature.variadic {
+                    return Err(IrError::verify("va_start occurs in a nonvariadic function"));
+                }
+                if self
+                    .function
+                    .parameters
+                    .last()
+                    .is_none_or(|parameter| parameter.local != *last_named_parameter)
+                {
+                    return Err(IrError::verify(
+                        "va_start does not name the final fixed parameter",
+                    ));
+                }
+            }
+            FullInstructionKind::VaArg { list, requested } => {
+                self.verify_va_list_address(*list)?;
+                if is_void(types, requested.ty)
+                    || matches!(
+                        types.try_kind(requested.ty),
+                        Some(TypeKind::Array(_) | TypeKind::Function(_))
+                    )
+                {
+                    return Err(IrError::verify("va_arg requested a non-object type"));
+                }
+                if is_variably_modified(types, requested.ty) {
+                    return Err(IrError::verify("va_arg requested a variably modified type"));
+                }
+                if requested.qualifiers.contains(TypeQualifiers::ATOMIC)
+                    || changed_by_default_argument_promotions(types, requested.ty)
+                {
+                    return Err(IrError::verify(
+                        "va_arg requested a type changed by the default argument promotions",
+                    ));
+                }
+                if contains_long_double(types, requested.ty, &mut HashSet::new()) {
+                    return Err(IrError::verify(
+                        "va_arg requested an unsupported long double boundary type",
+                    ));
+                }
+                if matches!(
+                    types.try_kind(requested.ty),
+                    Some(TypeKind::Record(record))
+                        if types.record(*record).is_none_or(|record| !record.is_complete())
+                ) {
+                    return Err(IrError::verify("va_arg requested an incomplete type"));
+                }
+                let result = require_result(result, instruction, "va_arg")?;
+                if result.ty != requested.ty {
+                    return Err(IrError::verify("va_arg result has the wrong type"));
+                }
+            }
+            FullInstructionKind::VaCopy {
+                destination,
+                source,
+            } => {
+                require_no_result(result, instruction, "va_copy")?;
+                self.verify_va_list_address(*destination)?;
+                self.verify_va_list_address(*source)?;
+            }
+            FullInstructionKind::VaEnd { list } => {
+                require_no_result(result, instruction, "va_end")?;
+                self.verify_va_list_address(*list)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn is_owned_aggregate_value(&self, value: ValueId) -> Result<bool, IrError> {
+        let definition = self
+            .definitions
+            .get(value.0 as usize)
+            .and_then(|definition| *definition)
+            .ok_or_else(|| IrError::verify("aggregate value has no definition"))?;
+        Ok(match definition {
+            Definition::BlockParameter(_) => true,
+            Definition::Instruction { block, position } => matches!(
+                self.function.blocks[block.0 as usize].instructions[position].kind,
+                FullInstructionKind::AggregateSnapshot { .. }
+                    | FullInstructionKind::DirectCall { .. }
+                    | FullInstructionKind::IndirectCall { .. }
+                    | FullInstructionKind::VaArg { .. }
+            ),
+        })
+    }
+
+    fn verify_va_list_address(&self, value: ValueId) -> Result<(), IrError> {
+        let types = &self.module.types;
+        let va_list = types
+            .target_builtin_id(TargetBuiltinType::VaList)
+            .ok_or_else(|| IrError::verify("variadic IR has no target va_list type"))?;
+        let Some(TypeKind::Array(array)) = types.try_kind(va_list) else {
+            return Err(IrError::verify("target va_list is not an array type"));
+        };
+        let pointee = pointer_pointee(types, self.value_type(value)?.ty)
+            .ok_or_else(|| IrError::verify("va_list operand is not an address"))?;
+        if pointee.ty != va_list && pointee.ty != array.element.ty {
+            return Err(IrError::verify(
+                "va_list operand points to an unrelated object",
+            ));
         }
         Ok(())
     }
@@ -1139,6 +1357,15 @@ impl FunctionVerifier<'_> {
                 parameters.len()
             }
         };
+        for argument in arguments {
+            if is_aggregate(&self.module.types, self.value_type(*argument)?.ty)
+                && !self.is_owned_aggregate_value(*argument)?
+            {
+                return Err(IrError::verify(
+                    "call aggregate argument is not owned aggregate storage",
+                ));
+            }
+        }
         if variadic_boundary != fixed {
             return Err(IrError::verify(
                 "call variadic boundary disagrees with its signature",
@@ -1215,6 +1442,13 @@ impl FunctionVerifier<'_> {
                     if self.value_type(*value)?.ty != self.function.result_type.ty {
                         return Err(IrError::verify("return value has the wrong type"));
                     }
+                    if is_aggregate(&self.module.types, self.function.result_type.ty)
+                        && !self.is_owned_aggregate_value(*value)?
+                    {
+                        return Err(IrError::verify(
+                            "return value is not owned aggregate storage",
+                        ));
+                    }
                     if is_void(&self.module.types, self.function.result_type.ty) {
                         return Err(IrError::verify("void function returns a value"));
                     }
@@ -1250,6 +1484,13 @@ impl FunctionVerifier<'_> {
                     "edge from block {} to block {} has an argument type mismatch",
                     source.0, edge.target.0
                 )));
+            }
+            if is_aggregate(&self.module.types, self.value_type(*argument)?.ty)
+                && !self.is_owned_aggregate_value(*argument)?
+            {
+                return Err(IrError::verify(
+                    "edge aggregate argument is not owned aggregate storage",
+                ));
             }
         }
         Ok(())
@@ -1319,6 +1560,59 @@ impl FunctionVerifier<'_> {
             _ => Err(IrError::verify("address constant has an invalid target")),
         }
     }
+
+    fn verify_bitfield_projection_consumer(
+        &self,
+        value: ValueId,
+        expected: super::BitfieldDescriptor,
+    ) -> Result<(), IrError> {
+        let mut matching_loads = 0_u32;
+        for block in &self.function.blocks {
+            for instruction in &block.instructions {
+                let uses = instruction_operands(&instruction.kind)
+                    .into_iter()
+                    .filter(|operand| *operand == value)
+                    .count();
+                if uses == 0 {
+                    continue;
+                }
+                match &instruction.kind {
+                    FullInstructionKind::BitfieldLoad {
+                        address,
+                        descriptor,
+                        ..
+                    } if *address == value && *descriptor == expected && uses == 1 => {
+                        matching_loads += 1;
+                    }
+                    FullInstructionKind::BitfieldLoad { .. } => {
+                        return Err(IrError::verify(
+                            "aggregate bitfield projection and load descriptors disagree",
+                        ));
+                    }
+                    _ => {
+                        return Err(IrError::verify(
+                            "aggregate bitfield projection is not consumed by a bitfield load",
+                        ));
+                    }
+                }
+            }
+            if block
+                .terminator
+                .as_ref()
+                .is_some_and(|terminator| terminator_operands(terminator).contains(&value))
+            {
+                return Err(IrError::verify(
+                    "aggregate bitfield projection escapes through a terminator",
+                ));
+            }
+        }
+        if matching_loads != 1 {
+            return Err(IrError::verify(
+                "aggregate bitfield projection must have exactly one bitfield load consumer",
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn instruction_operands(kind: &FullInstructionKind) -> Vec<ValueId> {
@@ -1343,7 +1637,21 @@ fn instruction_operands(kind: &FullInstructionKind) -> Vec<ValueId> {
             destination: address,
             ..
         }
-        | FullInstructionKind::AggregateValue { address, .. } => vec![*address],
+        | FullInstructionKind::AggregateSnapshot {
+            source: address, ..
+        } => vec![*address],
+        FullInstructionKind::AggregateProject {
+            base, projections, ..
+        } => std::iter::once(*base)
+            .chain(
+                projections
+                    .iter()
+                    .filter_map(|projection| match projection {
+                        AggregateProjection::Field { .. } => None,
+                        AggregateProjection::Index { index } => Some(*index),
+                    }),
+            )
+            .collect(),
         FullInstructionKind::Store { address, value, .. }
         | FullInstructionKind::BitfieldStore { address, value, .. } => vec![*address, *value],
         FullInstructionKind::AggregateCopy {
@@ -1359,6 +1667,13 @@ fn instruction_operands(kind: &FullInstructionKind) -> Vec<ValueId> {
         } => std::iter::once(*callee)
             .chain(arguments.iter().copied())
             .collect(),
+        FullInstructionKind::VaStart { list, .. }
+        | FullInstructionKind::VaArg { list, .. }
+        | FullInstructionKind::VaEnd { list } => vec![*list],
+        FullInstructionKind::VaCopy {
+            destination,
+            source,
+        } => vec![*destination, *source],
     }
 }
 
@@ -1523,6 +1838,76 @@ fn pointer_pointee(types: &TypeStore, ty: TypeId) -> Option<QualifiedType> {
 
 fn is_void(types: &TypeStore, ty: TypeId) -> bool {
     types.builtin_type(ty) == Some(BuiltinType::Void)
+}
+
+fn is_variably_modified(types: &TypeStore, ty: TypeId) -> bool {
+    match types.try_kind(ty) {
+        Some(TypeKind::Array(array)) => {
+            matches!(array.length, ArrayLength::Variable(_))
+                || is_variably_modified(types, array.element.ty)
+        }
+        Some(TypeKind::Pointer(pointer)) => is_variably_modified(types, pointer.pointee.ty),
+        _ => false,
+    }
+}
+
+fn contains_long_double(types: &TypeStore, ty: TypeId, seen: &mut HashSet<TypeId>) -> bool {
+    if ty == TypeId::LONG_DOUBLE {
+        return true;
+    }
+    if !seen.insert(ty) {
+        return false;
+    }
+    match types.try_kind(ty) {
+        Some(TypeKind::Array(array)) => contains_long_double(types, array.element.ty, seen),
+        Some(TypeKind::Record(record)) => types
+            .record(*record)
+            .and_then(|record| record.fields.as_ref())
+            .is_some_and(|fields| {
+                fields
+                    .iter()
+                    .any(|field| contains_long_double(types, field.ty.ty, seen))
+            }),
+        _ => false,
+    }
+}
+
+fn changed_by_default_argument_promotions(types: &TypeStore, ty: TypeId) -> bool {
+    if matches!(
+        types.builtin_type(ty),
+        Some(
+            BuiltinType::Bool
+                | BuiltinType::Char
+                | BuiltinType::SignedChar
+                | BuiltinType::UnsignedChar
+                | BuiltinType::Short
+                | BuiltinType::UnsignedShort
+                | BuiltinType::Float
+        )
+    ) {
+        return true;
+    }
+    let Some(TypeKind::Enum(id)) = types.try_kind(ty) else {
+        return false;
+    };
+    let Some(underlying) = types
+        .enumeration(*id)
+        .and_then(|enumeration| enumeration.body.as_ref())
+        .map(|body| body.underlying)
+    else {
+        return true;
+    };
+    matches!(
+        types.builtin_type(underlying),
+        Some(
+            BuiltinType::Bool
+                | BuiltinType::Char
+                | BuiltinType::SignedChar
+                | BuiltinType::UnsignedChar
+                | BuiltinType::Short
+                | BuiltinType::UnsignedShort
+        )
+    )
 }
 
 fn is_aggregate(types: &TypeStore, ty: TypeId) -> bool {

@@ -3,6 +3,7 @@ use ccc_sema::generic::analyze_frontend;
 use ccc_session::SourceMap;
 use ccc_syntax::frontend as syntax;
 use ccc_target::EffectiveCompilationConfig;
+use ccc_types::{ArrayLength, ArrayType, QualifiedType, RecordKind, TypeId};
 
 use super::*;
 
@@ -29,7 +30,7 @@ fn dumps_explicit_places_compound_updates_and_volatile_effects_exactly() {
         dump_frontend_ir(&module),
         concat!(
             "data d0 @g : volatile int [file:g0 linkage=External duration=Static visibility=Default definition=TentativeCommon]\n",
-            "function f0 @f(v0 %p: pointer to int -> ssa) -> int [signature=int (pointer to int) linkage=External inline=false noreturn=false] {\n",
+            "function f0 @f(v0 %p: pointer to int -> ssa) -> int [signature=int (pointer to int) linkage=External visibility=Default inline=false noreturn=false] {\n",
             "  b0(v0: pointer to int):\n",
             "    i0: v1: int = load v0 object=int [plain]\n",
             "    i1: v2: int = const signed:2\n",
@@ -60,7 +61,7 @@ fn golden_covers_data_strings_places_and_cfg() {
             "    n0: array[2] of char = string-data s0 units=2\n",
             "  }\n",
             "string s0 Ordinary : array[3] of char = [120, 121, 0]\n",
-            "function f0 @f(v0 %x: int -> ssa) -> int [signature=int (int) linkage=External inline=false noreturn=false] {\n",
+            "function f0 @f(v0 %x: int -> ssa) -> int [signature=int (int) linkage=External visibility=Default inline=false noreturn=false] {\n",
             "  b0(v0: int):\n",
             "    i0: v1: int = convert.to-boolean v0 int -> int\n",
             "    conditional v1 ? b1(v0) : b2(v0)\n",
@@ -79,6 +80,360 @@ fn golden_covers_data_strings_places_and_cfg() {
             "    return v11\n",
             "}\n",
         )
+    );
+}
+
+#[test]
+fn aggregate_rvalues_are_owned_and_project_field_index_paths() {
+    let module = lower_source(
+        "struct Matrix { int items[2][3]; };\n\
+         struct Matrix make(void);\n\
+         int read(int choose, int row, int column) {\n\
+             return (choose ? make() : make()).items[row][column];\n\
+         }",
+    );
+    verify_frontend(&module).unwrap();
+    let dump = dump_frontend_ir(&module);
+    assert_eq!(
+        dump,
+        concat!(
+            "declare f0 @make : struct Matrix () [linkage=External visibility=Default]\n",
+            "function f1 @read(v0 %choose: int -> ssa, v1 %row: int -> ssa, v2 %column: int -> ssa) -> int [signature=int (int, int, int) linkage=External visibility=Default inline=false noreturn=false] {\n",
+            "  b0(v0: int, v1: int, v2: int):\n",
+            "    i0: v3: int = convert.to-boolean v0 int -> int\n",
+            "    conditional v3 ? b1(v0, v1, v2) : b2(v0, v1, v2)\n",
+            "  b1(v4: int, v5: int, v6: int):\n",
+            "    i1: v7: struct Matrix = call.direct f0 () signature=struct Matrix () variadic-boundary=0 [read=true write=true unwind=true noreturn=false]\n",
+            "    branch b3(v7, v4, v5, v6)\n",
+            "  b2(v8: int, v9: int, v10: int):\n",
+            "    i2: v11: struct Matrix = call.direct f0 () signature=struct Matrix () variadic-boundary=0 [read=true write=true unwind=true noreturn=false]\n",
+            "    branch b3(v11, v8, v9, v10)\n",
+            "  b3(v12: struct Matrix, v13: int, v14: int, v15: int):\n",
+            "    i3: v16: pointer to int = aggregate.project v12 object=struct Matrix path=field#0:items/index:v14/index:v15\n",
+            "    i4: v17: int = load v16 object=int [plain]\n",
+            "    return v17\n",
+            "}\n",
+        )
+    );
+}
+
+#[test]
+fn bitfield_storage_offsets_are_relative_to_the_projected_field() {
+    let module = lower_source(
+        "struct Bits { unsigned prefix; unsigned value : 5; };\n\
+         unsigned update(struct Bits *bits) {\n\
+             bits->value = 7;\n\
+             return bits->value;\n\
+         }",
+    );
+    verify_frontend(&module).unwrap();
+    let dump = dump_frontend_ir(&module);
+    assert_eq!(dump.matches("storage=0:4").count(), 2, "{dump}");
+    assert!(!dump.contains("storage=4:4"), "{dump}");
+}
+
+#[test]
+fn aggregate_rvalue_bitfields_use_a_final_projection_anchor() {
+    let module = lower_source(
+        "struct Inner { unsigned prefix; signed value : 6; };\n\
+         struct Outer { struct Inner inner; unsigned tail; };\n\
+         struct Outer make(void);\n\
+         int read(void) { return make().inner.value; }",
+    );
+    verify_frontend(&module).unwrap();
+    let dump = dump_frontend_ir(&module);
+    let relevant = dump
+        .lines()
+        .filter(|line| line.contains("aggregate.project") || line.contains("bitfield.load"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        relevant,
+        [
+            "    i1: v1: pointer to int = aggregate.project v0 object=struct Outer path=field#0:inner/field#1:value:bits(0:0/6)",
+            "    i2: v2: int = bitfield.load v1 field=1 storage=0:4 bit=0/6 signed=true [plain]",
+        ],
+        "{dump}"
+    );
+}
+
+#[test]
+fn verifier_rejects_escaped_and_mismatched_aggregate_bitfield_anchors() {
+    fn module() -> FullModule {
+        lower_source(
+            "struct Bits { unsigned value : 6; };\n\
+             struct Bits make(void);\n\
+             unsigned read(void) { return make().value; }",
+        )
+    }
+
+    let mut escaped = module();
+    let function = &mut escaped.functions[1];
+    let projection = function.blocks[0]
+        .instructions
+        .iter_mut()
+        .find(|instruction| {
+            matches!(
+                instruction.kind,
+                FullInstructionKind::AggregateProject { .. }
+            )
+        })
+        .unwrap();
+    let FullInstructionKind::AggregateProject {
+        base, projections, ..
+    } = &mut projection.kind
+    else {
+        unreachable!()
+    };
+    projections.push(AggregateProjection::Index { index: *base });
+    let error = verify_frontend(&escaped).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("bitfield must be the final aggregate projection"),
+        "{error}"
+    );
+
+    let mut mismatched = module();
+    let load = mismatched.functions[1].blocks[0]
+        .instructions
+        .iter_mut()
+        .find_map(|instruction| match &mut instruction.kind {
+            FullInstructionKind::BitfieldLoad { descriptor, .. } => Some(descriptor),
+            _ => None,
+        })
+        .unwrap();
+    load.width -= 1;
+    let error = verify_frontend(&mismatched).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("aggregate bitfield projection and load descriptors disagree"),
+        "{error}"
+    );
+}
+
+#[test]
+fn verifier_rejects_bitfield_load_result_type_mismatches() {
+    let mut module = lower_source(
+        "struct Bits { unsigned value : 6; };\n\
+         unsigned read(struct Bits *bits) { return bits->value; }",
+    );
+    let result = module.functions[0].blocks[0]
+        .instructions
+        .iter()
+        .find_map(|instruction| {
+            matches!(instruction.kind, FullInstructionKind::BitfieldLoad { .. })
+                .then_some(instruction.result.unwrap())
+        })
+        .unwrap();
+    module.functions[0].value_types[result.0 as usize] = TypeId::INT;
+    let error = verify_frontend(&module).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("bitfield load result disagrees with its address pointee"),
+        "{error}"
+    );
+}
+
+#[test]
+fn lowers_variadic_builtins_to_abi_neutral_effects() {
+    let module = lower_source(
+        "typedef __builtin_va_list va_list;\n\
+         int read(int count, ...) {\n\
+             va_list list, copy;\n\
+             __builtin_va_start(list, count);\n\
+             __builtin_va_copy(copy, list);\n\
+             int value = __builtin_va_arg(copy, int);\n\
+             __builtin_va_end(copy);\n\
+             __builtin_va_end(list);\n\
+             return value;\n\
+         }",
+    );
+    verify_frontend(&module).unwrap();
+    let dump = dump_frontend_ir(&module);
+    assert_eq!(
+        dump,
+        concat!(
+            "function f0 @read(v0 %count: int -> ssa) -> int [signature=int (int, ...) linkage=External visibility=Default inline=false noreturn=false] {\n",
+            "  storage m0 l1 %list: array[1] of struct __ccc_sysv_va_list_tag [Automatic; AddressTaken,Aggregate]\n",
+            "  storage m1 l2 %copy: array[1] of struct __ccc_sysv_va_list_tag [Automatic; AddressTaken,Aggregate]\n",
+            "  b0(v0: int):\n",
+            "    i0: v1: int = const signed:0\n",
+            "    i1: v2: pointer to array[1] of struct __ccc_sysv_va_list_tag = address.storage m0\n",
+            "    i2: va.start v2 last=l0\n",
+            "    i3: v3: pointer to array[1] of struct __ccc_sysv_va_list_tag = address.storage m1\n",
+            "    i4: v4: pointer to array[1] of struct __ccc_sysv_va_list_tag = address.storage m0\n",
+            "    i5: va.copy v4 -> v3\n",
+            "    i6: v5: pointer to array[1] of struct __ccc_sysv_va_list_tag = address.storage m1\n",
+            "    i7: v6: int = va.arg v5 requested=int\n",
+            "    i8: v7: pointer to array[1] of struct __ccc_sysv_va_list_tag = address.storage m1\n",
+            "    i9: va.end v7\n",
+            "    i10: v8: pointer to array[1] of struct __ccc_sysv_va_list_tag = address.storage m0\n",
+            "    i11: va.end v8\n",
+            "    return v6\n",
+            "}\n",
+        )
+    );
+}
+
+#[test]
+fn aggregate_va_arg_results_are_owned_projection_roots() {
+    let module = lower_source(
+        "typedef __builtin_va_list va_list;\n\
+         struct Pair { int values[2]; };\n\
+         int read(int count, ...) {\n\
+             va_list list;\n\
+             __builtin_va_start(list, count);\n\
+             return __builtin_va_arg(list, struct Pair).values[1];\n\
+         }",
+    );
+    verify_frontend(&module).unwrap();
+    let instructions = module.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .collect::<Vec<_>>();
+    let va_arg = instructions
+        .iter()
+        .find_map(|instruction| {
+            matches!(instruction.kind, FullInstructionKind::VaArg { .. })
+                .then(|| instruction.result.expect("va_arg instruction result"))
+        })
+        .expect("aggregate va_arg result");
+    assert!(instructions.iter().any(|instruction| matches!(
+        &instruction.kind,
+        FullInstructionKind::AggregateProject {
+            base,
+            projections,
+            ..
+        } if *base == va_arg
+            && matches!(projections.as_slice(), [
+                AggregateProjection::Field { index: 0, .. },
+                AggregateProjection::Index { .. }
+            ])
+    )));
+}
+
+#[test]
+fn verifier_rejects_invalid_va_arg_types_independently_of_sema() {
+    fn module() -> FullModule {
+        lower_source(
+            "typedef __builtin_va_list va_list;\n\
+             int read(int count, ...) {\n\
+                 va_list list;\n\
+                 __builtin_va_start(list, count);\n\
+                 return __builtin_va_arg(list, int);\n\
+             }",
+        )
+    }
+
+    fn replace_requested(module: &mut FullModule, replacement: QualifiedType) {
+        let mut result = None;
+        for instruction in module.functions[0]
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.instructions)
+        {
+            if let FullInstructionKind::VaArg { requested, .. } = &mut instruction.kind {
+                *requested = replacement;
+                result = instruction.result;
+                break;
+            }
+        }
+        let result = result.expect("va_arg result");
+        module.functions[0].value_types[result.0 as usize] = replacement.ty;
+    }
+
+    let mut promotion = module();
+    replace_requested(&mut promotion, QualifiedType::unqualified(TypeId::FLOAT));
+    assert!(
+        verify_frontend(&promotion)
+            .unwrap_err()
+            .message
+            .contains("default argument promotions")
+    );
+
+    let mut variable = module();
+    let bound = variable.types.fresh_variable_length();
+    let array = variable.types.array(ArrayType {
+        element: QualifiedType::unqualified(TypeId::INT),
+        length: ArrayLength::Variable(bound),
+    });
+    let pointer = variable.types.pointer(array);
+    replace_requested(&mut variable, QualifiedType::unqualified(pointer));
+    assert!(
+        verify_frontend(&variable)
+            .unwrap_err()
+            .message
+            .contains("variably modified")
+    );
+
+    let mut unsupported = module();
+    replace_requested(
+        &mut unsupported,
+        QualifiedType::unqualified(TypeId::LONG_DOUBLE),
+    );
+    assert!(
+        verify_frontend(&unsupported)
+            .unwrap_err()
+            .message
+            .contains("long double")
+    );
+
+    let mut incomplete = module();
+    let (_, record) = incomplete
+        .types
+        .declare_record(RecordKind::Struct, Some("Incomplete".to_owned()));
+    replace_requested(&mut incomplete, QualifiedType::unqualified(record));
+    assert!(
+        verify_frontend(&incomplete)
+            .unwrap_err()
+            .message
+            .contains("incomplete")
+    );
+}
+
+#[test]
+fn verifier_accepts_va_arg_with_an_int_compatible_enum() {
+    let module = lower_source(
+        "enum Choice { CHOICE = 3 };\n\
+         typedef __builtin_va_list va_list;\n\
+         enum Choice read(enum Choice final, ...) {\n\
+             va_list list;\n\
+             __builtin_va_start(list, final);\n\
+             return __builtin_va_arg(list, enum Choice);\n\
+         }",
+    );
+    verify_frontend(&module).unwrap();
+    assert!(
+        dump_frontend_ir(&module).contains("requested=enum Choice"),
+        "{}",
+        dump_frontend_ir(&module)
+    );
+}
+
+#[test]
+fn variadic_promotions_ir_dump_matches_the_committed_golden() {
+    let module = lower_source(include_str!(
+        "../../../../tests/frontend/typed-ast/variadic-promotions.c"
+    ));
+    verify_frontend(&module).unwrap();
+    assert_eq!(
+        dump_frontend_ir(&module),
+        include_str!("../../../../tests/frontend/goldens/ir-variadic-promotions.out")
+    );
+}
+
+#[test]
+fn comma_values_ir_dump_matches_the_committed_golden() {
+    let module = lower_source(include_str!(
+        "../../../../tests/frontend/typed-ast/comma-values.c"
+    ));
+    verify_frontend(&module).unwrap();
+    assert_eq!(
+        dump_frontend_ir(&module),
+        include_str!("../../../../tests/frontend/goldens/ir-comma-values.out")
     );
 }
 
@@ -183,10 +538,20 @@ fn const_and_volatile_aggregate_sources_preserve_independent_copy_accesses() {
              *destination = *source;\n\
          }",
     );
-    let copy = module.functions[0]
+    let instructions = module.functions[0]
         .blocks
         .iter()
         .flat_map(|block| &block.instructions)
+        .collect::<Vec<_>>();
+    let snapshot = instructions
+        .iter()
+        .find_map(|instruction| match &instruction.kind {
+            FullInstructionKind::AggregateSnapshot { object, access, .. } => Some((object, access)),
+            _ => None,
+        })
+        .expect("aggregate snapshot");
+    let copy = instructions
+        .iter()
         .find_map(|instruction| match &instruction.kind {
             FullInstructionKind::AggregateCopy {
                 destination_object,
@@ -204,14 +569,22 @@ fn const_and_volatile_aggregate_sources_preserve_independent_copy_accesses() {
         })
         .expect("aggregate copy");
     assert!(copy.0.qualifiers.is_empty());
-    assert!(copy.1.qualifiers.contains(ccc_types::TypeQualifiers::CONST));
+    assert!(copy.1.qualifiers.is_empty());
+    assert!(!copy.2.volatile);
+    assert!(!copy.3.volatile);
     assert!(
-        copy.1
+        snapshot
+            .0
+            .qualifiers
+            .contains(ccc_types::TypeQualifiers::CONST)
+    );
+    assert!(
+        snapshot
+            .0
             .qualifiers
             .contains(ccc_types::TypeQualifiers::VOLATILE)
     );
-    assert!(!copy.2.volatile);
-    assert!(copy.3.volatile);
+    assert!(snapshot.1.volatile);
 }
 
 #[test]
@@ -242,7 +615,7 @@ fn discarded_places_lower_and_keep_exact_volatile_read_effects() {
             .iter()
             .filter(|instruction| matches!(
                 instruction.kind,
-                FullInstructionKind::AggregateValue { access, .. } if access.volatile
+                FullInstructionKind::AggregateSnapshot { access, .. } if access.volatile
             ))
             .count(),
         1
@@ -540,18 +913,22 @@ fn verifier_rejects_edge_types_storage_terminators_and_relocation_targets() {
 }
 
 #[test]
-fn reports_unsupported_atomic_updates_and_aggregate_calls_explicitly() {
+fn reports_unsupported_atomic_updates_and_accepts_aggregate_calls() {
     let atomic = typed_source("_Atomic int value; int f(void) { return value += 1; }");
     let error = lower_frontend(&atomic).unwrap_err();
     assert_eq!(error.code, "CCC3101");
     assert!(error.message.contains("atomic compound"), "{error}");
 
-    let aggregate = typed_source(
+    let aggregate = lower_source(
         "struct Pair { int x; int y; };\n\
          int consume(struct Pair);\n\
          int f(void) { struct Pair value = {1, 2}; return consume(value); }",
     );
-    let error = lower_frontend(&aggregate).unwrap_err();
-    assert_eq!(error.code, "CCC3101");
-    assert!(error.message.contains("aggregate call"), "{error}");
+    verify_frontend(&aggregate).unwrap();
+    assert!(aggregate.functions[1].blocks.iter().any(|block| {
+        block
+            .instructions
+            .iter()
+            .any(|instruction| matches!(instruction.kind, FullInstructionKind::DirectCall { .. }))
+    }));
 }

@@ -484,15 +484,14 @@ impl<'a> InitializerWriter<'a> {
                         .fields
                         .get(*index)
                         .ok_or_else(|| error(format!("record layout has no field {index}")))?;
+                    offset = offset
+                        .checked_add(field_layout.offset)
+                        .ok_or_else(|| error("initializer field offset overflow"))?;
                     if let Some(descriptor) = descriptor {
                         if path_index + 1 != path.len() {
                             return Err(error("an initializer path continues through a bitfield"));
                         }
                         bitfield = Some(*descriptor);
-                    } else {
-                        offset = offset
-                            .checked_add(field_layout.offset)
-                            .ok_or_else(|| error("initializer field offset overflow"))?;
                     }
                     current = field.ty;
                 }

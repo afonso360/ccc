@@ -1,62 +1,198 @@
 # ABI lowering and variadic functions
 
-This document defines how C calls cross the CCC-IR/Cranelift boundary. CCC-IR retains the source-level C signature; target-specific decisions are explicit data produced by `ccc-abi` and consumed by code generation.
+This document defines how C calls cross the CCC-IR/Cranelift boundary. CCC-IR
+retains source-level value semantics. Target-specific classification,
+transport, generated bridge state, and packaging requirements are immutable
+data produced by `ccc-abi` and consumed by code generation and the driver.
 
-## ABI plans
+## Module ABI plan
 
-`ccc-abi` produces an immutable `AbiPlan` for every function definition and call site. It does not rewrite CCC-IR in place. A plan records:
+`ccc-abi` constructs one `ModuleAbiPlan` after CCC-IR verification. Definition
+plans are keyed by stable function IDs and call plans by stable function and
+instruction IDs. A call plan includes the complete promoted actual argument
+list, fixed variadic boundary, direct or indirect target identity, source
+location, result storage, and required bridge operations.
 
-- the source C signature and effective calling convention;
-- the lowered scalar signature accepted by Cranelift;
-- argument and return classifications, including register classes, stack offsets, extension rules, aggregate pieces, hidden `sret`, and copy-in/copy-out actions;
-- whether the call is direct or indirect and the symbol/visibility/relocation requirements;
-- variadic fixed-argument count, default promotions, target `va_list` layout, and any required bridge;
-- the exact [`EffectiveCompilationConfig`](targets.md#effective-compilation-configuration) used to compute it.
+The plan records an `AbiConfigKey` containing the normalized target triple,
+data layout, calling convention, boundary-profile revision, classifier
+revision, psABI source identity, and pinned backend profile. Absolute tool
+paths, executable versions, sysroots, and packaging fingerprints are
+operational provenance and are not part of ABI-plan identity or deterministic
+`--dump-abi` output.
 
-The plan is serializable in `--dump-abi` output and is part of ABI snapshot tests. Optimizations may inspect the source signature but cannot change an `AbiPlan`; any transformation that changes a call signature must request a new plan.
+Planning stores a canonical digest of the verified IR. Plan verification is a
+mandatory compiler operation immediately after planning and immediately before
+dumping or code generation. The driver does not mutate IR after planning.
 
-## Aggregate calls
+## Classification and placement authority
 
-Each target classifier implements its published psABI, including SysV eightbytes, AAPCS64 HFA/HVA rules, RISC-V flattening, stack alignment, and hidden returns. An aggregate passed indirectly is copied into ABI-owned storage with the alignment and aliasing behavior specified by the plan. Cross-linked caller/callee tests are the authority; matching CCC on both sides is insufficient evidence.
+The SysV AMD64 classifier models `NO_CLASS`, `INTEGER`, `SSE`, `SSEUP`, `X87`,
+`X87UP`, `COMPLEX_X87`, and `MEMORY`, including recursive merging, cleanup,
+unaligned fallback, whole-aggregate register rollback, hidden-return
+consumption, and stack-area calculation before placement.
 
-## Variadic calls
+Classification and transport are distinct:
 
-Semantic analysis applies the C default argument promotions and retains the promoted type of every variadic actual argument. `ccc-abi` classifies the complete actual argument list even for an indirect call.
+- `ccc-abi` is authoritative for source classification, aggregate rollback,
+  memory versus register transport, carrier order, copy sizes, and hidden
+  return selection.
+- Cranelift is the sole physical register and stack-placement authority for a
+  native fixed boundary. A native plan records ordered `AbiParam` carriers and
+  purposes but does not claim physical locations.
+- A generated bridge plan owns exact registers, stack offsets, frame offsets,
+  and marshal operations.
 
-Cranelift signatures do not currently express C variadic semantics. CCC therefore has two interchangeable backend capabilities:
+`--dump-abi` labels native placement as Cranelift-owned and prints the lowered
+signature. It prints physical locations only for generated bridge plans.
 
-1. **Native capability:** a pinned Cranelift version can express the target's variadic call and callee-entry rules, including fixed-argument count and special registers.
-2. **Generated bridge:** `ccc-abi` emits a `VarArgBridgePlan`; `ccc-link` assembles a target-specific bridge object. A call bridge receives a callee address plus a packed argument/return area, reconstructs the psABI register and stack state, performs the call, and stores the return value. This uniform form supports both direct and indirect calls without smuggling the callee through a global or changing argument positions.
+The native backend profile is enabled only while a permanent cross-linked
+compatibility test proves scalar interleaving, register rollback,
+`StructArgument` placement and copy size, multi-value returns, and
+`StructReturn` pointer echo behavior for the exact pinned Cranelift version and
+settings.
 
-No pinned Cranelift release currently provides the native capability, so until
-an upgrade passes the gates every variadic call and definition takes the bridge
-path. The bridges are required for supported variadic ABI behavior, not a
-rarely exercised fallback corner.
+## Supported boundary profile
 
-For SysV AMD64 the bridge sets `%al` to the required upper bound on used vector argument registers. For Darwin arm64 it places unnamed arguments according to Apple's stack rules. AArch64 Linux and RISC-V bridges follow their own psABI rules; no target inherits another target's workaround.
+The enabled `x86_64-unknown-linux-gnu` SysV boundary profile supports the
+compiler's existing integer types, enumerations, pointers, `float`, `double`,
+and aggregates recursively composed from those types with required alignment
+no greater than eight.
 
-If neither capability exists for the selected target and argument shape, declarations remain parseable but a variadic call is a hard, target-specific diagnostic. CCC never accepts only integer variadic calls while implying that general C variadics work.
+Native `long double`, vector types, `_BitInt`, `__int128`, over-aligned types,
+and aggregates containing them remain representable for declarations and
+layout queries but are rejected when a definition, call, return, or `va_arg`
+requires an unsupported boundary. The profile is versioned so an additional
+profile can add address-only or generated-bridge transport without changing
+the meaning of already produced plans.
+
+## Aggregate values and fixed calls
+
+Every aggregate rvalue in CCC-IR is an immutable owned snapshot. Parameter
+materialization, assignment, conditional expressions, calls, and returns all
+use that representation. Compiler-owned snapshot storage has an explicit
+lifetime, and verifier-controlled field/index projection may derive an address
+into it for array decay or subobject access. Generic storage-address operations
+cannot expose compiler temporaries.
+
+Volatile aggregate evaluation performs exactly one ordered observation.
+Padding is never used as a C value. A memory-class argument is copied into a
+zeroed ABI staging object whose allocation is rounded to the backend's
+`StructArgument` size; only the logical source bytes are read. Register pieces
+carry valid-byte ranges so loads and stores do not cross object bounds.
+
+A hidden result uses fresh nonaliasing storage supplied by the caller. On SysV
+AMD64 the hidden pointer consumes the first GP argument position and the callee
+returns that exact pointer in `%rax`.
+
+## Generated call bridge
+
+Every bridged call uses a versioned `BridgeFrameV1` passed to a nonvariadic
+assembly helper. The 16-byte-aligned fixed area is 256 bytes:
+
+| Offset | Field                                                               |
+| -----: | ------------------------------------------------------------------- |
+|      0 | magic (`u32`), version (`u16`), header size (`u16`)                 |
+|      8 | target address (`u64`)                                              |
+|     16 | outgoing stack size and total frame size (`u32`, `u32`)             |
+|     24 | advisory GP/XMM counts, `%al`, result counts, flags, reserved bytes |
+|     32 | six eight-byte GP argument slots                                    |
+|     80 | eight sixteen-byte XMM argument slots                               |
+|    208 | `%rax` and `%rdx` result slots                                      |
+|    224 | `%xmm0` and `%xmm1` result slots                                    |
+|    256 | outgoing stack payload                                              |
+
+The producer zeroes the complete fixed area. The helper holds the target in
+`%r11`, preserves the frame pointer across the target call, copies the stack
+payload with the required alignment, unconditionally loads all GP and XMM
+slots, and writes `%al` last. It unconditionally captures the supported result
+registers. Header counts are diagnostic metadata, not dispatch inputs.
+
+The helper does not use the red zone and does not modify the x87 control word,
+MXCSR control bits, or direction flag. It carries explicit CFI and a
+non-executable-stack note. Bridge assembly intentionally has no `.file` or
+`.loc` directives because assembler-produced line tables can encode the build
+working directory. Debuggers can unwind through generated bridges but do not
+provide source-level stepping within them. Same-compilation magic and version
+validation happens in Rust before assembly materialization; production bridge
+code does not contain an unreachable protocol trap.
 
 ## Variadic definitions and `va_list`
 
-A variadic definition needs more than call-site shaping. When native backend support is unavailable, CCC emits an externally visible assembly entry bridge and an internal non-variadic CLIF body:
+A variadic definition has an externally visible ABI-valid assembly entry and a
+generated private nonvariadic CLIF body. Same-translation-unit calls and
+function addresses use the public entry.
 
-- the entry bridge receives the platform C ABI state, saves the required general-purpose and floating-point argument registers, identifies the overflow stack area, and constructs a target-specific `VaState`;
-- it calls the internal body with the fixed parameters plus a hidden `VaState*`;
-- `va_start` initializes the public target `va_list` from that state; `va_arg`, `va_copy`, and `va_end` operate on the psABI layout and enforce type/alignment rules;
-- the bridge marshals the internal return value back through the platform ABI.
+The entry snapshots incoming `%al` before using `%rax`, saves the required GP
+and XMM registers, computes the initial overflow address, and constructs a
+208-byte `VaStateV1`:
 
-Calls within the same translation unit still use the externally valid entry point unless an optimization proves an equivalent ABI-preserving path. `va_list` is never represented by a single generic pointer: its type, array/struct spelling, register offsets, and overflow-area rules come from the target specification and must match the shipped `stdarg.h`.
+| Offset | Field                                   |
+| -----: | --------------------------------------- |
+|      0 | magic (`u32`), version and size (`u16`) |
+|      8 | `gp_offset` (`u32`)                     |
+|     12 | `fp_offset` (`u32`)                     |
+|     16 | `overflow_arg_area` pointer             |
+|     24 | `reg_save_area` pointer                 |
+|     32 | 176-byte SysV AMD64 register-save area  |
 
-Bridge and shim assembly is a first-class deliverable: every call, entry, and long-double bridge carries hand-written CFI/unwind records and minimal debug information so unwinding, `backtrace`, and debugger stepping work through it.
+The public `va_list` view starts at byte eight and is the psABI array-of-one
+24-byte structure. Its register-save area has six eight-byte GP slots followed
+by eight sixteen-byte XMM slots.
+
+`va_arg` is one effectful ABI-neutral CCC-IR operation with an immutable
+`VaArgPlan`. Code generation expands it into register, overflow, and merge
+blocks. A `MEMORY` argument goes directly to the overflow path. For register
+arguments every required GP and SSE slot is checked before either cursor is
+updated; if either class is exhausted the entire argument comes from the
+overflow area. Mixed values are reconstructed in owned storage.
+
+Promotion-invalid requests such as `va_arg(ap, float)` are rejected with a
+stable semantic diagnostic. Ordinary dynamic type mismatch remains C undefined
+behavior and is not checked at runtime.
+
+## Header contract
+
+`stdarg.h` is compiler-owned, target-invariant interface text. It defines
+`va_list` and guarded `__gnuc_va_list` aliases of the reserved
+`__builtin_va_list` type and maps the standard operations to compiler builtins.
+The target owns the canonical builtin type and layout; the header does not
+spell target fields or offsets.
+
+## Object packaging
+
+Code generation returns a primary object, deterministic bridge assembly,
+logical bridge locations for diagnostic inventory, required capabilities, and
+an exact private-symbol allowlist. Logical bridge locations are not serialized
+as assembler line records. If assembly is present, the driver:
+
+1. assembles it through the resolved target compiler driver;
+2. combines it with the primary object through a driver-mediated relocatable
+   link;
+3. localizes only the exact generated-symbol allowlist with a compatible
+   object copier;
+4. verifies architecture, relocatable format, bindings, visibility,
+   relocations, CFI, and non-generated symbol preservation;
+5. publishes the final single object atomically.
+
+Bridge-free object emission resolves none of these operational tools. Blanket
+hidden-symbol localization is forbidden because user-defined hidden symbols
+can still require cross-object resolution.
 
 ## Required validation
 
-- classifier unit tests generated over scalar and aggregate shapes;
-- CCC caller/reference callee and reference caller/CCC callee tests in both directions;
-- direct and indirect variadic calls with zero and many unnamed arguments;
-- integer, promoted floating-point, pointer, vector where supported, and aggregate `va_arg` cases;
-- exhaustion boundaries between registers and stack, alignment holes, nested `va_list`, `va_copy`, and repeated traversal;
-- disassembly assertions for target-only requirements such as SysV `%al`;
-- unwind/backtrace and debugger stepping through call and entry bridges;
-- a hard-error test for every target/configuration without a complete native or bridge capability.
+- canonical classifier cases and exact plan/digest snapshots;
+- semantic C-to-IR aggregate snapshot goldens that do not freeze copy counts;
+- fixed aggregate cross-linking with GCC and Clang in both directions;
+- direct and indirect variadic calls with zero, one, eight, and more than eight
+  floating actuals, including a disassembly assertion for `%al` saturation;
+- GCC/Clang-created `va_list` values consumed by CCC and CCC-created lists
+  consumed by `vsnprintf` and `vfprintf`;
+- register and overflow exhaustion, mixed-class reconstruction, independent
+  `va_copy`, repeated traversal, and hidden returns;
+- exact generated-symbol bindings, relocation closure, non-executable stack,
+  FDE coverage, `_Unwind_Backtrace` execution, and debugger backtraces across
+  both bridge kinds;
+- byte-identical bridge packaging from distinct working directories, with no
+  assembler file symbol or build path;
+- injected missing/failing packaging tools with destination preservation and
+  complete temporary cleanup.

@@ -188,6 +188,12 @@ impl CapabilityRegistry {
                 "ignoring this optimization contract preserves C program behavior",
             );
         }
+        registry.insert_with_rationale(
+            CapabilityKind::Attribute,
+            "visibility",
+            CapabilityState::Implemented,
+            "the frontend carries ELF visibility through ABI planning and object emission",
+        );
         for name in [
             "warn_unused_result",
             "__warn_unused_result__",
@@ -211,6 +217,19 @@ impl CapabilityRegistry {
             CapabilityState::Implemented,
             "the operator uses the canonical target layout engine",
         );
+        for name in [
+            "__builtin_va_start",
+            "__builtin_va_arg",
+            "__builtin_va_copy",
+            "__builtin_va_end",
+        ] {
+            registry.insert_with_rationale(
+                CapabilityKind::Builtin,
+                name,
+                CapabilityState::Implemented,
+                "the operator is typed by the frontend and lowered through the target ABI plan",
+            );
+        }
 
         registry
     }
@@ -331,6 +350,10 @@ mod tests {
             );
             assert!(registry.is_available(CapabilityKind::Attribute, name));
         }
+        assert_eq!(
+            registry.state(CapabilityKind::Attribute, "visibility"),
+            CapabilityState::Implemented
+        );
         for name in [
             "__warn_unused_result__",
             "__nonnull__",
@@ -344,11 +367,19 @@ mod tests {
             );
             assert!(!registry.is_available(CapabilityKind::Attribute, name));
         }
-        assert_eq!(
-            registry.state(CapabilityKind::Builtin, "__builtin_offsetof"),
-            CapabilityState::Implemented
-        );
-        assert!(registry.is_available(CapabilityKind::Builtin, "__builtin_offsetof"));
+        for name in [
+            "__builtin_offsetof",
+            "__builtin_va_start",
+            "__builtin_va_arg",
+            "__builtin_va_copy",
+            "__builtin_va_end",
+        ] {
+            assert_eq!(
+                registry.state(CapabilityKind::Builtin, name),
+                CapabilityState::Implemented
+            );
+            assert!(registry.is_available(CapabilityKind::Builtin, name));
+        }
     }
 
     #[test]

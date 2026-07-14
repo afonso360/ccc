@@ -1,0 +1,10 @@
+declare f0 @sink : int (int, ...) [linkage=External visibility=Default]
+function f1 @forward(v0 %byte: char -> ssa, v1 %half: unsigned short int -> ssa, v2 %real: float -> ssa) -> int [signature=int (char, unsigned short int, float) linkage=External visibility=Default inline=false noreturn=false] {
+  b0(v0: char, v1: unsigned short int, v2: float):
+    i0: v3: int = const signed:0
+    i1: v4: int = convert.integer-promotion v0 char -> int
+    i2: v5: int = convert.integer-promotion v1 unsigned short int -> int
+    i3: v6: double = convert.floating-conversion v2 float -> double
+    i4: v7: int = call.direct f0 (v3, v4, v5, v6) signature=int (int, ...) variadic-boundary=1 [read=true write=true unwind=true noreturn=false]
+    return v7
+}

@@ -19,13 +19,13 @@ use ccc_types::{
 };
 
 use super::{
-    AggregateOverlap, BinaryOperation, BitfieldDescriptor, BlockId, CallEffects, DataId,
-    DataOrigin, FullBlock, FullEdge, FullFunction, FullGlobal, FullInstruction,
-    FullInstructionKind, FullModule, FullParameter, FullStorage, FullString, FullTerminator,
-    InitializerEdge, InitializerGraph, InitializerNode, InitializerNodeId, InitializerNodeKind,
-    InitializerPath, InstructionId, IrError, MemoryAccess, MemoryOrder, MemoryResidencyReason,
-    RelocationKind, RelocationTarget, ScalarConstant, ScalarConversion, StorageId, StorageLocation,
-    StringEncoding, SwitchEdge, UnaryOperation, ValueId,
+    AggregateOverlap, AggregateProjection, BinaryOperation, BitfieldDescriptor, BlockId,
+    CallEffects, DataId, DataOrigin, FullBlock, FullEdge, FullFunction, FullGlobal,
+    FullInstruction, FullInstructionKind, FullModule, FullParameter, FullStorage, FullString,
+    FullTerminator, InitializerEdge, InitializerGraph, InitializerNode, InitializerNodeId,
+    InitializerNodeKind, InitializerPath, InstructionId, IrError, MemoryAccess, MemoryOrder,
+    MemoryResidencyReason, RelocationKind, RelocationTarget, ScalarConstant, ScalarConversion,
+    StorageId, StorageLocation, StringEncoding, SwitchEdge, UnaryOperation, ValueId,
 };
 
 const LOWERING_ERROR: &str = "CCC3101";
@@ -763,6 +763,25 @@ fn scan_expression_for_address_taken(
                 scan_expression_for_address_taken(expression, facts);
             }
         }
+        E::VaStart { list, .. } | E::VaArg { list, .. } | E::VaEnd { list } => {
+            scan_expression_for_address_taken(list, facts);
+            if let Some(place) = &list.place {
+                mark_place_address_taken(place, facts);
+            }
+        }
+        E::VaCopy {
+            destination,
+            source,
+        } => {
+            scan_expression_for_address_taken(destination, facts);
+            scan_expression_for_address_taken(source, facts);
+            if let Some(place) = &destination.place {
+                mark_place_address_taken(place, facts);
+            }
+            if let Some(place) = &source.place {
+                mark_place_address_taken(place, facts);
+            }
+        }
         E::Constant(_)
         | E::StringLiteral(_)
         | E::DeclRef(_)
@@ -786,6 +805,53 @@ struct LoweredPlace {
     object: QualifiedType,
     access: MemoryAccess,
     bitfield: Option<BitfieldDescriptor>,
+}
+
+enum PendingAggregateProjection<'a> {
+    Field {
+        index: usize,
+        name: &'a str,
+        bitfield: Option<BitfieldDescriptor>,
+    },
+    Index {
+        index: &'a FullTypedExpression,
+    },
+}
+
+fn collect_aggregate_projection<'a>(
+    expression: &'a FullTypedExpression,
+    projections: &mut Vec<PendingAggregateProjection<'a>>,
+) -> Option<&'a FullTypedExpression> {
+    match &expression.kind {
+        FullTypedExpressionKind::Member {
+            base,
+            field_index,
+            name,
+            indirect: false,
+            bitfield,
+        } if base.place.is_none() => {
+            let root = collect_aggregate_projection(base, projections).unwrap_or(base);
+            projections.push(PendingAggregateProjection::Field {
+                index: *field_index,
+                name,
+                bitfield: bitfield.as_deref().map(bitfield_descriptor),
+            });
+            Some(root)
+        }
+        FullTypedExpressionKind::Subscript { base, index } => {
+            let FullTypedExpressionKind::Conversion {
+                kind: ConversionKind::ArrayToPointer,
+                expression: array,
+            } = &base.kind
+            else {
+                return None;
+            };
+            let root = collect_aggregate_projection(array, projections)?;
+            projections.push(PendingAggregateProjection::Index { index });
+            Some(root)
+        }
+        _ => None,
+    }
 }
 
 struct SwitchContext {
@@ -822,22 +888,6 @@ impl<'a> FunctionBuilder<'a> {
                 format!("function `{}` has a non-function signature", source.name),
             )
         })?;
-        if source.body.is_some()
-            && (is_aggregate(types, signature.result.ty)
-                || source
-                    .parameters
-                    .iter()
-                    .any(|parameter| is_aggregate(types, parameter.ty.ty)))
-        {
-            return Err(IrError::lower(
-                LOWERING_ERROR,
-                source.span,
-                format!(
-                    "aggregate parameters or results for function `{}` require ABI lowering and are not supported",
-                    source.name
-                ),
-            ));
-        }
         let facts = if source.body.is_some() {
             local_facts(source, types)
         } else {
@@ -890,6 +940,7 @@ impl<'a> FunctionBuilder<'a> {
                 signature: source.signature,
                 storage_class: source.storage,
                 linkage: source.linkage,
+                visibility: source.visibility,
                 properties: source.properties,
                 symbol_name,
                 result_type: signature.result,
@@ -929,15 +980,30 @@ impl<'a> FunctionBuilder<'a> {
             builder.function.parameters[index].incoming = Some(incoming);
             if let Some(storage) = builder.function.parameters[index].storage {
                 let address = builder.address_of_storage(storage, span)?;
-                builder.emit_effect(
-                    FullInstructionKind::Store {
-                        address,
-                        value: incoming,
-                        object: ty,
-                        access: access_from_qualified(ty),
-                    },
-                    span,
-                )?;
+                if is_aggregate(builder.types, ty.ty) {
+                    builder.emit_effect(
+                        FullInstructionKind::AggregateCopy {
+                            destination: address,
+                            source: incoming,
+                            destination_object: ty,
+                            source_object: QualifiedType::unqualified(ty.ty),
+                            destination_access: access_from_qualified(ty),
+                            source_access: MemoryAccess::default(),
+                            overlap: AggregateOverlap::MayOverlap,
+                        },
+                        span,
+                    )?;
+                } else {
+                    builder.emit_effect(
+                        FullInstructionKind::Store {
+                            address,
+                            value: incoming,
+                            object: ty,
+                            access: access_from_qualified(ty),
+                        },
+                        span,
+                    )?;
+                }
             }
         }
 
@@ -953,11 +1019,9 @@ impl<'a> FunctionBuilder<'a> {
                 let value = builder.zero_value(builder.function.result_type, body.span)?;
                 builder.terminate(FullTerminator::Return(Some(value)))?;
             } else {
-                return Err(IrError::lower(
-                    LOWERING_ERROR,
-                    body.span,
-                    "aggregate-return fallthrough is not supported",
-                ));
+                // Reaching the closing brace of a non-void function other than
+                // `main` has undefined behavior when the result is used.
+                builder.terminate(FullTerminator::Unreachable)?;
             }
         }
         for block in &mut builder.function.blocks {
@@ -1441,7 +1505,19 @@ fn remap_instruction_values(
         }
         FullInstructionKind::Load { address, .. }
         | FullInstructionKind::BitfieldLoad { address, .. }
-        | FullInstructionKind::AggregateValue { address, .. } => map(address)?,
+        | FullInstructionKind::AggregateSnapshot {
+            source: address, ..
+        } => map(address)?,
+        FullInstructionKind::AggregateProject {
+            base, projections, ..
+        } => {
+            map(base)?;
+            for projection in projections {
+                if let AggregateProjection::Index { index } = projection {
+                    map(index)?;
+                }
+            }
+        }
         FullInstructionKind::Store { address, value, .. }
         | FullInstructionKind::BitfieldStore { address, value, .. } => {
             map(address)?;
@@ -1471,6 +1547,16 @@ fn remap_instruction_values(
             for argument in arguments {
                 map(argument)?;
             }
+        }
+        FullInstructionKind::VaStart { list, .. }
+        | FullInstructionKind::VaArg { list, .. }
+        | FullInstructionKind::VaEnd { list } => map(list)?,
+        FullInstructionKind::VaCopy {
+            destination,
+            source,
+        } => {
+            map(destination)?;
+            map(source)?;
         }
     }
     Ok(())
@@ -2172,6 +2258,10 @@ impl FunctionBuilder<'_> {
             {
                 self.expression(pointer)
             }
+            E::Member { .. } if expression.place.is_none() => {
+                let place = self.place(expression)?;
+                self.load_place(&place, expression.span).map(Some)
+            }
             E::Dereference(_) | E::Subscript { .. } | E::Member { .. } => {
                 if expression.place.is_some() {
                     Err(IrError::lower(
@@ -2271,6 +2361,52 @@ impl FunctionBuilder<'_> {
                     expression.span,
                 )
                 .map(Some),
+            E::VaStart {
+                list,
+                last_named_parameter,
+            } => {
+                let list = self.va_list_address(list)?;
+                self.emit_effect(
+                    FullInstructionKind::VaStart {
+                        list,
+                        last_named_parameter: *last_named_parameter,
+                    },
+                    expression.span,
+                )?;
+                Ok(None)
+            }
+            E::VaArg { list, requested } => {
+                let list = self.va_list_address(list)?;
+                self.emit_result(
+                    FullInstructionKind::VaArg {
+                        list,
+                        requested: *requested,
+                    },
+                    *requested,
+                    expression.span,
+                )
+                .map(Some)
+            }
+            E::VaCopy {
+                destination,
+                source,
+            } => {
+                let destination = self.va_list_address(destination)?;
+                let source = self.va_list_address(source)?;
+                self.emit_effect(
+                    FullInstructionKind::VaCopy {
+                        destination,
+                        source,
+                    },
+                    expression.span,
+                )?;
+                Ok(None)
+            }
+            E::VaEnd { list } => {
+                let list = self.va_list_address(list)?;
+                self.emit_effect(FullInstructionKind::VaEnd { list }, expression.span)?;
+                Ok(None)
+            }
         }
     }
 
@@ -2282,6 +2418,17 @@ impl FunctionBuilder<'_> {
                 "void expression used where a value is required",
             )
         })
+    }
+
+    fn va_list_address(&mut self, expression: &FullTypedExpression) -> Result<ValueId, IrError> {
+        if matches!(
+            self.types.try_kind(expression.ty.ty),
+            Some(TypeKind::Array(_))
+        ) {
+            self.place(expression).map(|place| place.address)
+        } else {
+            self.expect_value(expression)
+        }
     }
 
     fn constant(
@@ -2439,6 +2586,70 @@ impl FunctionBuilder<'_> {
     }
 
     fn place(&mut self, expression: &FullTypedExpression) -> Result<LoweredPlace, IrError> {
+        let mut pending = Vec::new();
+        if let Some(root) = collect_aggregate_projection(expression, &mut pending) {
+            if !is_aggregate(self.types, root.ty.ty) {
+                return Err(IrError::lower(
+                    LOWERING_ERROR,
+                    expression.span,
+                    "aggregate projection root does not have aggregate type",
+                ));
+            }
+            let base = self.expect_value(root)?;
+            let mut projections = Vec::with_capacity(pending.len());
+            let projection_count = pending.len();
+            let mut projected_bitfield = None;
+            for (position, projection) in pending.into_iter().enumerate() {
+                projections.push(match projection {
+                    PendingAggregateProjection::Field {
+                        index,
+                        name,
+                        bitfield,
+                    } => {
+                        if bitfield.is_some() && position + 1 != projection_count {
+                            return Err(IrError::lower(
+                                LOWERING_ERROR,
+                                expression.span,
+                                "bitfield is not the final aggregate projection",
+                            ));
+                        }
+                        projected_bitfield = bitfield;
+                        AggregateProjection::Field {
+                            index,
+                            name: Some(name.to_owned()),
+                            bitfield,
+                        }
+                    }
+                    PendingAggregateProjection::Index { index } => AggregateProjection::Index {
+                        index: self.expect_value(index)?,
+                    },
+                });
+            }
+            let pointer = self.types.pointer(expression.ty);
+            let address = self.emit_result(
+                FullInstructionKind::AggregateProject {
+                    base,
+                    aggregate: root.ty,
+                    projections,
+                },
+                QualifiedType::unqualified(pointer),
+                expression.span,
+            )?;
+            let semantic_place = expression.place.as_ref();
+            return Ok(LoweredPlace {
+                address,
+                object: expression.ty,
+                access: semantic_place.map_or_else(
+                    || access_from_qualified(expression.ty),
+                    |place| access_from_semantics(place.access),
+                ),
+                bitfield: projected_bitfield.or_else(|| {
+                    semantic_place
+                        .and_then(|place| place.bitfield.as_ref())
+                        .map(bitfield_descriptor)
+                }),
+            });
+        }
         let semantic_place = expression.place.as_ref().ok_or_else(|| {
             IrError::lower(
                 LOWERING_ERROR,
@@ -2495,6 +2706,7 @@ impl FunctionBuilder<'_> {
                 field_index,
                 name,
                 indirect,
+                ..
             } => {
                 let (base_address, record) = if *indirect {
                     let address = self.expect_value(base)?;
@@ -2638,8 +2850,8 @@ impl FunctionBuilder<'_> {
             )
         } else if is_aggregate(self.types, place.object.ty) {
             self.emit_result(
-                FullInstructionKind::AggregateValue {
-                    address: place.address,
+                FullInstructionKind::AggregateSnapshot {
+                    source: place.address,
                     object: place.object,
                     access,
                 },
@@ -2701,22 +2913,13 @@ impl FunctionBuilder<'_> {
         &mut self,
         expression: &FullTypedExpression,
     ) -> Result<LoweredPlace, IrError> {
-        if let FullTypedExpressionKind::Conversion {
-            expression: operand,
-            ..
-        } = &expression.kind
-            && is_aggregate(self.types, operand.ty.ty)
-        {
-            return self.aggregate_source(operand);
-        }
-        if expression.place.is_some() {
-            return self.place(expression);
-        }
-        Err(IrError::lower(
-            LOWERING_ERROR,
-            expression.span,
-            "aggregate value is not backed by an addressable source object",
-        ))
+        let address = self.expect_value(expression)?;
+        Ok(LoweredPlace {
+            address,
+            object: QualifiedType::unqualified(expression.ty.ty),
+            access: MemoryAccess::default(),
+            bitfield: None,
+        })
     }
 
     fn aggregate_copy(
@@ -2769,15 +2972,8 @@ impl FunctionBuilder<'_> {
             }
             let source = self.aggregate_source(value)?;
             self.aggregate_copy(&destination, &source, span)?;
-            return self.emit_result(
-                FullInstructionKind::AggregateValue {
-                    address: destination.address,
-                    object: destination.object,
-                    access: destination.access,
-                },
-                result_ty,
-                span,
-            );
+            debug_assert_eq!(source.object.ty, result_ty.ty);
+            return Ok(source.address);
         }
         let stored = if let Some(plan) = compound {
             if destination.access.atomic.is_some() {
@@ -3025,15 +3221,8 @@ impl FunctionBuilder<'_> {
         then_expression: &FullTypedExpression,
         else_expression: &FullTypedExpression,
         result_ty: QualifiedType,
-        span: Span,
+        _span: Span,
     ) -> Result<Option<ValueId>, IrError> {
-        if is_aggregate(self.types, result_ty.ty) {
-            return Err(IrError::lower(
-                LOWERING_ERROR,
-                span,
-                "aggregate conditional values are not supported",
-            ));
-        }
         let condition = self.expect_value(condition)?;
         let then_block = self.new_block();
         let else_block = self.new_block();
@@ -3119,17 +3308,6 @@ impl FunctionBuilder<'_> {
                 "call instruction does not carry a canonical function signature",
             )
         })?;
-        if is_aggregate(self.types, function_type.result.ty)
-            || arguments
-                .iter()
-                .any(|argument| is_aggregate(self.types, argument.ty.ty))
-        {
-            return Err(IrError::lower(
-                LOWERING_ERROR,
-                span,
-                "aggregate call arguments and results require ABI lowering and are not supported",
-            ));
-        }
         let callee_value = if direct.is_none() {
             Some(self.expect_value(callee)?)
         } else {

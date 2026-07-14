@@ -1,0 +1,5 @@
+ccc: error[CCC2414]: `va_arg` cannot request a variably modified type
+ --> tests/diagnostics/cases/variably-modified-va-arg.c:5:35
+   |
+ 5 |     return __builtin_va_arg(list, int (*)[count]) != 0;
+   |                                   ^^^^^^^^^^^^^^

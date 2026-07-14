@@ -1,0 +1,5 @@
+ccc: error[CCC2403]: `va_arg` type `float` is changed by the default argument promotions; request the promoted type
+ --> tests/diagnostics/cases/promotion-invalid-va-arg.c:5:36
+   |
+ 5 |     value = __builtin_va_arg(list, float);
+   |                                    ^^^^^

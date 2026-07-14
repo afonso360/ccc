@@ -1,5 +1,18 @@
 //! Target tool resolution and executable link-plan execution.
 
+pub mod artifact;
+pub mod bridge;
+mod package;
+
+pub use artifact::{
+    ArtifactBundle, BridgeManifestV1, GeneratedSymbol, GeneratedSymbolOwner,
+    GeneratedSymbolVisibility, VerifiedArtifactBundle,
+};
+pub use package::{
+    PackagingReport, PackagingToolIdentity, package_artifact_bundle,
+    package_artifact_bundle_with_runner,
+};
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -30,6 +43,13 @@ impl fmt::Display for LinkError {
 
 impl std::error::Error for LinkError {}
 
+fn artifact_error(message: impl Into<String>) -> LinkError {
+    LinkError {
+        code: "CCC5010",
+        message: message.into(),
+    }
+}
+
 /// Components required by the selected compiler actions.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct ToolchainRequirements {
@@ -37,6 +57,7 @@ pub struct ToolchainRequirements {
     pub disable_system_headers: bool,
     pub assembler: bool,
     pub linker: bool,
+    pub object_copier: bool,
     pub archiver: bool,
 }
 
@@ -47,6 +68,7 @@ impl ToolchainRequirements {
             disable_system_headers: !default_system_includes,
             assembler: false,
             linker: false,
+            object_copier: false,
             archiver: false,
         }
     }
@@ -57,6 +79,7 @@ impl ToolchainRequirements {
             disable_system_headers: !default_system_includes,
             assembler: true,
             linker: false,
+            object_copier: false,
             archiver: false,
         }
     }
@@ -67,6 +90,7 @@ impl ToolchainRequirements {
             disable_system_headers: false,
             assembler: false,
             linker: true,
+            object_copier: false,
             archiver: false,
         }
     }
@@ -77,7 +101,22 @@ impl ToolchainRequirements {
             disable_system_headers: false,
             assembler: false,
             linker: false,
+            object_copier: false,
             archiver: true,
+        }
+    }
+
+    /// Tools needed to turn generated assembly into one relocatable object.
+    pub const fn package_generated_assembly() -> Self {
+        Self {
+            system_headers: false,
+            disable_system_headers: false,
+            // Assembly is intentionally driven through the compiler driver;
+            // the standalone assembler is not part of this contract.
+            assembler: false,
+            linker: false,
+            object_copier: true,
+            archiver: false,
         }
     }
 }
@@ -141,7 +180,9 @@ impl ProbeRunner for ProcessProbeRunner {
 
 const RELEVANT_ENVIRONMENT_VARIABLES: &[&str] = &[
     "CCC_CC",
+    "CCC_OBJCOPY",
     "CC",
+    "OBJCOPY",
     "PATH",
     "SDKROOT",
     "DEVELOPER_DIR",
@@ -297,6 +338,7 @@ struct ExistingToolchainCacheKey {
     compiler_driver: Option<CommandCacheKey>,
     assembler: Option<CommandCacheKey>,
     linker_driver: Option<CommandCacheKey>,
+    object_copier: Option<CommandCacheKey>,
     archiver: Option<CommandCacheKey>,
     ranlib: Option<CommandCacheKey>,
     sysroot: Option<PathBuf>,
@@ -311,6 +353,7 @@ impl From<&ToolchainSpec> for ExistingToolchainCacheKey {
             compiler_driver: spec.compiler_driver.as_ref().map(Into::into),
             assembler: spec.assembler.as_ref().map(Into::into),
             linker_driver: spec.linker_driver.as_ref().map(Into::into),
+            object_copier: spec.object_copier.as_ref().map(Into::into),
             archiver: spec.archiver.as_ref().map(Into::into),
             ranlib: spec.ranlib.as_ref().map(Into::into),
             sysroot: spec.sysroot.clone(),
@@ -626,7 +669,7 @@ impl<R: ProbeRunner> ToolchainResolver<R> {
         let sysroot = if needs_sysroot {
             match &self.explicit_sysroot {
                 Some(sysroot) => Some(sysroot.clone()),
-                None => self.probe_sysroot(candidate)?,
+                None => self.probe_sysroot(candidate, &version)?,
             }
         } else {
             self.explicit_sysroot.clone()
@@ -678,6 +721,16 @@ impl<R: ProbeRunner> ToolchainResolver<R> {
         } else {
             (self.existing.archiver.clone(), self.existing.ranlib.clone())
         };
+        let object_copier = if requirements.object_copier {
+            let explicit = environment_value(environment, "CCC_OBJCOPY")
+                .or_else(|| environment_value(environment, "OBJCOPY"));
+            Some(match explicit {
+                Some(command) => parse_tool_command(command, "object copier")?,
+                None => self.probe_program(candidate, "objcopy")?,
+            })
+        } else {
+            self.existing.object_copier.clone()
+        };
 
         let driver_path = executable.path.clone();
         let fingerprint_arguments = candidate
@@ -714,6 +767,7 @@ impl<R: ProbeRunner> ToolchainResolver<R> {
             compiler_driver: Some(resolved_driver.clone()),
             assembler,
             linker_driver: requirements.linker.then_some(resolved_driver),
+            object_copier,
             archiver,
             ranlib,
             sysroot,
@@ -773,7 +827,15 @@ impl<R: ProbeRunner> ToolchainResolver<R> {
         }
     }
 
-    fn probe_sysroot(&self, driver: &ToolCommandSpec) -> Result<Option<PathBuf>, LinkError> {
+    fn probe_sysroot(
+        &self,
+        driver: &ToolCommandSpec,
+        driver_version: &str,
+    ) -> Result<Option<PathBuf>, LinkError> {
+        if driver_version.to_ascii_lowercase().contains("clang") {
+            return self.probe_clang_sysroot(driver);
+        }
+
         let output = self.probe_text(
             driver,
             self.target_arguments
@@ -785,6 +847,50 @@ impl<R: ProbeRunner> ToolchainResolver<R> {
         )?;
         let path = output.trim();
         Ok((!path.is_empty()).then(|| PathBuf::from(path)))
+    }
+
+    fn probe_clang_sysroot(&self, driver: &ToolCommandSpec) -> Result<Option<PathBuf>, LinkError> {
+        let output = self.probe(
+            driver,
+            self.target_arguments.iter().cloned().chain([
+                OsString::from("-###"),
+                OsString::from("-E"),
+                OsString::from("-x"),
+                OsString::from("c"),
+                OsString::from("-"),
+            ]),
+            Some(Vec::new()),
+            "effective sysroot",
+        )?;
+        let mut trace = String::from_utf8(output.stderr).map_err(|error| LinkError {
+            code: "CCC5006",
+            message: format!(
+                "compiler driver `{}` returned non-UTF-8 effective sysroot trace: {error}",
+                driver.display()
+            ),
+        })?;
+        trace.push('\n');
+        trace.push_str(
+            &String::from_utf8(output.stdout).map_err(|error| LinkError {
+                code: "CCC5006",
+                message: format!(
+                    "compiler driver `{}` returned non-UTF-8 effective sysroot trace: {error}",
+                    driver.display()
+                ),
+            })?,
+        );
+
+        match parse_clang_sysroot_trace(&trace) {
+            Some(ClangSysrootTrace::Default) => Ok(None),
+            Some(ClangSysrootTrace::Path(path)) => Ok(Some(path)),
+            None => Err(LinkError {
+                code: "CCC5006",
+                message: format!(
+                    "compiler driver `{}` returned no recognizable frontend command while probing the effective sysroot",
+                    driver.display()
+                ),
+            }),
+        }
     }
 
     fn probe_resource_dir(
@@ -1081,6 +1187,71 @@ pub fn parse_system_include_search(
     entries
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ClangSysrootTrace {
+    Default,
+    Path(PathBuf),
+}
+
+fn parse_clang_sysroot_trace(output: &str) -> Option<ClangSysrootTrace> {
+    let mut saw_frontend_command = false;
+    let mut effective_sysroot = None;
+    for line in output.lines() {
+        if !line.contains("\"-cc1\"") {
+            continue;
+        }
+        let arguments = parse_clang_trace_arguments(line)?;
+        if !arguments.iter().any(|argument| argument == "-cc1") {
+            continue;
+        }
+        saw_frontend_command = true;
+
+        let mut index = 0;
+        while index < arguments.len() {
+            match arguments[index].as_str() {
+                "-isysroot" | "--sysroot" => {
+                    index += 1;
+                    let path = arguments.get(index)?;
+                    effective_sysroot = Some(PathBuf::from(path));
+                }
+                argument => {
+                    if let Some(path) = argument
+                        .strip_prefix("-isysroot=")
+                        .or_else(|| argument.strip_prefix("--sysroot="))
+                    {
+                        effective_sysroot = Some(PathBuf::from(path));
+                    }
+                }
+            }
+            index += 1;
+        }
+    }
+
+    saw_frontend_command
+        .then(|| effective_sysroot.map_or(ClangSysrootTrace::Default, ClangSysrootTrace::Path))
+}
+
+fn parse_clang_trace_arguments(line: &str) -> Option<Vec<String>> {
+    let mut arguments = Vec::new();
+    let mut characters = line.chars();
+    while let Some(character) = characters.next() {
+        if character != '"' {
+            continue;
+        }
+
+        let mut argument = String::new();
+        loop {
+            match characters.next()? {
+                '"' => break,
+                '\\' => argument.push(characters.next()?),
+                character => argument.push(character),
+            }
+        }
+        arguments.push(argument);
+    }
+    Some(arguments)
+}
+
 pub fn target_matches(reported: &Triple, expected: &Triple) -> bool {
     reported.architecture == expected.architecture
         && reported.operating_system == expected.operating_system
@@ -1102,6 +1273,7 @@ fn requirements_satisfied(
         && (!requirements.system_headers || !spec.system_includes.is_empty())
         && (!requirements.assembler || spec.assembler.is_some())
         && (!requirements.linker || spec.linker_driver.is_some())
+        && (!requirements.object_copier || spec.object_copier.is_some())
         && (!requirements.archiver || (spec.archiver.is_some() && spec.ranlib.is_some()))
 }
 
@@ -1113,11 +1285,15 @@ fn driver_from_environment(environment: &[EnvironmentEntry]) -> Result<ToolComma
 }
 
 fn parse_driver_command(value: OsString) -> Result<ToolCommandSpec, LinkError> {
+    parse_tool_command(&value, "target compiler driver")
+}
+
+fn parse_tool_command(value: &OsStr, description: &str) -> Result<ToolCommandSpec, LinkError> {
     let value = value.to_string_lossy();
     let mut words = value.split_whitespace();
     let program = words.next().ok_or_else(|| LinkError {
         code: "CCC5002",
-        message: "target compiler driver environment entry is empty".to_owned(),
+        message: format!("{description} environment entry is empty"),
     })?;
     Ok(ToolCommandSpec::with_arguments(
         program,
@@ -1252,6 +1428,7 @@ fn fingerprint_digest(inputs: &FingerprintInputs<'_>) -> String {
         ),
         ("assembler", inputs.requirements.assembler),
         ("linker", inputs.requirements.linker),
+        ("object-copier", inputs.requirements.object_copier),
         ("archiver", inputs.requirements.archiver),
     ] {
         update(OsStr::new(name));
@@ -1342,6 +1519,31 @@ mod tests {
                 SystemIncludeEntry::new("/usr/local/include", SystemIncludeKind::System),
                 SystemIncludeEntry::new("/System/Library/Frameworks", SystemIncludeKind::Framework,),
             ]
+        );
+    }
+
+    #[test]
+    fn parses_clang_effective_sysroot_traces() {
+        let native = r#" "/usr/bin/clang" "-cc1" "-triple" "x86_64-pc-linux-gnu" "-E""#;
+        assert_eq!(
+            parse_clang_sysroot_trace(native),
+            Some(ClangSysrootTrace::Default)
+        );
+
+        let configured = r#" "/usr/bin/clang" "-cc1" "-isysroot" "/sdk with space" "-E""#;
+        assert_eq!(
+            parse_clang_sysroot_trace(configured),
+            Some(ClangSysrootTrace::Path(PathBuf::from("/sdk with space")))
+        );
+
+        let escaped = r#" "/usr/bin/clang" "-cc1" "-isysroot" "/sdk\\root" "-E""#;
+        assert_eq!(
+            parse_clang_sysroot_trace(escaped),
+            Some(ClangSysrootTrace::Path(PathBuf::from(r"/sdk\root")))
+        );
+        assert_eq!(
+            parse_clang_sysroot_trace("Target: x86_64-pc-linux-gnu"),
+            None
         );
     }
 
@@ -1681,7 +1883,10 @@ mod tests {
         let runner = FakeRunner::new([
             successful("x86_64-linux-gnu\n"),
             successful("fixture clang version 20.1.0\n"),
-            successful("/sdk\n"),
+            successful_with_stderr(
+                r#" "/opt/clang/bin/clang" "-cc1" "-triple" "x86_64-unknown-linux-gnu" "-isysroot" "/sdk" "-E" "-x" "c" "-"
+"#,
+            ),
             successful("/opt/clang/lib/clang/20\n"),
             successful_with_stderr(include_str!("../testdata/clang-include-search.txt")),
         ]);
@@ -1709,6 +1914,13 @@ mod tests {
 
         let requests = resolver.runner.requests.borrow();
         assert_eq!(requests.len(), 5);
+        assert_eq!(
+            requests[2].arguments,
+            ["-###", "-E", "-x", "c", "-"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
         let include_probe = requests.last().unwrap();
         assert!(
             include_probe
@@ -1723,5 +1935,79 @@ mod tests {
                 .any(|argument| argument == "--sysroot=/sdk")
         );
         assert_eq!(include_probe.stdin, Some(Vec::new()));
+    }
+
+    #[test]
+    fn resolves_gnu_sysroots_with_the_machine_readable_driver_query() {
+        let config = EffectiveCompilationConfig::default();
+        let runner = FakeRunner::new([
+            successful("x86_64-linux-gnu\n"),
+            successful("gcc (Debian 14.2.0) 14.2.0\n"),
+            successful("/sdk\n"),
+        ]);
+        let resolver = ToolchainResolver::with_runner(&config, runner)
+            .driver(ToolCommandSpec::new("fixture-gcc"));
+
+        let spec = resolver.resolve(ToolchainRequirements::link()).unwrap();
+
+        assert_eq!(spec.sysroot.as_deref(), Some(Path::new("/sdk")));
+        assert_eq!(
+            spec.linker_driver,
+            Some(ToolCommandSpec::new("fixture-gcc"))
+        );
+        let requests = resolver.runner.requests.borrow();
+        assert_eq!(requests.len(), 3);
+        assert_eq!(
+            requests[2].arguments.last(),
+            Some(&OsString::from("--print-sysroot"))
+        );
+        assert!(
+            requests[2]
+                .arguments
+                .iter()
+                .all(|argument| argument != "-###")
+        );
+    }
+
+    #[test]
+    fn resolves_native_clang_when_the_gnu_sysroot_query_is_unsupported() {
+        let config = EffectiveCompilationConfig::default();
+        let runner = FakeRunner::new([
+            successful("x86_64-pc-linux-gnu\n"),
+            successful("Debian clang version 14.0.6\n"),
+            successful_with_stderr(
+                r#"Debian clang version 14.0.6
+ "/usr/lib/llvm-14/bin/clang" "-cc1" "-triple" "x86_64-pc-linux-gnu" "-E" "-resource-dir" "/usr/lib/llvm-14/lib/clang/14.0.6" "-x" "c" "-"
+"#,
+            ),
+            successful("/opt/clang/lib/clang/20\n"),
+            successful_with_stderr(include_str!("../testdata/clang-include-search.txt")),
+        ]);
+        let resolver = ToolchainResolver::with_runner(&config, runner)
+            .driver(ToolCommandSpec::new("fixture-clang"));
+
+        let spec = resolver
+            .resolve(ToolchainRequirements::preprocess(true))
+            .unwrap();
+
+        assert!(spec.sysroot.is_none());
+        assert_eq!(spec.system_includes.len(), 3);
+
+        let requests = resolver.runner.requests.borrow();
+        assert_eq!(requests.len(), 5);
+        assert_eq!(
+            requests[2].arguments,
+            ["-###", "-E", "-x", "c", "-"]
+                .into_iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(requests[2].stdin, Some(Vec::new()));
+        assert!(
+            requests[4]
+                .arguments
+                .iter()
+                .all(|argument| !argument.to_string_lossy().starts_with("--sysroot="))
+        );
     }
 }

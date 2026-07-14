@@ -2,12 +2,15 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 
-use ccc_target::{PackingPolicy, TargetDataLayout};
+use ccc_target::{
+    Architecture, CallingConvention, EffectiveCompilationConfig, Environment, OperatingSystem,
+    PackingPolicy, TargetBuiltinType, TargetDataLayout,
+};
 
 use crate::{
-    ArrayType, BuiltinType, EnumBody, EnumDefinition, EnumId, Enumerator, FunctionParameters,
-    FunctionType, LayoutError, QualifiedType, RecordDefinition, RecordId, RecordKind, TypeId,
-    TypeKind, TypeLayout, VariableLengthId,
+    ArrayLength, ArrayType, BuiltinType, EnumBody, EnumDefinition, EnumId, Enumerator, Field,
+    FunctionParameters, FunctionType, LayoutError, QualifiedType, RecordDefinition, RecordId,
+    RecordKind, TypeId, TypeKind, TypeLayout, VariableLengthId,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -25,6 +28,24 @@ pub enum DefinitionError {
     EnumAlreadyComplete(EnumId),
     InvalidEnumUnderlying(TypeId),
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TargetBuiltinTypeError {
+    pub kind: TargetBuiltinType,
+    pub target: String,
+}
+
+impl fmt::Display for TargetBuiltinTypeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "target builtin type {:?} is unavailable for {}",
+            self.kind, self.target
+        )
+    }
+}
+
+impl std::error::Error for TargetBuiltinTypeError {}
 
 impl fmt::Display for DefinitionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -57,6 +78,7 @@ pub struct TypeStore {
     pub(crate) records: Vec<RecordDefinition>,
     pub(crate) enums: Vec<EnumDefinition>,
     next_variable_length: u32,
+    target_builtins: HashMap<TargetBuiltinType, TypeId>,
     pub(crate) layout_cache: RefCell<Vec<(LayoutCacheKey, Result<TypeLayout, LayoutError>)>>,
 }
 
@@ -92,6 +114,7 @@ impl Default for TypeStore {
             records: Vec::new(),
             enums: Vec::new(),
             next_variable_length: 0,
+            target_builtins: HashMap::new(),
             layout_cache: RefCell::new(Vec::new()),
         }
     }
@@ -108,6 +131,14 @@ impl TypeStore {
 
     pub fn contains(&self, id: TypeId) -> bool {
         id.index() < self.kinds.len()
+    }
+
+    /// Iterates canonical types in stable `TypeId` order.
+    pub fn iter_types(&self) -> impl ExactSizeIterator<Item = (TypeId, &TypeKind)> {
+        self.kinds
+            .iter()
+            .enumerate()
+            .map(|(index, kind)| (TypeId(index as u32), kind))
     }
 
     pub const fn builtin(&self, kind: BuiltinType) -> TypeId {
@@ -151,6 +182,64 @@ impl TypeStore {
 
     pub fn array(&mut self, array: ArrayType) -> TypeId {
         self.intern(TypeKind::Array(array))
+    }
+
+    /// Returns the canonical representation of a compiler-provided target
+    /// type. The SysV AMD64 `va_list` is an array of one ABI record so normal C
+    /// parameter adjustment produces the required pointer representation.
+    pub fn target_builtin(
+        &mut self,
+        kind: TargetBuiltinType,
+        config: &EffectiveCompilationConfig,
+    ) -> Result<TypeId, TargetBuiltinTypeError> {
+        let supported = config.target.triple.architecture == Architecture::X86_64
+            && config.target.triple.operating_system == OperatingSystem::Linux
+            && config.target.triple.environment == Environment::Gnu
+            && config.target.calling_convention() == Some(CallingConvention::SystemV);
+        if !supported {
+            return Err(TargetBuiltinTypeError {
+                kind,
+                target: config.target.triple.to_string(),
+            });
+        }
+        if let Some(ty) = self.target_builtins.get(&kind) {
+            return Ok(*ty);
+        }
+        let ty = match kind {
+            TargetBuiltinType::VaList => {
+                let void_pointer = self.pointer(TypeId::VOID);
+                let (record, record_ty) = self.declare_record(
+                    RecordKind::Struct,
+                    Some("__ccc_sysv_va_list_tag".to_owned()),
+                );
+                self.complete_record(
+                    record,
+                    vec![
+                        Field::named("gp_offset", TypeId::UNSIGNED_INT),
+                        Field::named("fp_offset", TypeId::UNSIGNED_INT),
+                        Field::named("overflow_arg_area", void_pointer),
+                        Field::named("reg_save_area", void_pointer),
+                    ],
+                )
+                .expect("a newly declared target record is incomplete");
+                self.array(ArrayType {
+                    element: QualifiedType::unqualified(record_ty),
+                    length: ArrayLength::Constant(1),
+                })
+            }
+        };
+        self.target_builtins.insert(kind, ty);
+        Ok(ty)
+    }
+
+    pub fn target_builtin_type(&self, ty: TypeId) -> Option<TargetBuiltinType> {
+        self.target_builtins
+            .iter()
+            .find_map(|(kind, candidate)| (*candidate == ty).then_some(*kind))
+    }
+
+    pub fn target_builtin_id(&self, kind: TargetBuiltinType) -> Option<TypeId> {
+        self.target_builtins.get(&kind).copied()
     }
 
     pub fn fresh_variable_length(&mut self) -> VariableLengthId {

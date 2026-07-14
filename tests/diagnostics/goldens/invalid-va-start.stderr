@@ -1,0 +1,5 @@
+ccc: error[CCC2400]: `va_start` is only valid in a variadic function definition
+ --> tests/diagnostics/cases/invalid-va-start.c:3:5
+   |
+ 3 |     __builtin_va_start(list, final);
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

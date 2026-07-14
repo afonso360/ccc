@@ -1,0 +1,5 @@
+ccc: error[CCC2402]: the second `va_start` argument must name the final fixed parameter
+ --> tests/diagnostics/cases/wrong-va-start-parameter.c:3:30
+   |
+ 3 |     __builtin_va_start(list, first);
+   |                              ^^^^^

@@ -1,0 +1,5 @@
+ccc: error[CCC2410]: this `va_list` operand must be modifiable
+ --> tests/diagnostics/cases/nonmodifiable-va-list.c:3:24
+   |
+ 3 |     __builtin_va_start(list, final);
+   |                        ^^^^

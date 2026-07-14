@@ -1,0 +1,5 @@
+ccc: error[CCC3506]: a function type without a prototype has no fixed ABI plan
+ --> tests/diagnostics/cases/unspecified-call-boundary.c:4:12
+   |
+ 4 |     return external(1);
+   |            ^^^^^^^^^^^ while generating native code

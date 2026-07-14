@@ -1,5 +1,0 @@
-ccc: error[CCC3101]: aggregate parameters or results for function `identity` require ABI lowering and are not supported
- --> tests/diagnostics/cases/aggregate-call-boundary.c:2:1
-   |
- 2 | struct pair identity(struct pair value) {
-   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ while lowering typed C to IR

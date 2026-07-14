@@ -9,6 +9,7 @@ pub(crate) enum DumpKind {
     Ast,
     TypedAst,
     Ir,
+    Abi,
     Clif,
 }
 
@@ -146,6 +147,7 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
             "--dump-ast" => select_dump(&mut dump, DumpKind::Ast)?,
             "--dump-typed-ast" => select_dump(&mut dump, DumpKind::TypedAst)?,
             "--dump-ir" => select_dump(&mut dump, DumpKind::Ir)?,
+            "--dump-abi" => select_dump(&mut dump, DumpKind::Abi)?,
             "--emit=clif" => select_dump(&mut dump, DumpKind::Clif)?,
             "-trigraphs" => trigraphs = TrigraphPolicy::Enabled,
             "-nostdinc" => no_standard_includes = true,
@@ -459,6 +461,14 @@ mod tests {
         assert_eq!(
             options(&["--dump-typed-ast", "input.c"]).action,
             PrimaryAction::Dump(DumpKind::TypedAst)
+        );
+    }
+
+    #[test]
+    fn selects_the_abi_dump() {
+        assert_eq!(
+            options(&["--dump-abi", "input.c"]).action,
+            PrimaryAction::Dump(DumpKind::Abi)
         );
     }
 

@@ -108,6 +108,7 @@ impl AstDumper {
             }
             TypeSpecifier::Atomic(_) => self.line(indent, "type Atomic"),
             TypeSpecifier::Typeof(_) => self.line(indent, "type Typeof"),
+            TypeSpecifier::BuiltinVaList => self.line(indent, "type __builtin_va_list"),
             other => self.line(indent, &format!("type {other:?}")),
         }
     }
@@ -338,6 +339,30 @@ impl AstDumper {
                 }
             }
             ExpressionKind::BuiltinOffsetof { .. } => self.line(indent, "builtin-offsetof"),
+            ExpressionKind::BuiltinVaStart {
+                list,
+                last_named_parameter,
+            } => {
+                self.line(indent, "builtin-va-start");
+                self.expression(list, indent + 1);
+                self.expression(last_named_parameter, indent + 1);
+            }
+            ExpressionKind::BuiltinVaArg { list, .. } => {
+                self.line(indent, "builtin-va-arg");
+                self.expression(list, indent + 1);
+            }
+            ExpressionKind::BuiltinVaCopy {
+                destination,
+                source,
+            } => {
+                self.line(indent, "builtin-va-copy");
+                self.expression(destination, indent + 1);
+                self.expression(source, indent + 1);
+            }
+            ExpressionKind::BuiltinVaEnd { list } => {
+                self.line(indent, "builtin-va-end");
+                self.expression(list, indent + 1);
+            }
             ExpressionKind::Comma(expressions) => {
                 self.line(indent, "comma");
                 for expression in expressions {

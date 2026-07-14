@@ -1,0 +1,21 @@
+translation-unit full-typed
+function @0 sink : int (int, ...) storage=Extern linkage=External visibility=Default inline=false noreturn=false declaration
+function @1 forward : int (char, unsigned short int, float) storage=Extern linkage=External visibility=Default inline=false noreturn=false definition
+  parameter %0 byte : char
+  parameter %1 half : unsigned short int
+  parameter %2 real : float
+  compound
+    return
+      call function=Some(FullFunctionId(0)) variadic-boundary=1 : int Value
+        convert FunctionToPointer : pointer to int (int, ...) Value
+          decl-ref Function(FullFunctionId(0)) : int (int, ...) FunctionDesignator
+        constant Signed(0) : int Value
+        convert IntegerPromotion : int Value
+          convert LvalueToValue { access: AccessSemantics { volatile: false, atomic: false } } : char Value
+            decl-ref Local(FullLocalId(0)) : char Lvalue
+        convert IntegerPromotion : int Value
+          convert LvalueToValue { access: AccessSemantics { volatile: false, atomic: false } } : unsigned short int Value
+            decl-ref Local(FullLocalId(1)) : unsigned short int Lvalue
+        convert FloatingConversion : double Value
+          convert LvalueToValue { access: AccessSemantics { volatile: false, atomic: false } } : float Value
+            decl-ref Local(FullLocalId(2)) : float Lvalue

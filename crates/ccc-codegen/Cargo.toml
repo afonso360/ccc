@@ -8,6 +8,7 @@ version.workspace = true
 [dependencies]
 ccc-abi = { path = "../ccc-abi" }
 ccc-ir = { path = "../ccc-ir" }
+ccc-link = { path = "../ccc-link" }
 ccc-sema = { path = "../ccc-sema" }
 ccc-session = { path = "../ccc-session" }
 ccc-target = { path = "../ccc-target" }
@@ -16,11 +17,13 @@ cranelift-codegen.workspace = true
 cranelift-frontend.workspace = true
 cranelift-module.workspace = true
 cranelift-object.workspace = true
+gimli.workspace = true
 object.workspace = true
 
 [dev-dependencies]
 ccc-pp = { path = "../ccc-pp" }
 ccc-syntax = { path = "../ccc-syntax" }
+sha2.workspace = true
 
 [lints]
 workspace = true

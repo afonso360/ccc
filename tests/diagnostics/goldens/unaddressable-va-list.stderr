@@ -1,0 +1,5 @@
+ccc: error[CCC2409]: a `va_list` object is required
+ --> tests/diagnostics/cases/unaddressable-va-list.c:3:24
+   |
+ 3 |     __builtin_va_start(list, final);
+   |                        ^^^^

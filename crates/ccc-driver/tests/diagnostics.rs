@@ -61,20 +61,54 @@ fn rejected_translations_match_diagnostic_goldens_and_emit_no_object() {
             ),
         },
         Case {
+            name: "long-double-boundary",
+            expected: include_str!(
+                "../../../tests/diagnostics/goldens/long-double-boundary.stderr"
+            ),
+        },
+        Case {
+            name: "unspecified-call-boundary",
+            expected: include_str!(
+                "../../../tests/diagnostics/goldens/unspecified-call-boundary.stderr"
+            ),
+        },
+        Case {
+            name: "invalid-va-start",
+            expected: include_str!("../../../tests/diagnostics/goldens/invalid-va-start.stderr"),
+        },
+        Case {
+            name: "wrong-va-start-parameter",
+            expected: include_str!(
+                "../../../tests/diagnostics/goldens/wrong-va-start-parameter.stderr"
+            ),
+        },
+        Case {
+            name: "nonmodifiable-va-list",
+            expected: include_str!(
+                "../../../tests/diagnostics/goldens/nonmodifiable-va-list.stderr"
+            ),
+        },
+        Case {
+            name: "unaddressable-va-list",
+            expected: include_str!(
+                "../../../tests/diagnostics/goldens/unaddressable-va-list.stderr"
+            ),
+        },
+        Case {
+            name: "promotion-invalid-va-arg",
+            expected: include_str!(
+                "../../../tests/diagnostics/goldens/promotion-invalid-va-arg.stderr"
+            ),
+        },
+        Case {
+            name: "variably-modified-va-arg",
+            expected: include_str!(
+                "../../../tests/diagnostics/goldens/variably-modified-va-arg.stderr"
+            ),
+        },
+        Case {
             name: "atomic-access",
             expected: include_str!("../../../tests/diagnostics/goldens/atomic-access.stderr"),
-        },
-        Case {
-            name: "aggregate-call-boundary",
-            expected: include_str!(
-                "../../../tests/diagnostics/goldens/aggregate-call-boundary.stderr"
-            ),
-        },
-        Case {
-            name: "variadic-call-boundary",
-            expected: include_str!(
-                "../../../tests/diagnostics/goldens/variadic-call-boundary.stderr"
-            ),
         },
         Case {
             name: "wrong-call-arity",

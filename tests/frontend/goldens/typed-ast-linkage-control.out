@@ -14,7 +14,7 @@ global-redeclaration @0
 global @1 state : int storage=Static linkage=Internal duration=Static symbol=state definition=Definition
   initializer : int
     constant Signed(1) : int Value
-function @0 transform : int (int) storage=Extern linkage=External inline=false noreturn=false definition
+function @0 transform : int (int) storage=Extern linkage=External visibility=Default inline=false noreturn=false definition
   parameter %0 value : int
   compound
     return
@@ -25,7 +25,7 @@ function @0 transform : int (int) storage=Extern linkage=External inline=false n
           decl-ref Global(GlobalId(1)) : int Lvalue
 function-redeclaration @0
 function-redeclaration @0
-function @1 drive : int (int) storage=Extern linkage=External inline=false noreturn=false definition
+function @1 drive : int (int) storage=Extern linkage=External visibility=Default inline=false noreturn=false definition
   parameter %0 limit : int
   compound
     local %1 total : int storage=Automatic duration=Automatic

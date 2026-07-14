@@ -29,6 +29,11 @@ frontend builtin. The template honors the conventional `__need_*` partial
 include protocol so libc wrappers can request one definition without blocking
 a later complete include.
 
+`stdarg.h` is compiler-owned and contains no target layout constants. It maps
+the standard interface to typed compiler builtins and names the target-derived
+`__builtin_va_list` type. The target type system, ABI planner, and code
+generator own the concrete list representation.
+
 The manifest also records the GNU compatibility profile used to select and
 parse hosted-header paths. Its checked capability and declined-feature sets
 keep the advertised compiler version tied to preprocessing and declaration

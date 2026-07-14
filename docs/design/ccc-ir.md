@@ -1,13 +1,28 @@
 # CCC-IR invariants
 
-CCC-IR is a typed, ABI-independent CFG representation between the typed AST and Cranelift. The decision to have it is [ADR-0001](../adr/0001-ccc-ir-middle-layer.md); target call details are separate immutable [`AbiPlan`s](abi-and-varargs.md#abi-plans).
+CCC-IR is a typed, ABI-independent CFG representation between the typed AST
+and Cranelift. The decision to have it is
+[ADR-0001](../adr/0001-ccc-ir-middle-layer.md); target call details are a
+separate immutable [module ABI plan](abi-and-varargs.md#module-abi-plan).
 
 ## Core invariants
 
 - **Places vs values.** A place is an address expression plus type, qualifiers, and an optional bitfield descriptor. Every read is an explicit load and every write an explicit store; lvalue-to-rvalue conversion is never implicit.
 - **Object identity and address-taking.** Address-taken, volatile, aggregate, atomic, and variably modified objects are materialized in memory. A pre-lowering scan classifies locals before any SSA value is emitted, so later `&local` cannot require retroactive materialization.
 - **Pointer operations.** Scaled pointer arithmetic, pointer difference, array/member offsets, null values, and integer/pointer conversions are explicit operations with the source C rules attached. Codegen does not infer pointee size or signedness.
-- **Aggregate value semantics.** `AggregateCopy` has C assignment semantics and remains correct when source and destination are identical or overlap through aliasing. Lowering may use loads/stores, a temporary, `memmove`, or a proven-nonoverlapping `memcpy`; it cannot blindly call `memcpy`. Volatile aggregate accesses are expanded into ordered volatile accesses of the required width.
+- **Aggregate value semantics.** Every aggregate rvalue is an immutable owned
+  snapshot with compiler-managed backing storage. `AggregateSnapshot` observes
+  its source once; `AggregateCopy` has C assignment semantics and remains
+  correct when source and destination are identical or overlap through
+  aliasing. `AggregateProject` derives a verifier-bounded field/index address
+  into owned storage, including array decay from an aggregate rvalue. Lowering
+  may use loads/stores, a temporary, `memmove`, or a proven-nonoverlapping
+  `memcpy`; it cannot blindly call `memcpy`. Volatile aggregate accesses are
+  expanded into ordered volatile accesses of the required width.
+- **Variadic operations.** `VaStart`, `VaArg`, `VaCopy`, and `VaEnd` are
+  ABI-neutral effectful instructions. `VaArg` records the requested canonical
+  type; its immutable target fetch plan and control-flow expansion belong to
+  `ccc-abi` and codegen respectively.
 - **Bitfields.** A bitfield place carries storage unit, bit offset, width, signedness, and volatility/atomic restrictions. Layout is computed during semantic analysis by the shared `ccc-types` layout engine from the effective configuration.
 - **Compound literals.** The IR creates an anonymous object with the correct block or static storage duration and makes initialization explicit.
 

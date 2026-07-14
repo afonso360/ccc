@@ -32,7 +32,7 @@ C distinguishes **preprocessing tokens** (pp-tokens: pp-numbers, header-names, u
       │  (CCC-IR)
       ▼
   ABI planning  ──────────────── per-target classification, sret, vararg bridges  [ccc-abi]
-      │  (CCC-IR + immutable AbiPlans)
+      │  (CCC-IR + immutable ModuleAbiPlan)
       ▼
   Codegen  ───────────────────── cranelift-frontend FunctionBuilder → CLIF         [ccc-codegen]
       │
@@ -60,9 +60,14 @@ _Typedef-name classification, concretely ([ADR-0002](../adr/0002-syntax-owned-ty
 
 **CCC-IR (`ccc-ir`, locked — [ADR-0001](../adr/0001-ccc-ir-middle-layer.md)).** A typed, ABI-independent mid-level IR in CFG form between the typed AST and Cranelift. All surface-language desugaring happens here once (loops → blocks+branches, `&&`/`||`/`?:` → control flow, compound assignment expanded, implicit conversions materialized). It hosts backend-independent C-level optimizations and retains explicit memory/call effects. Its semantic contract is [CCC-IR invariants](ccc-ir.md).
 
-**ABI planning (`ccc-abi`).** Produces immutable target-specific [`AbiPlan`s](abi-and-varargs.md#abi-plans) for definitions and call sites: aggregate classification, hidden returns, register/stack placement, extensions, variadic shaping, and required bridges. Plans remain separate from CCC-IR and are tested against the [ABI oracle](testing.md#abi-oracle).
+**ABI planning (`ccc-abi`).** Produces one immutable target-specific
+[module ABI plan](abi-and-varargs.md#module-abi-plan) for definitions and call
+sites: aggregate classification, native carrier encoding, bridge placement,
+hidden returns, extensions, variadic shaping, and packaging requirements. The
+plan remains separate from CCC-IR, is verified against a canonical IR digest,
+and is tested against the [ABI oracle](testing.md#abi-oracle).
 
-**Codegen (`ccc-codegen`).** Uses `cranelift-frontend`'s `FunctionBuilder`; eligible scalar locals become Cranelift `Variable`s while memory-resident objects follow the CCC-IR place/effect rules. It consumes `AbiPlan`s, checks backend capabilities, and emits CLIF or a hard diagnostic—never an ABI approximation. `cranelift-object` emits the primary object; generated bridge/assembly inputs are owned by `ccc-link`.
+**Codegen (`ccc-codegen`).** Uses `cranelift-frontend`'s `FunctionBuilder`; eligible scalar locals become Cranelift `Variable`s while memory-resident objects follow the CCC-IR place/effect rules. It consumes the verified `ModuleAbiPlan`, checks backend capabilities, and emits CLIF or a hard diagnostic—never an ABI approximation. `cranelift-object` emits the primary object; generated bridge/assembly inputs are owned by `ccc-link`.
 
 ## Workspace layout
 
@@ -80,7 +85,7 @@ ccc/
 │  ├─ ccc-syntax/      # phases 5–7: token conversion + parser + AST + parser-owned typedef table
 │  ├─ ccc-sema/        # type system, scopes, const-eval → typed AST
 │  ├─ ccc-ir/          # CCC-IR definition + builder + invariants + C-level opt passes
-│  ├─ ccc-abi/         # per-target ABI plans + variadic/long-double bridge plans
+│  ├─ ccc-abi/         # module ABI planning + target-specific boundary classification
 │  ├─ ccc-codegen/     # CCC-IR → CLIF via cranelift-frontend/object
 │  └─ ccc-link/        # resolved target tools, archives, bridge/asm objects, final link plan
 ├─ resource-dir/       # shipped builtin headers (stdarg.h, stddef.h, …) + runtime shim

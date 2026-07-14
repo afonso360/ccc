@@ -65,7 +65,8 @@ The fully annotated pipeline — which crate owns each stage, the component brea
 | [Testing strategy](design/testing.md)                    | Snapshot/execution/differential tiers, the ABI oracle, corpus licensing                        |
 | [Toolchain & policy](design/toolchain.md)                | Dependencies, Cranelift pinning, MSRV, lint/dep policy                                         |
 
-Delivery order and acceptance gates are kept separately in the [delivery roadmap](ROADMAP.md); they are not part of feature design.
+Project planning is documented separately in [ROADMAP.md]; it is not part of
+the feature design.
 
 ## Decision records
 

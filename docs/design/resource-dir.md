@@ -1,12 +1,18 @@
 # Compiler resource directory, headers, and runtime
 
-The resource directory contains compiler-owned headers, hosted wrappers, target bridge templates, and CCC runtime shims. Its version and target capability manifest are checked against the compiler binary; mixing incompatible installations is a hard error.
+The resource directory contains compiler-owned headers, hosted wrappers, and
+optional CCC runtime shims. Its version and target capability manifest are
+checked against the compiler binary; mixing incompatible installations is a
+hard error.
 
 ## Header ownership
 
 Headers are classified rather than all being treated as complete CCC replacements:
 
-- **Compiler-owned:** `stdarg.h` and compiler builtin internals whose representation must match `ccc-abi`; small standard spelling headers such as `stdbool.h`, `stdalign.h`, and `stdnoreturn.h` where no libc ABI is involved.
+- **Compiler-owned:** target-invariant compiler interface text such as
+  `stdarg.h`, which may delegate representation to a target-derived builtin
+  type; small standard spelling headers such as `stdbool.h`, `stdalign.h`, and
+  `stdnoreturn.h` where no libc ABI is involved.
 - **Target-derived compiler headers:** `stddef.h`, `float.h`, and `stdatomic.h`, generated or selected from the effective configuration and backend/runtime capability table.
 - **Hosted wrappers:** `stdint.h`, `limits.h`, and any platform header for which libc owns public typedefs, feature-test integration, or ABI declarations. A wrapper supplies compiler builtins and uses `#include_next` when the resolved libc header is authoritative.
 
@@ -28,7 +34,14 @@ It implements the conventional `__need_*` partial-include protocol used by
 hosted headers. The associated parser and builtin requirements are part of the
 [frontend capability contract](frontend-capabilities.md).
 
-`stdatomic.h` reports lock-free properties from the same table used by codegen. `stdarg.h` uses the target's actual `va_list` spelling and builtin operations. `float.h` follows the selected native or explicit compatibility long-double mode. When complex support is unavailable, the configuration defines `__STDC_NO_COMPLEX__` and the complex wrapper fails clearly rather than exposing unusable declarations.
+`stdatomic.h` reports lock-free properties from the same table used by codegen.
+`stdarg.h` aliases the reserved `__builtin_va_list` spelling and maps the
+standard operations to compiler builtins; its source does not embed a target
+record layout. The canonical builtin type supplies the target's actual
+array-of-one representation. `float.h` follows the selected native or explicit
+compatibility long-double mode. When complex support is unavailable, the
+configuration defines `__STDC_NO_COMPLEX__` and the complex wrapper fails
+clearly rather than exposing unusable declarations.
 
 ## Include search
 
@@ -77,4 +90,10 @@ System include directories are obtained from the resolved target toolchain/sysro
 
 ## Runtime and generated bridges
 
-The resource directory contains versioned target objects or assembly templates for ABI bridges, long-double boundaries, stack probes, and helpers not supplied with the required ABI by the selected toolchain. The [runtime helper manifest](toolchain.md#runtime-helper-manifest) chooses the provider for every symbol. Generated bridge objects are placed in per-compilation temporary directories and are linked in deterministic order; their target, ABI mode, and build ID must match the compilation.
+Versioned runtime shims may be resource-owned when a target operation is not
+provided with the required ABI by the selected toolchain. The
+[runtime helper manifest](toolchain.md#runtime-helper-manifest) chooses the
+provider for each such symbol. ABI bridge assembly is not a resource template:
+`ccc-link` renders it from the verified `ModuleAbiPlan` for each compilation,
+then assembles, partially links, and exactly localizes it as specified by
+[ADR-0010](../adr/0010-generate-abi-bridges-as-assembly.md).

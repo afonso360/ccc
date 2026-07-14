@@ -281,6 +281,45 @@ mod tests {
     }
 
     #[test]
+    fn parses_target_va_list_and_typed_variadic_builtins() {
+        let unit = parse_source(
+            "typedef __builtin_va_list va_list;\n\
+             struct Pair { int left; int right; };\n\
+             int read(int count, ...) {\n\
+                 va_list list, copy;\n\
+                 __builtin_va_start(list, count);\n\
+                 __builtin_va_copy(copy, list);\n\
+                 struct Pair pair = __builtin_va_arg(copy, struct Pair);\n\
+                 __builtin_va_end(copy);\n\
+                 __builtin_va_end(list);\n\
+                 return pair.left;\n\
+             }",
+        )
+        .unwrap();
+        let dump = dump_ast(&unit);
+        assert!(dump.contains("type __builtin_va_list"), "{dump}");
+        assert!(dump.contains("builtin-va-start"), "{dump}");
+        assert!(dump.contains("builtin-va-arg"), "{dump}");
+        assert!(dump.contains("builtin-va-copy"), "{dump}");
+        assert_eq!(dump.matches("builtin-va-end").count(), 2, "{dump}");
+    }
+
+    #[test]
+    fn rejects_a_missing_va_arg_type_name_during_parsing() {
+        let error = parse_source(
+            "typedef __builtin_va_list va_list;\n\
+             int read(int count, ...) {\n\
+                 va_list list; return __builtin_va_arg(list, );\n\
+             }",
+        )
+        .unwrap_err();
+        assert!(
+            error.message.contains("declaration specifiers") || error.message.contains("type"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn parses_the_curated_hosted_header_output() {
         let source = include_str!("../../../../tests/preprocessing/goldens/hosted-header.out");
         let unit = parse_source(source).unwrap();

@@ -7,9 +7,10 @@ behavior includes fundamental integer types, `_Bool`, `float`, `double`,
 pointers, arrays, fixed-prototype function pointers, structures, unions,
 enumerations, bit-fields, scalar and aggregate initializers, string literals,
 globals, block statics, linkage, tentative definitions, direct and indirect
-scalar calls, C control flow, and `const`, `restrict`, and `volatile`
-qualifiers. Type widths, plain-`char` signedness, layout, packing, conversions,
-and volatile accesses come from the effective target configuration.
+scalar and aggregate calls, prototyped variadic calls and definitions, C
+control flow, and `const`, `restrict`, and `volatile` qualifiers. Type widths,
+plain-`char` signedness, layout, packing, conversions, and volatile accesses
+come from the effective target configuration.
 
 The C11 preprocessing pipeline supports object-like, function-like, and
 variadic macros; stringization and token pasting; conditional directives;
@@ -28,9 +29,8 @@ resource directory supplies target-derived headers such as `<stddef.h>`.
 
 Unavailable behavior is diagnosed rather than approximated. Current hard
 boundaries include native `long double` arithmetic and calls, runtime-sized
-automatic arrays, atomic operations, aggregate and variadic call boundaries,
-unprototyped calls, and GNU attributes or assembly labels whose observable
-semantics are not implemented.
+automatic arrays, atomic operations, unprototyped calls, and GNU attributes or
+assembly labels whose observable semantics are not implemented.
 
 ```sh
 cargo run -p ccc-driver -- -c program.c
@@ -40,6 +40,7 @@ cargo run -p ccc-driver -- --dump-pp-tokens program.c
 cargo run -p ccc-driver -- --dump-ast program.c
 cargo run -p ccc-driver -- --dump-typed-ast program.c
 cargo run -p ccc-driver -- --dump-ir program.c
+cargo run -p ccc-driver -- --dump-abi program.c
 cargo run -p ccc-driver -- --emit=clif program.c
 ```
 

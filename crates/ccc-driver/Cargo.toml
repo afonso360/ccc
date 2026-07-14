@@ -5,11 +5,15 @@ license.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
+[features]
+ci-sysv-amd64 = []
+
 [[bin]]
 name = "ccc"
 path = "src/main.rs"
 
 [dependencies]
+ccc-abi = { path = "../ccc-abi" }
 ccc-codegen = { path = "../ccc-codegen" }
 ccc-diag = { path = "../ccc-diag" }
 ccc-ir = { path = "../ccc-ir" }

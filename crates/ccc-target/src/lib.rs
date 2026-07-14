@@ -26,6 +26,13 @@ pub enum RelocationModel {
     Static,
 }
 
+/// Compiler-provided C types whose representation is selected by the target
+/// ABI rather than by the language's arithmetic type system.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum TargetBuiltinType {
+    VaList,
+}
+
 /// The accepted source-language dialect.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum LanguageMode {
@@ -534,6 +541,12 @@ pub struct ToolchainSpec {
     pub compiler_driver: Option<ToolCommandSpec>,
     pub assembler: Option<ToolCommandSpec>,
     pub linker_driver: Option<ToolCommandSpec>,
+    /// Object-file rewriting tool selected by the target compiler driver.
+    ///
+    /// This is resolved only for artifact bundles that contain generated
+    /// assembly and therefore need exact symbol localization after a partial
+    /// link.
+    pub object_copier: Option<ToolCommandSpec>,
     pub archiver: Option<ToolCommandSpec>,
     pub ranlib: Option<ToolCommandSpec>,
     pub sysroot: Option<PathBuf>,

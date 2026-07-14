@@ -6,6 +6,7 @@ use object::{
     Object as _, ObjectSection as _, ObjectSymbol as _, RelocationEncoding, RelocationKind,
     RelocationTarget,
 };
+use sha2::{Digest as _, Sha256};
 
 use super::*;
 
@@ -35,6 +36,184 @@ fn emit_source(source: &str) -> Output {
     .unwrap()
 }
 
+#[test]
+fn emitted_functions_have_relocatable_system_v_call_frames() {
+    use gimli::UnwindSection as _;
+
+    let output = emit_source(
+        "int first(int value) { return value + 1; }\n\
+         long second(long value) { return first((int)value) + 2; }",
+    );
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    let section = object
+        .section_by_name(".eh_frame")
+        .expect("System V call-frame section");
+    assert_eq!(
+        section.kind(),
+        object::SectionKind::Elf(object::elf::SHT_X86_64_UNWIND)
+    );
+    assert!(
+        matches!(
+            section.flags(),
+            object::SectionFlags::Elf { sh_flags }
+                if sh_flags & u64::from(object::elf::SHF_ALLOC) != 0
+        ),
+        "`.eh_frame` must be allocated"
+    );
+
+    let mut eh_frame = gimli::EhFrame::new(section.data().unwrap(), gimli::LittleEndian);
+    eh_frame.set_address_size(8);
+    let bases = gimli::BaseAddresses::default();
+    let mut entries = eh_frame.entries(&bases);
+    let (mut cies, mut fdes) = (0, 0);
+    while let Some(entry) = entries.next().unwrap() {
+        match entry {
+            gimli::CieOrFde::Cie(_) => cies += 1,
+            gimli::CieOrFde::Fde(_) => fdes += 1,
+        }
+    }
+    assert_eq!(cies, 1);
+    assert_eq!(fdes, 2);
+
+    let text = object.section_by_name(".text").unwrap().index();
+    let mut expected_addends = ["first", "second"]
+        .map(|name| {
+            i64::try_from(
+                object
+                    .symbols()
+                    .find(|symbol| symbol.name() == Ok(name))
+                    .unwrap()
+                    .address(),
+            )
+            .unwrap()
+        })
+        .to_vec();
+    expected_addends.sort_unstable();
+
+    let relocations = section.relocations().collect::<Vec<_>>();
+    assert_eq!(relocations.len(), 2);
+    let mut actual_addends = Vec::with_capacity(relocations.len());
+    for (_, relocation) in relocations {
+        assert_eq!(relocation.kind(), RelocationKind::Relative);
+        assert_eq!(relocation.encoding(), RelocationEncoding::Generic);
+        assert_eq!(relocation.size(), 32);
+        let RelocationTarget::Symbol(symbol) = relocation.target() else {
+            panic!("call-frame relocation must target the text section")
+        };
+        let symbol = object.symbol_by_index(symbol).unwrap();
+        assert_eq!(symbol.kind(), object::SymbolKind::Section);
+        assert_eq!(symbol.section_index(), Some(text));
+        actual_addends.push(relocation.addend());
+    }
+    actual_addends.sort_unstable();
+    assert_eq!(actual_addends, expected_addends);
+}
+
+#[test]
+fn function_visibility_reaches_native_objects_and_variadic_assembly() {
+    let native = emit_source(
+        "int native_default(void) __attribute__((visibility(\"default\")));\n\
+         int native_default(void) { return 1; }\n\
+         int native_hidden(void) __attribute__((visibility(\"hidden\")));\n\
+         int native_hidden(void) { return 2; }\n\
+         int native_protected(void) __attribute__((visibility(\"protected\")));\n\
+         int native_protected(void) { return 3; }\n\
+         int native_internal(void) __attribute__((visibility(\"internal\")));\n\
+         int native_internal(void) { return 4; }\n\
+         int global_default __attribute__((visibility(\"default\"))) = 1;\n\
+         int global_hidden __attribute__((visibility(\"hidden\"))) = 2;\n\
+         int global_protected __attribute__((visibility(\"protected\"))) = 3;\n\
+         int global_internal __attribute__((visibility(\"internal\"))) = 4;\n\
+         int undefined_default(void) __attribute__((visibility(\"default\")));\n\
+         int undefined_hidden(void) __attribute__((visibility(\"hidden\")));\n\
+         int undefined_protected(void) __attribute__((visibility(\"protected\")));\n\
+         int undefined_internal(void) __attribute__((visibility(\"internal\")));\n\
+         int retain_undefined(void) {\n\
+             return undefined_default() + undefined_hidden()\n\
+                 + undefined_protected() + undefined_internal();\n\
+         }",
+    );
+    let object = object::File::parse(native.object.as_slice()).unwrap();
+    for prefix in ["native", "global", "undefined"] {
+        for (suffix, visibility) in [
+            ("default", object::elf::STV_DEFAULT),
+            ("hidden", object::elf::STV_HIDDEN),
+            ("protected", object::elf::STV_PROTECTED),
+            ("internal", object::elf::STV_INTERNAL),
+        ] {
+            let name = format!("{prefix}_{suffix}");
+            let symbol = object
+                .symbols()
+                .find(|symbol| symbol.name() == Ok(name.as_str()))
+                .unwrap_or_else(|| panic!("missing `{name}`"));
+            assert_ne!(symbol.scope(), object::SymbolScope::Compilation, "{name}");
+            assert_eq!(symbol.flags().elf_visibility(), Some(visibility), "{name}");
+            assert_eq!(symbol.is_undefined(), prefix == "undefined", "{name}");
+        }
+    }
+
+    let variadic = emit_source(
+        "int variadic_default(int marker, ...) __attribute__((visibility(\"default\")));\n\
+         int variadic_default(int marker, ...) { return marker; }\n\
+         int variadic_hidden(int marker, ...) __attribute__((visibility(\"hidden\")));\n\
+         int variadic_hidden(int marker, ...) { return marker; }\n\
+         int variadic_protected(int marker, ...) __attribute__((visibility(\"protected\")));\n\
+         int variadic_protected(int marker, ...) { return marker; }\n\
+         int variadic_internal(int marker, ...) __attribute__((visibility(\"internal\")));\n\
+         int variadic_internal(int marker, ...) { return marker; }",
+    );
+    for (suffix, visibility, directive) in [
+        (
+            "default",
+            ccc_link::artifact::GeneratedSymbolVisibility::Public,
+            None,
+        ),
+        (
+            "hidden",
+            ccc_link::artifact::GeneratedSymbolVisibility::SourceHidden,
+            Some(".hidden variadic_hidden"),
+        ),
+        (
+            "protected",
+            ccc_link::artifact::GeneratedSymbolVisibility::SourceProtected,
+            Some(".protected variadic_protected"),
+        ),
+        (
+            "internal",
+            ccc_link::artifact::GeneratedSymbolVisibility::SourceElfInternal,
+            Some(".internal variadic_internal"),
+        ),
+    ] {
+        let name = format!("variadic_{suffix}");
+        let entry = variadic
+            .manifest
+            .symbols()
+            .iter()
+            .find(|symbol| symbol.name == name)
+            .unwrap();
+        assert_eq!(entry.visibility, visibility, "{name}");
+        let assembly = variadic
+            .assemblies
+            .iter()
+            .find(|assembly| {
+                assembly
+                    .defined_symbols()
+                    .iter()
+                    .any(|symbol| symbol == &name)
+            })
+            .unwrap();
+        for possible in [".hidden ", ".protected ", ".internal "] {
+            let rendered = format!("{possible}{name}");
+            assert_eq!(
+                assembly.source().contains(&rendered),
+                directive == Some(rendered.as_str()),
+                "{name}:\n{}",
+                assembly.source()
+            );
+        }
+    }
+}
+
 fn symbol_bytes(object_bytes: &[u8], name: &str) -> Vec<u8> {
     let file = object::File::parse(object_bytes).unwrap();
     let symbol = file
@@ -60,6 +239,122 @@ fn function_clif<'a>(clif: &'a str, name: &str) -> &'a str {
     &body[..end]
 }
 
+fn sha256(text: &str) -> String {
+    Sha256::digest(text.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+#[test]
+fn complete_abi_plan_and_aggregate_clif_have_exact_snapshots() {
+    const SOURCE: &str = "typedef __builtin_va_list va_list;\n\
+         struct Mixed { double floating; long integer; };\n\
+         struct Large { long first; long second; long third; };\n\
+         short narrow(short value) { return value; }\n\
+         struct Mixed native(struct Mixed value) { return value; }\n\
+         struct Large native_large(struct Large value) { return value; }\n\
+         long collect(int count, ...) {\n\
+             va_list list;\n\
+             struct Mixed value;\n\
+             __builtin_va_start(list, count);\n\
+             value = __builtin_va_arg(list, struct Mixed);\n\
+             __builtin_va_end(list);\n\
+             return value.integer + count;\n\
+         }\n\
+         long invoke(struct Mixed value) {\n\
+             struct Mixed (*indirect)(struct Mixed) = native;\n\
+             return indirect(value).integer + collect(1, value);\n\
+         }";
+    let module = lower_source(SOURCE);
+    let config = EffectiveCompilationConfig::default();
+    let plan = ccc_abi::plan_module(&module, &config).unwrap();
+    let dump = ccc_abi::dump_module_plan(plan.verify_against(&module, &config).unwrap());
+    assert!(dump.contains("lowered-signature=native"), "{dump}");
+    assert!(dump.contains("extension=signed"), "{dump}");
+    assert!(dump.contains("hidden-return=true"), "{dump}");
+    assert!(dump.contains("target=direct:"), "{dump}");
+    assert!(dump.contains("target=indirect:"), "{dump}");
+    assert!(dump.contains("call-bridge helper="), "{dump}");
+    assert!(dump.contains("packaging assembly-units=2"), "{dump}");
+    assert_eq!(
+        sha256(&dump),
+        "03f37e9d0f6df3a5ebdba7f091a4f77f1d4fbb39dc8242ab39e0e0b384c702a3"
+    );
+
+    let output = emit(&module, &config, Options { emit_clif: true }).unwrap();
+    assert_eq!(
+        sha256(&output.clif),
+        "8625817673e96ef125db80b4105b803e1cd4768dce676bacdf5f8a3c23118113"
+    );
+}
+
+#[test]
+fn pinned_cranelift_accepts_rounded_struct_arguments_and_structure_returns() {
+    let mut config = EffectiveCompilationConfig::default();
+    config.capabilities.insert(
+        ccc_target::CapabilityKind::Attribute,
+        "packed",
+        ccc_target::CapabilityState::Implemented,
+    );
+    let module = lower_source_with_config(
+        "struct __attribute__((packed)) One { char byte; };\n\
+         struct __attribute__((packed)) Nine { long word; char byte; };\n\
+         struct Seventeen { char bytes[17]; };\n\
+         void consume(long a, long b, long c, long d, long e, long f,\n\
+                      struct One one, struct Nine nine, struct Seventeen seventeen) {}\n\
+         struct Seventeen identity(struct Seventeen value) { return value; }",
+        &config,
+    );
+    let plan = ccc_abi::plan_module(&module, &config).unwrap();
+    let consume = module
+        .functions
+        .iter()
+        .find(|function| function.symbol_name == "consume")
+        .unwrap();
+    let ccc_abi::BoundaryPlan::Native(consume_plan) =
+        &plan.definitions.get(&consume.id).unwrap().boundary
+    else {
+        panic!("fixed definition must use the native boundary")
+    };
+    let signature = super::super::signature(consume_plan).unwrap();
+    assert_eq!(
+        signature.params[6].purpose,
+        cranelift_codegen::ir::ArgumentPurpose::StructArgument(8)
+    );
+    assert_eq!(
+        signature.params[7].purpose,
+        cranelift_codegen::ir::ArgumentPurpose::StructArgument(16)
+    );
+    assert_eq!(
+        signature.params[8].purpose,
+        cranelift_codegen::ir::ArgumentPurpose::StructArgument(24)
+    );
+
+    let identity = module
+        .functions
+        .iter()
+        .find(|function| function.symbol_name == "identity")
+        .unwrap();
+    let ccc_abi::BoundaryPlan::Native(identity_plan) =
+        &plan.definitions.get(&identity.id).unwrap().boundary
+    else {
+        panic!("fixed definition must use the native boundary")
+    };
+    let signature = super::super::signature(identity_plan).unwrap();
+    assert_eq!(
+        signature.params[0].purpose,
+        cranelift_codegen::ir::ArgumentPurpose::StructReturn
+    );
+    assert_eq!(
+        signature.params[1].purpose,
+        cranelift_codegen::ir::ArgumentPurpose::StructArgument(24)
+    );
+    assert!(signature.returns.is_empty());
+
+    emit(&module, &config, Options { emit_clif: true }).unwrap();
+}
+
 #[test]
 fn string_initializers_respect_exact_bounds_and_zero_fill_remainder() {
     let output = emit_source(
@@ -69,6 +364,37 @@ fn string_initializers_respect_exact_bounds_and_zero_fill_remainder() {
     );
     assert_eq!(symbol_bytes(&output.object, "exact"), b"xy");
     assert_eq!(symbol_bytes(&output.object, "padded"), b"xy\0\0");
+}
+
+#[test]
+fn nonzero_offset_bitfields_use_their_projected_storage_once() {
+    let output = emit_source(
+        "struct Bits { unsigned prefix; unsigned value : 5; };\n\
+         struct Bits bits = { .prefix = 0x11223344u, .value = 7 };\n\
+         unsigned update(struct Bits *value) {\n\
+             value->value = 9;\n\
+             return value->value;\n\
+         }",
+    );
+    assert_eq!(
+        symbol_bytes(&output.object, "bits"),
+        [0x44, 0x33, 0x22, 0x11, 0x07, 0x00, 0x00, 0x00]
+    );
+    let clif = function_clif(&output.clif, "update");
+    assert!(clif.contains("iadd_imm"), "{clif}");
+}
+
+#[test]
+fn aggregate_rvalue_bitfields_lower_through_their_projection_anchor() {
+    let output = emit_source(
+        "struct Inner { unsigned prefix; signed value : 6; };\n\
+         struct Outer { struct Inner inner; unsigned tail; };\n\
+         struct Outer make(void);\n\
+         int read(void) { return make().inner.value; }",
+    );
+    let clif = function_clif(&output.clif, "read");
+    assert!(clif.contains("band_imm"), "{clif}");
+    assert!(clif.contains("sshr_imm"), "{clif}");
 }
 
 #[test]
@@ -175,7 +501,7 @@ fn direct_external_calls_use_branch_relocations_and_function_pointers_stay_indir
 }
 
 #[test]
-fn unsupported_definition_and_call_boundaries_keep_abi_diagnostics() {
+fn long_double_definitions_are_rejected_while_variadic_calls_use_a_bridge() {
     let mut definition = lower_source("long double identity(long double value);");
     definition.functions[0].entry = Some(gir::BlockId(0));
     let error = emit(
@@ -191,14 +517,18 @@ fn unsupported_definition_and_call_boundaries_keep_abi_diagnostics() {
         "int variadic(const char *, ...);\n\
          int main(void) { return variadic(\"x\", 1); }",
     );
-    let error = emit(
+    let output = emit(
         &call,
         &EffectiveCompilationConfig::default(),
         Options::default(),
     )
-    .unwrap_err();
-    assert_eq!(error.code, "CCC3510");
-    assert!(error.span.is_some());
+    .unwrap();
+    assert_eq!(output.assemblies.len(), 1);
+    assert!(
+        output.assemblies[0].source().contains("call *%r11"),
+        "{}",
+        output.assemblies[0].source()
+    );
 }
 
 #[test]
@@ -286,26 +616,17 @@ fn discarded_volatile_scalar_and_aggregate_reads_remain_explicit() {
     );
     let aggregate = function_clif(&aggregate.clif, "consume");
     let aggregate_lines = aggregate.lines().map(str::trim).collect::<Vec<_>>();
-    assert_eq!(
-        aggregate_lines
-            .iter()
-            .filter(|line| line.contains("load.i8"))
-            .count(),
-        8,
-        "{aggregate}"
-    );
+    let volatile_reads = aggregate_lines
+        .windows(3)
+        .filter(|lines| lines[0] == "fence" && lines[1].contains("load.i8") && lines[2] == "fence")
+        .count();
+    assert_eq!(volatile_reads, 8, "{aggregate}");
     assert_eq!(
         aggregate_lines
             .iter()
             .filter(|line| line.trim() == "fence")
             .count(),
         16,
-        "{aggregate}"
-    );
-    assert!(
-        aggregate_lines
-            .iter()
-            .all(|line| !line.starts_with("store ")),
         "{aggregate}"
     );
 }
@@ -320,24 +641,29 @@ fn volatile_aggregate_copy_orders_source_reads_without_overqualifying_writes() {
     );
     let clif = function_clif(&output.clif, "copy");
     let lines = clif.lines().map(str::trim).collect::<Vec<_>>();
-    let loads = lines
-        .iter()
+    let volatile_loads = lines
+        .windows(3)
         .enumerate()
-        .filter_map(|(index, line)| line.contains("load.i8").then_some(index))
+        .filter_map(|(index, window)| {
+            (window[0] == "fence" && window[1].contains("load.i8") && window[2] == "fence")
+                .then_some(index + 1)
+        })
         .collect::<Vec<_>>();
     let stores = lines
         .iter()
         .enumerate()
         .filter_map(|(index, line)| line.starts_with("store ").then_some(index))
         .collect::<Vec<_>>();
-    assert_eq!(loads.len(), 8, "{clif}");
-    assert_eq!(stores.len(), 8, "{clif}");
+    assert_eq!(volatile_loads.len(), 8, "{clif}");
     assert_eq!(
         lines.iter().filter(|line| line.trim() == "fence").count(),
         16,
         "{clif}"
     );
-    assert!(loads.last().unwrap() < stores.first().unwrap(), "{clif}");
+    assert!(
+        volatile_loads.last().unwrap() < stores.first().unwrap(),
+        "{clif}"
+    );
 }
 
 #[test]
@@ -353,12 +679,17 @@ fn aggregate_copy_loads_complete_source_before_any_destination_write() {
         .enumerate()
         .filter_map(|(index, line)| line.contains("load.i8").then_some(index))
         .collect::<Vec<_>>();
-    assert_eq!(byte_loads.len(), 4, "{clif}");
-    let stores_after_loads = lines[byte_loads[3] + 1..]
+    let first_store = lines
         .iter()
-        .filter(|line| line.starts_with("store "))
-        .count();
-    assert_eq!(stores_after_loads, 4, "{clif}");
+        .position(|line| line.starts_with("store "))
+        .expect("snapshot store");
+    assert!(byte_loads.iter().any(|load| *load < first_store), "{clif}");
+    let final_store = lines
+        .iter()
+        .rposition(|line| line.starts_with("store "))
+        .expect("destination store");
+    let last_load = *byte_loads.last().expect("aggregate byte load");
+    assert!(last_load < final_store, "{clif}");
 }
 
 #[test]

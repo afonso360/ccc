@@ -2,7 +2,7 @@ use std::fmt;
 
 use ccc_sema::generic::{
     FullFunctionId, FullLocalId, FunctionProperties, GlobalEmission, GlobalId, Linkage,
-    SemanticStorageClass, StorageDuration, StringId,
+    SemanticStorageClass, StorageDuration, StringId, SymbolVisibility,
 };
 use ccc_session::Span;
 use ccc_types::{QualifiedType, TypeId, TypeStore};
@@ -161,6 +161,7 @@ pub struct FullFunction {
     pub signature: TypeId,
     pub storage_class: SemanticStorageClass,
     pub linkage: Linkage,
+    pub visibility: SymbolVisibility,
     pub properties: FunctionProperties,
     pub symbol_name: String,
     pub result_type: QualifiedType,
@@ -309,10 +310,20 @@ pub enum FullInstructionKind {
         source_access: MemoryAccess,
         overlap: AggregateOverlap,
     },
-    AggregateValue {
-        address: ValueId,
+    /// Observes an aggregate object once and produces immutable, independently
+    /// owned backing storage. Aggregate-typed SSA values are represented by
+    /// the address of that backing storage.
+    AggregateSnapshot {
+        source: ValueId,
         object: QualifiedType,
         access: MemoryAccess,
+    },
+    /// Derives a bounded subobject address from owned aggregate backing
+    /// storage. Generic address-taking cannot be used for aggregate SSA values.
+    AggregateProject {
+        base: ValueId,
+        aggregate: QualifiedType,
+        projections: Vec<AggregateProjection>,
     },
     Convert {
         kind: ScalarConversion,
@@ -343,6 +354,36 @@ pub enum FullInstructionKind {
         variadic_boundary: usize,
         effects: CallEffects,
     },
+    VaStart {
+        list: ValueId,
+        last_named_parameter: FullLocalId,
+    },
+    VaArg {
+        list: ValueId,
+        requested: QualifiedType,
+    },
+    VaCopy {
+        destination: ValueId,
+        source: ValueId,
+    },
+    VaEnd {
+        list: ValueId,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AggregateProjection {
+    Field {
+        index: usize,
+        name: Option<String>,
+        /// Marks the final projected field as a bitfield access anchor. The
+        /// resulting pointer may only be consumed by the matching bitfield
+        /// load; it is not a generally addressable subobject.
+        bitfield: Option<BitfieldDescriptor>,
+    },
+    Index {
+        index: ValueId,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -361,6 +402,7 @@ pub enum MemoryOrder {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BitfieldDescriptor {
     pub field_index: usize,
+    /// Byte offset from the selected field's projected address to its access unit.
     pub storage_offset: u64,
     pub storage_size: u64,
     pub storage_align: u64,

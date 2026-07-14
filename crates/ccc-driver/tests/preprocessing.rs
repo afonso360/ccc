@@ -1633,6 +1633,83 @@ fn discovers_and_preprocesses_compiler_resource_headers() {
 }
 
 #[test]
+fn stdarg_resource_header_supports_repeated_and_partial_inclusion() {
+    let directory = TestDirectory::new("stdarg-resource-header");
+    let source = directory.write(
+        "stdarg.c",
+        concat!(
+            "#if !__has_builtin(__builtin_va_arg)\n",
+            "#error variadic builtin registry is unavailable\n",
+            "#endif\n",
+            "#define __need___va_list\n",
+            "#include <stdarg.h>\n",
+            "__gnuc_va_list first;\n",
+            "#define __need_va_list\n",
+            "#include <stdarg.h>\n",
+            "va_list second;\n",
+            "#define __need_va_arg\n",
+            "#define __need_va_copy\n",
+            "#include <stdarg.h>\n",
+            "#include <stdarg.h>\n",
+            "int consume(int marker, ...) {\n",
+            "    va_list list;\n",
+            "    va_start(list, marker);\n",
+            "    va_copy(second, list);\n",
+            "    marker = va_arg(list, int);\n",
+            "    va_end(list);\n",
+            "    return marker;\n",
+            "}\n",
+        ),
+    );
+    let resources = repository_fixture("resource-dir");
+
+    let mut command = directory.command();
+    command
+        .args(["-E", "-P", "-resource-dir"])
+        .arg(resources)
+        .arg(source);
+    let result = run(command);
+    result.assert_success();
+    let output = squash_whitespace(&result.stdout);
+    assert_eq!(
+        output
+            .matches("typedef__builtin_va_list__gnuc_va_list;")
+            .count(),
+        1
+    );
+    assert_eq!(
+        output.matches("typedef__builtin_va_listva_list;").count(),
+        1
+    );
+    assert!(
+        output.contains("__builtin_va_start(list,marker)"),
+        "{output}"
+    );
+    assert!(
+        output.contains("__builtin_va_copy(second,list)"),
+        "{output}"
+    );
+    assert!(output.contains("__builtin_va_arg(list,int)"), "{output}");
+    assert!(output.contains("__builtin_va_end(list)"), "{output}");
+}
+
+#[test]
+fn nobuiltininc_removes_the_stdarg_resource_header() {
+    let directory = TestDirectory::new("stdarg-nobuiltininc");
+    let source = directory.write("stdarg.c", "#include <stdarg.h>\n");
+    let resources = repository_fixture("resource-dir");
+
+    let mut command = directory.command();
+    command
+        .args(["-E", "-P", "-nostdinc", "-nobuiltininc", "-resource-dir"])
+        .arg(resources)
+        .arg(source);
+    let result = run(command);
+    result.assert_failure();
+    assert!(result.stderr.contains("stdarg.h"), "{}", result.stderr);
+}
+
+#[test]
 fn dependency_rules_preserve_default_and_explicit_relative_spellings() {
     let directory = TestDirectory::new("relative-dependency-spelling");
     directory.write(

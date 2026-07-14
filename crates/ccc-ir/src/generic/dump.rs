@@ -3,9 +3,9 @@ use std::fmt::Write;
 use ccc_types::TypeStore;
 
 use super::{
-    BinaryOperation, CallEffects, FullEdge, FullInstructionKind, FullModule, FullTerminator,
-    InitializerGraph, InitializerNodeKind, InitializerPath, MemoryAccess, RelocationTarget,
-    ScalarConstant, ScalarConversion, UnaryOperation,
+    AggregateProjection, BinaryOperation, CallEffects, FullEdge, FullInstructionKind, FullModule,
+    FullTerminator, InitializerGraph, InitializerNodeKind, InitializerPath, MemoryAccess,
+    RelocationTarget, ScalarConstant, ScalarConversion, UnaryOperation,
 };
 
 pub fn dump_frontend_ir(module: &FullModule) -> String {
@@ -66,10 +66,12 @@ pub fn dump_frontend_ir(module: &FullModule) -> String {
         if function.entry.is_none() {
             let _ = writeln!(
                 output,
-                "declare f{} @{} : {}",
+                "declare f{} @{} : {} [linkage={:?} visibility={:?}]",
                 function.id.0,
                 function.symbol_name,
-                module.types.display(function.signature)
+                module.types.display(function.signature),
+                function.linkage,
+                function.visibility,
             );
             continue;
         }
@@ -92,13 +94,14 @@ pub fn dump_frontend_ir(module: &FullModule) -> String {
             .join(", ");
         let _ = writeln!(
             output,
-            "function f{} @{}({}) -> {} [signature={} linkage={:?} inline={} noreturn={}] {{",
+            "function f{} @{}({}) -> {} [signature={} linkage={:?} visibility={:?} inline={} noreturn={}] {{",
             function.id.0,
             function.symbol_name,
             parameters,
             module.types.display_qualified(function.result_type),
             module.types.display(function.signature),
             function.linkage,
+            function.visibility,
             function.properties.inline,
             function.properties.no_return,
         );
@@ -392,15 +395,47 @@ fn display_instruction(module: &FullModule, kind: &FullInstructionKind) -> Strin
             display_access(*source_access),
             display_access(*destination_access),
         ),
-        FullInstructionKind::AggregateValue {
-            address,
+        FullInstructionKind::AggregateSnapshot {
+            source,
             object,
             access,
         } => format!(
-            "aggregate.value v{} object={} {}",
-            address.0,
+            "aggregate.snapshot v{} object={} {}",
+            source.0,
             module.types.display_qualified(*object),
             display_access(*access)
+        ),
+        FullInstructionKind::AggregateProject {
+            base,
+            aggregate,
+            projections,
+        } => format!(
+            "aggregate.project v{} object={} path={}",
+            base.0,
+            module.types.display_qualified(*aggregate),
+            projections
+                .iter()
+                .map(|projection| match projection {
+                    AggregateProjection::Field {
+                        index,
+                        name,
+                        bitfield,
+                    } => {
+                        let field = name.as_ref().map_or_else(
+                            || format!("field#{index}"),
+                            |name| format!("field#{index}:{name}"),
+                        );
+                        bitfield.map_or(field.clone(), |descriptor| {
+                            format!(
+                                "{field}:bits({}:{}/{})",
+                                descriptor.storage_offset, descriptor.bit_offset, descriptor.width
+                            )
+                        })
+                    }
+                    AggregateProjection::Index { index } => format!("index:v{}", index.0),
+                })
+                .collect::<Vec<_>>()
+                .join("/")
         ),
         FullInstructionKind::Convert {
             kind,
@@ -450,6 +485,20 @@ fn display_instruction(module: &FullModule, kind: &FullInstructionKind) -> Strin
             variadic_boundary,
             display_call_effects(*effects)
         ),
+        FullInstructionKind::VaStart {
+            list,
+            last_named_parameter,
+        } => format!("va.start v{} last=l{}", list.0, last_named_parameter.0),
+        FullInstructionKind::VaArg { list, requested } => format!(
+            "va.arg v{} requested={}",
+            list.0,
+            module.types.display_qualified(*requested)
+        ),
+        FullInstructionKind::VaCopy {
+            destination,
+            source,
+        } => format!("va.copy v{} -> v{}", source.0, destination.0),
+        FullInstructionKind::VaEnd { list } => format!("va.end v{}", list.0),
     }
 }
 

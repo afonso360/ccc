@@ -55,6 +55,56 @@ fn analyze_preprocessed_source(
     analyze_frontend(&parsed, &session.config)
 }
 
+fn analyze_resource_source(
+    source: &str,
+) -> Result<FullTypedTranslationUnit, Vec<ccc_diag::Diagnostic>> {
+    let resource_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("resource-dir");
+    let mut session =
+        Session::new(EffectiveCompilationConfig::default().with_resource_dir(resource_dir));
+    let file = session.sources.add_file("resource-test.c", source);
+    let options = PreprocessOptions::default();
+    let files = FsFileProvider;
+    let mut diagnostics = VecDiagnosticSink::default();
+    let output = preprocess(
+        &mut PreprocessContext {
+            session: &mut session,
+            diagnostics: &mut diagnostics,
+            options: &options,
+            files: &files,
+        },
+        file,
+    );
+    assert!(!output.had_errors, "{:#?}", diagnostics.diagnostics);
+    let items = syntax::convert_pp_items(output.items).unwrap();
+    let parsed = syntax::parse(&items).unwrap();
+    analyze_frontend(&parsed, &session.config)
+}
+
+#[test]
+fn function_visibility_attributes_survive_redeclarations() {
+    let unit = analyze_source(
+        "int hidden(int) __attribute__((visibility(\"hidden\")));\n\
+         int hidden(int value) { return value; }\n\
+         int protected_fn(void) __attribute__((visibility(\"protected\")));\n\
+         int protected_fn(void) { return 1; }",
+    )
+    .unwrap();
+    let hidden = unit
+        .functions
+        .iter()
+        .find(|function| function.name == "hidden")
+        .unwrap();
+    assert_eq!(hidden.visibility, SymbolVisibility::Hidden);
+    let protected = unit
+        .functions
+        .iter()
+        .find(|function| function.name == "protected_fn")
+        .unwrap();
+    assert_eq!(protected.visibility, SymbolVisibility::Protected);
+}
+
 fn diagnostic_codes(source: &str) -> Vec<String> {
     analyze_source(source)
         .unwrap_err()
@@ -75,6 +125,230 @@ fn first_local(function: &FullTypedFunction) -> &FullTypedLocalDeclaration {
             _ => None,
         })
         .expect("function has a local declaration")
+}
+
+#[test]
+fn types_target_va_list_and_variadic_builtins_without_exposing_layout_in_syntax() {
+    let unit = analyze_source(
+        "typedef __builtin_va_list va_list;\n\
+         int read(int count, ...) {\n\
+             va_list list, copy;\n\
+             __builtin_va_start(list, count);\n\
+             __builtin_va_copy(copy, list);\n\
+             int value = __builtin_va_arg(copy, int);\n\
+             __builtin_va_end(copy);\n\
+             __builtin_va_end(list);\n\
+             return value;\n\
+         }",
+    )
+    .unwrap();
+    let va_list = unit
+        .types
+        .target_builtin_id(ccc_types::TargetBuiltinType::VaList)
+        .expect("target va_list type");
+    let layout = unit
+        .types
+        .layout_of(va_list, &EffectiveCompilationConfig::default())
+        .unwrap();
+    assert_eq!((layout.size, layout.align), (24, 8));
+    assert!(matches!(unit.types.kind(va_list), TypeKind::Array(_)));
+    let dump = dump_frontend_typed_ast(&unit);
+    assert!(dump.contains("va-start"), "{dump}");
+    assert!(dump.contains("va-arg requested=int"), "{dump}");
+    assert!(dump.contains("va-copy"), "{dump}");
+    assert_eq!(dump.matches("va-end").count(), 2, "{dump}");
+}
+
+#[test]
+fn diagnoses_invalid_variadic_builtin_uses_even_when_unreachable() {
+    assert_eq!(
+        diagnostic_codes(
+            "typedef __builtin_va_list va_list;\n\
+             int fixed(int count) { va_list list; __builtin_va_start(list, count); return 0; }"
+        ),
+        vec!["CCC2400"]
+    );
+    assert_eq!(
+        diagnostic_codes(
+            "typedef __builtin_va_list va_list;\n\
+             int bad(int first, int last, ...) {\n\
+                 va_list list; __builtin_va_start(list, first); return 0;\n\
+             }"
+        ),
+        vec!["CCC2402"]
+    );
+    assert_eq!(
+        diagnostic_codes(
+            "typedef __builtin_va_list va_list;\n\
+             int bad(int count, ...) {\n\
+                 va_list list; __builtin_va_start(list, count);\n\
+                 if (0) __builtin_va_arg(list, float);\n\
+                 return 0;\n\
+             }"
+        ),
+        vec!["CCC2403"]
+    );
+    assert_eq!(
+        diagnostic_codes(
+            "int bad(int count, ...) {\n\
+                 int list; __builtin_va_start(list, count); return 0;\n\
+             }"
+        ),
+        vec!["CCC2411"]
+    );
+    assert_eq!(
+        diagnostic_codes(
+            "typedef __builtin_va_list va_list;\n\
+             int bad(int count, ...) {\n\
+                 const va_list list; __builtin_va_end(list); return 0;\n\
+             }"
+        ),
+        vec!["CCC2410"]
+    );
+    assert_eq!(
+        diagnostic_codes(
+            "typedef __builtin_va_list va_list;\n\
+             int bad(int count, ...) {\n\
+                 va_list list; return __builtin_va_arg(list, int[2])[0];\n\
+             }"
+        ),
+        vec!["CCC2405"]
+    );
+    assert_eq!(
+        diagnostic_codes(
+            "typedef __builtin_va_list va_list;\n\
+             int bad(int count, ...) {\n\
+                 va_list list;\n\
+                 return __builtin_va_arg(list, int (*)[count]) != 0;\n\
+             }"
+        ),
+        vec!["CCC2414"]
+    );
+    for parameter in ["float count", "register int count", "int count[1]"] {
+        let source = format!(
+            "typedef __builtin_va_list va_list;\n\
+             int bad({parameter}, ...) {{\n\
+                 va_list list; __builtin_va_start(list, count); return 0;\n\
+             }}"
+        );
+        assert_eq!(diagnostic_codes(&source), vec!["CCC2413"], "{parameter}");
+    }
+}
+
+#[test]
+fn accepts_compatible_enum_types_at_variadic_boundaries() {
+    let unit = analyze_source(
+        "enum Choice { CHOICE = 3 };\n\
+         typedef __builtin_va_list va_list;\n\
+         enum Choice read(enum Choice final, ...) {\n\
+             va_list list;\n\
+             __builtin_va_start(list, final);\n\
+             enum Choice value = __builtin_va_arg(list, enum Choice);\n\
+             __builtin_va_end(list);\n\
+             return value;\n\
+         }",
+    )
+    .unwrap();
+    let dump = dump_frontend_typed_ast(&unit);
+    assert!(dump.contains("va-start"), "{dump}");
+    assert!(dump.contains("va-arg requested=enum Choice"), "{dump}");
+}
+
+#[test]
+fn promotes_narrow_unsigned_int_bitfields_through_an_ellipsis() {
+    let unit = analyze_source(
+        "struct Bits { unsigned narrow : 5; unsigned wide : 32; };\n\
+         int sink(int marker, ...);\n\
+         int pass(struct Bits *bits) {\n\
+             return sink(0, bits->narrow, bits->wide);\n\
+         }",
+    )
+    .unwrap();
+    let dump = dump_frontend_typed_ast(&unit);
+    let promotions = dump
+        .lines()
+        .filter(|line| line.contains("convert IntegerPromotion"))
+        .collect::<Vec<_>>();
+    assert_eq!(promotions, ["        convert IntegerPromotion : int Value"]);
+    assert_eq!(
+        dump.matches("convert LvalueToValue { access: AccessSemantics { volatile: false, atomic: false } } : unsigned int Value")
+            .count(),
+        2,
+        "{dump}"
+    );
+}
+
+#[test]
+fn adjusts_va_list_parameters_to_the_public_record_pointer() {
+    let unit = analyze_source(
+        "typedef __builtin_va_list va_list;\n\
+         int next(va_list list) { return __builtin_va_arg(list, int); }",
+    )
+    .unwrap();
+    let function = unit
+        .functions
+        .iter()
+        .find(|function| function.name == "next")
+        .unwrap();
+    let TypeKind::Pointer(pointer) = unit.types.kind(function.parameters[0].ty.ty) else {
+        panic!("va_list parameter must be adjusted to a pointer")
+    };
+    assert!(matches!(
+        unit.types.kind(pointer.pointee.ty),
+        TypeKind::Record(_)
+    ));
+    assert!(dump_frontend_typed_ast(&unit).contains("va-arg requested=int"));
+}
+
+#[test]
+fn resource_stdarg_supports_partial_and_repeated_inclusion() {
+    let unit = analyze_resource_source(
+        "#if !__has_builtin(__builtin_va_start) || !__has_builtin(__builtin_va_arg) || \
+             !__has_builtin(__builtin_va_copy) || !__has_builtin(__builtin_va_end)\n\
+         #error missing variadic builtins\n\
+         #endif\n\
+         #define __need___va_list\n\
+         #include <stdarg.h>\n\
+         __gnuc_va_list first;\n\
+         #define __need_va_list\n\
+         #include <stdarg.h>\n\
+         va_list second;\n\
+         #define __need_va_arg\n\
+         #include <stdarg.h>\n\
+         #ifndef va_arg\n\
+         #error va_arg partial include failed\n\
+         #endif\n\
+         #define __need___va_copy\n\
+         #include <stdarg.h>\n\
+         #ifndef __va_copy\n\
+         #error __va_copy partial include failed\n\
+         #endif\n\
+         #define __need_va_copy\n\
+         #include <stdarg.h>\n\
+         #ifndef va_copy\n\
+         #error va_copy partial include failed\n\
+         #endif\n\
+         #include <stdarg.h>\n\
+         #include <stdarg.h>\n\
+         int next(va_list list) { return va_arg(list, int); }",
+    )
+    .unwrap();
+    assert_eq!(
+        unit.globals
+            .iter()
+            .map(|global| global.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["first", "second"]
+    );
+    let next = unit
+        .functions
+        .iter()
+        .find(|function| function.name == "next")
+        .unwrap();
+    assert!(matches!(
+        unit.types.kind(next.parameters[0].ty.ty),
+        TypeKind::Pointer(_)
+    ));
 }
 
 #[test]
@@ -347,6 +621,7 @@ fn aggregate_initializer_paths_carry_bitfield_layout() {
         panic!("bitfield initializer has its storage descriptor")
     };
     assert_eq!(bitfield.width, 5);
+    assert_eq!(bitfield.storage_offset, 0);
     assert!(bitfield.storage_size >= 1);
 
     let offset = unit
@@ -359,6 +634,48 @@ fn aggregate_initializer_paths_carry_bitfield_layout() {
         panic!("offset initializer is scalar")
     };
     assert_eq!(expression.constant, Some(ConstantValue::Unsigned(0)));
+}
+
+#[test]
+fn aggregate_rvalue_members_retain_bitfield_layout() {
+    let unit = analyze_source(
+        "struct Bits { unsigned prefix; unsigned value : 6; };\n\
+         struct Bits make(void);\n\
+         unsigned read(void) { return make().value; }",
+    )
+    .unwrap();
+    let read = unit
+        .functions
+        .iter()
+        .find(|function| function.name == "read")
+        .unwrap();
+    let FullTypedStatementKind::Compound(items) = &read.body.as_ref().unwrap().kind else {
+        panic!("function body is compound")
+    };
+    let FullTypedBlockItem::Statement(statement) = &items[0] else {
+        panic!("function body contains a return")
+    };
+    let FullTypedStatementKind::Return(Some(expression)) = &statement.kind else {
+        panic!("statement returns a value")
+    };
+    let FullTypedExpressionKind::Member { base, bitfield, .. } = &expression.kind else {
+        panic!("return value is a member access")
+    };
+    assert_eq!(expression.category, ValueCategory::Value);
+    assert!(expression.place.is_none());
+    assert!(base.place.is_none());
+    let bitfield = bitfield
+        .as_deref()
+        .expect("rvalue member retains its bitfield descriptor");
+    assert_eq!(bitfield.field_index, 1);
+    assert_eq!(bitfield.storage_offset, 0);
+    assert_eq!(bitfield.storage_size, 4);
+    assert_eq!(bitfield.width, 6);
+    assert!(!bitfield.signed);
+    assert!(
+        dump_frontend_typed_ast(&unit)
+            .contains("member #1 value indirect=false bitfield=0:4:0/6 : unsigned int Value")
+    );
 }
 
 #[test]
@@ -648,6 +965,42 @@ fn linkage_and_control_flow_typed_dump_matches_the_committed_golden() {
     assert_eq!(
         dump,
         include_str!("../../../../tests/frontend/goldens/typed-ast-linkage-control.out")
+    );
+}
+
+#[test]
+fn variadic_promotions_typed_dump_matches_the_committed_golden() {
+    let unit = analyze_preprocessed_source(
+        "variadic-promotions.c",
+        include_str!("../../../../tests/frontend/typed-ast/variadic-promotions.c"),
+    )
+    .unwrap();
+    assert_eq!(
+        dump_frontend_typed_ast(&unit),
+        include_str!("../../../../tests/frontend/goldens/typed-ast-variadic-promotions.out")
+    );
+}
+
+#[test]
+fn comma_values_typed_dump_matches_the_committed_golden() {
+    let unit = analyze_preprocessed_source(
+        "comma-values.c",
+        include_str!("../../../../tests/frontend/typed-ast/comma-values.c"),
+    )
+    .unwrap();
+    assert_eq!(
+        dump_frontend_typed_ast(&unit),
+        include_str!("../../../../tests/frontend/goldens/typed-ast-comma-values.out")
+    );
+    assert_eq!(
+        diagnostic_codes(
+            "struct Pair { int value; };\n\
+             int invalid(struct Pair first, struct Pair second) {\n\
+                 (first, second) = first;\n\
+                 return 0;\n\
+             }"
+        ),
+        vec!["CCC2283"]
     );
 }
 

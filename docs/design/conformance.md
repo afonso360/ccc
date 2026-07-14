@@ -33,6 +33,34 @@ Declarations, `sizeof`, and `_Alignof` remain usable even when the selected back
 
 The runtime/helper and assembly-bridge availability is a target capability checked before code generation. Soft-float arithmetic alone is not considered ABI support.
 
+The enabled `x86_64-unknown-linux-gnu` SysV boundary profile does not yet
+provide native x87 transport or an address-backed scalar `long double` value.
+A call, definition, return, or variadic fetch using `long double` is therefore
+rejected. The same profile rejects an aggregate containing `long double`, even
+when the psABI would ultimately pass that aggregate in memory: accepting it
+would also require 16-byte overflow and fixed-argument placement that the
+native Cranelift `StructArgument` interface cannot describe. Declarations and
+layout queries remain valid. The profile is explicitly versioned so an
+address-only generated bridge capability can remove this accepted-program
+restriction coherently.
+
+## Variadic fetch restrictions
+
+The requested type in `va_arg` must be complete, non-variably-modified,
+object-sized, and unchanged by the default argument promotions. The target
+`va_list` operand must designate modifiable list state.
+CCC rejects promotion-invalid requests such as `float`, `_Bool`, character and
+short integer types, and promotion-affected enumerations.
+
+C specifies undefined behavior when an executed `va_arg` requests a type that
+is incompatible with the promoted actual argument; it does not require a
+translation diagnostic for an unreachable request. CCC deliberately applies a
+hard semantic diagnostic even when the expression is unreachable. This is a
+fail-loud accepted-program restriction: CCC never silently fetches a promoted
+`double` or `int` using the wrong layout. Ordinary mismatches between otherwise
+valid requested types remain runtime undefined behavior and are not dynamically
+checked.
+
 ## `_Complex` and `_Imaginary`
 
 When complex arithmetic is not enabled for a target configuration, CCC defines `__STDC_NO_COMPLEX__` to `1`, does not claim the corresponding GNU capability, and diagnoses semantic use of `_Complex`, `_Imaginary`, or complex builtins. The parser still recognizes the syntax so the diagnostic is precise. `<complex.h>` either comes from a compatible libc that observes `__STDC_NO_COMPLEX__` or from a CCC wrapper that reports the unsupported capability; it must not expose declarations that would later miscompile.

@@ -30,5 +30,7 @@ cranelift-codegen = { version = "=0.132.0", default-features = false, features =
 cranelift-frontend = { version = "=0.132.0", default-features = false, features = ["std"] }
 cranelift-module = { version = "=0.132.0" }
 cranelift-object = { version = "=0.132.0" }
+gimli = { version = "=0.33.0", default-features = false, features = ["read", "write"] }
 object = { version = "=0.39.0", default-features = false, features = ["read", "write"] }
+sha2 = { version = "=0.10.2" }
 target-lexicon = { version = "=0.13.5" }

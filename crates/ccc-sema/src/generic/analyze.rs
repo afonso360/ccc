@@ -4,7 +4,9 @@ use ccc_diag::Diagnostic;
 use ccc_pp::{CharacterConstantPrefix, FloatingConstantSuffix, PragmaEvent, StringLiteralPrefix};
 use ccc_session::Span;
 use ccc_syntax::frontend as syntax;
-use ccc_target::{CapabilityKind, CapabilityState, EffectiveCompilationConfig, PackingPolicy};
+use ccc_target::{
+    CapabilityKind, CapabilityState, EffectiveCompilationConfig, PackingPolicy, TargetBuiltinType,
+};
 use ccc_types::{
     ArrayLength, ArrayType, BuiltinType, Field, FunctionParameters, FunctionType, LayoutShape,
     QualifiedType, RecordKind, TypeId, TypeKind, TypeQualifiers,
@@ -52,6 +54,8 @@ struct ResolvedParameter {
     name: Option<String>,
     ty: QualifiedType,
     span: Span,
+    addressable: bool,
+    va_start_restriction: Option<&'static str>,
 }
 
 #[derive(Clone, Debug)]
@@ -82,9 +86,13 @@ struct FunctionState {
     name: String,
     return_ty: QualifiedType,
     next_local: u32,
+    unaddressable_locals: HashSet<FullLocalId>,
     labels: LabelScope,
     loop_depth: usize,
     switches: Vec<SwitchState>,
+    variadic: bool,
+    last_named_parameter: Option<FullLocalId>,
+    last_named_parameter_restriction: Option<&'static str>,
 }
 
 #[derive(Clone, Debug)]
@@ -344,9 +352,13 @@ impl<'a> Analyzer<'a> {
             name: name.clone(),
             return_ty,
             next_local: 0,
+            unaddressable_locals: HashSet::new(),
             labels: LabelScope::default(),
             loop_depth: 0,
             switches: Vec::new(),
+            variadic: signature.variadic,
+            last_named_parameter: None,
+            last_named_parameter_restriction: None,
         });
         self.collect_labels(&definition.body);
         self.push_scope();
@@ -363,6 +375,13 @@ impl<'a> Analyzer<'a> {
                 );
             };
             let local = self.fresh_local();
+            if !parameter.addressable {
+                self.function
+                    .as_mut()
+                    .expect("parameter analysis occurs inside a function")
+                    .unaddressable_locals
+                    .insert(local);
+            }
             self.bind_current(
                 parameter_name.clone(),
                 OrdinarySymbol::Local(local, parameter.ty),
@@ -374,6 +393,14 @@ impl<'a> Analyzer<'a> {
                 ty: parameter.ty,
                 span: parameter.span,
             });
+            self.function
+                .as_mut()
+                .expect("parameter analysis occurs inside a function")
+                .last_named_parameter = Some(local);
+            self.function
+                .as_mut()
+                .expect("parameter analysis occurs inside a function")
+                .last_named_parameter_restriction = parameter.va_start_restriction;
         }
 
         let body = self.analyze_statement(&definition.body);
@@ -499,6 +526,15 @@ impl<'a> Analyzer<'a> {
                         "`typeof` is parse-only and has no supported semantic meaning",
                     );
                 }
+                syntax::TypeSpecifier::BuiltinVaList => {
+                    let ty = self
+                        .types
+                        .target_builtin(TargetBuiltinType::VaList, self.config)
+                        .map_err(|error| {
+                            self.emit("CCC2408", span, error.to_string());
+                        })?;
+                    return Ok(QualifiedType::unqualified(ty));
+                }
                 _ => {}
             }
         }
@@ -511,6 +547,7 @@ impl<'a> Analyzer<'a> {
                     | syntax::TypeSpecifier::TypedefName(_)
                     | syntax::TypeSpecifier::Atomic(_)
                     | syntax::TypeSpecifier::Typeof(_)
+                    | syntax::TypeSpecifier::BuiltinVaList
             )
         }) {
             return self.fail(
@@ -810,13 +847,34 @@ impl<'a> Analyzer<'a> {
                 "a parameter may only use the `register` storage class",
             );
         }
+        let register = info.storage == Some(syntax::StorageClass::Register);
         let (name, mut ty, span) = if let Some(declarator) = &parameter.declarator {
             let resolved = self.resolve_declarator(info.base, declarator)?;
             (resolved.name, resolved.ty, resolved.name_span)
         } else {
             (None, info.base, parameter.span)
         };
-        ty = match self.types.try_kind(ty.ty).cloned() {
+        let declared_kind = self.types.try_kind(ty.ty).cloned();
+        let va_start_restriction = if register {
+            Some("it has `register` storage class")
+        } else {
+            match &declared_kind {
+                Some(TypeKind::Array(_) | TypeKind::Function(_)) => {
+                    Some("it is declared with array or function type")
+                }
+                Some(TypeKind::Builtin(BuiltinType::Float)) => {
+                    Some("its type is changed by the default argument promotions")
+                }
+                Some(TypeKind::Builtin(kind)) if kind.is_integer() => self
+                    .integer_promotion_changes_type(ty.ty)
+                    .then_some("its type is changed by the default argument promotions"),
+                Some(TypeKind::Enum(_)) => self
+                    .integer_promotion_changes_type(ty.ty)
+                    .then_some("its type is changed by the default argument promotions"),
+                _ => None,
+            }
+        };
+        ty = match declared_kind {
             Some(TypeKind::Array(array)) => {
                 let pointer = self.types.pointer(array.element);
                 QualifiedType::new(pointer, parameter_array_qualifiers(&parameter.declarator))
@@ -824,7 +882,13 @@ impl<'a> Analyzer<'a> {
             Some(TypeKind::Function(_)) => QualifiedType::unqualified(self.types.pointer(ty)),
             _ => ty,
         };
-        Ok(ResolvedParameter { name, ty, span })
+        Ok(ResolvedParameter {
+            name,
+            ty,
+            span,
+            addressable: !register,
+            va_start_restriction,
+        })
     }
 
     fn resolve_record_specifier(
@@ -1146,6 +1210,7 @@ impl<'a> Analyzer<'a> {
                 "a function may only have `extern` or `static` storage class",
             );
         }
+        let declared_visibility = self.function_visibility(&attributes, span)?;
         if let Some(existing) = self.lookup_file_ordinary(&name).cloned() {
             if let OrdinarySymbol::Function(id, existing_signature) = existing {
                 let existing_linkage = self.functions[id.0 as usize].linkage;
@@ -1173,6 +1238,9 @@ impl<'a> Analyzer<'a> {
                 function.properties.no_return |= properties.no_return;
                 if function.asm_label.is_none() {
                     function.asm_label = asm_label;
+                }
+                if let Some(visibility) = declared_visibility {
+                    function.visibility = visibility;
                 }
                 function.attributes.extend(attributes);
                 self.scopes
@@ -1202,6 +1270,7 @@ impl<'a> Analyzer<'a> {
             signature,
             storage: semantic_storage,
             linkage,
+            visibility: declared_visibility.unwrap_or_default(),
             properties,
             parameters: Vec::new(),
             body: None,
@@ -1478,6 +1547,13 @@ impl<'a> Analyzer<'a> {
                     unreachable!("rejected with the declaration specifiers")
                 }
             };
+            if storage == SemanticStorageClass::Register {
+                self.function
+                    .as_mut()
+                    .expect("block objects occur inside a function")
+                    .unaddressable_locals
+                    .insert(local);
+            }
             let (initializer, completed_ty) = match init.initializer.as_ref() {
                 Some(initializer) => {
                     let (typed, completed) = self.analyze_initializer(resolved.ty, initializer)?;
@@ -2003,13 +2079,9 @@ impl<'a> Analyzer<'a> {
             } => self.analyze_assignment(*operator, target, value, expression.span),
             E::Comma(expressions) => {
                 let mut typed = Vec::new();
-                for (index, item) in expressions.iter().enumerate() {
+                for item in expressions {
                     let item = self.analyze_expression(item)?;
-                    typed.push(if index + 1 == expressions.len() {
-                        item
-                    } else {
-                        self.value_conversion(item)?
-                    });
+                    typed.push(self.value_conversion(item)?);
                 }
                 let Some(last) = typed.last() else {
                     return self.fail("CCC2273", expression.span, "an empty comma expression");
@@ -2017,8 +2089,8 @@ impl<'a> Analyzer<'a> {
                 Ok(FullTypedExpression {
                     kind: FullTypedExpressionKind::Comma(typed.clone()),
                     ty: last.ty,
-                    category: last.category,
-                    place: last.place.clone(),
+                    category: ValueCategory::Value,
+                    place: None,
                     constant: last.constant,
                     span: expression.span,
                 })
@@ -2027,6 +2099,276 @@ impl<'a> Analyzer<'a> {
             E::BuiltinOffsetof { ty, designator } => {
                 self.analyze_offsetof(ty, designator, expression.span)
             }
+            E::BuiltinVaStart {
+                list,
+                last_named_parameter,
+            } => self.analyze_va_start(list, last_named_parameter, expression.span),
+            E::BuiltinVaArg { list, ty } => self.analyze_va_arg(list, ty, expression.span),
+            E::BuiltinVaCopy {
+                destination,
+                source,
+            } => self.analyze_va_copy(destination, source, expression.span),
+            E::BuiltinVaEnd { list } => self.analyze_va_end(list, expression.span),
+        }
+    }
+
+    fn analyze_va_start(
+        &mut self,
+        list: &syntax::Expression,
+        last_named_parameter: &syntax::Expression,
+        span: Span,
+    ) -> AnalysisResult<FullTypedExpression> {
+        self.require_builtin("__builtin_va_start", span)?;
+        let (variadic, expected, restriction) = self
+            .function
+            .as_ref()
+            .map(|function| {
+                (
+                    function.variadic,
+                    function.last_named_parameter,
+                    function.last_named_parameter_restriction,
+                )
+            })
+            .unwrap_or((false, None, None));
+        if !variadic {
+            return self.fail(
+                "CCC2400",
+                span,
+                "`va_start` is only valid in a variadic function definition",
+            );
+        }
+        let Some(expected) = expected else {
+            return self.fail(
+                "CCC2401",
+                span,
+                "`va_start` requires a final named parameter",
+            );
+        };
+        let last = self.analyze_expression(last_named_parameter)?;
+        if !matches!(last.kind, FullTypedExpressionKind::DeclRef(SymbolReference::Local(local)) if local == expected)
+        {
+            return self.fail(
+                "CCC2402",
+                last_named_parameter.span,
+                "the second `va_start` argument must name the final fixed parameter",
+            );
+        }
+        if let Some(restriction) = restriction {
+            return self.fail(
+                "CCC2413",
+                last_named_parameter.span,
+                format!(
+                    "the final fixed parameter cannot be used by `va_start` because {restriction}"
+                ),
+            );
+        }
+        let list = self.analyze_va_list_operand(list, true)?;
+        Ok(FullTypedExpression {
+            kind: FullTypedExpressionKind::VaStart {
+                list: Box::new(list),
+                last_named_parameter: expected,
+            },
+            ty: QualifiedType::unqualified(TypeId::VOID),
+            category: ValueCategory::Value,
+            place: None,
+            constant: None,
+            span,
+        })
+    }
+
+    fn analyze_va_arg(
+        &mut self,
+        list: &syntax::Expression,
+        type_name: &syntax::TypeName,
+        span: Span,
+    ) -> AnalysisResult<FullTypedExpression> {
+        self.require_builtin("__builtin_va_arg", span)?;
+        let list = self.analyze_va_list_operand(list, true)?;
+        let requested = self.resolve_type_name(type_name)?;
+        self.validate_object_type(requested, type_name.span, true)?;
+        if self.is_variably_modified(requested.ty) {
+            return self.fail(
+                "CCC2414",
+                type_name.span,
+                "`va_arg` cannot request a variably modified type",
+            );
+        }
+        if matches!(self.types.try_kind(requested.ty), Some(TypeKind::Array(_))) {
+            return self.fail(
+                "CCC2405",
+                type_name.span,
+                "`va_arg` cannot produce an array type; request the promoted pointer type",
+            );
+        }
+        let changed_by_default_promotions = requested.ty == TypeId::FLOAT
+            || (self.types.is_integer(requested.ty)
+                && self.integer_promotion_changes_type(requested.ty));
+        if requested.qualifiers.contains(TypeQualifiers::ATOMIC) || changed_by_default_promotions {
+            return self.fail(
+                "CCC2403",
+                type_name.span,
+                format!(
+                    "`va_arg` type `{}` is changed by the default argument promotions; request the promoted type",
+                    self.types.display_qualified(requested)
+                ),
+            );
+        }
+        if self.type_contains_long_double(requested.ty, &mut HashSet::new()) {
+            return self.fail(
+                "CCC2404",
+                type_name.span,
+                "`va_arg` does not support `long double` or an aggregate containing it",
+            );
+        }
+        let layout = self
+            .types
+            .layout_of(requested.ty, self.config)
+            .expect("a validated, non-variably-modified object type has a layout");
+        if layout.align > 8 {
+            return self.fail(
+                "CCC2406",
+                type_name.span,
+                format!(
+                    "`va_arg` type `{}` requires unsupported {}-byte alignment",
+                    self.types.display_qualified(requested),
+                    layout.align
+                ),
+            );
+        }
+        Ok(FullTypedExpression {
+            kind: FullTypedExpressionKind::VaArg {
+                list: Box::new(list),
+                requested,
+            },
+            ty: QualifiedType::unqualified(requested.ty),
+            category: ValueCategory::Value,
+            place: None,
+            constant: None,
+            span,
+        })
+    }
+
+    fn analyze_va_copy(
+        &mut self,
+        destination: &syntax::Expression,
+        source: &syntax::Expression,
+        span: Span,
+    ) -> AnalysisResult<FullTypedExpression> {
+        self.require_builtin("__builtin_va_copy", span)?;
+        let destination = self.analyze_va_list_operand(destination, true)?;
+        let source = self.analyze_va_list_operand(source, false)?;
+        Ok(FullTypedExpression {
+            kind: FullTypedExpressionKind::VaCopy {
+                destination: Box::new(destination),
+                source: Box::new(source),
+            },
+            ty: QualifiedType::unqualified(TypeId::VOID),
+            category: ValueCategory::Value,
+            place: None,
+            constant: None,
+            span,
+        })
+    }
+
+    fn analyze_va_end(
+        &mut self,
+        list: &syntax::Expression,
+        span: Span,
+    ) -> AnalysisResult<FullTypedExpression> {
+        self.require_builtin("__builtin_va_end", span)?;
+        let list = self.analyze_va_list_operand(list, true)?;
+        Ok(FullTypedExpression {
+            kind: FullTypedExpressionKind::VaEnd {
+                list: Box::new(list),
+            },
+            ty: QualifiedType::unqualified(TypeId::VOID),
+            category: ValueCategory::Value,
+            place: None,
+            constant: None,
+            span,
+        })
+    }
+
+    fn require_builtin(&mut self, name: &str, span: Span) -> AnalysisResult<()> {
+        if self
+            .config
+            .capabilities
+            .state(CapabilityKind::Builtin, name)
+            == CapabilityState::Implemented
+        {
+            Ok(())
+        } else {
+            self.fail(
+                "CCC2407",
+                span,
+                format!("compiler builtin `{name}` is unavailable for this configuration"),
+            )
+        }
+    }
+
+    fn analyze_va_list_operand(
+        &mut self,
+        expression: &syntax::Expression,
+        writable: bool,
+    ) -> AnalysisResult<FullTypedExpression> {
+        let va_list = self
+            .types
+            .target_builtin(TargetBuiltinType::VaList, self.config)
+            .map_err(|error| {
+                self.emit("CCC2408", expression.span, error.to_string());
+            })?;
+        let TypeKind::Array(array) = self.types.kind(va_list).clone() else {
+            unreachable!("the target va_list contract is an array")
+        };
+        let parameter_pointer = self.types.pointer(array.element);
+        let typed = self.analyze_expression(expression)?;
+        if typed.ty.ty == va_list {
+            if typed.category != ValueCategory::Lvalue
+                || typed.place.as_ref().is_none_or(|place| !place.addressable)
+            {
+                return self.fail("CCC2409", expression.span, "a `va_list` object is required");
+            }
+            if writable && typed.ty.qualifiers.contains(TypeQualifiers::CONST) {
+                return self.fail(
+                    "CCC2410",
+                    expression.span,
+                    "this `va_list` operand must be modifiable",
+                );
+            }
+            return Ok(typed);
+        }
+        if typed.ty.ty == parameter_pointer {
+            return self.value_conversion(typed);
+        }
+        self.fail(
+            "CCC2411",
+            expression.span,
+            format!(
+                "expected `va_list`, found `{}`",
+                self.types.display_qualified(typed.ty)
+            ),
+        )
+    }
+
+    fn type_contains_long_double(&self, ty: TypeId, seen: &mut HashSet<TypeId>) -> bool {
+        if ty == TypeId::LONG_DOUBLE {
+            return true;
+        }
+        if !seen.insert(ty) {
+            return false;
+        }
+        match self.types.try_kind(ty) {
+            Some(TypeKind::Array(array)) => self.type_contains_long_double(array.element.ty, seen),
+            Some(TypeKind::Record(record)) => self
+                .types
+                .record(*record)
+                .and_then(|record| record.fields.as_ref())
+                .is_some_and(|fields| {
+                    fields
+                        .iter()
+                        .any(|field| self.type_contains_long_double(field.ty.ty, seen))
+                }),
+            _ => false,
         }
     }
 
@@ -2060,13 +2402,19 @@ impl<'a> Analyzer<'a> {
                     one_past: false,
                 })),
             ),
-            OrdinarySymbol::Local(id, ty) => (
-                SymbolReference::Local(id),
-                ty,
-                ValueCategory::Lvalue,
-                Some(self.object_place(PlaceBase::Local(id), ty, true)),
-                None,
-            ),
+            OrdinarySymbol::Local(id, ty) => {
+                let addressable = self
+                    .function
+                    .as_ref()
+                    .is_none_or(|function| !function.unaddressable_locals.contains(&id));
+                (
+                    SymbolReference::Local(id),
+                    ty,
+                    ValueCategory::Lvalue,
+                    Some(self.object_place(PlaceBase::Local(id), ty, addressable)),
+                    None,
+                )
+            }
             OrdinarySymbol::Enumerator(value, ty) => {
                 let constant = if self.is_signed_integer(ty.ty) {
                     ConstantValue::Signed(value)
@@ -2891,50 +3239,57 @@ impl<'a> Analyzer<'a> {
             );
         };
         let result_ty = QualifiedType::new(field.ty.ty, field.ty.qualifiers | record_ty.qualifiers);
-        let mut bitfield = None;
+        let member_access = access_semantics(result_ty);
+        let bitfield = if field.bitfield.is_some() {
+            let layout = self
+                .types
+                .layout_of(record_ty.ty, self.config)
+                .map_err(|error| {
+                    self.emit("CCC2297", span, error.to_string());
+                })?;
+            let LayoutShape::Record(layout) = layout.shape else {
+                unreachable!("the queried type is a record")
+            };
+            let field_layout = &layout.fields[field_index];
+            let shared = field_layout
+                .bitfield
+                .expect("a semantic bitfield has a bitfield layout");
+            let storage_offset = shared
+                .storage_offset
+                .checked_sub(field_layout.offset)
+                .expect("bitfield storage begins within its projected field");
+            Some(BitfieldPlace {
+                field_index,
+                storage_offset,
+                storage_size: shared.storage_size,
+                storage_align: shared.storage_align,
+                bit_offset: shared.bit_offset,
+                width: shared.width,
+                signed: self.is_signed_integer(field.ty.ty),
+                access: member_access,
+            })
+        } else {
+            None
+        };
         if let Some(place) = &mut place {
             place.projections.push(PlaceProjection::Field {
                 index: field_index,
                 name: field.name.clone(),
             });
-            place.access = access_semantics(result_ty);
+            place.access = member_access;
             place.modifiable = self.is_modifiable_type(result_ty);
-            if field.bitfield.is_some() {
-                let layout = self
-                    .types
-                    .layout_of(record_ty.ty, self.config)
-                    .map_err(|error| {
-                        self.emit("CCC2297", span, error.to_string());
-                    })?;
-                let LayoutShape::Record(layout) = layout.shape else {
-                    unreachable!("the queried type is a record")
-                };
-                let field_layout = &layout.fields[field_index];
-                let shared = field_layout
-                    .bitfield
-                    .expect("a semantic bitfield has a bitfield layout");
-                let descriptor = BitfieldPlace {
-                    field_index,
-                    storage_offset: shared.storage_offset,
-                    storage_size: shared.storage_size,
-                    storage_align: shared.storage_align,
-                    bit_offset: shared.bit_offset,
-                    width: shared.width,
-                    signed: self.is_signed_integer(field.ty.ty),
-                    access: place.access,
-                };
+            if let Some(descriptor) = bitfield {
                 place.bitfield = Some(descriptor);
                 place.addressable = false;
-                bitfield = Some(descriptor);
             }
         }
-        let _ = bitfield;
         Ok(FullTypedExpression {
             kind: FullTypedExpressionKind::Member {
                 base: Box::new(base),
                 field_index,
                 name: member.name.clone(),
                 indirect,
+                bitfield: bitfield.map(Box::new),
             },
             ty: result_ty,
             category,
@@ -3547,14 +3902,19 @@ impl<'a> Analyzer<'a> {
             unreachable!("a bitfield belongs to a record")
         };
         debug_assert_eq!(layout.id, record_id);
-        let shared = layout.fields[field_index]
+        let field_layout = &layout.fields[field_index];
+        let shared = field_layout
             .bitfield
             .expect("a semantic bitfield has a shared layout descriptor");
+        let storage_offset = shared
+            .storage_offset
+            .checked_sub(field_layout.offset)
+            .expect("bitfield storage begins within its projected field");
         let field_ty = QualifiedType::new(field.ty.ty, field.ty.qualifiers | record_ty.qualifiers);
         let access = access_semantics(field_ty);
         Ok(Some(BitfieldPlace {
             field_index,
-            storage_offset: shared.storage_offset,
+            storage_offset,
             storage_size: shared.storage_size,
             storage_align: shared.storage_align,
             bit_offset: shared.bit_offset,
@@ -3661,7 +4021,7 @@ impl<'a> Analyzer<'a> {
                 "integer promotion requires a complete integer type",
             );
         };
-        let target = self.promoted_integer_type(expression.ty.ty);
+        let target = self.promoted_integer_type_for_expression(&expression);
         if self.types.builtin_type(expression.ty.ty).is_some()
             && integer_rank(kind) >= integer_rank(BuiltinType::Int)
             && target == expression.ty.ty
@@ -4078,6 +4438,31 @@ impl<'a> Analyzer<'a> {
             TypeId::INT
         } else {
             TypeId::UNSIGNED_INT
+        }
+    }
+
+    fn promoted_integer_type_for_expression(&self, expression: &FullTypedExpression) -> TypeId {
+        let ordinary = self.promoted_integer_type(expression.ty.ty);
+        if self.types.builtin_type(expression.ty.ty) == Some(BuiltinType::UnsignedInt)
+            && loaded_bitfield(expression).is_some_and(|bitfield| {
+                bitfield.width < u32::from(self.integer_width(BuiltinType::Int))
+            })
+        {
+            TypeId::INT
+        } else {
+            ordinary
+        }
+    }
+
+    fn integer_promotion_changes_type(&self, ty: TypeId) -> bool {
+        let promoted = self.promoted_integer_type(ty);
+        match self.types.try_kind(ty) {
+            Some(TypeKind::Enum(id)) => self
+                .types
+                .enumeration(*id)
+                .and_then(|enumeration| enumeration.body.as_ref())
+                .is_none_or(|body| body.underlying != promoted),
+            _ => promoted != ty,
         }
     }
 
@@ -4633,6 +5018,35 @@ impl<'a> Analyzer<'a> {
             literal_spelling: label.literal_spelling.clone(),
             symbol,
         }))
+    }
+
+    fn function_visibility(
+        &mut self,
+        attributes: &[FullTypedAttribute],
+        span: Span,
+    ) -> AnalysisResult<Option<SymbolVisibility>> {
+        let mut visibility = None;
+        for attribute in attributes {
+            if attribute.name != "visibility" {
+                continue;
+            }
+            visibility = Some(
+                match attribute_argument_string(&attribute.arguments).as_deref() {
+                    Some("hidden") => SymbolVisibility::Hidden,
+                    Some("protected") => SymbolVisibility::Protected,
+                    Some("internal") => SymbolVisibility::Internal,
+                    Some("default") => SymbolVisibility::Default,
+                    _ => {
+                        return self.fail(
+                            "CCC2353",
+                            span,
+                            "implemented `visibility` has an invalid argument",
+                        );
+                    }
+                },
+            );
+        }
+        Ok(visibility)
     }
 
     fn apply_emission_attributes(
@@ -5222,6 +5636,26 @@ fn evaluate_binary_constant(
         },
         _ => None,
     }
+}
+
+fn loaded_bitfield(expression: &FullTypedExpression) -> Option<&BitfieldPlace> {
+    expression
+        .place
+        .as_ref()
+        .and_then(|place| place.bitfield.as_ref())
+        .or_else(|| {
+            let FullTypedExpressionKind::Conversion {
+                kind: ConversionKind::LvalueToValue { .. },
+                expression,
+            } = &expression.kind
+            else {
+                return None;
+            };
+            expression
+                .place
+                .as_ref()
+                .and_then(|place| place.bitfield.as_ref())
+        })
 }
 
 fn split_pack_parts<'a>(tokens: &'a [&'a str]) -> Option<Vec<Vec<&'a str>>> {

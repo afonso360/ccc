@@ -41,7 +41,41 @@ zero-width barriers, storage-unit boundaries, unnamed fields, nested records,
 unions, and packed records. A missing reference compiler is a test failure,
 not a skipped oracle.
 
-Variadic tests separately cover call sites and definitions, direct and indirect calls, promoted floating-point arguments, aggregates, register/stack boundaries, `va_copy`, and target-specific state such as SysV `%al`. Long-double tests verify size/alignment/macros, arithmetic, object representation, and calls in both directions; explicit compatibility-mode objects must be rejected when mixed with incompatible CCC objects.
+The `x86_64-unknown-linux-gnu` classifier generator records seed
+`0x4343435f41424931`. It materializes 45 type recipes from 11 structural
+families: 32 integer-byte aggregate sizes, one float record, four double-array
+sizes, and eight fixed record, union, nested, bit-field, and packing recipes.
+Those recipes are crossed with deterministic leading/trailing GP and SSE
+allocator-pressure patterns to produce 4,096 distinct canonical plan inputs;
+this count does not claim 4,096 unrelated aggregate layouts. Named boundary
+regressions are always selected. Remaining inputs are partitioned by passing
+mode, return mode, size bucket, packing, mixed-class status, and
+register-exhaustion shape. The 256-case cross-link set is chosen by sorting
+canonical encodings by a domain-separated SHA-256 digest within each bucket
+and visiting bucket keys in lexicographic round-robin order. The selector test
+proves every declared nonempty bucket is represented and snapshots the
+selected identifiers.
+
+Variadic tests separately cover call sites and definitions, direct and indirect
+calls, explicit `float`-to-`double` and character/short-to-`int` default
+promotions through ellipses, aggregates, register/stack
+boundaries, `va_copy`, and target-specific state such as SysV `%al`. CCC-created
+lists are consumed by libc `vsnprintf` and `vfprintf`; GCC- and Clang-created
+lists are consumed and copied by CCC. Exact formatted-output checks run under
+the `C` locale. Generated CFI is exercised by the real libgcc
+`_Unwind_Backtrace` API across both generated bridge kinds in addition to the
+debugger checks. Long-double tests verify
+size/alignment/macros and object representation; profiles that support boundary
+transport also test calls in both directions, while profiles that do not must
+reject those boundaries exactly. Explicit compatibility-mode objects must be
+rejected when mixed with incompatible CCC objects.
+
+Planner, IR, digest, renderer, fake-command, and manifest tests run on every
+host. Native `x86_64-unknown-linux-gnu` execution and object suites compile only
+on Linux x86-64. The required CI feature rejects the wrong host at compile time,
+preflights every reference and packaging tool, and invokes each named native
+test binary explicitly. A missing tool or zero-test configuration is a hard
+failure, never an implicit skip.
 
 ## Differential testing and undefined behavior
 

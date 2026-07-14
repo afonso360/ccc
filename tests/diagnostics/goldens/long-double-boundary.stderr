@@ -1,0 +1,5 @@
+ccc: error[CCC3509]: native `long double` parameter type `long double` is outside the enabled boundary profile
+ --> tests/diagnostics/cases/long-double-boundary.c:1:1
+   |
+ 1 | int consume(long double value) {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ while generating native code

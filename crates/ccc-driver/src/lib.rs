@@ -10,7 +10,6 @@ mod resource;
 
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -55,7 +54,7 @@ const HELP: &str = "Usage: ccc [options] <input.c>\n\
   -M|-MM|-MD|-MMD            Generate Make dependencies\n\
   --dump-pp-tokens           Dump expanded preprocessing tokens\n\
   --dump-tokens              Dump converted parser tokens\n\
-  --dump-ast|--dump-typed-ast|--dump-ir\n\
+  --dump-ast|--dump-typed-ast|--dump-ir|--dump-abi\n\
                              Dump frontend representations\n\
   --emit=clif                Dump Cranelift IR\n";
 
@@ -227,7 +226,9 @@ fn effective_config(
                 ),
             ));
         }
-        config.resource_dir = Some(resources.root().to_path_buf());
+        if !options.no_standard_includes && !options.no_builtin_includes {
+            config.resource_dir = Some(resources.root().to_path_buf());
+        }
     }
 
     let link = matches!(options.action, PrimaryAction::Compile { link: true });
@@ -242,6 +243,7 @@ fn effective_config(
             disable_system_headers: options.no_standard_includes,
             assembler: false,
             linker: link,
+            object_copier: false,
             archiver: false,
         };
         let mut toolchain = resolver
@@ -297,7 +299,8 @@ fn required_compatibility_scope(action: &PrimaryAction) -> CompatibilityScope {
         }
         PrimaryAction::Dump(DumpKind::Tokens | DumpKind::Ast) => CompatibilityScope::Parsing,
         PrimaryAction::Dump(DumpKind::TypedAst) => CompatibilityScope::SemanticAnalysis,
-        PrimaryAction::Compile { .. } | PrimaryAction::Dump(DumpKind::Ir | DumpKind::Clif) => {
+        PrimaryAction::Compile { .. }
+        | PrimaryAction::Dump(DumpKind::Ir | DumpKind::Abi | DumpKind::Clif) => {
             CompatibilityScope::CodeGeneration
         }
     }
@@ -561,6 +564,20 @@ fn dump_output(
                 stderr: parsed.stderr,
             });
         }
+        DumpKind::Abi => {
+            let (parsed, ir) = lower_frontend_preprocessed(prepared, &prior_stderr)?;
+            let plan = ccc_abi::plan_module(&ir, &parsed.session.config)
+                .map_err(|error| abi_driver_error(&parsed.session.sources, error))?;
+            let verified = plan
+                .verify_against(&ir, &parsed.session.config)
+                .map_err(|error| abi_driver_error(&parsed.session.sources, error))?;
+            let mut stdout = ccc_abi::dump_module_plan(verified);
+            stdout.push_str(&dependency_stdout);
+            return Ok(DriverOutput {
+                stdout,
+                stderr: parsed.stderr,
+            });
+        }
         DumpKind::Clif => {
             let (parsed, ir) = lower_frontend_preprocessed(prepared, &prior_stderr)?;
             let generated =
@@ -608,12 +625,18 @@ fn compile_output(
     let (parsed, ir) = lower_frontend_preprocessed(prepared, &prior_stderr)?;
     let generated = codegen_frontend(&ir, &parsed.session.config, &parsed.session.sources, false)
         .map_err(|error| with_prior_diagnostics(&parsed.stderr, error))?;
+    let artifact = generated.into_artifact_bundle();
     if link {
         let mut temporary = TemporaryObject::create()
             .map_err(|error| with_prior_diagnostics(&parsed.stderr, error))?;
-        temporary
-            .write_all(&generated.object)
-            .map_err(|error| with_prior_diagnostics(&parsed.stderr, error))?;
+        let artifact_path = temporary
+            .prepare_external_write()
+            .map_err(|error| with_prior_diagnostics(&parsed.stderr, error))?
+            .to_path_buf();
+        ccc_link::package_artifact_bundle(artifact, &artifact_path, &parsed.session.config)
+            .map_err(|error| {
+                with_prior_diagnostics(&parsed.stderr, owner_error(error.code, error.message))
+            })?;
         let mut pending = atomic_output::PendingOutput::create(&output).map_err(|error| {
             with_prior_diagnostics(
                 &parsed.stderr,
@@ -654,12 +677,9 @@ fn compile_output(
             )
         })?;
     } else {
-        atomic_output::write_atomic(&output, &generated.object).map_err(|error| {
-            with_prior_diagnostics(
-                &parsed.stderr,
-                DriverError::new(format!("ccc: cannot write {}: {error}", output.display())),
-            )
-        })?;
+        ccc_link::package_artifact_bundle(artifact, &output, &parsed.session.config).map_err(
+            |error| with_prior_diagnostics(&parsed.stderr, owner_error(error.code, error.message)),
+        )?;
     }
     Ok(DriverOutput {
         stdout: dependency_stdout,
@@ -809,6 +829,14 @@ fn frontend_ir_error(sources: &SourceMap, error: FrontendIrError) -> DriverError
     diagnostic_error(sources, diagnostic)
 }
 
+fn abi_driver_error(sources: &SourceMap, error: ccc_abi::AbiError) -> DriverError {
+    let mut diagnostic = Diagnostic::error(error.code, error.message);
+    if let Some(span) = error.span {
+        diagnostic = diagnostic.with_primary(span, "while planning the native ABI boundary");
+    }
+    diagnostic_error(sources, diagnostic)
+}
+
 fn codegen_frontend(
     ir: &FullModule,
     config: &EffectiveCompilationConfig,
@@ -911,7 +939,7 @@ fn warning_toggle(options: &[String], enable: &str, disable: &str, default: bool
 
 struct TemporaryObject {
     path: PathBuf,
-    file: File,
+    file: Option<File>,
 }
 
 impl TemporaryObject {
@@ -920,7 +948,12 @@ impl TemporaryObject {
             let id = TEMPORARY_ID.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!("ccc-{}-{id}.o", std::process::id()));
             match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(file) => return Ok(Self { path, file }),
+                Ok(file) => {
+                    return Ok(Self {
+                        path,
+                        file: Some(file),
+                    });
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
                 Err(error) => {
                     return Err(DriverError::new(format!(
@@ -934,10 +967,13 @@ impl TemporaryObject {
         ))
     }
 
-    fn write_all(&mut self, bytes: &[u8]) -> Result<(), DriverError> {
-        self.file.write_all(bytes).map_err(|error| {
-            DriverError::new(format!("ccc: cannot write temporary object: {error}"))
-        })
+    fn prepare_external_write(&mut self) -> Result<&Path, DriverError> {
+        if let Some(file) = self.file.take() {
+            file.sync_all().map_err(|error| {
+                DriverError::new(format!("ccc: cannot prepare temporary object: {error}"))
+            })?;
+        }
+        Ok(&self.path)
     }
 
     fn path(&self) -> &Path {
@@ -1140,6 +1176,17 @@ mod tests {
         .unwrap()
         .stdout;
         assert!(ir.contains("function f0 @main("));
+        let abi = run([
+            "--dump-abi".to_owned(),
+            "-nostdinc".to_owned(),
+            input.clone(),
+        ])
+        .unwrap()
+        .stdout;
+        assert!(abi.contains("abi-plan schema=ccc-abi-config-v1"));
+        assert!(abi.contains("target=x86_64-unknown-linux-gnu"));
+        assert!(abi.contains("definition function=0"));
+        assert!(!abi.contains(std::env::temp_dir().to_string_lossy().as_ref()));
         let clif = run(["--emit=clif".to_owned(), "-nostdinc".to_owned(), input])
             .unwrap()
             .stdout;

@@ -1,0 +1,13 @@
+schema_version = 1
+source_id = "x86-64-psABI"
+upstream = "https://gitlab.com/x86-psABIs/x86-64-ABI"
+commit = "e1ce098331da5dbd66e1ffc74162380bcc213236"
+retrieved = "2026-07-14"
+license_status = "unresolved"
+vendored = false
+classifier_revision = 1
+
+[[files]]
+path = "x86-64-ABI/low-level-sys-info.tex"
+url = "https://gitlab.com/x86-psABIs/x86-64-ABI/-/raw/e1ce098331da5dbd66e1ffc74162380bcc213236/x86-64-ABI/low-level-sys-info.tex"
+sha256 = "2d42f2ab76b99a3b8456e6bc07e18314e85991119f72db90ca1175328e27b705"

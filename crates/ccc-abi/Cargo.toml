@@ -6,9 +6,12 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+ccc-ir = { path = "../ccc-ir" }
+ccc-sema = { path = "../ccc-sema" }
 ccc-session = { path = "../ccc-session" }
 ccc-target = { path = "../ccc-target" }
 ccc-types = { path = "../ccc-types" }
+sha2.workspace = true
 
 [lints]
 workspace = true

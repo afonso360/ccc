@@ -1,0 +1,28 @@
+declare f0 @side : int () [linkage=External visibility=Default]
+declare f1 @take : int (struct Pair) [linkage=External visibility=Default]
+function f2 @scalar(v0 %value: int -> ssa) -> int [signature=int (int) linkage=External visibility=Default inline=false noreturn=false] {
+  b0(v0: int):
+    i0: v1: int = call.direct f0 () signature=int () variadic-boundary=0 [read=true write=true unwind=true noreturn=false]
+    return v0
+}
+function f3 @aggregate(v0 %first: struct Pair -> m0, v2 %second: struct Pair -> m1) -> int [signature=int (struct Pair, struct Pair) linkage=External visibility=Default inline=false noreturn=false] {
+  storage m0 l0 %first: struct Pair [Automatic; Aggregate]
+  storage m1 l1 %second: struct Pair [Automatic; Aggregate]
+  b0(v0: struct Pair, v2: struct Pair):
+    i0: v1: pointer to struct Pair = address.storage m0
+    i1: aggregate.copy v0 -> v1 source=struct Pair destination=struct Pair overlap=MayOverlap source-access=[plain] destination-access=[plain]
+    i2: v3: pointer to struct Pair = address.storage m1
+    i3: aggregate.copy v2 -> v3 source=struct Pair destination=struct Pair overlap=MayOverlap source-access=[plain] destination-access=[plain]
+    i4: v4: int = call.direct f0 () signature=int () variadic-boundary=0 [read=true write=true unwind=true noreturn=false]
+    i5: v5: pointer to struct Pair = address.storage m1
+    i6: v6: struct Pair = aggregate.snapshot v5 object=struct Pair [plain]
+    i7: v7: int = call.direct f1 (v6) signature=int (struct Pair) variadic-boundary=1 [read=true write=true unwind=true noreturn=false]
+    i8: v8: pointer to struct Pair = address.storage m0
+    i9: v9: struct Pair = aggregate.snapshot v8 object=struct Pair [plain]
+    i10: v10: pointer to struct Pair = address.storage m1
+    i11: v11: struct Pair = aggregate.snapshot v10 object=struct Pair [plain]
+    i12: v12: pointer to int = aggregate.project v11 object=struct Pair path=field#0:value
+    i13: v13: int = load v12 object=int [plain]
+    i14: v14: int = add v7, v13
+    return v14
+}

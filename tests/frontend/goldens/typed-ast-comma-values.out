@@ -1,0 +1,35 @@
+translation-unit full-typed
+type-declaration struct Pair
+function @0 side : int () storage=Extern linkage=External visibility=Default inline=false noreturn=false declaration
+function @1 take : int (struct Pair) storage=Extern linkage=External visibility=Default inline=false noreturn=false declaration
+function @2 scalar : int (int) storage=Extern linkage=External visibility=Default inline=false noreturn=false definition
+  parameter %0 value : int
+  compound
+    return
+      comma : int Value
+        call function=Some(FullFunctionId(0)) variadic-boundary=0 : int Value
+          convert FunctionToPointer : pointer to int () Value
+            decl-ref Function(FullFunctionId(0)) : int () FunctionDesignator
+        convert LvalueToValue { access: AccessSemantics { volatile: false, atomic: false } } : int Value
+          decl-ref Local(FullLocalId(0)) : int Lvalue
+function @3 aggregate : int (struct Pair, struct Pair) storage=Extern linkage=External visibility=Default inline=false noreturn=false definition
+  parameter %0 first : struct Pair
+  parameter %1 second : struct Pair
+  compound
+    return
+      binary Add : int Value
+        call function=Some(FullFunctionId(1)) variadic-boundary=1 : int Value
+          convert FunctionToPointer : pointer to int (struct Pair) Value
+            decl-ref Function(FullFunctionId(1)) : int (struct Pair) FunctionDesignator
+          comma : struct Pair Value
+            call function=Some(FullFunctionId(0)) variadic-boundary=0 : int Value
+              convert FunctionToPointer : pointer to int () Value
+                decl-ref Function(FullFunctionId(0)) : int () FunctionDesignator
+            convert LvalueToValue { access: AccessSemantics { volatile: false, atomic: false } } : struct Pair Value
+              decl-ref Local(FullLocalId(1)) : struct Pair Lvalue
+        member #0 value indirect=false : int Value
+          comma : struct Pair Value
+            convert LvalueToValue { access: AccessSemantics { volatile: false, atomic: false } } : struct Pair Value
+              decl-ref Local(FullLocalId(0)) : struct Pair Lvalue
+            convert LvalueToValue { access: AccessSemantics { volatile: false, atomic: false } } : struct Pair Value
+              decl-ref Local(FullLocalId(1)) : struct Pair Lvalue

@@ -16,7 +16,7 @@ global @1 counter : volatile unsigned int storage=Extern linkage=External durati
   initializer : volatile unsigned int
     convert IntegerConversion : unsigned int Value
       constant Signed(2) : int Value
-function @0 convert : int (short int, pointer to int) storage=Extern linkage=External inline=false noreturn=false definition
+function @0 convert : int (short int, pointer to int) storage=Extern linkage=External visibility=Default inline=false noreturn=false definition
   parameter %0 value : short int
   parameter %1 out : restrict pointer to int
   compound

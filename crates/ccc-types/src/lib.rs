@@ -1,5 +1,7 @@
 //! Canonical C types and target-derived layout queries.
 
+pub use ccc_target::TargetBuiltinType;
+
 mod layout;
 mod model;
 mod store;
@@ -10,7 +12,7 @@ pub use model::{
     Field, FunctionParameters, FunctionType, PointerType, QualType, QualifiedType,
     RecordDefinition, RecordId, RecordKind, TypeId, TypeKind, TypeQualifiers, VariableLengthId,
 };
-pub use store::{DefinitionError, TypeStore};
+pub use store::{DefinitionError, TargetBuiltinTypeError, TypeStore};
 
 #[cfg(test)]
 mod tests {
@@ -70,5 +72,40 @@ mod tests {
             length: ArrayLength::Constant(2),
         });
         assert!(types.layout_cache.borrow().is_empty());
+    }
+
+    #[test]
+    fn target_va_list_is_a_canonical_array_of_one_public_abi_record() {
+        let mut types = TypeStore::default();
+        let config = EffectiveCompilationConfig::default();
+        let first = types
+            .target_builtin(TargetBuiltinType::VaList, &config)
+            .unwrap();
+        let second = types
+            .target_builtin(TargetBuiltinType::VaList, &config)
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            types.target_builtin_type(first),
+            Some(TargetBuiltinType::VaList)
+        );
+        let TypeKind::Array(array) = types.kind(first) else {
+            panic!("va_list must retain array parameter-adjustment semantics")
+        };
+        assert_eq!(array.length, ArrayLength::Constant(1));
+        let layout = types.layout_of(first, &config).unwrap();
+        assert_eq!((layout.size, layout.align), (24, 8));
+        let record = types.layout_of(array.element.ty, &config).unwrap();
+        let LayoutShape::Record(record) = record.shape else {
+            panic!("va_list element must be a record")
+        };
+        assert_eq!(
+            record
+                .fields
+                .iter()
+                .map(|field| field.offset)
+                .collect::<Vec<_>>(),
+            vec![0, 4, 8, 16]
+        );
     }
 }

@@ -145,6 +145,7 @@ pub struct FullTypedFunction {
     pub signature: TypeId,
     pub storage: SemanticStorageClass,
     pub linkage: Linkage,
+    pub visibility: SymbolVisibility,
     pub properties: FunctionProperties,
     pub parameters: Vec<FullTypedParameter>,
     pub body: Option<FullTypedStatement>,
@@ -316,6 +317,7 @@ pub enum PlaceProjection {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BitfieldPlace {
     pub field_index: usize,
+    /// Byte offset from the selected field's projected address to its access unit.
     pub storage_offset: u64,
     pub storage_size: u64,
     pub storage_align: u64,
@@ -397,6 +399,7 @@ pub enum FullTypedExpressionKind {
         field_index: usize,
         name: String,
         indirect: bool,
+        bitfield: Option<Box<BitfieldPlace>>,
     },
     Assignment {
         operator: AssignmentOperator,
@@ -435,6 +438,21 @@ pub enum FullTypedExpressionKind {
         record_ty: QualifiedType,
         path: Vec<ResolvedOffsetDesignator>,
         offset: u64,
+    },
+    VaStart {
+        list: Box<FullTypedExpression>,
+        last_named_parameter: FullLocalId,
+    },
+    VaArg {
+        list: Box<FullTypedExpression>,
+        requested: QualifiedType,
+    },
+    VaCopy {
+        destination: Box<FullTypedExpression>,
+        source: Box<FullTypedExpression>,
+    },
+    VaEnd {
+        list: Box<FullTypedExpression>,
     },
 }
 

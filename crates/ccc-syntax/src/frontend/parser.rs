@@ -366,6 +366,14 @@ impl Parser<'_> {
                     self.position += 1;
                     DeclarationSpecifier::Type(TypeSpecifier::Typeof(self.typeof_specifier()?))
                 }
+                Some(TokenKind::Identifier)
+                    if self
+                        .current_token()
+                        .is_some_and(|token| token.spelling == "__builtin_va_list") =>
+                {
+                    self.position += 1;
+                    DeclarationSpecifier::Type(TypeSpecifier::BuiltinVaList)
+                }
                 Some(TokenKind::Keyword(Keyword::Alignas)) => {
                     self.position += 1;
                     DeclarationSpecifier::Alignment(self.alignment_specifier()?)
@@ -1447,6 +1455,18 @@ impl Parser<'_> {
         if token.spelling == "__builtin_offsetof" {
             return self.builtin_offsetof();
         }
+        if token.spelling == "__builtin_va_start" {
+            return self.builtin_va_start();
+        }
+        if token.spelling == "__builtin_va_arg" {
+            return self.builtin_va_arg();
+        }
+        if token.spelling == "__builtin_va_copy" {
+            return self.builtin_va_copy();
+        }
+        if token.spelling == "__builtin_va_end" {
+            return self.builtin_va_end();
+        }
         match token.kind {
             TokenKind::Identifier => {
                 self.position += 1;
@@ -1583,6 +1603,107 @@ impl Parser<'_> {
         })
     }
 
+    fn builtin_va_start(&mut self) -> Result<Expression, ParseError> {
+        let builtin = self
+            .current_token()
+            .expect("caller checked builtin")
+            .clone();
+        self.position += 1;
+        self.expect_punctuator(
+            Punctuator::LeftParen,
+            "expected `(` after `__builtin_va_start`",
+        )?;
+        let list = self.assignment_expression()?;
+        self.expect_punctuator(Punctuator::Comma, "expected `,` after va_list expression")?;
+        let last_named_parameter = self.assignment_expression()?;
+        let right = self.expect_punctuator(
+            Punctuator::RightParen,
+            "expected `)` after `__builtin_va_start` arguments",
+        )?;
+        Ok(Expression {
+            kind: ExpressionKind::BuiltinVaStart {
+                list: Box::new(list),
+                last_named_parameter: Box::new(last_named_parameter),
+            },
+            span: span_through(builtin.span, right.span),
+        })
+    }
+
+    fn builtin_va_arg(&mut self) -> Result<Expression, ParseError> {
+        let builtin = self
+            .current_token()
+            .expect("caller checked builtin")
+            .clone();
+        self.position += 1;
+        self.expect_punctuator(
+            Punctuator::LeftParen,
+            "expected `(` after `__builtin_va_arg`",
+        )?;
+        let list = self.assignment_expression()?;
+        self.expect_punctuator(Punctuator::Comma, "expected `,` after va_list expression")?;
+        let ty = self.type_name()?;
+        let right = self.expect_punctuator(
+            Punctuator::RightParen,
+            "expected `)` after `__builtin_va_arg` type",
+        )?;
+        Ok(Expression {
+            kind: ExpressionKind::BuiltinVaArg {
+                list: Box::new(list),
+                ty: Box::new(ty),
+            },
+            span: span_through(builtin.span, right.span),
+        })
+    }
+
+    fn builtin_va_copy(&mut self) -> Result<Expression, ParseError> {
+        let builtin = self
+            .current_token()
+            .expect("caller checked builtin")
+            .clone();
+        self.position += 1;
+        self.expect_punctuator(
+            Punctuator::LeftParen,
+            "expected `(` after `__builtin_va_copy`",
+        )?;
+        let destination = self.assignment_expression()?;
+        self.expect_punctuator(Punctuator::Comma, "expected `,` after destination va_list")?;
+        let source = self.assignment_expression()?;
+        let right = self.expect_punctuator(
+            Punctuator::RightParen,
+            "expected `)` after `__builtin_va_copy` arguments",
+        )?;
+        Ok(Expression {
+            kind: ExpressionKind::BuiltinVaCopy {
+                destination: Box::new(destination),
+                source: Box::new(source),
+            },
+            span: span_through(builtin.span, right.span),
+        })
+    }
+
+    fn builtin_va_end(&mut self) -> Result<Expression, ParseError> {
+        let builtin = self
+            .current_token()
+            .expect("caller checked builtin")
+            .clone();
+        self.position += 1;
+        self.expect_punctuator(
+            Punctuator::LeftParen,
+            "expected `(` after `__builtin_va_end`",
+        )?;
+        let list = self.assignment_expression()?;
+        let right = self.expect_punctuator(
+            Punctuator::RightParen,
+            "expected `)` after `__builtin_va_end` argument",
+        )?;
+        Ok(Expression {
+            kind: ExpressionKind::BuiltinVaEnd {
+                list: Box::new(list),
+            },
+            span: span_through(builtin.span, right.span),
+        })
+    }
+
     fn current_binary_operator(&self) -> Option<(u8, BinaryOperator)> {
         let punctuator = match self.current_token()?.kind {
             TokenKind::Punctuator(punctuator) => punctuator,
@@ -1658,7 +1779,12 @@ impl Parser<'_> {
     }
 
     fn starts_declaration(&self) -> bool {
-        if self.current_identifier_is_typedef() || self.current_is_plain_gnu("typeof") {
+        if self.current_identifier_is_typedef()
+            || self.current_is_plain_gnu("typeof")
+            || self
+                .current_token()
+                .is_some_and(|token| token.spelling == "__builtin_va_list")
+        {
             return true;
         }
         matches!(
@@ -1749,6 +1875,9 @@ impl Parser<'_> {
             && token.spelling == "typeof"
             && self.language_mode == LanguageMode::Gnu11
         {
+            return true;
+        }
+        if token.kind == TokenKind::Identifier && token.spelling == "__builtin_va_list" {
             return true;
         }
         matches!(

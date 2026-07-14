@@ -93,12 +93,13 @@ fn dump_function(output: &mut String, unit: &FullTypedTranslationUnit, id: FullF
         output,
         0,
         format_args!(
-            "function @{} {} : {} storage={:?} linkage={:?} inline={} noreturn={} {}",
+            "function @{} {} : {} storage={:?} linkage={:?} visibility={:?} inline={} noreturn={} {}",
             id.0,
             function.name,
             unit.types.display(function.signature),
             function.storage,
             function.linkage,
+            function.visibility,
             function.properties.inline,
             function.properties.no_return,
             if function.body.is_some() {
@@ -418,11 +419,21 @@ fn dump_expression(
             field_index,
             name,
             indirect,
+            bitfield,
         } => {
+            let bitfield = bitfield.as_deref().map_or_else(String::new, |descriptor| {
+                format!(
+                    " bitfield={}:{}:{}/{}",
+                    descriptor.storage_offset,
+                    descriptor.storage_size,
+                    descriptor.bit_offset,
+                    descriptor.width
+                )
+            });
             line(
                 output,
                 indent,
-                format_args!("member #{field_index} {name} indirect={indirect}{suffix}"),
+                format_args!("member #{field_index} {name} indirect={indirect}{bitfield}{suffix}"),
             );
             dump_expression(output, unit, base, indent + 1);
         }
@@ -532,6 +543,40 @@ fn dump_expression(
                 path
             ),
         ),
+        FullTypedExpressionKind::VaStart {
+            list,
+            last_named_parameter,
+        } => {
+            line(
+                output,
+                indent,
+                format_args!("va-start last=l{}{suffix}", last_named_parameter.0),
+            );
+            dump_expression(output, unit, list, indent + 1);
+        }
+        FullTypedExpressionKind::VaArg { list, requested } => {
+            line(
+                output,
+                indent,
+                format_args!(
+                    "va-arg requested={}{suffix}",
+                    unit.types.display_qualified(*requested)
+                ),
+            );
+            dump_expression(output, unit, list, indent + 1);
+        }
+        FullTypedExpressionKind::VaCopy {
+            destination,
+            source,
+        } => {
+            line(output, indent, format_args!("va-copy{suffix}"));
+            dump_expression(output, unit, destination, indent + 1);
+            dump_expression(output, unit, source, indent + 1);
+        }
+        FullTypedExpressionKind::VaEnd { list } => {
+            line(output, indent, format_args!("va-end{suffix}"));
+            dump_expression(output, unit, list, indent + 1);
+        }
     }
 }
 

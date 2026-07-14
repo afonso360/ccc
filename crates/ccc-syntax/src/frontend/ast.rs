@@ -103,6 +103,9 @@ pub enum TypeSpecifier {
     Enum(Box<EnumSpecifier>),
     TypedefName(Identifier),
     Typeof(TypeofSpecifier),
+    /// A compiler-provided target type. This is intentionally separate from
+    /// the arithmetic builtin type specifiers.
+    BuiltinVaList,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -340,6 +343,21 @@ pub enum ExpressionKind {
     BuiltinOffsetof {
         ty: Box<TypeName>,
         designator: Vec<OffsetDesignator>,
+    },
+    BuiltinVaStart {
+        list: Box<Expression>,
+        last_named_parameter: Box<Expression>,
+    },
+    BuiltinVaArg {
+        list: Box<Expression>,
+        ty: Box<TypeName>,
+    },
+    BuiltinVaCopy {
+        destination: Box<Expression>,
+        source: Box<Expression>,
+    },
+    BuiltinVaEnd {
+        list: Box<Expression>,
     },
 }
 
