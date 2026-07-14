@@ -1,0 +1,5 @@
+ccc: error[CCC2258]: variably modified object storage is not supported
+ --> tests/diagnostics/cases/variable-length-object.c:2:9
+   |
+ 2 |     int values[count];
+   |         ^^^^^^^^^^^^^

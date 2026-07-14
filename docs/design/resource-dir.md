@@ -12,6 +12,22 @@ Headers are classified rather than all being treated as complete CCC replacement
 
 Every wrapper is tested against each supported libc. CCC does not place a generic header ahead of the system tree if doing so changes libc typedefs or feature-test behavior. Freestanding mode uses self-contained target-derived variants and does not pretend hosted libc declarations are available.
 
+The versioned resource manifest assigns every shipped header to exactly one
+ownership class: `compiler_owned`, `target_derived`, or `hosted_wrappers`. Its
+complete inventory is validated before the directory enters include search.
+Duplicate classification, unlisted files, missing files, and normalized-path
+violations are hard installation errors. A manifest format change is rejected
+rather than interpreted using an older ownership model.
+
+The target-derived `<stddef.h>` template uses `__SIZE_TYPE__`,
+`__PTRDIFF_TYPE__`, and `__WCHAR_TYPE__` from the effective configuration. Its
+`max_align_t` combines the target's fundamental `long long` and `long double`
+alignment requirements, and `offsetof` delegates to `__builtin_offsetof` so
+semantic analysis and the ABI layout oracle share one member-offset answer.
+It implements the conventional `__need_*` partial-include protocol used by
+hosted headers. The associated parser and builtin requirements are part of the
+[frontend capability contract](frontend-capabilities.md).
+
 `stdatomic.h` reports lock-free properties from the same table used by codegen. `stdarg.h` uses the target's actual `va_list` spelling and builtin operations. `float.h` follows the selected native or explicit compatibility long-double mode. When complex support is unavailable, the configuration defines `__STDC_NO_COMPLEX__` and the complex wrapper fails clearly rather than exposing unusable declarations.
 
 ## Include search

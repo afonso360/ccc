@@ -136,6 +136,55 @@ fn normalize_fixture_snapshot(text: &str) -> String {
     normalized
 }
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+fn installed_glibc_identity() -> (String, String, String) {
+    let installed_header = Path::new("/usr/include/features.h");
+    let installed_contents = fs::read_to_string(installed_header)
+        .expect("the Linux hosted-header gate requires /usr/include/features.h");
+    assert!(
+        installed_contents.contains("__GLIBC__"),
+        "the installed features.h is not a glibc header"
+    );
+
+    let compiler = Command::new("cc")
+        .arg("--version")
+        .output()
+        .expect("the Linux hosted-header gate requires cc");
+    assert!(compiler.status.success(), "cc --version failed");
+    let compiler_target = Command::new("cc")
+        .arg("-dumpmachine")
+        .output()
+        .expect("the Linux hosted-header gate requires cc -dumpmachine");
+    assert!(
+        compiler_target.status.success(),
+        "cc -dumpmachine failed with {}",
+        compiler_target.status
+    );
+    let libc = Command::new("getconf")
+        .arg("GNU_LIBC_VERSION")
+        .output()
+        .expect("the Linux hosted-header gate requires getconf");
+    assert!(
+        libc.status.success(),
+        "getconf GNU_LIBC_VERSION failed with {}",
+        libc.status
+    );
+
+    let compiler_identity = String::from_utf8_lossy(&compiler.stdout)
+        .lines()
+        .next()
+        .unwrap_or("unknown compiler")
+        .to_owned();
+    let compiler_target = String::from_utf8_lossy(&compiler_target.stdout)
+        .trim()
+        .to_owned();
+    let libc_identity = String::from_utf8_lossy(&libc.stdout).trim().to_owned();
+    eprintln!(
+        "hosted-header gate: compiler={compiler_identity}; target={compiler_target}; libc={libc_identity}"
+    );
+    (compiler_identity, compiler_target, libc_identity)
+}
+
 #[test]
 fn committed_preprocessing_fixtures_match_their_goldens() {
     let cases = [
@@ -1027,7 +1076,7 @@ fn preprocesses_the_curated_hosted_header_tree_as_system_headers() {
     assert!(output.contains("typedefunsignedlongintsize_t;"), "{output}");
     assert!(output.contains("typedeflongintssize_t;"), "{output}");
     assert!(
-        output.contains("externssize_tfixture_read(int,void*,size_t)"),
+        output.contains("externssize_tfixture_read(int,void*__restrict,size_t)"),
         "{output}"
     );
     assert!(
@@ -1036,37 +1085,40 @@ fn preprocesses_the_curated_hosted_header_tree_as_system_headers() {
     );
 }
 
+#[test]
+fn parses_the_curated_hosted_header_tree_as_system_headers() {
+    let include_directory = repository_fixture("test-corpus/libc-headers/glibc-like");
+    let source = include_directory.join("probe.c");
+    let directory = TestDirectory::new("curated-hosted-header-parse");
+
+    let mut command = directory.command();
+    command
+        .args(["--dump-ast", "-nostdinc", "-isystem"])
+        .arg(&include_directory)
+        .arg(source);
+    let result = run(command);
+    result.assert_success();
+    assert!(result.stderr.trim().is_empty(), "{}", result.stderr);
+    for sentinel in [
+        "declarator fixture_record_t",
+        "declarator fixture_read",
+        "attribute __attribute__ __nothrow__",
+        "asm-label __asm",
+        "function-definition fixture_identity",
+        "declarator hosted_header_preprocessing_sentinel",
+    ] {
+        assert!(
+            result.stdout.contains(sentinel),
+            "AST dump is missing {sentinel:?}:\n{}",
+            result.stdout
+        );
+    }
+}
+
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
 fn preprocesses_installed_target_glibc_headers() {
-    let installed_header = Path::new("/usr/include/features.h");
-    let installed_contents = fs::read_to_string(installed_header)
-        .expect("the Linux hosted-header gate requires /usr/include/features.h");
-    assert!(
-        installed_contents.contains("__GLIBC__"),
-        "the installed features.h is not a glibc header"
-    );
-    let compiler = Command::new("cc")
-        .arg("--version")
-        .output()
-        .expect("the Linux hosted-header gate requires cc");
-    assert!(compiler.status.success(), "cc --version failed");
-    let libc = Command::new("getconf")
-        .arg("GNU_LIBC_VERSION")
-        .output()
-        .expect("the Linux hosted-header gate requires getconf");
-    assert!(
-        libc.status.success(),
-        "getconf GNU_LIBC_VERSION failed with {}",
-        libc.status
-    );
-    let compiler_identity = String::from_utf8_lossy(&compiler.stdout)
-        .lines()
-        .next()
-        .unwrap_or("unknown compiler")
-        .to_owned();
-    let libc_identity = String::from_utf8_lossy(&libc.stdout).trim().to_owned();
-    eprintln!("hosted-header gate: {compiler_identity}; {libc_identity}");
+    let (compiler_identity, compiler_target, libc_identity) = installed_glibc_identity();
 
     let directory = TestDirectory::new("installed-glibc-header");
     let source = directory.write(
@@ -1095,7 +1147,7 @@ fn preprocesses_installed_target_glibc_headers() {
     let result = run(command);
     assert!(
         result.status.success(),
-        "hosted-header gate failed for {compiler_identity}; {libc_identity}\nstdout:\n{}\nstderr:\n{}",
+        "hosted-header gate failed for {compiler_identity}; {compiler_target}; {libc_identity}\nstdout:\n{}\nstderr:\n{}",
         result.stdout,
         result.stderr
     );
@@ -1119,6 +1171,78 @@ fn preprocesses_installed_target_glibc_headers() {
         assert!(
             !result.stdout.contains(unexpanded),
             "installed headers left {unexpanded} unexpanded:\n{}",
+            result.stdout
+        );
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn parses_installed_target_glibc_headers() {
+    let (compiler_identity, compiler_target, libc_identity) = installed_glibc_identity();
+    let directory = TestDirectory::new("installed-glibc-header-parse");
+    let source = directory.write(
+        "installed-parse.c",
+        concat!(
+            "#define _GNU_SOURCE 1\n",
+            "#include <features.h>\n",
+            "#include <stddef.h>\n",
+            "#include <stdint.h>\n",
+            "#include <sys/types.h>\n",
+            "#include <unistd.h>\n",
+            "#include <string.h>\n",
+            "__extension__ typedef __typeof__(sizeof(0)) installed_typeof_sentinel_t;\n",
+            "typedef __signed__ int *installed_pointer_sentinel_t;\n",
+            "__restrict__ installed_pointer_sentinel_t installed_restrict_sentinel;\n",
+            "extern __signed__ int installed_asm_sentinel(\n",
+            "    __const__ char *__restrict__ value)\n",
+            "    __asm__(\"installed_asm_target\") __attribute__((__nothrow__));\n",
+            "static __inline__ __signed__ int installed_inline_sentinel(\n",
+            "    __const__ __signed__ int *__restrict__ value) { return *value; }\n",
+            "int installed_glibc_parse_sentinel;\n",
+        ),
+    );
+
+    let mut command = directory.command();
+    command.arg("--dump-ast").arg(source);
+    let result = run(command);
+    assert!(
+        result.status.success(),
+        "hosted-header parse gate failed for {compiler_identity}; {compiler_target}; {libc_identity}\nstdout:\n{}\nstderr:\n{}",
+        result.stdout,
+        result.stderr
+    );
+    assert!(result.stderr.trim().is_empty(), "{}", result.stderr);
+
+    let ast_lines = result.stdout.lines().map(str::trim).collect::<Vec<_>>();
+    for declaration in [
+        "declarator size_t",
+        "declarator ssize_t",
+        "declarator read(3)",
+        "declarator *memcpy(3)",
+        "declarator installed_typeof_sentinel_t",
+        "declarator installed_restrict_sentinel",
+        "declarator installed_asm_sentinel(1)",
+        "asm-label __asm__ \"installed_asm_target\"",
+        "attribute __attribute__ __nothrow__",
+        "function-definition installed_inline_sentinel",
+        "declarator installed_glibc_parse_sentinel",
+    ] {
+        assert!(
+            ast_lines.contains(&declaration),
+            "AST dump is missing exact line {declaration:?}:\n{}",
+            result.stdout
+        );
+    }
+    for syntax_surface in [
+        "extension",
+        "type Typeof",
+        "qualifier Restrict",
+        "function-specifier Inline",
+    ] {
+        assert!(
+            ast_lines.contains(&syntax_surface),
+            "AST dump is missing GNU declaration surface {syntax_surface:?}:\n{}",
             result.stdout
         );
     }

@@ -1,0 +1,5 @@
+ccc: error[CCC4011]: atomic memory access requires native atomic instruction lowering
+ --> tests/diagnostics/cases/atomic-access.c:3:12
+   |
+ 3 |     return value;
+   |            ^^^^^ while generating native code

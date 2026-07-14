@@ -1,0 +1,5 @@
+ccc: error[CCC2274]: use of undeclared identifier `missing`
+ --> tests/diagnostics/cases/undeclared-identifier.c:2:12
+   |
+ 2 |     return missing;
+   |            ^^^^^^^

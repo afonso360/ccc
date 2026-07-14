@@ -1,0 +1,5 @@
+ccc: error[CCC2372]: static declaration of function `function` follows a non-static declaration
+ --> tests/diagnostics/cases/linkage-function.c:2:12
+   |
+ 2 | static int function(void);
+   |            ^^^^^^^^^^^^^^

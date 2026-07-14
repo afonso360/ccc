@@ -68,6 +68,11 @@ GNU spellings and capabilities are described by a versioned registry shared by t
 - **Parse-only:** retained in the AST for header parsing, but semantic use or code-generation reachability produces a hard diagnostic.
 - **Unsupported:** rejected at the point of use.
 
+The exact alternative-keyword, attribute, declaration, and phase-certification
+rules are the [frontend capability contract](frontend-capabilities.md). Syntax
+recognition alone does not advance a hosted-header profile beyond its recorded
+phase.
+
 Layout, calling-convention, visibility, aliasing, section, TLS, cleanup, control-flow, vector, and code-generation attributes can never be classified as no-ops. Unknown attributes are preserved for diagnostics and rejected unless the standard explicitly permits them to be ignored and doing so is behavior-safe.
 
 `__has_attribute`, `__has_builtin`, `__has_feature`, and related predicates
@@ -80,11 +85,13 @@ while computed operands use normal macro expansion.
 CCC always defines `__CCC__` and a CCC version tuple. `__GNUC__` and its version macros are defined only when a named GNU compatibility profile is active. Each profile has a checked manifest of the unguarded syntax and semantics that headers may infer from that GCC version; CCC does not raise the advertised version until the manifest passes on every target that exposes it.
 
 The manifest distinguishes claims needed to select a hosted header's
-preprocessing path from claims needed to compile the resulting declarations.
-A preprocessing-only invocation may use a checked header-selection manifest;
-an invocation that continues into parsing may consume hosted system headers
-only when the parser and semantic capability entries inferred by the same GNU
-version also pass. The exact advertised GCC version is data in the manifest,
+preprocessing path from claims needed to parse or compile the resulting
+declarations. A preprocessing-only invocation may use a checked
+header-selection manifest. An invocation that continues into parsing requires
+the parser entries inferred by the same GNU version and retains parse-only
+constructs in the AST. Semantic analysis and object emission each require their
+own stronger capability ceiling; a parsing profile never promotes parse-only
+entries implicitly. The exact advertised GCC version is data in the manifest,
 and changes to it require an audit of every version gate exercised by the
 pinned libc-header corpus.
 

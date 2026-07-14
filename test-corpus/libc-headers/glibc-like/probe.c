@@ -8,4 +8,5 @@
 #error the declaration compatibility macro is missing
 #endif
 
+fixture_record_t hosted_header_record;
 int hosted_header_preprocessing_sentinel;

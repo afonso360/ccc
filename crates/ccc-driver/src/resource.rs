@@ -4,10 +4,10 @@ use std::path::{Component, Path, PathBuf};
 
 use ccc_target::GnuCompatibilityProfile;
 
-const RESOURCE_FORMAT_VERSION: u64 = 1;
+const RESOURCE_FORMAT_VERSION: u64 = 2;
 const GNU_PROFILE_NAME: &str = "gcc-4.2.1";
 const GNU_PROFILE_VERSION: &str = "4.2.1";
-const GNU_PROFILE_SCOPE: &str = "preprocessing";
+const GNU_PROFILE_SCOPE: &str = "parsing";
 const GNU_PROFILE_SELECTION_GATE: &str = "__GNUC_PREREQ(4, 2)";
 const GNU_PROFILE_CAPABILITIES: &[&str] = &[
     "computed-includes",
@@ -15,7 +15,13 @@ const GNU_PROFILE_CAPABILITIES: &[&str] = &[
     "gcc-diagnostic-pragma",
     "gcc-system-header-pragma",
     "gnu-comma-elision",
+    "gnu-alternative-keywords",
+    "gnu-attribute-specifiers",
+    "gnu-declaration-asm-labels",
+    "gnu-extension-marker",
     "gnu-named-variadic-macros",
+    "gnu-restrict-qualifiers",
+    "gnu-typeof",
     "include-next",
     "line-control",
     "object-like-macros",
@@ -100,7 +106,9 @@ struct ResourceManifest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct HeaderManifest {
     directory: String,
-    owned: Vec<String>,
+    compiler_owned: Vec<String>,
+    target_derived: Vec<String>,
+    hosted_wrappers: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -122,7 +130,9 @@ impl ResourceManifest {
             compiler_version: document.string("compiler_version")?,
             headers: HeaderManifest {
                 directory: document.string("headers.directory")?,
-                owned: document.strings("headers.owned")?,
+                compiler_owned: document.strings("headers.compiler_owned")?,
+                target_derived: document.strings("headers.target_derived")?,
+                hosted_wrappers: document.strings("headers.hosted_wrappers")?,
             },
             hosted_header_profile: HostedHeaderProfileManifest {
                 name: document.string("hosted_header_profile.name")?,
@@ -167,27 +177,40 @@ impl ResourceManifest {
             ));
         }
 
-        let mut listed = BTreeSet::new();
-        for header in &self.headers.owned {
-            let path = checked_relative_path(header, "headers.owned entry")?;
-            let normalized = slash_path(&path);
-            if !listed.insert(normalized.clone()) {
-                return Err(format!(
-                    "resource manifest {} lists header {normalized:?} more than once",
-                    manifest_path.display()
-                ));
-            }
-            let header_path = include.join(path);
-            if !header_path.is_file() {
-                return Err(format!(
-                    "resource manifest {} lists missing header {}",
-                    manifest_path.display(),
-                    header_path.display()
-                ));
+        let mut classified = BTreeMap::new();
+        for (class, headers) in [
+            ("headers.compiler_owned", &self.headers.compiler_owned),
+            ("headers.target_derived", &self.headers.target_derived),
+            ("headers.hosted_wrappers", &self.headers.hosted_wrappers),
+        ] {
+            for header in headers {
+                let path = checked_relative_path(header, &format!("{class} entry"))?;
+                let normalized = slash_path(&path);
+                if let Some(previous) = classified.insert(normalized.clone(), class) {
+                    if previous == class {
+                        return Err(format!(
+                            "resource manifest {} lists header {normalized:?} more than once in {class}",
+                            manifest_path.display()
+                        ));
+                    }
+                    return Err(format!(
+                        "resource manifest {} classifies header {normalized:?} in both {previous} and {class}",
+                        manifest_path.display()
+                    ));
+                }
+                let header_path = include.join(path);
+                if !header_path.is_file() {
+                    return Err(format!(
+                        "resource manifest {} lists missing header {} in {class}",
+                        manifest_path.display(),
+                        header_path.display()
+                    ));
+                }
             }
         }
 
         let discovered = header_inventory(&include)?;
+        let listed = classified.keys().cloned().collect::<BTreeSet<_>>();
         let missing_from_manifest = discovered.difference(&listed).cloned().collect::<Vec<_>>();
         let absent_from_disk = listed.difference(&discovered).cloned().collect::<Vec<_>>();
         if !missing_from_manifest.is_empty() || !absent_from_disk.is_empty() {
@@ -575,28 +598,36 @@ mod tests {
     use super::*;
 
     const VALID_MANIFEST: &str = concat!(
-        "format_version = 1\n",
+        "format_version = 2\n",
         "compiler_version = \"",
         env!("CARGO_PKG_VERSION"),
         "\"\n",
         "\n",
         "[headers]\n",
         "directory = \"include\"\n",
-        "owned = [\"stdbool.h\"]\n",
+        "compiler_owned = [\"stdbool.h\"]\n",
+        "target_derived = [\"stddef.h\"]\n",
+        "hosted_wrappers = [\"stdint.h\"]\n",
         "\n",
         "[hosted_header_profile]\n",
         "name = \"gcc-4.2.1\"\n",
         "version = \"4.2.1\"\n",
-        "scope = \"preprocessing\"\n",
+        "scope = \"parsing\"\n",
         "selection_gate = \"__GNUC_PREREQ(4, 2)\"\n",
-        "rationale = \"The conservative gate selects preprocessing declarations without implying newer GNU features.\"\n",
+        "rationale = \"The conservative gate selects a tested preprocessing and declaration-parsing surface without implying newer GNU features.\"\n",
         "capabilities = [\n",
         "  \"computed-includes\",\n",
         "  \"function-like-macros\",\n",
         "  \"gcc-diagnostic-pragma\",\n",
         "  \"gcc-system-header-pragma\",\n",
         "  \"gnu-comma-elision\",\n",
+        "  \"gnu-alternative-keywords\",\n",
+        "  \"gnu-attribute-specifiers\",\n",
+        "  \"gnu-declaration-asm-labels\",\n",
+        "  \"gnu-extension-marker\",\n",
         "  \"gnu-named-variadic-macros\",\n",
+        "  \"gnu-restrict-qualifiers\",\n",
+        "  \"gnu-typeof\",\n",
         "  \"include-next\",\n",
         "  \"line-control\",\n",
         "  \"object-like-macros\",\n",
@@ -619,6 +650,12 @@ mod tests {
                 std::env::temp_dir().join(format!("ccc-resource-test-{}-{id}", std::process::id()));
             fs::create_dir_all(path.join("include")).unwrap();
             fs::write(path.join("include/stdbool.h"), "#define bool _Bool\n").unwrap();
+            fs::write(
+                path.join("include/stddef.h"),
+                "typedef __SIZE_TYPE__ size_t;\n",
+            )
+            .unwrap();
+            fs::write(path.join("include/stdint.h"), "#include_next <stdint.h>\n").unwrap();
             Self(path)
         }
 
@@ -638,6 +675,43 @@ mod tests {
         let resources = ResourceDirectory::discover(None).unwrap();
         assert!(resources.root().ends_with("resource-dir"));
         assert!(resources.include().join("stdbool.h").is_file());
+        assert!(resources.include().join("stddef.h").is_file());
+    }
+
+    #[test]
+    fn ships_the_target_derived_stddef_contract() {
+        let resources = ResourceDirectory::discover(None).unwrap();
+        let manifest_source = fs::read_to_string(resources.root().join("manifest.toml")).unwrap();
+        let manifest = ResourceManifest::parse(&manifest_source).unwrap();
+        assert_eq!(manifest.format_version, RESOURCE_FORMAT_VERSION);
+        assert_eq!(manifest.headers.target_derived, vec!["stddef.h".to_owned()]);
+        assert!(
+            !manifest
+                .headers
+                .compiler_owned
+                .iter()
+                .any(|header| header == "stddef.h")
+        );
+        assert!(
+            !manifest
+                .headers
+                .hosted_wrappers
+                .iter()
+                .any(|header| header == "stddef.h")
+        );
+
+        let stddef = fs::read_to_string(resources.include().join("stddef.h")).unwrap();
+        for contract in [
+            "typedef __SIZE_TYPE__ size_t;",
+            "typedef __PTRDIFF_TYPE__ ptrdiff_t;",
+            "max_align_t;",
+            "#define offsetof(type, member) __builtin_offsetof(type, member)",
+        ] {
+            assert!(
+                stddef.contains(contract),
+                "stddef.h is missing contract {contract:?}"
+            );
+        }
     }
 
     #[test]
@@ -673,13 +747,15 @@ mod tests {
     #[test]
     fn rejects_incompatible_format_and_compiler_versions() {
         let directory = TestDirectory::new();
-        directory.write_manifest(&VALID_MANIFEST.replacen(
-            "format_version = 1",
-            "format_version = 2",
-            1,
-        ));
-        let error = ResourceDirectory::load(directory.0.clone()).unwrap_err();
-        assert!(error.contains("expected 1"), "{error}");
+        for incompatible in [1, 3] {
+            directory.write_manifest(&VALID_MANIFEST.replacen(
+                "format_version = 2",
+                &format!("format_version = {incompatible}"),
+                1,
+            ));
+            let error = ResourceDirectory::load(directory.0.clone()).unwrap_err();
+            assert!(error.contains("expected 2"), "{error}");
+        }
 
         directory.write_manifest(&VALID_MANIFEST.replacen(
             concat!("compiler_version = \"", env!("CARGO_PKG_VERSION"), "\""),
@@ -717,14 +793,27 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_inventory_and_unsafe_paths() {
+    fn rejects_duplicate_or_overlapping_header_classes_and_unsafe_paths() {
         let directory = TestDirectory::new();
         directory.write_manifest(&VALID_MANIFEST.replace(
-            "owned = [\"stdbool.h\"]",
-            "owned = [\"stdbool.h\", \"stdbool.h\"]",
+            "compiler_owned = [\"stdbool.h\"]",
+            "compiler_owned = [\"stdbool.h\", \"stdbool.h\"]",
         ));
         let error = ResourceDirectory::load(directory.0.clone()).unwrap_err();
-        assert!(error.contains("more than once"), "{error}");
+        assert!(
+            error.contains("more than once in headers.compiler_owned"),
+            "{error}"
+        );
+
+        directory.write_manifest(&VALID_MANIFEST.replace(
+            "target_derived = [\"stddef.h\"]",
+            "target_derived = [\"stddef.h\", \"stdbool.h\"]",
+        ));
+        let error = ResourceDirectory::load(directory.0.clone()).unwrap_err();
+        assert!(
+            error.contains("both headers.compiler_owned and headers.target_derived"),
+            "{error}"
+        );
 
         directory.write_manifest(
             &VALID_MANIFEST.replace("directory = \"include\"", "directory = \"../include\""),

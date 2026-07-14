@@ -1,0 +1,95 @@
+translation-unit full-typed
+global @0 values : array[3] of int storage=Extern linkage=External duration=Static symbol=values definition=Definition
+  initializer : array[3] of int
+    subobject [Index(0)]
+      initializer : int
+        constant Signed(2) : int Value
+    subobject [Index(1)]
+      initializer : int
+        constant Signed(3) : int Value
+    subobject [Index(2)]
+      initializer : int
+        constant Signed(5) : int Value
+global-redeclaration @0
+global @1 state : int storage=Static linkage=Internal duration=Static symbol=state definition=Definition
+  initializer : int
+    constant Signed(1) : int Value
+function @0 transform : int (int) storage=Extern linkage=External inline=false noreturn=false definition
+  parameter %0 value : int
+  compound
+    return
+      binary Add : int Value
+        convert LvalueToValue { access: AccessSemantics { volatile: false, atomic: false } } : int Value
+          decl-ref Local(FullLocalId(0)) : int Lvalue
+        convert LvalueToValue { access: AccessSemantics { volatile: false, atomic: false } } : int Value
+          decl-ref Global(GlobalId(1)) : int Lvalue
+function-redeclaration @0
+function-redeclaration @0
+function @1 drive : int (int) storage=Extern linkage=External inline=false noreturn=false definition
+  parameter %0 limit : int
+  compound
+    local %1 total : int storage=Automatic duration=Automatic
+      initializer : int
+        constant Signed(0) : int Value
+    local %2 operation : pointer to int (int) storage=Automatic duration=Automatic
+      initializer : pointer to int (int)
+        convert PointerConversion : pointer to int (int) Value
+          convert FunctionToPointer : pointer to int (int) Value
+            decl-ref Function(FullFunctionId(0)) : int (int) FunctionDesignator
+    for
+      initializer declarations
+        local %3 index : int storage=Automatic duration=Automatic
+          initializer : int
+            constant Signed(0) : int Value
+      condition
+        convert ToBoolean : int Value
+          binary Less : int Value
+            convert LvalueToValue { access: AccessSemantics { volatile: false, atomic: false } } : int Value
+              decl-ref Local(FullLocalId(3)) : int Lvalue
+            convert LvalueToValue { access: AccessSemantics { volatile: false, atomic: false } } : int Value
+              decl-ref Local(FullLocalId(0)) : int Lvalue
+      step
+        increment decrement=false postfix=false store=AccessSemantics { volatile: false, atomic: false } : int Value
+          decl-ref Local(FullLocalId(3)) : int Lvalue
+      compound
+        switch
+          value
+            binary BitwiseAnd : int Value
+              convert LvalueToValue { access: AccessSemantics { volatile: false, atomic: false } } : int Value
+                decl-ref Local(FullLocalId(3)) : int Lvalue
+              constant Signed(1) : int Value
+          compound
+            case 0
+              expression-statement
+                assignment Add store=AccessSemantics { volatile: false, atomic: false } compound=operator=Add load=int calculation=int access=AccessSemantics { volatile: false, atomic: false } result=None : int Value
+                  decl-ref Local(FullLocalId(1)) : int Lvalue
+                  convert LvalueToValue { access: AccessSemantics { volatile: false, atomic: false } } : int Value
+                    subscript : int Lvalue
+                      convert ArrayToPointer : pointer to int Value
+                        decl-ref Global(GlobalId(0)) : array[3] of int Lvalue
+                      convert LvalueToValue { access: AccessSemantics { volatile: false, atomic: false } } : int Value
+                        decl-ref Local(FullLocalId(3)) : int Lvalue
+            break
+            default
+              expression-statement
+                assignment Add store=AccessSemantics { volatile: false, atomic: false } compound=operator=Add load=int calculation=int access=AccessSemantics { volatile: false, atomic: false } result=None : int Value
+                  decl-ref Local(FullLocalId(1)) : int Lvalue
+                  convert LvalueToValue { access: AccessSemantics { volatile: false, atomic: false } } : int Value
+                    decl-ref Local(FullLocalId(3)) : int Lvalue
+            if
+              condition
+                convert ToBoolean : int Value
+                  binary Greater : int Value
+                    convert LvalueToValue { access: AccessSemantics { volatile: false, atomic: false } } : int Value
+                      decl-ref Local(FullLocalId(1)) : int Lvalue
+                    constant Signed(20) : int Value
+              then
+                goto ^0 done
+    label ^0 done
+      return
+        call function=None variadic-boundary=1 : int Value
+          convert LvalueToValue { access: AccessSemantics { volatile: false, atomic: false } } : pointer to int (int) Value
+            decl-ref Local(FullLocalId(2)) : pointer to int (int) Lvalue
+          convert LvalueToValue { access: AccessSemantics { volatile: false, atomic: false } } : int Value
+            decl-ref Local(FullLocalId(1)) : int Lvalue
+global-redeclaration @0

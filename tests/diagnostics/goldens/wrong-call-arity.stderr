@@ -1,0 +1,5 @@
+ccc: error[CCC2300]: function expects 2 argument(s), but 1 were supplied
+ --> tests/diagnostics/cases/wrong-call-arity.c:3:12
+   |
+ 3 |     return add(1);
+   |            ^^^^^^

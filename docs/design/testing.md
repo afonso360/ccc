@@ -32,6 +32,15 @@ For every target:
 - aggregate, hidden return, register exhaustion, stack alignment, variadic, TLS, long-double, and helper-call cases are included;
 - matching CCC on both sides is never treated as proof of platform ABI compatibility.
 
+The enabled x86-64 Linux layout gate requires both GCC and Clang, records each
+compiler identity, and rejects a reported target that is not ABI-compatible
+with `x86_64-unknown-linux-gnu`. It compares ELF symbol sizes plus XOR deltas
+from zero-initialized baselines, so padding bytes are not treated as values.
+The bit-field corpus includes mixed declared types, signed negative values,
+zero-width barriers, storage-unit boundaries, unnamed fields, nested records,
+unions, and packed records. A missing reference compiler is a test failure,
+not a skipped oracle.
+
 Variadic tests separately cover call sites and definitions, direct and indirect calls, promoted floating-point arguments, aggregates, register/stack boundaries, `va_copy`, and target-specific state such as SysV `%al`. Long-double tests verify size/alignment/macros, arithmetic, object representation, and calls in both directions; explicit compatibility-mode objects must be rejected when mixed with incompatible CCC objects.
 
 ## Differential testing and undefined behavior
@@ -57,12 +66,15 @@ Every enabled target has a required matrix entry. A target without an execution 
 
 SQLite, Lua, zlib, musl, tcc, selected libc-header fixtures, c-testsuite, and GCC torture tests exercise drop-in compatibility. Each integration records the exact build command, enabled features, patches if any, expected exclusions, and whether success means preprocess, compile, link, or run. “Builds unmodified” is used only when no source or build-system patch is applied.
 
-The hosted-header preprocessing gate consists of a licensed, pinned fixture
-with deterministic goldens and a Linux-only smoke test against installed glibc
-feature, definition, and integer headers. The installed-header test records the
-toolchain and libc identity and asserts stable sentinel properties rather than
-snapshotting a mutable system header. Parsing that header is not implied by
-preprocessing success.
+Hosted-header preprocessing and parsing are separate gates. A licensed, pinned
+glibc-like fixture has both a deterministic preprocessing golden and an AST
+surface check. On x86-64 Linux, installed glibc feature, definition, integer,
+type, unistd, and string headers are also exercised by separate preprocessing
+and parsing tests. The installed-header tests record compiler, target, and libc
+identity and assert stable sentinel properties rather than snapshotting a
+mutable system header. Parsing success certifies only the advertised parsing
+ceiling; it does not imply semantic analysis or object-emission support for
+parse-only declarations.
 
 Corpus pins encode capability dependencies. SQLite is pinned to ≥ 3.45, which removed core `long double` arithmetic — an earlier pin silently requires the f80 runtime on the primary target — and its gate runs the `veryquick` TCL set through `testfixture`, which needs a TCL development environment; the full suite and TH3 are out of scope. Lua's default GNU-profile build exercises `setjmp`/`longjmp` and computed-goto dispatch. musl feeds `$CC` assembly files.
 

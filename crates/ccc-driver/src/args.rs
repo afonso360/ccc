@@ -7,6 +7,7 @@ pub(crate) enum DumpKind {
     PpTokens,
     Tokens,
     Ast,
+    TypedAst,
     Ir,
     Clif,
 }
@@ -143,6 +144,7 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
             "--dump-pp-tokens" => select_dump(&mut dump, DumpKind::PpTokens)?,
             "--dump-tokens" => select_dump(&mut dump, DumpKind::Tokens)?,
             "--dump-ast" => select_dump(&mut dump, DumpKind::Ast)?,
+            "--dump-typed-ast" => select_dump(&mut dump, DumpKind::TypedAst)?,
             "--dump-ir" => select_dump(&mut dump, DumpKind::Ir)?,
             "--emit=clif" => select_dump(&mut dump, DumpKind::Clif)?,
             "-trigraphs" => trigraphs = TrigraphPolicy::Enabled,
@@ -450,6 +452,14 @@ mod tests {
             }
         );
         assert_eq!(options.dependencies.output, Some(PathBuf::from("deps.d")));
+    }
+
+    #[test]
+    fn selects_the_typed_ast_dump() {
+        assert_eq!(
+            options(&["--dump-typed-ast", "input.c"]).action,
+            PrimaryAction::Dump(DumpKind::TypedAst)
+        );
     }
 
     #[test]

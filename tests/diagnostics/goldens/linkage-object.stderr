@@ -1,0 +1,5 @@
+ccc: error[CCC2372]: static declaration of object `object` follows a non-static declaration
+ --> tests/diagnostics/cases/linkage-object.c:2:12
+   |
+ 2 | static int object;
+   |            ^^^^^^

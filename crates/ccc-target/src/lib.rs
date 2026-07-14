@@ -1,9 +1,20 @@
 //! Target defaults and the effective configuration shared by compiler phases.
 
+mod compat;
+mod layout;
+
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+pub use compat::{
+    CapabilityEntry, CapabilityKey, CapabilityKind, CapabilityRegistry, CapabilityState,
+    CompatibilityScope, CompatibilityVersion, GnuCompatibilityProfile,
+};
+pub use layout::{
+    BitfieldLayoutPolicy, BitfieldOrder, ByteOrder, PackingPolicy, ScalarLayout, TargetDataLayout,
+    TargetScalarKind,
+};
 pub use target_lexicon::{
     Architecture, BinaryFormat, CallingConvention, Environment, OperatingSystem, PointerWidth,
     Triple, Vendor,
@@ -72,160 +83,6 @@ impl LanguageOptions {
     }
 }
 
-/// A compiler compatibility version advertised to hosted headers.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct CompatibilityVersion {
-    pub major: u16,
-    pub minor: u16,
-    pub patch: u16,
-}
-
-impl CompatibilityVersion {
-    pub const fn new(major: u16, minor: u16, patch: u16) -> Self {
-        Self {
-            major,
-            minor,
-            patch,
-        }
-    }
-}
-
-/// The compiler phases certified by a hosted-header compatibility profile.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum CompatibilityScope {
-    /// The profile selects and expands hosted headers but does not certify the
-    /// resulting declarations for parsing or semantic analysis.
-    Preprocessing,
-}
-
-/// The GNU compatibility contract used to select hosted-header paths.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GnuCompatibilityProfile {
-    pub name: String,
-    pub version: CompatibilityVersion,
-    pub scope: CompatibilityScope,
-}
-
-impl GnuCompatibilityProfile {
-    pub fn gcc_4_2_1() -> Self {
-        Self {
-            name: "gcc-4.2.1".to_owned(),
-            version: CompatibilityVersion::new(4, 2, 1),
-            scope: CompatibilityScope::Preprocessing,
-        }
-    }
-}
-
-/// The family of a compatibility capability.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum CapabilityKind {
-    Attribute,
-    Builtin,
-    Extension,
-    Feature,
-    Pragma,
-}
-
-/// The semantic state of a compatibility capability.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub enum CapabilityState {
-    Implemented,
-    BehaviorCompatibleNoOp,
-    ParseOnly,
-    Unsupported,
-}
-
-impl CapabilityState {
-    /// Whether a feature predicate may truthfully report this capability.
-    pub const fn is_available(self) -> bool {
-        matches!(self, Self::Implemented | Self::BehaviorCompatibleNoOp)
-    }
-}
-
-/// A stable lookup key in the shared compatibility registry.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct CapabilityKey {
-    pub kind: CapabilityKind,
-    pub name: String,
-}
-
-impl CapabilityKey {
-    pub fn new(kind: CapabilityKind, name: impl Into<String>) -> Self {
-        Self {
-            kind,
-            name: name.into(),
-        }
-    }
-}
-
-/// One entry in the shared compatibility registry.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CapabilityEntry {
-    pub state: CapabilityState,
-    pub rationale: Option<String>,
-}
-
-/// Compatibility facts shared by preprocessing, parsing, and diagnostics.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct CapabilityRegistry {
-    entries: BTreeMap<CapabilityKey, CapabilityEntry>,
-}
-
-impl CapabilityRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn insert(
-        &mut self,
-        kind: CapabilityKind,
-        name: impl Into<String>,
-        state: CapabilityState,
-    ) -> Option<CapabilityEntry> {
-        self.entries.insert(
-            CapabilityKey::new(kind, name),
-            CapabilityEntry {
-                state,
-                rationale: None,
-            },
-        )
-    }
-
-    pub fn insert_with_rationale(
-        &mut self,
-        kind: CapabilityKind,
-        name: impl Into<String>,
-        state: CapabilityState,
-        rationale: impl Into<String>,
-    ) -> Option<CapabilityEntry> {
-        self.entries.insert(
-            CapabilityKey::new(kind, name),
-            CapabilityEntry {
-                state,
-                rationale: Some(rationale.into()),
-            },
-        )
-    }
-
-    pub fn entry(&self, kind: CapabilityKind, name: &str) -> Option<&CapabilityEntry> {
-        self.entries.get(&CapabilityKey::new(kind, name))
-    }
-
-    /// Unknown entries are unsupported rather than optimistically accepted.
-    pub fn state(&self, kind: CapabilityKind, name: &str) -> CapabilityState {
-        self.entry(kind, name)
-            .map_or(CapabilityState::Unsupported, |entry| entry.state)
-    }
-
-    pub fn is_available(&self, kind: CapabilityKind, name: &str) -> bool {
-        self.state(kind, name).is_available()
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = (&CapabilityKey, &CapabilityEntry)> {
-        self.entries.iter()
-    }
-}
-
 /// Target-derived predefined macro spellings and replacement text.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PredefinedMacroFacts {
@@ -264,26 +121,6 @@ impl PredefinedMacroFacts {
     }
 }
 
-/// Immutable data-layout defaults for an enabled target.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct TargetDataLayout {
-    pub char_is_signed: bool,
-    pub char_width: u8,
-    pub short_width: u8,
-    pub int_width: u8,
-    pub long_width: u8,
-    pub long_long_width: u8,
-    pub pointer_width: u8,
-    pub float_width: u8,
-    pub double_width: u8,
-    pub long_double_width: u8,
-    pub long_double_align: u8,
-    pub wchar_width: u8,
-    pub wchar_is_signed: bool,
-    pub wint_width: u8,
-    pub wint_is_signed: bool,
-}
-
 /// Immutable defaults for an enabled target.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TargetSpec {
@@ -306,6 +143,10 @@ impl TargetSpec {
 
     pub fn calling_convention(&self) -> Option<CallingConvention> {
         self.triple.default_calling_convention().ok()
+    }
+
+    pub const fn scalar_layout(&self, kind: TargetScalarKind) -> ScalarLayout {
+        self.data_layout.scalar(kind)
     }
 
     pub fn predefined_macro_facts(&self) -> PredefinedMacroFacts {
@@ -732,7 +573,7 @@ impl EffectiveCompilationConfig {
             target,
             language: LanguageOptions::default(),
             gnu_profile: Some(GnuCompatibilityProfile::gcc_4_2_1()),
-            capabilities: CapabilityRegistry::default(),
+            capabilities: CapabilityRegistry::gnu_frontend(),
             target_macros,
             resource_dir: None,
             toolchain: ToolchainSpec::default(),
@@ -809,21 +650,40 @@ pub const X86_64_UNKNOWN_LINUX_GNU: TargetSpec = TargetSpec {
     },
     int_align: 4,
     data_layout: TargetDataLayout {
+        byte_order: ByteOrder::Little,
         char_is_signed: true,
+        bool_width: 8,
+        bool_align: 1,
         char_width: 8,
+        char_align: 1,
         short_width: 16,
+        short_align: 2,
         int_width: 32,
+        int_align: 4,
         long_width: 64,
+        long_align: 8,
         long_long_width: 64,
+        long_long_align: 8,
         pointer_width: 64,
+        pointer_align: 8,
         float_width: 32,
+        float_align: 4,
         double_width: 64,
+        double_align: 8,
         long_double_width: 128,
         long_double_align: 16,
         wchar_width: 32,
         wchar_is_signed: true,
         wint_width: 32,
         wint_is_signed: false,
+        bitfields: BitfieldLayoutPolicy {
+            order: BitfieldOrder::LeastSignificantFirst,
+            may_cross_storage_units: false,
+            coalesce_different_declared_types: true,
+            packed_fields_are_contiguous: true,
+            zero_width_uses_declared_alignment: true,
+        },
+        default_packing: PackingPolicy::NATIVE,
     },
 };
 
@@ -842,6 +702,12 @@ mod tests {
         assert_eq!(config.target.triple.data_model(), Ok(CDataModel::LP64));
         assert_eq!(config.target.int_width(), Some(32));
         assert_eq!(config.target.pointer_width(), Some(64));
+        let bitfields = config.target.data_layout.bitfields;
+        assert_eq!(bitfields.order, BitfieldOrder::LeastSignificantFirst);
+        assert!(!bitfields.may_cross_storage_units);
+        assert!(bitfields.coalesce_different_declared_types);
+        assert!(bitfields.packed_fields_are_contiguous);
+        assert!(bitfields.zero_width_uses_declared_alignment);
         assert_eq!(
             config.target.calling_convention(),
             Some(CallingConvention::SystemV)
@@ -854,7 +720,7 @@ mod tests {
         );
         assert_eq!(
             config.gnu_profile.as_ref().map(|profile| profile.scope),
-            Some(CompatibilityScope::Preprocessing)
+            Some(CompatibilityScope::Parsing)
         );
     }
 
@@ -887,27 +753,6 @@ mod tests {
         assert_eq!(facts.get("__linux__"), Some("1"));
         assert_eq!(facts.get("linux"), None);
         assert_eq!(facts.get("unix"), None);
-    }
-
-    #[test]
-    fn unknown_capabilities_are_not_advertised() {
-        let mut registry = CapabilityRegistry::new();
-        assert_eq!(
-            registry.state(CapabilityKind::Builtin, "__builtin_unknown"),
-            CapabilityState::Unsupported
-        );
-        registry.insert(
-            CapabilityKind::Attribute,
-            "unused",
-            CapabilityState::BehaviorCompatibleNoOp,
-        );
-        assert!(registry.is_available(CapabilityKind::Attribute, "unused"));
-        registry.insert(
-            CapabilityKind::Builtin,
-            "__builtin_parse_only",
-            CapabilityState::ParseOnly,
-        );
-        assert!(!registry.is_available(CapabilityKind::Builtin, "__builtin_parse_only"));
     }
 
     #[test]

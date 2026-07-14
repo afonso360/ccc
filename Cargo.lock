@@ -33,11 +33,7 @@ dependencies = [
 name = "ccc-abi"
 version = "0.1.0"
 dependencies = [
- "ccc-ir",
- "ccc-pp",
- "ccc-sema",
  "ccc-session",
- "ccc-syntax",
  "ccc-target",
  "ccc-types",
 ]
@@ -72,7 +68,6 @@ dependencies = [
 name = "ccc-driver"
 version = "0.1.0"
 dependencies = [
- "ccc-abi",
  "ccc-codegen",
  "ccc-diag",
  "ccc-ir",
@@ -82,7 +77,6 @@ dependencies = [
  "ccc-session",
  "ccc-syntax",
  "ccc-target",
- "ccc-types",
  "object",
 ]
 
@@ -94,6 +88,7 @@ dependencies = [
  "ccc-sema",
  "ccc-session",
  "ccc-syntax",
+ "ccc-target",
  "ccc-types",
 ]
 

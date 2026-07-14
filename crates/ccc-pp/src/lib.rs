@@ -27,8 +27,10 @@ pub use engine::{
 pub use files::{FileIdentity, FileProvider, FsFileProvider, LoadedFile};
 pub use lexer::{LexError, LexerOptions, lex, lex_with_options};
 pub use literal::{
-    CharacterConstant, CharacterConstantPrefix, IntegerConstant, IntegerSuffix, LiteralError,
-    decode_character_constant, decode_integer_constant,
+    CharacterConstant, CharacterConstantPrefix, FloatingConstant, FloatingConstantSuffix,
+    IntegerConstant, IntegerSuffix, LiteralError, StringLiteral, StringLiteralPrefix,
+    concatenate_string_literals, decode_character_constant, decode_floating_constant,
+    decode_integer_constant, decode_string_literal,
 };
 pub use options::{
     CommandLineMacro, DependencyMode, IncludePath, IncludePathKind, LanguageMode, PreprocessLimits,

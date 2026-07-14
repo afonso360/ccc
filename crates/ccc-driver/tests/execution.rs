@@ -44,7 +44,7 @@ fn empty_translation_unit_emits_a_valid_object() {
 }
 
 #[test]
-fn scalar_programs_emit_x86_64_objects() {
+fn execution_programs_emit_x86_64_objects() {
     use object::{Architecture, Object as _, ObjectSymbol as _};
 
     for (name, _) in execution_cases() {
@@ -75,7 +75,7 @@ fn scalar_programs_emit_x86_64_objects() {
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
-fn scalar_programs_produce_the_expected_exit_status() {
+fn execution_programs_produce_the_expected_exit_status() {
     for (name, expected) in execution_cases() {
         let directory = test_directory(name);
         let executable = directory.join("program");
@@ -124,5 +124,19 @@ fn execution_cases() -> &'static [(&'static str, i32)] {
         ("unused_fallthrough_result.c", 7),
         ("minimum_signed_int.c", 1),
         ("header_program.c", 42),
+        ("integer_types.c", 41),
+        ("pointers_and_arrays.c", 42),
+        ("records_unions_enums.c", 43),
+        ("bitfields_and_packing.c", 44),
+        ("globals_and_static_initializers.c", 45),
+        ("string_literals.c", 46),
+        ("full_control_flow.c", 47),
+        ("indirect_calls.c", 48),
+        ("layout_operators.c", 49),
+        ("volatile_access.c", 50),
+        ("floating_point.c", 51),
+        ("operators_and_conversions.c", 52),
+        ("combined_language_features.c", 53),
+        ("semantic_regressions.c", 54),
     ]
 }

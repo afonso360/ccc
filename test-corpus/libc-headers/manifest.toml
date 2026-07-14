@@ -1,10 +1,20 @@
-format_version = 1
-name = "ccc-glibc-like-preprocessing-fixture"
-revision = 1
+format_version = 2
+name = "ccc-glibc-like-header-fixture"
+revision = 2
 origin = "original-project-test-data"
 license = "Apache-2.0 OR MIT"
 entrypoint = "glibc-like/probe.c"
 compatibility_profile = "gcc-4.2.1"
+certified_through = "parsing"
+modeled_surfaces = ["preprocessing", "gnu-declarations"]
+parser_requirements = [
+    "gnu-alternative-keywords",
+    "gnu-attribute-specifiers",
+    "gnu-declaration-asm-labels",
+    "gnu-extension-marker",
+    "gnu-restrict-qualifiers",
+    "gnu-typeof",
+]
 expected_files = [
     "glibc-like/features.h",
     "glibc-like/probe.c",

@@ -1,0 +1,44 @@
+translation-unit full-typed
+pragma pack ( push , wire , 1 )
+global @0 packed_global : struct <anonymous-0> storage=Extern linkage=External duration=Static symbol=packed_global definition=Definition
+  initializer : struct <anonymous-0>
+    subobject [Field { index: 0, name: Some("pointer"), bitfield: None }]
+      initializer : volatile pointer to const int
+        convert PointerConversion : pointer to const int Value
+          constant Signed(0) : int Value
+    subobject [Field { index: 1, name: Some("nested"), bitfield: None }]
+      initializer : struct <anonymous-1>
+        subobject [Field { index: 1, name: Some("value"), bitfield: None }]
+          initializer : int
+            constant Signed(7) : int Value
+pragma pack ( pop , wire )
+global @1 counter : volatile unsigned int storage=Extern linkage=External duration=Static symbol=counter definition=Definition
+  initializer : volatile unsigned int
+    convert IntegerConversion : unsigned int Value
+      constant Signed(2) : int Value
+function @0 convert : int (short int, pointer to int) storage=Extern linkage=External inline=false noreturn=false definition
+  parameter %0 value : short int
+  parameter %1 out : restrict pointer to int
+  compound
+    expression-statement
+      assignment Assign store=AccessSemantics { volatile: false, atomic: false } compound=none : int Value
+        dereference : int Lvalue
+          convert LvalueToValue { access: AccessSemantics { volatile: false, atomic: false } } : pointer to int Value
+            decl-ref Local(FullLocalId(1)) : restrict pointer to int Lvalue
+        convert IntegerConversion : int Value
+          binary Add : unsigned int Value
+            convert IntegerConversion : unsigned int Value
+              convert IntegerPromotion : int Value
+                convert LvalueToValue { access: AccessSemantics { volatile: false, atomic: false } } : short int Value
+                  decl-ref Local(FullLocalId(0)) : short int Lvalue
+            convert LvalueToValue { access: AccessSemantics { volatile: true, atomic: false } } : unsigned int Value
+              decl-ref Global(GlobalId(1)) : volatile unsigned int Lvalue
+    return
+      convert IntegerConversion : int Value
+        binary Add : unsigned long int Value
+          convert IntegerConversion : unsigned long int Value
+            convert LvalueToValue { access: AccessSemantics { volatile: false, atomic: false } } : int Value
+              member #1 value indirect=false : int Lvalue
+                member #1 nested indirect=false : struct <anonymous-1> Lvalue
+                  decl-ref Global(GlobalId(0)) : struct <anonymous-0> Lvalue
+          sizeof struct <anonymous-0> = 13 : unsigned long int Value

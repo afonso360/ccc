@@ -1,0 +1,320 @@
+# Frontend capability contract
+
+This document is the auditable acceptance inventory for the compiler's current
+`x86_64-unknown-linux-gnu` configuration. It distinguishes syntax that reaches
+the untyped AST from semantics that reach CCC-IR and object emission. The
+broader architecture documents describe intended invariants; this inventory is
+the authority for what an invocation may rely on today.
+
+The implementation authorities are
+[`ccc-syntax::frontend`](../../crates/ccc-syntax/src/frontend/mod.rs),
+[`ccc-sema::generic`](../../crates/ccc-sema/src/generic/analyze.rs),
+[`ccc-types`](../../crates/ccc-types/src/), and the
+[`CapabilityRegistry`](../../crates/ccc-target/src/lib.rs). The corresponding
+black-box evidence lives in the driver
+[`execution`](../../crates/ccc-driver/tests/execution.rs),
+[`diagnostics`](../../crates/ccc-driver/tests/diagnostics.rs),
+[`ABI oracle`](../../crates/ccc-driver/tests/abi_oracle.rs), and
+[`object-emission`](../../crates/ccc-driver/tests/object_emission.rs) tests.
+
+## Capability states and compiler boundaries
+
+Frontend capabilities use the states defined by the
+[conformance policy](conformance.md#gnu-compatibility-registry): implemented,
+behavior-compatible no-op, parse-only, and unsupported. Those states apply to
+one named construct, not to a family inferred from similar syntax.
+
+- **Preprocessing** covers header selection, macro expansion, feature
+  predicates, includes, pragmas, and deterministic textual output.
+- **Parsing** covers phase-7 token conversion, declaration grammar, scope
+  events needed for typedef-name disambiguation, and the untyped AST.
+- **Semantic analysis** covers name and type resolution, composite types,
+  constant expressions, explicit conversions, storage duration, and layout.
+- **Object emission** covers verified CCC-IR, ABI planning, sections, symbols,
+  relocations, and machine code.
+
+A later boundary requires all earlier boundaries. Parsing a construct does not
+grant semantic support, and a semantically valid declaration is not proof that
+its function ABI can be emitted. `--dump-tokens`, `--dump-ast`, and
+`--dump-typed-ast` request their actual boundary rather than sharing a generic
+"continues after preprocessing" permission.
+
+Phase-7 conversion decodes integer, floating, character, and string constants
+once, concatenates adjacent string literals, and preserves intervening pragma
+and location events. The six C digraphs are canonicalized exactly: `<:` and
+`:>` become brackets, `<%` and `%>` become braces, and `%:` and `%:%:` become
+the preprocessing `#` and `##` punctuators. Unsupported punctuation is retained
+as an unsupported token and receives the ordinary spanned parser diagnostic;
+it is not guessed from a similar spelling.
+
+## Declaration and declarator inventory
+
+### Declaration forms and type specifiers
+
+| Surface                   | Accepted forms                                                                                                                       | Current semantic and emission contract                                                                                                                                                                                                                                                                                              |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Translation-unit items    | Object and function declarations, function definitions, type-only declarations, `_Static_assert`, and ordered pragmas                | Implemented. External items retain source order while declarations use stable arena IDs.                                                                                                                                                                                                                                            |
+| Block items               | Declarations, typedefs, function declarations, `_Static_assert`, statements, and ordered pragmas                                     | Implemented. File, function, prototype, block, and `for` scopes are distinct.                                                                                                                                                                                                                                                       |
+| Storage classes           | `typedef`, `extern`, `static`, `auto`, `register`, `_Thread_local`                                                                   | Context rules are checked. Automatic, static, and thread storage durations are represented; block `extern` resolves to file scope. GNU `__thread` remains a separate parse-only registry spelling.                                                                                                                                  |
+| Function specifiers       | `inline`, `_Noreturn` and reserved `__inline` spellings                                                                              | Parsed and retained as function properties. No optimization is inferred from `inline`; complete ISO inline-definition/linkage behavior is not advertised separately.                                                                                                                                                                |
+| Type qualifiers           | `const`, `restrict`, `volatile`, `_Atomic`                                                                                           | Qualifiers remain on declarations and places; value conversion produces an unqualified rvalue type. `const` modification is rejected and volatile accesses are ordered. Atomic access reaches a hard backend boundary (`CCC4011`).                                                                                                  |
+| Scalar types              | `void`, `_Bool`, plain/signed/unsigned `char`, signed/unsigned `short`, `int`, `long`, `long long`, `float`, `double`, `long double` | Integer width, rank, signedness, promotions, and target plain-`char` behavior are implemented. `float` and `double` scalar operations are implemented. `long double` size/alignment are implemented, while literals requiring conversion, arithmetic, initialization, calls, and returns are hard boundaries (`CCC2343`/`CCC3509`). |
+| Tags                      | Named and anonymous `struct`, `union`, and `enum`; forward declarations; definitions; nested tag scopes                              | Implemented with nominal identity and deterministic translation-unit-local anonymous names. Redefinition and cross-category tag conflicts are diagnosed.                                                                                                                                                                            |
+| Typedef names             | File- and block-scope typedef declarations, shadowing, use in declarations and type names                                            | Implemented. Parser-owned `NameClassEnv` records point-of-declaration events and rolls back tentative parses.                                                                                                                                                                                                                       |
+| C11 semantic-only forms   | `_Alignas(type)`, `_Alignas(expression)`, `_Complex`, `_Imaginary`                                                                   | Syntax is retained, then semantic analysis rejects `_Alignas` (`CCC2211`) and complex/imaginary types (`CCC2216`).                                                                                                                                                                                                                  |
+| Type-producing extensions | `typeof(type-name)` and `typeof(expression)`, including reserved spellings                                                           | Parse-only; semantic use is rejected with `CCC2214`.                                                                                                                                                                                                                                                                                |
+
+`_Static_assert` requires an integer constant expression and fails with
+`CCC2269` when false. `_Atomic(type-name)` and the `_Atomic` qualifier are
+represented so an attempted access receives the atomic-capability diagnostic
+instead of being compiled as an ordinary access.
+
+### Derived declarators
+
+| Declarator shape            | Accepted forms                                                                                                                                     | Current boundary                                                                                                                                                                                                                                                                            |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Pointers                    | Arbitrary pointer nesting; `const`, `restrict`, `volatile`, and `_Atomic` pointer qualifiers; parenthesized binding                                | Implemented. Pointee qualification is distinct from top-level qualification.                                                                                                                                                                                                                |
+| Arrays                      | Constant bounds, omitted bounds, `[*]`, runtime bounds, and parameter-array `static`/qualifiers                                                    | Constant and incomplete arrays are implemented. Parameter arrays adjust to pointers while bracket qualifiers apply to the adjusted parameter. Variably modified types are represented, but object storage and runtime layout operations are unsupported (`CCC2258` or a layout diagnostic). |
+| Functions                   | Fixed prototypes, `(void)`, an unspecified parameter list `()`, variadic syntax, nested function pointers, and array/function parameter adjustment | Fixed non-variadic scalar prototypes are implemented through object emission. Unspecified and variadic signatures remain represented but calls/definitions are ABI hard boundaries (`CCC3506` and `CCC3510`). A compatible later prototype forms the order-independent composite type.      |
+| Old-style definitions       | Identifier lists and following parameter declarations                                                                                              | Preserved in the syntax tree; semantic analysis rejects the identifier-list function type (`CCC2224`).                                                                                                                                                                                      |
+| Abstract declarators        | Pointers, arrays, and functions in casts, `sizeof`, `_Alignof`, parameters, and type names                                                         | Implemented subject to the same type and ABI boundaries as named declarators.                                                                                                                                                                                                               |
+| Attributes                  | Before specifiers, within specifier sequences, after declarators/prototypes, and on tags, members, enumerators, and labels                         | Balanced arguments and original spelling are retained. Semantic status is determined only by the exact registry entry below.                                                                                                                                                                |
+| Declaration assembly labels | Reserved or GNU-mode `asm` after a declarator, before later attributes or `;`                                                                      | Retained as a distinct AST node; the default registry classifies symbol-renaming semantics as parse-only, so semantic use fails with `CCC2346`.                                                                                                                                             |
+
+`struct` and `union` members include named fields, unnamed record members,
+ordinary fields, named and unnamed bit-fields, and zero-width bit-field
+barriers. Flexible array member syntax is recognized but rejected cleanly with
+`CCC2370`; it is not approximated as a zero- or one-element array.
+
+Enumeration values are integer constant expressions. The complete value range
+selects a representable target integer type, including an unsigned type for
+large nonnegative values; later references and promotions use that selected
+underlying type.
+
+## Expression and conversion inventory
+
+### Expressions
+
+| Expression family          | Implemented forms                                                                                                    | Explicit boundary                                                                                                                                                                                                                  |
+| -------------------------- | -------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Primary and literals       | Identifiers; integer, floating, character, and ordinary/`u8`/`u`/`U`/`L` string literals; parenthesized expressions  | Integer literal candidates follow radix and suffix rules. Ordinary character constants apply target plain-`char` signedness. Adjacent strings are concatenated before parsing. Native `long double` operations remain unavailable. |
+| Postfix                    | Subscript, direct and indirect calls, `.` and `->`, postfix `++`/`--`                                                | Implemented for supported operand and call types. Compound literals are parsed but rejected with `CCC2271`.                                                                                                                        |
+| Unary                      | Prefix `++`/`--`, address, dereference, unary `+`/`-`, bitwise `~`, logical `!`                                      | Implemented with lvalue/modifiability checks, target signedness, and explicit loads/stores.                                                                                                                                        |
+| Layout operators           | `sizeof expression`, `sizeof(type-name)`, `_Alignof(type-name)`, `__builtin_offsetof` with nested member/index paths | Implemented for types with a compile-time layout. `offsetof` rejects bit-fields and nonconstant indices. Runtime VLA layout is not implemented.                                                                                    |
+| Casts                      | Arithmetic conversions, pointer/integer casts, pointer/pointer casts, casts to `_Bool` and `void`                    | Implemented for scalar types other than native `long double`.                                                                                                                                                                      |
+| Arithmetic and bitwise     | `*`, `/`, `%`, `+`, `-`, shifts, `&`, `^`, and bitwise-or                                                            | Integer promotions and usual arithmetic conversions are explicit. Pointer addition/subtraction is scaled; pointer difference uses the target `ptrdiff_t` type.                                                                     |
+| Comparison and logic       | `<`, `<=`, `>`, `>=`, `==`, `!=`, `&&`, and logical-or                                                               | Arithmetic and compatible-pointer comparisons are implemented; both logical operators short-circuit in the CFG.                                                                                                                    |
+| Conditional                | `?:`                                                                                                                 | Implemented for compatible arithmetic, pointer, and `void` operands; the condition converts explicitly to Boolean. Compatible aggregate operands type-check, then fail at the CCC-IR boundary with `CCC3101`.                      |
+| Assignment                 | `=`, all arithmetic/shift/bitwise compound assignments, prefix/postfix increments                                    | Implemented with one evaluation of the target place. Aggregate assignment uses an overlap-safe copy; volatile aggregate reads and writes expand into ordered accesses.                                                             |
+| Comma and discarded values | Comma expressions and expression statements, including lvalues whose result is unused                                | Implemented. Discarding a value does not suppress required volatile scalar, member, array, bit-field, or aggregate reads.                                                                                                          |
+| Generic selection          | `_Generic` syntax and associations                                                                                   | Parsed, then rejected with `CCC2270`.                                                                                                                                                                                              |
+| GNU expression marker      | `__extension__ expression`                                                                                           | Behavior-compatible no-op; it only suppresses diagnostics CCC does not emit.                                                                                                                                                       |
+
+GNU statement expressions, labels-as-values, computed `goto`, and inline
+assembly expressions/bodies are not part of the current grammar. Declaration
+assembly labels are the separate parse-only construct listed above.
+
+### Explicit typed-AST conversions
+
+The typed AST has a closed conversion inventory in
+[`ConversionKind`](../../crates/ccc-sema/src/generic/model.rs):
+
+| Conversion                                | Inserted for                                                                                                           |
+| ----------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `LvalueToValue`                           | Every object read, carrying volatile/atomic access metadata                                                            |
+| `ArrayToPointer`, `FunctionToPointer`     | The standard value conversions outside their excluded contexts                                                         |
+| `IntegerPromotion`                        | Narrow integers, `_Bool`, `char`, and enumerations                                                                     |
+| `IntegerConversion`, `FloatingConversion` | Same-category arithmetic conversions                                                                                   |
+| `IntegerToFloating`, `FloatingToInteger`  | Mixed arithmetic assignment, casts, and usual arithmetic conversions                                                   |
+| `PointerConversion`                       | Null pointer constants, compatible object pointers, `void *`, and explicit integer/pointer casts                       |
+| `QualificationAdjustment`                 | Reserved as a distinct IR-supported category; current compatible pointer qualification changes use `PointerConversion` |
+| `ToBoolean`                               | Conditions, logical operators, and `_Bool` assignment/casts                                                            |
+| `ToVoid`                                  | Explicit casts to `void`                                                                                               |
+
+Default argument promotions are represented (`float` to `double` and integer
+promotions), but representation does not lift the variadic/unspecified ABI
+boundary. Relocation-bearing constants remain symbol-plus-addend values through
+conversion instead of being flattened to integers. SSA value types are
+top-level-unqualified `TypeId`s; qualifiers and access semantics remain on
+declarations, places, loads, and stores.
+
+## Layout and initialization inventory
+
+All layout queries go through
+[`TypeStore::layout_of`](../../crates/ccc-types/src/layout.rs) using the
+effective target data layout and record-local packing policy. Results are
+cached by type, target layout, and packing configuration; type completion
+invalidates affected entries.
+
+| Area                 | Current contract                                                                                                                                                                                                                       |
+| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Scalars and pointers | Sizes and alignments derive from `TargetDataLayout`; the enabled target is little-endian LP64 with signed plain `char`, 32-bit `int`, 64-bit `long`/pointers, and a 16-byte `long double` object.                                      |
+| Arrays               | Layout records length and element stride. Incomplete arrays may appear where C permits and become complete through a compatible redeclaration or initializer. Variable length remains an explicit non-layout result.                   |
+| Structures           | Source-order fields, natural padding/alignment, anonymous record members, nested records, packed records, and bit-field allocation are target-derived.                                                                                 |
+| Unions               | Size/alignment are the maxima of members; ordinary and bit-field union members share offset zero according to target policy.                                                                                                           |
+| Bit-fields           | Declared type, signedness, storage offset/size/alignment, bit offset, width, zero-width barriers, packing, and mixed declared types are explicit. The x86-64 oracle compares zero baselines and XOR deltas against both GCC and Clang. |
+| Packing pragmas      | `pack()`, `pack(0)`, `pack(n)`, `push`, `pop`, named frames, and combined label/alignment forms are implemented for `n = 1, 2, 4, 8, 16`; zero restores native alignment. Malformed, unmatched, or unknown forms are hard diagnostics. |
+| Layout operators     | `sizeof`, `_Alignof`, and `__builtin_offsetof` consume the same layout result used by initialization, ABI planning, and code generation.                                                                                               |
+
+Initializers accept scalar expressions, brace-enclosed aggregate lists,
+designated array/member paths, nested aggregates, string-to-character-array
+initialization, union member selection, bit-fields, and implicit zero fill.
+Incomplete arrays are completed from list or string length. Excess elements,
+invalid or out-of-range designators, incompatible assignments, and nonconstant
+static initializers are diagnosed before object emission.
+
+Static data is retained as a verified initializer graph containing zero,
+target-endian scalar data, symbol-plus-addend relocations, encoded string data,
+aggregate edges, and repeated fragments. Repetition denotes identical adjacent
+subobjects without changing their required stride or alignment. Object emission
+resolves the graph into `.data`, `.bss`, and `.rodata` bytes plus relocations;
+bit-field fragments update only their allocated bits.
+
+String pooling is keyed by element type, encoding, complete code-unit sequence
+including the terminator, required alignment, and mutability mode. It does not
+merge ordinary, UTF-8, wide, UTF-16, or UTF-32 objects merely because their raw
+bytes happen to match.
+
+## Linkage, storage, and control-flow inventory
+
+### Names, storage, and object files
+
+| Area                   | Current contract                                                                                                                                                                                                                                                                                                  |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Linkage                | File objects and functions have internal or external linkage; block declarations without linkage remain distinct. Incompatible redeclarations are errors. `extern` followed by `static` is rejected at the later declaration (`CCC2372`) for objects and functions.                                               |
+| Composite declarations | Compatible incomplete/complete arrays and unspecified/prototype function declarations form a composite type independent of declaration order. Top-level parameter qualifiers are ignored when forming function types.                                                                                             |
+| Definitions            | Multiple initialized object definitions and multiple function definitions are rejected. Tentative external objects become ELF common symbols with target size/alignment; an initialized definition supersedes a tentative declaration.                                                                            |
+| Static locals          | Block statics use translation-unit-local ELF data symbols and require constant initialization. They are never initialized by an automatic-entry store.                                                                                                                                                            |
+| Automatic locals       | Non-address-taken, nonvolatile scalar locals are promoted to SSA. Address-taken, volatile, aggregate, atomic, and variably modified locals retain explicit storage.                                                                                                                                               |
+| Strings and globals    | Objects carry symbol name, binding, visibility, section request, alignment, TLS model, and definition policy. The default supported attribute registry does not yet expose layout/linkage overrides.                                                                                                              |
+| ELF proof              | Object tests inspect `.text`, `.data`, `.bss`, `.rodata`, local/global/undefined bindings, data and string relocations, and `R_X86_64_PLT32` direct external calls. Linux tests cross-link CCC callers and callees with a reference compiler in both directions and prove same-spelled `static` names stay local. |
+
+Standard `_Thread_local` objects are represented through TLS storage and
+relocation nodes, but the current acceptance suite does not certify a
+cross-linked TLS access model. It is therefore not part of the advertised
+cross-link contract. The GNU `__thread` spelling remains parse-only in the
+registry even though it is recognized by token conversion.
+
+### Statements and CFG behavior
+
+| Statement               | Current contract                                                                                                                                                                   |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Compound and expression | Implemented with lexical block scopes; empty and discarded-value expressions are valid.                                                                                            |
+| Selection               | `if`/`else` and `switch` with integer-promoted controlling expressions are implemented. Duplicate `case`, duplicate `default`, and nonconstant cases are diagnosed.                |
+| Iteration               | `while`, `do`/`while`, and `for` with expression or declaration initializers are implemented. `for` declarations have their own scope.                                             |
+| Labels and jumps        | Ordinary labels and `goto`, `break`, `continue`, and `return` are implemented. Duplicate/undefined labels and jumps outside the required loop/switch context are diagnosed.        |
+| Expression CFG          | Short-circuit logic and `?:` use explicit blocks and block parameters. Loop/switch exits and `goto` are verified CFG edges.                                                        |
+| Calls                   | Direct and function-pointer calls use the same fixed scalar ABI plan. Aggregate, variadic, unspecified-prototype, and native-`long double` boundaries fail before object emission. |
+
+## Exact GNU compatibility registry
+
+The following tables transcribe
+[`CapabilityRegistry::gnu_frontend`](../../crates/ccc-target/src/lib.rs). The
+key is `(kind, name)`; similarly spelled keys do not inherit one another's
+state. Aggregate manifest keys such as `gnu-alternative-keywords` describe the
+weakest member of that advertised surface, so individual reserved qualifier
+spellings can be implemented while the aggregate key remains parse-only.
+
+### Extensions
+
+| State                     | Exact keys                                                                                                                                                                                    |
+| ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Implemented               | `__const`, `__const__`, `__inline`, `__inline__`, `__restrict`, `__restrict__`, `__signed`, `__signed__`, `__volatile`, `__volatile__`, `__alignof`, `__alignof__`, `gnu-restrict-qualifiers` |
+| Behavior-compatible no-op | `__extension__`, `gnu-extension-marker`                                                                                                                                                       |
+| Parse-only                | `__asm`, `__asm__`, `__attribute`, `__attribute__`, `__typeof`, `__typeof__`, `__thread`, `gnu-alternative-keywords`, `gnu-attribute-specifiers`, `gnu-declaration-asm-labels`, `gnu-typeof`  |
+| Unsupported               | Every other extension key, including plain unreserved spellings in strict `c11` mode                                                                                                          |
+
+Plain `asm` and `typeof` are accepted only in `gnu11`. Reserved alternatives
+remain recognizable in strict `c11` because hosted headers use them to avoid
+changing the caller's language mode. A spelling that token conversion maps to
+a standard AST node does not acquire a stronger contract than its registry key.
+
+### Attributes
+
+| State                     | Exact keys and rationale                                                                                                                                                                                                                   |
+| ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Behavior-compatible no-op | `nothrow`, `__nothrow__`, `pure`, `__pure__`; these are optimization promises whose omission does not change C behavior in the current optimizer                                                                                           |
+| Parse-only                | `warn_unused_result`, `__warn_unused_result__`, `nonnull`, `__nonnull__`, `aligned`, `__aligned__`, `gnu_inline`, `__gnu_inline__`; each has diagnostic, semantic, layout, or emission effects not advertised by the default configuration |
+| Unsupported               | Every other attribute name, including empty or unknown names                                                                                                                                                                               |
+
+There are no default `Implemented` attribute entries. Semantic analysis rejects
+parse-only and unknown attributes with `CCC2345`; retaining balanced argument
+tokens in the AST is not permission to ignore them.
+
+### Builtins, features, and pragmas
+
+| Kind    | Exact default entries                                                                                                                                                                                                                  |
+| ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Builtin | Implemented: `__builtin_offsetof`. Every other builtin key is unsupported.                                                                                                                                                             |
+| Feature | No default entries. Feature predicates are false unless the effective configuration explicitly inserts an implemented or behavior-compatible entry.                                                                                    |
+| Pragma  | No generic registry entries. Ordered built-in handling implements `#pragma pack`, `#pragma once`, `#pragma GCC system_header`, and the supported `#pragma GCC diagnostic` forms; unknown semantic pragmas are rejected with `CCC2355`. |
+
+`__has_attribute`, `__has_builtin`, `__has_feature`, and related predicates
+report true only for registry states whose promised behavior is available.
+Parse-only recognition returns false.
+
+## Explicit unsupported boundaries
+
+The current frontend never silently approximates these constructs:
+
+| Construct                                                          | Furthest retained boundary                | Diagnostic or behavior                                                |
+| ------------------------------------------------------------------ | ----------------------------------------- | --------------------------------------------------------------------- |
+| Flexible array members                                             | Untyped AST                               | `CCC2370` during semantic analysis                                    |
+| Variably modified object storage and runtime VLA layout            | Typed representation                      | `CCC2258` for storage; layout-dependent use fails explicitly          |
+| `_Atomic` object access and operations                             | Typed AST/CCC-IR boundary                 | `CCC4011`; no ordinary non-atomic fallback                            |
+| Native `long double` arithmetic, initialization, calls, returns    | Layout/type representation                | `CCC2343` or `CCC3509`; no implicit `double` substitution             |
+| `_Complex`, `_Imaginary`                                           | Declaration syntax                        | `CCC2216`                                                             |
+| `_Alignas`                                                         | Declaration syntax                        | `CCC2211`                                                             |
+| `_Generic`                                                         | Expression syntax                         | `CCC2270`                                                             |
+| Compound literals                                                  | Expression syntax                         | `CCC2271`                                                             |
+| Aggregate conditional values                                       | Typed expression                          | `CCC3101`; aggregate assignment remains implemented                   |
+| Old-style identifier-list function definitions                     | Declarator syntax                         | `CCC2224`                                                             |
+| Variadic or unspecified-prototype call/definition ABI              | Typed signature                           | `CCC3510` or `CCC3506`                                                |
+| Aggregate arguments or returns                                     | Typed signature                           | `CCC3508`; aggregate assignment within a function remains implemented |
+| GNU `typeof`, semantic attributes, declaration assembly labels     | Untyped AST with original spelling/tokens | `CCC2214`, `CCC2345`, or `CCC2346` under the default registry         |
+| GNU statement expressions, inline assembly bodies, computed `goto` | Preprocessing tokens                      | Not in the current parser grammar                                     |
+| Unsupported targets, output modes, or command-line options         | Driver option/configuration               | Rejected before source compilation; no host fallback                  |
+
+An unused declaration with an unsupported call boundary may remain in an
+object when no definition or call requires its ABI. The boundary is checked
+when code generation must materialize that signature.
+
+## Hosted-header parsing evidence
+
+The shipped
+[`resource-dir/manifest.toml`](../../resource-dir/manifest.toml) advertises the
+named GCC 4.2.1 compatibility profile through parsing, not semantic analysis or
+code generation. Its exact header inventory is three compiler-owned spelling
+headers (`stdalign.h`, `stdbool.h`, `stdnoreturn.h`) plus target-derived
+`stddef.h`; it ships no hosted wrapper headers in this profile.
+
+The profile has four independent gates in
+[`preprocessing.rs`](../../crates/ccc-driver/tests/preprocessing.rs) and the
+dedicated [`header_parsing.rs`](../../crates/ccc-driver/tests/header_parsing.rs):
+
+1. deterministic preprocessing of the pinned glibc-like fixture;
+2. an AST dump of that fixture containing the required declarations,
+   attributes, assembly label, restrict qualifiers, and inline definition;
+3. Linux-only preprocessing of installed glibc `features.h`, `stddef.h`, and
+   `stdint.h`, with exact type/macro sentinels; and
+4. a Linux-only AST dump of installed glibc headers plus exact sentinel
+   declarations for `typeof`, restrict, an assembly label, an attribute, and an
+   inline definition.
+
+Installed-header gates log compiler identity, reported target, and libc
+identity. They assert stable sentinel declarations rather than snapshotting a
+mutable system header. The installed parsing gate proves only the advertised
+parsing ceiling: parse-only GNU constructs remain in the AST, and an action
+that requests semantic analysis or object emission must satisfy its own
+stronger capability checks.
+
+Changing the advertised GNU version, the manifest ceiling, or a required
+declaration spelling requires all of the following:
+
+1. manifest validation rejects missing, duplicated, or unknown capability
+   entries;
+2. the curated fixture exercises each newly claimed spelling in context;
+3. strict-`c11` and `gnu11` tests verify the intended alternative-keyword
+   policy;
+4. parse-only constructs remain visible in the AST; and
+5. every action beyond the certified ceiling fails before emitting output.

@@ -1,0 +1,5 @@
+ccc: error[CCC2374]: `__thread` is parse-only until GNU thread-local storage semantics are enabled
+ --> tests/diagnostics/cases/gnu-thread-local.c:1:1
+   |
+ 1 | __thread int value;
+   | ^^^^^^^^^^^^

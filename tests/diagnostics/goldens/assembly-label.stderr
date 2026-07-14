@@ -1,0 +1,5 @@
+ccc: error[CCC2346]: assembly labels are retained by parsing but require implemented symbol semantics
+ --> tests/diagnostics/cases/assembly-label.c:1:27
+   |
+ 1 | extern int function(void) __asm__("renamed");
+   |                           ^^^^^^^^^^^^^^^^^^

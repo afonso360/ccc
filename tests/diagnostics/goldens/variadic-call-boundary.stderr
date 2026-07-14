@@ -1,0 +1,5 @@
+ccc: error[CCC3510]: variadic function boundaries require the target variadic bridge capability
+ --> tests/diagnostics/cases/variadic-call-boundary.c:3:12
+   |
+ 3 |     return variadic("x", 1);
+   |            ^^^^^^^^^^^^^^^^ while generating native code

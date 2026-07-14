@@ -1,4 +1,24 @@
 typedef unsigned long int size_t;
 typedef long int ssize_t;
-extern ssize_t fixture_read(int, void *, size_t) __attribute__((__nothrow__));
+__extension__ typedef __signed__ long long int fixture_int64_t;
+typedef struct {
+int tag;
+unsigned long payload;
+} fixture_record_t
+__attribute__((__aligned__(__alignof(long int))));
+extern ssize_t fixture_read(int, void *__restrict, size_t)
+__attribute__((__nothrow__)) __attribute__((__nonnull__ (2))) __attribute__((__warn_unused_result__));
+extern int fixture_compare(__const void *__restrict__, __const__ void *__restrict)
+__attribute((__pure__));
+extern __volatile__ int fixture_generation;
+extern __typeof(fixture_read) fixture_read_type_alias;
+extern __typeof__(fixture_read) fixture_read_spelled_alias
+__asm("fixture_read_impl") __attribute__((__nothrow__));
+extern ssize_t fixture_read_redirect (int, void *__restrict, size_t) __asm__("fixture_read_impl") __attribute__((__nothrow__));
+extern __inline__ __attribute__((__gnu_inline__)) int
+fixture_identity(int value)
+{
+return value;
+}
+fixture_record_t hosted_header_record;
 int hosted_header_preprocessing_sentinel;

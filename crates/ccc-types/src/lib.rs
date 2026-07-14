@@ -1,118 +1,74 @@
 //! Canonical C types and target-derived layout queries.
 
-use std::collections::HashMap;
+mod layout;
+mod model;
+mod store;
 
-use ccc_target::EffectiveCompilationConfig;
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct TypeId(u32);
-
-impl TypeId {
-    pub const VOID: Self = Self(0);
-    pub const INT: Self = Self(1);
-
-    pub const fn index(self) -> usize {
-        self.0 as usize
-    }
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub enum TypeKind {
-    Void,
-    Int,
-    Function {
-        result: TypeId,
-        parameters: Vec<TypeId>,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct Layout {
-    pub size: u64,
-    pub align: u64,
-}
-
-#[derive(Clone, Debug)]
-pub struct TypeStore {
-    kinds: Vec<TypeKind>,
-    interned: HashMap<TypeKind, TypeId>,
-}
-
-impl Default for TypeStore {
-    fn default() -> Self {
-        let kinds = vec![TypeKind::Void, TypeKind::Int];
-        let interned = kinds
-            .iter()
-            .cloned()
-            .enumerate()
-            .map(|(index, kind)| (kind, TypeId(index as u32)))
-            .collect();
-        Self { kinds, interned }
-    }
-}
-
-impl TypeStore {
-    pub fn kind(&self, id: TypeId) -> &TypeKind {
-        &self.kinds[id.index()]
-    }
-
-    pub fn contains(&self, id: TypeId) -> bool {
-        id.index() < self.kinds.len()
-    }
-
-    pub fn function(&mut self, result: TypeId, parameters: Vec<TypeId>) -> TypeId {
-        self.intern(TypeKind::Function { result, parameters })
-    }
-
-    pub fn layout(&self, id: TypeId, config: &EffectiveCompilationConfig) -> Option<Layout> {
-        match self.kind(id) {
-            TypeKind::Int => config.target.int_width().map(|width| Layout {
-                size: u64::from(width / 8),
-                align: u64::from(config.target.int_align),
-            }),
-            TypeKind::Void | TypeKind::Function { .. } => None,
-        }
-    }
-
-    pub fn display(&self, id: TypeId) -> String {
-        match self.kind(id) {
-            TypeKind::Void => "void".to_owned(),
-            TypeKind::Int => "int".to_owned(),
-            TypeKind::Function { result, parameters } => {
-                let parameters = parameters
-                    .iter()
-                    .map(|parameter| self.display(*parameter))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("{} ({parameters})", self.display(*result))
-            }
-        }
-    }
-
-    fn intern(&mut self, kind: TypeKind) -> TypeId {
-        if let Some(id) = self.interned.get(&kind) {
-            return *id;
-        }
-        let id = TypeId(self.kinds.len() as u32);
-        self.kinds.push(kind.clone());
-        self.interned.insert(kind, id);
-        id
-    }
-}
+pub use layout::{BitfieldLayout, FieldLayout, LayoutError, LayoutShape, RecordLayout, TypeLayout};
+pub use model::{
+    ArrayLength, ArrayType, Bitfield, BuiltinType, EnumBody, EnumDefinition, EnumId, Enumerator,
+    Field, FunctionParameters, FunctionType, PointerType, QualType, QualifiedType,
+    RecordDefinition, RecordId, RecordKind, TypeId, TypeKind, TypeQualifiers, VariableLengthId,
+};
+pub use store::{DefinitionError, TypeStore};
 
 #[cfg(test)]
 mod tests {
+    use ccc_target::EffectiveCompilationConfig;
+
     use super::*;
 
     #[test]
-    fn interns_function_types_and_uses_target_layout() {
+    fn interns_canonical_function_types() {
         let mut types = TypeStore::default();
-        let first = types.function(TypeId::INT, vec![TypeId::INT]);
-        let second = types.function(TypeId::INT, vec![TypeId::INT]);
+        let signature =
+            FunctionType::prototype(TypeId::INT, vec![QualifiedType::unqualified(TypeId::INT)]);
+        let first = types.function_type(signature.clone());
+        let second = types.function_type(signature.clone());
         assert_eq!(first, second);
         assert_eq!(
-            types.layout(TypeId::INT, &EffectiveCompilationConfig::default()),
-            Some(Layout { size: 4, align: 4 })
+            types.kind(TypeId::INT),
+            &TypeKind::Builtin(BuiltinType::Int)
         );
+        assert_eq!(types.kind(first), &TypeKind::Function(signature.clone()));
+        assert_eq!(types.display(first), "int (int)");
+        assert_eq!(
+            types
+                .layout_of(TypeId::INT, &EffectiveCompilationConfig::default())
+                .unwrap()
+                .size,
+            4
+        );
+        assert_eq!(types.function_signature(first), Some(signature));
+
+        let variadic = types.function_type(FunctionType::variadic(
+            TypeId::INT,
+            vec![QualifiedType::unqualified(TypeId::INT)],
+        ));
+        assert_ne!(variadic, first);
+        assert!(matches!(types.kind(variadic), TypeKind::Function(_)));
+    }
+
+    #[test]
+    fn layout_cache_is_keyed_by_target_layout_and_invalidated_by_new_types() {
+        let mut types = TypeStore::default();
+        let pointer = types.pointer(TypeId::INT);
+        let config = EffectiveCompilationConfig::default();
+
+        assert_eq!(types.layout_of(pointer, &config).unwrap().size, 8);
+        assert_eq!(types.layout_of(pointer, &config).unwrap().size, 8);
+        assert_eq!(types.layout_cache.borrow().len(), 1);
+
+        let mut narrow = config.clone();
+        narrow.target.data_layout.pointer_width = 32;
+        narrow.target.data_layout.pointer_align = 4;
+        assert_eq!(types.layout_of(pointer, &narrow).unwrap().size, 4);
+        assert_eq!(types.layout_cache.borrow().len(), 2);
+
+        let _ = types.array(ArrayType {
+            element: TypeId::INT.into(),
+            length: ArrayLength::Constant(2),
+        });
+        assert!(types.layout_cache.borrow().is_empty());
     }
 }

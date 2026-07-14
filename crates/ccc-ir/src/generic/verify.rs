@@ -1,0 +1,1551 @@
+use std::collections::{HashSet, VecDeque};
+
+use ccc_types::{
+    ArrayLength, BuiltinType, FunctionParameters, QualifiedType, TypeId, TypeKind, TypeStore,
+};
+
+use super::{
+    BlockId, DataOrigin, FullEdge, FullFunction, FullInstruction, FullInstructionKind, FullModule,
+    FullTerminator, InitializerGraph, InitializerNodeId, InitializerNodeKind, InitializerPath,
+    IrError, MemoryAccess, RelocationKind, RelocationTarget, ScalarConversion, StorageLocation,
+    ValueId,
+};
+
+#[derive(Clone, Copy, Debug)]
+enum Definition {
+    BlockParameter(BlockId),
+    Instruction { block: BlockId, position: usize },
+}
+
+pub fn verify_frontend(module: &FullModule) -> Result<(), IrError> {
+    verify_module_arenas(module)?;
+    for global in &module.globals {
+        verify_type(&module.types, global.ty, "global object")?;
+        if let Some(initializer) = &global.initializer {
+            verify_initializer(module, initializer, global.ty)?;
+        }
+    }
+    for string in &module.strings {
+        verify_type(&module.types, string.ty, "string object")?;
+        if !matches!(
+            module.types.try_kind(string.ty.ty),
+            Some(TypeKind::Array(_))
+        ) {
+            return Err(IrError::verify(format!(
+                "string {} does not have array type",
+                string.id.0
+            )));
+        }
+        if string.code_units.last().copied() != Some(0) {
+            return Err(IrError::verify(format!(
+                "string {} does not include its trailing zero code unit",
+                string.id.0
+            )));
+        }
+    }
+    for function in &module.functions {
+        verify_function(module, function)?;
+    }
+    Ok(())
+}
+
+fn verify_module_arenas(module: &FullModule) -> Result<(), IrError> {
+    let mut origins = HashSet::new();
+    for (index, global) in module.globals.iter().enumerate() {
+        if global.id.0 as usize != index {
+            return Err(IrError::verify(format!(
+                "data object id {} does not match arena index {index}",
+                global.id.0
+            )));
+        }
+        let origin_key = match global.source {
+            DataOrigin::FileScope(id) => (0_u8, id.0, 0_u32),
+            DataOrigin::BlockStatic { function, local } => (1_u8, function.0, local.0),
+        };
+        if !origins.insert(origin_key) {
+            return Err(IrError::verify(format!(
+                "data object {} duplicates a source object",
+                global.id.0
+            )));
+        }
+    }
+    for (index, string) in module.strings.iter().enumerate() {
+        if string.id.0 as usize != index {
+            return Err(IrError::verify(format!(
+                "string id {} does not match arena index {index}",
+                string.id.0
+            )));
+        }
+    }
+    for (index, function) in module.functions.iter().enumerate() {
+        if function.id.0 as usize != index {
+            return Err(IrError::verify(format!(
+                "function id {} does not match arena index {index}",
+                function.id.0
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn verify_initializer(
+    module: &FullModule,
+    graph: &InitializerGraph,
+    object: QualifiedType,
+) -> Result<(), IrError> {
+    let root = graph
+        .nodes
+        .get(graph.root.0 as usize)
+        .filter(|node| node.id == graph.root)
+        .ok_or_else(|| IrError::verify("initializer graph has an invalid root node"))?;
+    if !same_type(root.ty, object) {
+        return Err(IrError::verify(
+            "initializer root type does not match its data object",
+        ));
+    }
+    let mut referenced = vec![false; graph.nodes.len()];
+    let mut visiting = vec![false; graph.nodes.len()];
+    verify_initializer_node(module, graph, graph.root, &mut referenced, &mut visiting)?;
+    if referenced.iter().any(|visited| !visited) {
+        return Err(IrError::verify(
+            "initializer graph contains a node unreachable from its root",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_initializer_node(
+    module: &FullModule,
+    graph: &InitializerGraph,
+    id: InitializerNodeId,
+    referenced: &mut [bool],
+    visiting: &mut [bool],
+) -> Result<(), IrError> {
+    let index = id.0 as usize;
+    let node = graph
+        .nodes
+        .get(index)
+        .filter(|node| node.id == id)
+        .ok_or_else(|| IrError::verify(format!("initializer references unknown node {}", id.0)))?;
+    if visiting[index] {
+        return Err(IrError::verify("initializer graph contains a cycle"));
+    }
+    if referenced[index] {
+        return Ok(());
+    }
+    visiting[index] = true;
+    verify_type(&module.types, node.ty, "initializer node")?;
+    match &node.kind {
+        InitializerNodeKind::Zero => {}
+        InitializerNodeKind::Scalar(_) => {
+            if is_aggregate(&module.types, node.ty.ty) {
+                return Err(IrError::verify(
+                    "aggregate initializer node contains a scalar leaf directly",
+                ));
+            }
+        }
+        InitializerNodeKind::Relocation { target, kind, .. } => {
+            verify_relocation(module, *target, *kind)?;
+            if !is_pointer_or_integer(&module.types, node.ty.ty) {
+                return Err(IrError::verify(
+                    "relocation initializer does not have pointer or integer type",
+                ));
+            }
+        }
+        InitializerNodeKind::StringData {
+            string,
+            copy_code_units,
+        } => {
+            let literal = module
+                .strings
+                .get(string.0 as usize)
+                .filter(|literal| literal.id == *string)
+                .ok_or_else(|| {
+                    IrError::verify(format!(
+                        "initializer references unknown string {}",
+                        string.0
+                    ))
+                })?;
+            let bound = array_bound(&module.types, node.ty.ty).ok_or_else(|| {
+                IrError::verify("string-data initializer does not initialize a constant array")
+            })?;
+            if *copy_code_units > bound || *copy_code_units as usize > literal.code_units.len() {
+                return Err(IrError::verify(
+                    "string-data copy count exceeds the destination or literal",
+                ));
+            }
+        }
+        InitializerNodeKind::Repeat { element, count } => {
+            let Some(TypeKind::Array(array)) = module.types.try_kind(node.ty.ty) else {
+                return Err(IrError::verify(
+                    "repeated initializer node does not have array type",
+                ));
+            };
+            let ArrayLength::Constant(bound) = array.length else {
+                return Err(IrError::verify(
+                    "repeated initializer node does not have a constant array bound",
+                ));
+            };
+            if *count == 0 || *count > bound {
+                return Err(IrError::verify(
+                    "repeated initializer count is zero or exceeds its array bound",
+                ));
+            }
+            let child = graph
+                .nodes
+                .get(element.0 as usize)
+                .filter(|child| child.id == *element)
+                .ok_or_else(|| {
+                    IrError::verify(format!(
+                        "repeated initializer references unknown node {}",
+                        element.0
+                    ))
+                })?;
+            if element.0 >= node.id.0 {
+                return Err(IrError::verify(
+                    "initializer graph is not in stable child-before-parent order",
+                ));
+            }
+            if !same_type(array.element, child.ty) {
+                return Err(IrError::verify(
+                    "repeated initializer element type does not match its array element",
+                ));
+            }
+            verify_initializer_node(module, graph, *element, referenced, visiting)?;
+        }
+        InitializerNodeKind::Aggregate(edges) => {
+            if !is_aggregate(&module.types, node.ty.ty) {
+                return Err(IrError::verify(
+                    "aggregate initializer node does not have aggregate type",
+                ));
+            }
+            for edge in edges {
+                let child = graph
+                    .nodes
+                    .get(edge.node.0 as usize)
+                    .filter(|node| node.id == edge.node)
+                    .ok_or_else(|| {
+                        IrError::verify(format!(
+                            "initializer edge references unknown node {}",
+                            edge.node.0
+                        ))
+                    })?;
+                if edge.node.0 >= node.id.0 {
+                    return Err(IrError::verify(
+                        "initializer graph is not in stable child-before-parent order",
+                    ));
+                }
+                let selected = initializer_path_type(&module.types, node.ty, &edge.path)?;
+                if !same_type(selected, child.ty) {
+                    return Err(IrError::verify(
+                        "initializer edge type does not match its selected subobject",
+                    ));
+                }
+                verify_initializer_node(module, graph, edge.node, referenced, visiting)?;
+            }
+        }
+    }
+    visiting[index] = false;
+    referenced[index] = true;
+    Ok(())
+}
+
+fn verify_relocation(
+    module: &FullModule,
+    target: RelocationTarget,
+    kind: RelocationKind,
+) -> Result<(), IrError> {
+    match (target, kind) {
+        (RelocationTarget::Object(id), RelocationKind::ObjectAddress) => {
+            let object = module
+                .globals
+                .get(id.0 as usize)
+                .filter(|object| object.id == id)
+                .ok_or_else(|| {
+                    IrError::verify(format!("relocation references unknown data {}", id.0))
+                })?;
+            if object.duration == ccc_sema::generic::StorageDuration::Thread {
+                return Err(IrError::verify(
+                    "thread-local object uses a non-TLS relocation kind",
+                ));
+            }
+        }
+        (RelocationTarget::Object(id), RelocationKind::ThreadLocalAddress) => {
+            let object = module
+                .globals
+                .get(id.0 as usize)
+                .filter(|object| object.id == id)
+                .ok_or_else(|| {
+                    IrError::verify(format!("relocation references unknown data {}", id.0))
+                })?;
+            if object.duration != ccc_sema::generic::StorageDuration::Thread {
+                return Err(IrError::verify(
+                    "non-thread object uses a TLS relocation kind",
+                ));
+            }
+        }
+        (RelocationTarget::Function(id), RelocationKind::FunctionAddress) => {
+            if module
+                .functions
+                .get(id.0 as usize)
+                .is_none_or(|function| function.id != id)
+            {
+                return Err(IrError::verify(format!(
+                    "relocation references unknown function {}",
+                    id.0
+                )));
+            }
+        }
+        (RelocationTarget::String(id), RelocationKind::StringAddress) => {
+            if module
+                .strings
+                .get(id.0 as usize)
+                .is_none_or(|string| string.id != id)
+            {
+                return Err(IrError::verify(format!(
+                    "relocation references unknown string {}",
+                    id.0
+                )));
+            }
+        }
+        _ => return Err(IrError::verify("relocation target and kind disagree")),
+    }
+    Ok(())
+}
+
+fn initializer_path_type(
+    types: &TypeStore,
+    mut ty: QualifiedType,
+    path: &[InitializerPath],
+) -> Result<QualifiedType, IrError> {
+    for (position, element) in path.iter().enumerate() {
+        match element {
+            InitializerPath::Index(index) => {
+                let Some(TypeKind::Array(array)) = types.try_kind(ty.ty) else {
+                    return Err(IrError::verify(
+                        "initializer index path traverses a non-array type",
+                    ));
+                };
+                if let ArrayLength::Constant(bound) = array.length
+                    && *index >= bound
+                {
+                    return Err(IrError::verify(
+                        "initializer index path exceeds its array bound",
+                    ));
+                }
+                ty = array.element;
+            }
+            InitializerPath::Field {
+                index,
+                name,
+                bitfield,
+            } => {
+                let Some(TypeKind::Record(record)) = types.try_kind(ty.ty) else {
+                    return Err(IrError::verify(
+                        "initializer field path traverses a non-record type",
+                    ));
+                };
+                let field = types
+                    .record(*record)
+                    .and_then(|record| record.fields.as_ref())
+                    .and_then(|fields| fields.get(*index))
+                    .ok_or_else(|| IrError::verify("initializer path references unknown field"))?;
+                if name
+                    .as_ref()
+                    .is_some_and(|name| field.name.as_ref() != Some(name))
+                {
+                    return Err(IrError::verify(
+                        "initializer path field name does not match its field index",
+                    ));
+                }
+                if field.bitfield.is_some() != bitfield.is_some() {
+                    return Err(IrError::verify(
+                        "initializer path does not preserve its bitfield descriptor",
+                    ));
+                }
+                if let Some(bitfield) = bitfield {
+                    verify_bitfield(*bitfield)?;
+                    if position + 1 != path.len() {
+                        return Err(IrError::verify(
+                            "initializer path continues through a bitfield",
+                        ));
+                    }
+                }
+                ty = field.ty;
+            }
+        }
+    }
+    Ok(ty)
+}
+
+fn verify_function(module: &FullModule, function: &FullFunction) -> Result<(), IrError> {
+    let signature = module
+        .types
+        .function_signature(function.signature)
+        .ok_or_else(|| {
+            IrError::verify(format!(
+                "function `{}` has a non-function signature",
+                function.name
+            ))
+        })?;
+    if !same_type(signature.result, function.result_type) {
+        return Err(IrError::verify(format!(
+            "function `{}` result type disagrees with its signature",
+            function.name
+        )));
+    }
+    if function.entry.is_some()
+        && let FunctionParameters::Prototype(parameters) = &signature.parameters
+    {
+        if parameters.len() != function.parameters.len() {
+            return Err(IrError::verify(format!(
+                "function `{}` parameter count disagrees with its signature",
+                function.name
+            )));
+        }
+        for (parameter, expected) in function.parameters.iter().zip(parameters) {
+            if parameter.ty.ty != expected.ty {
+                return Err(IrError::verify(format!(
+                    "function `{}` parameter `{}` has the wrong type",
+                    function.name, parameter.name
+                )));
+            }
+        }
+    }
+    if function.entry.is_none() {
+        if !function.blocks.is_empty()
+            || !function.storage.is_empty()
+            || !function.value_types.is_empty()
+            || function.instruction_count != 0
+            || function
+                .parameters
+                .iter()
+                .any(|parameter| parameter.incoming.is_some() || parameter.storage.is_some())
+        {
+            return Err(IrError::verify(format!(
+                "function declaration `{}` contains definition state",
+                function.name
+            )));
+        }
+        return Ok(());
+    }
+    let entry = function.entry.expect("entry was checked");
+    if function
+        .blocks
+        .get(entry.0 as usize)
+        .is_none_or(|block| block.id != entry)
+    {
+        return Err(IrError::verify(format!(
+            "function `{}` has an invalid entry block",
+            function.name
+        )));
+    }
+    for (index, storage) in function.storage.iter().enumerate() {
+        if storage.id.0 as usize != index {
+            return Err(IrError::verify(format!(
+                "function `{}` storage id {} is not stable",
+                function.name, storage.id.0
+            )));
+        }
+        if storage.location != StorageLocation::Automatic {
+            return Err(IrError::verify(format!(
+                "function `{}` retains static-duration data in runtime storage",
+                function.name
+            )));
+        }
+        verify_type(&module.types, storage.ty, "local storage")?;
+        if storage.required_by.is_empty() {
+            return Err(IrError::verify(format!(
+                "function `{}` storage {} has no residency classification",
+                function.name, storage.id.0
+            )));
+        }
+    }
+
+    let mut definitions = vec![None; function.value_types.len()];
+    let mut instruction_ids = vec![false; function.instruction_count as usize];
+    for (index, block) in function.blocks.iter().enumerate() {
+        if block.id.0 as usize != index {
+            return Err(IrError::verify(format!(
+                "function `{}` block id {} is not stable",
+                function.name, block.id.0
+            )));
+        }
+        if block.terminator.is_none() {
+            return Err(IrError::verify(format!(
+                "function `{}` block {} has no terminator",
+                function.name, block.id.0
+            )));
+        }
+        for value in &block.parameters {
+            define_value(
+                &mut definitions,
+                *value,
+                Definition::BlockParameter(block.id),
+                function,
+            )?;
+        }
+        for (position, instruction) in block.instructions.iter().enumerate() {
+            let id_slot = instruction_ids
+                .get_mut(instruction.id.0 as usize)
+                .ok_or_else(|| {
+                    IrError::verify(format!(
+                        "function `{}` has out-of-range instruction id {}",
+                        function.name, instruction.id.0
+                    ))
+                })?;
+            if *id_slot {
+                return Err(IrError::verify(format!(
+                    "function `{}` defines instruction {} twice",
+                    function.name, instruction.id.0
+                )));
+            }
+            *id_slot = true;
+            if let Some(value) = instruction.result {
+                define_value(
+                    &mut definitions,
+                    value,
+                    Definition::Instruction {
+                        block: block.id,
+                        position,
+                    },
+                    function,
+                )?;
+            }
+        }
+    }
+    if instruction_ids.iter().any(|seen| !seen) {
+        return Err(IrError::verify(format!(
+            "function `{}` instruction ids are not dense",
+            function.name
+        )));
+    }
+    if definitions.iter().any(Option::is_none) {
+        return Err(IrError::verify(format!(
+            "function `{}` value ids are not densely defined",
+            function.name
+        )));
+    }
+    for parameter in &function.parameters {
+        let incoming = parameter.incoming.ok_or_else(|| {
+            IrError::verify(format!(
+                "function `{}` parameter `{}` has no incoming value",
+                function.name, parameter.name
+            ))
+        })?;
+        if !function.blocks[entry.0 as usize]
+            .parameters
+            .contains(&incoming)
+            || value_type(function, incoming)?.ty != parameter.ty.ty
+        {
+            return Err(IrError::verify(format!(
+                "function `{}` parameter `{}` is not an entry block parameter",
+                function.name, parameter.name
+            )));
+        }
+    }
+
+    let predecessors = predecessors(function)?;
+    let dominators = dominators(function, entry, &predecessors);
+    let verifier = FunctionVerifier {
+        module,
+        function,
+        definitions: &definitions,
+        dominators: &dominators,
+    };
+    for block in &function.blocks {
+        for (position, instruction) in block.instructions.iter().enumerate() {
+            verifier.instruction(block.id, position, instruction)?;
+        }
+        verifier.terminator(
+            block.id,
+            block.terminator.as_ref().expect("terminator was checked"),
+        )?;
+    }
+    Ok(())
+}
+
+fn define_value(
+    definitions: &mut [Option<Definition>],
+    value: ValueId,
+    definition: Definition,
+    function: &FullFunction,
+) -> Result<(), IrError> {
+    let slot = definitions.get_mut(value.0 as usize).ok_or_else(|| {
+        IrError::verify(format!(
+            "function `{}` defines out-of-range value {}",
+            function.name, value.0
+        ))
+    })?;
+    if slot.is_some() {
+        return Err(IrError::verify(format!(
+            "function `{}` defines value {} more than once",
+            function.name, value.0
+        )));
+    }
+    *slot = Some(definition);
+    Ok(())
+}
+
+fn predecessors(function: &FullFunction) -> Result<Vec<Vec<BlockId>>, IrError> {
+    let mut predecessors = vec![Vec::new(); function.blocks.len()];
+    for block in &function.blocks {
+        let terminator = block.terminator.as_ref().expect("terminator was checked");
+        for edge in terminator_edges(terminator) {
+            let slot = predecessors
+                .get_mut(edge.target.0 as usize)
+                .ok_or_else(|| {
+                    IrError::verify(format!(
+                        "function `{}` branches to unknown block {}",
+                        function.name, edge.target.0
+                    ))
+                })?;
+            slot.push(block.id);
+        }
+    }
+    Ok(predecessors)
+}
+
+fn dominators(
+    function: &FullFunction,
+    entry: BlockId,
+    predecessors: &[Vec<BlockId>],
+) -> Vec<HashSet<BlockId>> {
+    let mut reachable = HashSet::new();
+    let mut queue = VecDeque::from([entry]);
+    while let Some(block) = queue.pop_front() {
+        if !reachable.insert(block) {
+            continue;
+        }
+        let terminator = function.blocks[block.0 as usize]
+            .terminator
+            .as_ref()
+            .expect("terminator was checked");
+        queue.extend(terminator_edges(terminator).map(|edge| edge.target));
+    }
+    let mut result = vec![HashSet::new(); function.blocks.len()];
+    for block in &function.blocks {
+        if block.id == entry || !reachable.contains(&block.id) {
+            result[block.id.0 as usize].insert(block.id);
+        } else {
+            result[block.id.0 as usize] = reachable.clone();
+        }
+    }
+    loop {
+        let mut changed = false;
+        for block in &function.blocks {
+            if block.id == entry || !reachable.contains(&block.id) {
+                continue;
+            }
+            let reachable_predecessors = predecessors[block.id.0 as usize]
+                .iter()
+                .filter(|predecessor| reachable.contains(predecessor));
+            let mut intersection: Option<HashSet<BlockId>> = None;
+            for predecessor in reachable_predecessors {
+                intersection = Some(match intersection {
+                    None => result[predecessor.0 as usize].clone(),
+                    Some(current) => current
+                        .intersection(&result[predecessor.0 as usize])
+                        .copied()
+                        .collect(),
+                });
+            }
+            let mut next = intersection.unwrap_or_default();
+            next.insert(block.id);
+            if next != result[block.id.0 as usize] {
+                result[block.id.0 as usize] = next;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    result
+}
+
+struct FunctionVerifier<'a> {
+    module: &'a FullModule,
+    function: &'a FullFunction,
+    definitions: &'a [Option<Definition>],
+    dominators: &'a [HashSet<BlockId>],
+}
+
+impl FunctionVerifier<'_> {
+    fn instruction(
+        &self,
+        block: BlockId,
+        position: usize,
+        instruction: &FullInstruction,
+    ) -> Result<(), IrError> {
+        for operand in instruction_operands(&instruction.kind) {
+            self.use_value(block, position, operand)?;
+        }
+        self.instruction_types(block, position, instruction)
+    }
+
+    fn instruction_types(
+        &self,
+        block: BlockId,
+        position: usize,
+        instruction: &FullInstruction,
+    ) -> Result<(), IrError> {
+        let types = &self.module.types;
+        let result = instruction
+            .result
+            .map(|value| value_type(self.function, value))
+            .transpose()?;
+        match &instruction.kind {
+            FullInstructionKind::Constant(_) => {
+                let ty = require_result(result, instruction, "constant")?;
+                if is_aggregate(types, ty.ty) || is_void(types, ty.ty) {
+                    return Err(IrError::verify("constant has a non-scalar result type"));
+                }
+            }
+            FullInstructionKind::AddressConstant { target, .. } => {
+                let ty = require_result(result, instruction, "address constant")?;
+                self.verify_target(*target)?;
+                if !is_pointer_or_integer(types, ty.ty) {
+                    return Err(IrError::verify(
+                        "address constant has neither pointer nor integer type",
+                    ));
+                }
+            }
+            FullInstructionKind::AddressOfGlobal { global } => {
+                let object = self
+                    .module
+                    .globals
+                    .get(global.0 as usize)
+                    .filter(|object| object.id == *global)
+                    .ok_or_else(|| {
+                        IrError::verify(format!("address references unknown data {}", global.0))
+                    })?;
+                require_pointer_result(types, result, object.ty, instruction)?;
+            }
+            FullInstructionKind::AddressOfFunction {
+                function,
+                signature,
+            } => {
+                let declaration = self
+                    .module
+                    .functions
+                    .get(function.0 as usize)
+                    .filter(|declaration| declaration.id == *function)
+                    .ok_or_else(|| {
+                        IrError::verify(format!(
+                            "address references unknown function {}",
+                            function.0
+                        ))
+                    })?;
+                if declaration.signature != *signature {
+                    return Err(IrError::verify(
+                        "function address carries the wrong signature",
+                    ));
+                }
+                require_pointer_result(
+                    types,
+                    result,
+                    QualifiedType::unqualified(*signature),
+                    instruction,
+                )?;
+            }
+            FullInstructionKind::AddressOfString { string } => {
+                let literal = self
+                    .module
+                    .strings
+                    .get(string.0 as usize)
+                    .filter(|literal| literal.id == *string)
+                    .ok_or_else(|| {
+                        IrError::verify(format!("address references unknown string {}", string.0))
+                    })?;
+                require_pointer_result(types, result, literal.ty, instruction)?;
+            }
+            FullInstructionKind::AddressOfStorage { storage } => {
+                let object = self
+                    .function
+                    .storage
+                    .get(storage.0 as usize)
+                    .filter(|object| object.id == *storage)
+                    .ok_or_else(|| {
+                        IrError::verify(format!("address references unknown storage {}", storage.0))
+                    })?;
+                require_pointer_result(types, result, object.ty, instruction)?;
+            }
+            FullInstructionKind::ProjectField {
+                base,
+                record,
+                field_index,
+                field_name,
+            } => {
+                require_address(types, self.value_type(*base)?, *record, "field projection")?;
+                let Some(TypeKind::Record(record_id)) = types.try_kind(record.ty) else {
+                    return Err(IrError::verify(
+                        "field projection record operand is not a record",
+                    ));
+                };
+                let field = types
+                    .record(*record_id)
+                    .and_then(|record| record.fields.as_ref())
+                    .and_then(|fields| fields.get(*field_index))
+                    .ok_or_else(|| {
+                        IrError::verify("field projection has an invalid field index")
+                    })?;
+                if field_name
+                    .as_ref()
+                    .is_some_and(|name| field.name.as_ref() != Some(name))
+                {
+                    return Err(IrError::verify(
+                        "field projection name disagrees with its field index",
+                    ));
+                }
+                let projected =
+                    QualifiedType::new(field.ty.ty, field.ty.qualifiers | record.qualifiers);
+                require_pointer_result(types, result, projected, instruction)?;
+            }
+            FullInstructionKind::PointerOffset {
+                base,
+                index,
+                element,
+                ..
+            } => {
+                require_address(types, self.value_type(*base)?, *element, "pointer offset")?;
+                if !types.is_integer(self.value_type(*index)?.ty) {
+                    return Err(IrError::verify("pointer offset index is not an integer"));
+                }
+                require_pointer_result(types, result, *element, instruction)?;
+            }
+            FullInstructionKind::PointerDifference {
+                left,
+                right,
+                element,
+            } => {
+                require_address(
+                    types,
+                    self.value_type(*left)?,
+                    *element,
+                    "pointer difference",
+                )?;
+                require_address(
+                    types,
+                    self.value_type(*right)?,
+                    *element,
+                    "pointer difference",
+                )?;
+                let result = require_result(result, instruction, "pointer difference")?;
+                if !types.is_integer(result.ty) {
+                    return Err(IrError::verify(
+                        "pointer difference result is not an integer",
+                    ));
+                }
+            }
+            FullInstructionKind::Load {
+                address,
+                object,
+                access,
+            } => {
+                verify_access(*access)?;
+                require_address(types, self.value_type(*address)?, *object, "load")?;
+                let result = require_result(result, instruction, "load")?;
+                if result.ty != object.ty || is_aggregate(types, object.ty) {
+                    return Err(IrError::verify(
+                        "load result type disagrees with its object",
+                    ));
+                }
+            }
+            FullInstructionKind::Store {
+                address,
+                value,
+                object,
+                access,
+            } => {
+                require_no_result(result, instruction, "store")?;
+                verify_access(*access)?;
+                require_address(types, self.value_type(*address)?, *object, "store")?;
+                if self.value_type(*value)?.ty != object.ty || is_aggregate(types, object.ty) {
+                    return Err(IrError::verify(
+                        "store value type disagrees with its object",
+                    ));
+                }
+            }
+            FullInstructionKind::BitfieldLoad {
+                address,
+                descriptor,
+                access,
+            } => {
+                verify_access(*access)?;
+                verify_bitfield(*descriptor)?;
+                if pointer_pointee(types, self.value_type(*address)?.ty).is_none() {
+                    return Err(IrError::verify("bitfield load address is not a pointer"));
+                }
+                require_result(result, instruction, "bitfield load")?;
+            }
+            FullInstructionKind::BitfieldStore {
+                address,
+                value,
+                descriptor,
+                access,
+            } => {
+                require_no_result(result, instruction, "bitfield store")?;
+                verify_access(*access)?;
+                verify_bitfield(*descriptor)?;
+                let pointee = pointer_pointee(types, self.value_type(*address)?.ty)
+                    .ok_or_else(|| IrError::verify("bitfield store address is not a pointer"))?;
+                if pointee.ty != self.value_type(*value)?.ty {
+                    return Err(IrError::verify(
+                        "bitfield store value disagrees with its field type",
+                    ));
+                }
+            }
+            FullInstructionKind::ZeroInitialize {
+                destination,
+                object,
+            } => {
+                require_no_result(result, instruction, "zero initialization")?;
+                require_address(
+                    types,
+                    self.value_type(*destination)?,
+                    *object,
+                    "zero initialization",
+                )?;
+            }
+            FullInstructionKind::StringInitialize {
+                destination,
+                string,
+                object,
+                copy_code_units,
+            } => {
+                require_no_result(result, instruction, "string initialization")?;
+                require_address(
+                    types,
+                    self.value_type(*destination)?,
+                    *object,
+                    "string initialization",
+                )?;
+                let literal = self
+                    .module
+                    .strings
+                    .get(string.0 as usize)
+                    .filter(|literal| literal.id == *string)
+                    .ok_or_else(|| {
+                        IrError::verify("string initialization has invalid string id")
+                    })?;
+                let bound = array_bound(types, object.ty).ok_or_else(|| {
+                    IrError::verify("string initialization destination is not a constant array")
+                })?;
+                if *copy_code_units > bound || *copy_code_units as usize > literal.code_units.len()
+                {
+                    return Err(IrError::verify(
+                        "string initialization copy count is out of bounds",
+                    ));
+                }
+            }
+            FullInstructionKind::AggregateCopy {
+                destination,
+                source,
+                destination_object,
+                source_object,
+                destination_access,
+                source_access,
+                ..
+            } => {
+                require_no_result(result, instruction, "aggregate copy")?;
+                verify_access(*destination_access)?;
+                verify_access(*source_access)?;
+                if !is_aggregate(types, destination_object.ty)
+                    || destination_object.ty != source_object.ty
+                {
+                    return Err(IrError::verify(
+                        "aggregate copy objects do not have the same aggregate type",
+                    ));
+                }
+                require_address(
+                    types,
+                    self.value_type(*destination)?,
+                    *destination_object,
+                    "aggregate copy destination",
+                )?;
+                require_address(
+                    types,
+                    self.value_type(*source)?,
+                    *source_object,
+                    "aggregate copy source",
+                )?;
+            }
+            FullInstructionKind::AggregateValue {
+                address,
+                object,
+                access,
+            } => {
+                verify_access(*access)?;
+                if !is_aggregate(types, object.ty) {
+                    return Err(IrError::verify(
+                        "aggregate value does not have aggregate type",
+                    ));
+                }
+                require_address(
+                    types,
+                    self.value_type(*address)?,
+                    *object,
+                    "aggregate value",
+                )?;
+                let result = require_result(result, instruction, "aggregate value")?;
+                if result.ty != object.ty {
+                    return Err(IrError::verify("aggregate value result type is wrong"));
+                }
+            }
+            FullInstructionKind::Convert {
+                kind,
+                operand,
+                from,
+                to,
+            } => {
+                if *kind == ScalarConversion::ArrayToPointer {
+                    let Some(TypeKind::Array(_)) = types.try_kind(from.ty) else {
+                        return Err(IrError::verify(
+                            "array-to-pointer conversion source is not an array",
+                        ));
+                    };
+                    require_address(types, self.value_type(*operand)?, *from, "array decay")?;
+                } else if *kind != ScalarConversion::FunctionToPointer
+                    && self.value_type(*operand)?.ty != from.ty
+                {
+                    return Err(IrError::verify(
+                        "conversion operand type disagrees with its source type",
+                    ));
+                }
+                if *kind == ScalarConversion::ToVoid {
+                    require_no_result(result, instruction, "conversion to void")?;
+                    if !is_void(types, to.ty) {
+                        return Err(IrError::verify(
+                            "conversion to void does not carry void result type",
+                        ));
+                    }
+                } else {
+                    let result = require_result(result, instruction, "conversion")?;
+                    if result.ty != to.ty {
+                        return Err(IrError::verify(
+                            "conversion result type disagrees with its destination type",
+                        ));
+                    }
+                }
+            }
+            FullInstructionKind::Unary { operand, .. } => {
+                let result = require_result(result, instruction, "unary operation")?;
+                if result.ty != self.value_type(*operand)?.ty && !types.is_integer(result.ty) {
+                    return Err(IrError::verify("unary operation has inconsistent types"));
+                }
+            }
+            FullInstructionKind::Binary {
+                operator,
+                left,
+                right,
+            } => {
+                require_result(result, instruction, "binary operation")?;
+                let left = self.value_type(*left)?;
+                let right = self.value_type(*right)?;
+                let shift = matches!(
+                    operator,
+                    super::BinaryOperation::LeftShift | super::BinaryOperation::RightShift
+                );
+                if left.ty != right.ty
+                    && !(shift && types.is_integer(left.ty) && types.is_integer(right.ty))
+                {
+                    return Err(IrError::verify(
+                        "ordinary binary operation operands have different types",
+                    ));
+                }
+            }
+            FullInstructionKind::DirectCall {
+                function,
+                signature,
+                arguments,
+                variadic_boundary,
+                effects,
+            } => {
+                let declaration = self
+                    .module
+                    .functions
+                    .get(function.0 as usize)
+                    .filter(|declaration| declaration.id == *function)
+                    .ok_or_else(|| IrError::verify("direct call has invalid function id"))?;
+                if declaration.signature != *signature {
+                    return Err(IrError::verify("direct call carries the wrong signature"));
+                }
+                self.verify_call(
+                    *signature,
+                    arguments,
+                    *variadic_boundary,
+                    result,
+                    instruction,
+                )?;
+                self.verify_noreturn(block, position, effects.no_return)?;
+            }
+            FullInstructionKind::IndirectCall {
+                callee,
+                signature,
+                arguments,
+                variadic_boundary,
+                effects,
+            } => {
+                require_address(
+                    types,
+                    self.value_type(*callee)?,
+                    QualifiedType::unqualified(*signature),
+                    "indirect call",
+                )?;
+                self.verify_call(
+                    *signature,
+                    arguments,
+                    *variadic_boundary,
+                    result,
+                    instruction,
+                )?;
+                self.verify_noreturn(block, position, effects.no_return)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_call(
+        &self,
+        signature: TypeId,
+        arguments: &[ValueId],
+        variadic_boundary: usize,
+        result: Option<QualifiedType>,
+        instruction: &FullInstruction,
+    ) -> Result<(), IrError> {
+        let signature = self
+            .module
+            .types
+            .function_signature(signature)
+            .ok_or_else(|| IrError::verify("call signature is not a function type"))?;
+        let fixed = match &signature.parameters {
+            FunctionParameters::Unspecified => 0,
+            FunctionParameters::Prototype(parameters) => {
+                if arguments.len() < parameters.len()
+                    || (!signature.variadic && arguments.len() != parameters.len())
+                {
+                    return Err(IrError::verify(
+                        "call argument count disagrees with its signature",
+                    ));
+                }
+                for (argument, expected) in arguments.iter().zip(parameters) {
+                    if self.value_type(*argument)?.ty != expected.ty {
+                        return Err(IrError::verify(
+                            "call argument type disagrees with its signature",
+                        ));
+                    }
+                }
+                parameters.len()
+            }
+        };
+        if variadic_boundary != fixed {
+            return Err(IrError::verify(
+                "call variadic boundary disagrees with its signature",
+            ));
+        }
+        if is_void(&self.module.types, signature.result.ty) {
+            require_no_result(result, instruction, "void call")?;
+        } else {
+            let result = require_result(result, instruction, "call")?;
+            if result.ty != signature.result.ty {
+                return Err(IrError::verify("call result has the wrong type"));
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_noreturn(
+        &self,
+        block: BlockId,
+        position: usize,
+        no_return: bool,
+    ) -> Result<(), IrError> {
+        if no_return {
+            let body = &self.function.blocks[block.0 as usize];
+            if position + 1 != body.instructions.len()
+                || !matches!(body.terminator, Some(FullTerminator::Unreachable))
+            {
+                return Err(IrError::verify(
+                    "noreturn call is not immediately followed by unreachable",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn terminator(&self, block: BlockId, terminator: &FullTerminator) -> Result<(), IrError> {
+        for operand in terminator_operands(terminator) {
+            self.use_value(block, usize::MAX, operand)?;
+        }
+        match terminator {
+            FullTerminator::Branch(edge) => self.edge(block, edge)?,
+            FullTerminator::Conditional {
+                condition,
+                then_edge,
+                else_edge,
+            } => {
+                if !is_scalar(&self.module.types, self.value_type(*condition)?.ty) {
+                    return Err(IrError::verify(
+                        "conditional branch condition is not scalar",
+                    ));
+                }
+                self.edge(block, then_edge)?;
+                self.edge(block, else_edge)?;
+            }
+            FullTerminator::Switch {
+                selector,
+                cases,
+                default,
+            } => {
+                if !self.module.types.is_integer(self.value_type(*selector)?.ty) {
+                    return Err(IrError::verify("switch selector is not an integer"));
+                }
+                let mut values = HashSet::new();
+                for case in cases {
+                    if !values.insert(case.value) {
+                        return Err(IrError::verify("switch contains duplicate case values"));
+                    }
+                    self.edge(block, &case.edge)?;
+                }
+                self.edge(block, default)?;
+            }
+            FullTerminator::Return(value) => match value {
+                Some(value) => {
+                    if self.value_type(*value)?.ty != self.function.result_type.ty {
+                        return Err(IrError::verify("return value has the wrong type"));
+                    }
+                    if is_void(&self.module.types, self.function.result_type.ty) {
+                        return Err(IrError::verify("void function returns a value"));
+                    }
+                }
+                None if !is_void(&self.module.types, self.function.result_type.ty) => {
+                    return Err(IrError::verify("non-void function returns without a value"));
+                }
+                None => {}
+            },
+            FullTerminator::Unreachable => {}
+        }
+        Ok(())
+    }
+
+    fn edge(&self, source: BlockId, edge: &FullEdge) -> Result<(), IrError> {
+        let target = self
+            .function
+            .blocks
+            .get(edge.target.0 as usize)
+            .filter(|block| block.id == edge.target)
+            .ok_or_else(|| {
+                IrError::verify(format!("edge references unknown block {}", edge.target.0))
+            })?;
+        if edge.arguments.len() != target.parameters.len() {
+            return Err(IrError::verify(format!(
+                "edge from block {} to block {} has the wrong arity",
+                source.0, edge.target.0
+            )));
+        }
+        for (argument, parameter) in edge.arguments.iter().zip(&target.parameters) {
+            if !same_type(self.value_type(*argument)?, self.value_type(*parameter)?) {
+                return Err(IrError::verify(format!(
+                    "edge from block {} to block {} has an argument type mismatch",
+                    source.0, edge.target.0
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn use_value(&self, block: BlockId, position: usize, value: ValueId) -> Result<(), IrError> {
+        let definition = self
+            .definitions
+            .get(value.0 as usize)
+            .and_then(|definition| *definition)
+            .ok_or_else(|| IrError::verify(format!("use of undefined value {}", value.0)))?;
+        match definition {
+            Definition::BlockParameter(definition_block) if definition_block == block => Ok(()),
+            Definition::Instruction {
+                block: definition_block,
+                position: definition_position,
+            } if definition_block == block && definition_position < position => Ok(()),
+            Definition::BlockParameter(definition_block)
+            | Definition::Instruction {
+                block: definition_block,
+                ..
+            } if definition_block != block
+                && self.dominators[block.0 as usize].contains(&definition_block) =>
+            {
+                Ok(())
+            }
+            _ => Err(IrError::verify(format!(
+                "value {} does not dominate its use in block {}",
+                value.0, block.0
+            ))),
+        }
+    }
+
+    fn value_type(&self, value: ValueId) -> Result<QualifiedType, IrError> {
+        value_type(self.function, value)
+    }
+
+    fn verify_target(&self, target: RelocationTarget) -> Result<(), IrError> {
+        match target {
+            RelocationTarget::Object(id)
+                if self
+                    .module
+                    .globals
+                    .get(id.0 as usize)
+                    .is_some_and(|object| object.id == id) =>
+            {
+                Ok(())
+            }
+            RelocationTarget::Function(id)
+                if self
+                    .module
+                    .functions
+                    .get(id.0 as usize)
+                    .is_some_and(|function| function.id == id) =>
+            {
+                Ok(())
+            }
+            RelocationTarget::String(id)
+                if self
+                    .module
+                    .strings
+                    .get(id.0 as usize)
+                    .is_some_and(|string| string.id == id) =>
+            {
+                Ok(())
+            }
+            _ => Err(IrError::verify("address constant has an invalid target")),
+        }
+    }
+}
+
+fn instruction_operands(kind: &FullInstructionKind) -> Vec<ValueId> {
+    match kind {
+        FullInstructionKind::Constant(_)
+        | FullInstructionKind::AddressConstant { .. }
+        | FullInstructionKind::AddressOfGlobal { .. }
+        | FullInstructionKind::AddressOfFunction { .. }
+        | FullInstructionKind::AddressOfString { .. }
+        | FullInstructionKind::AddressOfStorage { .. } => Vec::new(),
+        FullInstructionKind::ProjectField { base, .. } => vec![*base],
+        FullInstructionKind::PointerOffset { base, index, .. } => vec![*base, *index],
+        FullInstructionKind::PointerDifference { left, right, .. }
+        | FullInstructionKind::Binary { left, right, .. } => vec![*left, *right],
+        FullInstructionKind::Load { address, .. }
+        | FullInstructionKind::BitfieldLoad { address, .. }
+        | FullInstructionKind::ZeroInitialize {
+            destination: address,
+            ..
+        }
+        | FullInstructionKind::StringInitialize {
+            destination: address,
+            ..
+        }
+        | FullInstructionKind::AggregateValue { address, .. } => vec![*address],
+        FullInstructionKind::Store { address, value, .. }
+        | FullInstructionKind::BitfieldStore { address, value, .. } => vec![*address, *value],
+        FullInstructionKind::AggregateCopy {
+            destination,
+            source,
+            ..
+        } => vec![*destination, *source],
+        FullInstructionKind::Convert { operand, .. }
+        | FullInstructionKind::Unary { operand, .. } => vec![*operand],
+        FullInstructionKind::DirectCall { arguments, .. } => arguments.clone(),
+        FullInstructionKind::IndirectCall {
+            callee, arguments, ..
+        } => std::iter::once(*callee)
+            .chain(arguments.iter().copied())
+            .collect(),
+    }
+}
+
+fn terminator_operands(terminator: &FullTerminator) -> Vec<ValueId> {
+    match terminator {
+        FullTerminator::Branch(edge) => edge.arguments.clone(),
+        FullTerminator::Conditional {
+            condition,
+            then_edge,
+            else_edge,
+        } => std::iter::once(*condition)
+            .chain(then_edge.arguments.iter().copied())
+            .chain(else_edge.arguments.iter().copied())
+            .collect(),
+        FullTerminator::Switch {
+            selector,
+            cases,
+            default,
+        } => std::iter::once(*selector)
+            .chain(
+                cases
+                    .iter()
+                    .flat_map(|case| case.edge.arguments.iter().copied()),
+            )
+            .chain(default.arguments.iter().copied())
+            .collect(),
+        FullTerminator::Return(value) => value.iter().copied().collect(),
+        FullTerminator::Unreachable => Vec::new(),
+    }
+}
+
+fn terminator_edges(terminator: &FullTerminator) -> impl Iterator<Item = &FullEdge> {
+    let mut edges = Vec::new();
+    match terminator {
+        FullTerminator::Branch(edge) => edges.push(edge),
+        FullTerminator::Conditional {
+            then_edge,
+            else_edge,
+            ..
+        } => {
+            edges.push(then_edge);
+            edges.push(else_edge);
+        }
+        FullTerminator::Switch { cases, default, .. } => {
+            edges.extend(cases.iter().map(|case| &case.edge));
+            edges.push(default);
+        }
+        FullTerminator::Return(_) | FullTerminator::Unreachable => {}
+    }
+    edges.into_iter()
+}
+
+fn require_result(
+    result: Option<QualifiedType>,
+    instruction: &FullInstruction,
+    name: &str,
+) -> Result<QualifiedType, IrError> {
+    result.ok_or_else(|| {
+        IrError::verify(format!(
+            "{name} instruction {} has no result",
+            instruction.id.0
+        ))
+    })
+}
+
+fn require_no_result(
+    result: Option<QualifiedType>,
+    instruction: &FullInstruction,
+    name: &str,
+) -> Result<(), IrError> {
+    if result.is_some() {
+        Err(IrError::verify(format!(
+            "{name} instruction {} unexpectedly has a result",
+            instruction.id.0
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn require_pointer_result(
+    types: &TypeStore,
+    result: Option<QualifiedType>,
+    pointee: QualifiedType,
+    instruction: &FullInstruction,
+) -> Result<(), IrError> {
+    let result = require_result(result, instruction, "address")?;
+    require_address(types, result, pointee, "address result")
+}
+
+fn require_address(
+    types: &TypeStore,
+    address: QualifiedType,
+    object: QualifiedType,
+    context: &str,
+) -> Result<(), IrError> {
+    let pointee = pointer_pointee(types, address.ty)
+        .ok_or_else(|| IrError::verify(format!("{context} operand is not a pointer")))?;
+    if !same_type(pointee, object) {
+        return Err(IrError::verify(format!(
+            "{context} pointer has the wrong pointee type"
+        )));
+    }
+    Ok(())
+}
+
+fn verify_access(access: MemoryAccess) -> Result<(), IrError> {
+    if (access.volatile || access.atomic.is_some()) && (!access.non_elidable || !access.non_movable)
+    {
+        return Err(IrError::verify(
+            "ordered memory access is missing non-elidable/non-movable markers",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_bitfield(bitfield: super::BitfieldDescriptor) -> Result<(), IrError> {
+    let bits = bitfield
+        .storage_size
+        .checked_mul(8)
+        .ok_or_else(|| IrError::verify("bitfield storage size overflows its bit representation"))?;
+    if bitfield.width == 0
+        || bitfield.storage_size == 0
+        || bitfield.storage_align == 0
+        || !bitfield.storage_align.is_power_of_two()
+        || u64::from(bitfield.bit_offset) + u64::from(bitfield.width) > bits
+    {
+        return Err(IrError::verify("bitfield descriptor is out of bounds"));
+    }
+    Ok(())
+}
+
+fn verify_type(types: &TypeStore, ty: QualifiedType, context: &str) -> Result<(), IrError> {
+    if types.contains(ty.ty) {
+        Ok(())
+    } else {
+        Err(IrError::verify(format!(
+            "{context} references an unknown type"
+        )))
+    }
+}
+
+fn value_type(function: &FullFunction, value: ValueId) -> Result<QualifiedType, IrError> {
+    function
+        .value_types
+        .get(value.0 as usize)
+        .copied()
+        .map(QualifiedType::unqualified)
+        .ok_or_else(|| IrError::verify(format!("value {} has no type", value.0)))
+}
+
+fn same_type(left: QualifiedType, right: QualifiedType) -> bool {
+    left.ty == right.ty && left.qualifiers == right.qualifiers
+}
+
+fn pointer_pointee(types: &TypeStore, ty: TypeId) -> Option<QualifiedType> {
+    match types.try_kind(ty) {
+        Some(TypeKind::Pointer(pointer)) => Some(pointer.pointee),
+        _ => None,
+    }
+}
+
+fn is_void(types: &TypeStore, ty: TypeId) -> bool {
+    types.builtin_type(ty) == Some(BuiltinType::Void)
+}
+
+fn is_aggregate(types: &TypeStore, ty: TypeId) -> bool {
+    matches!(
+        types.try_kind(ty),
+        Some(TypeKind::Array(_) | TypeKind::Record(_))
+    )
+}
+
+fn is_pointer_or_integer(types: &TypeStore, ty: TypeId) -> bool {
+    pointer_pointee(types, ty).is_some() || types.is_integer(ty)
+}
+
+fn is_scalar(types: &TypeStore, ty: TypeId) -> bool {
+    types.is_arithmetic(ty) || pointer_pointee(types, ty).is_some()
+}
+
+fn array_bound(types: &TypeStore, ty: TypeId) -> Option<u64> {
+    match types.try_kind(ty) {
+        Some(TypeKind::Array(array)) => match array.length {
+            ArrayLength::Constant(bound) => Some(bound),
+            ArrayLength::Incomplete | ArrayLength::Variable(_) => None,
+        },
+        _ => None,
+    }
+}

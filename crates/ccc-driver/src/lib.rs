@@ -19,19 +19,21 @@ use args::{
     ForcedInputKind, IncludePathKind as DriverIncludePathKind, MacroAction, ParsedCommand,
     PrimaryAction,
 };
-use ccc_abi::plan;
 use ccc_codegen::{Options as CodegenOptions, Output as CodegenOutput};
 use ccc_diag::Diagnostic;
-use ccc_ir::Module;
+use ccc_ir::generic::{FullModule, IrError as FrontendIrError};
 use ccc_link::{ToolchainRequirements, ToolchainResolver};
 use ccc_pp::{
     CommandLineMacro, DependencyMode, FileProvider, FsFileProvider, IncludePath, IncludePathKind,
     PpItem, PpToken, PreprocessContext, PreprocessLimits, PreprocessOptions, PreprocessOutput,
     preprocess, render_macro_definitions, render_preprocessed,
 };
-use ccc_sema::analyze_with_config;
+use ccc_sema::generic::{FullTypedTranslationUnit, analyze_frontend, dump_frontend_typed_ast};
 use ccc_session::{Session, SourceFileSpec, SourceMap};
-use ccc_syntax::{TranslationUnit, convert_pp_tokens, dump_ast, parse};
+use ccc_syntax::frontend::{
+    FrontendItem, TokenKind as FrontendTokenKind, TranslationUnit as FrontendTranslationUnit,
+    convert_pp_items, dump_ast as dump_frontend_ast, parse_with_mode as parse_frontend_with_mode,
+};
 use ccc_target::{CompatibilityScope, EffectiveCompilationConfig, SystemIncludeKind};
 
 use dependency::{
@@ -53,7 +55,8 @@ const HELP: &str = "Usage: ccc [options] <input.c>\n\
   -M|-MM|-MD|-MMD            Generate Make dependencies\n\
   --dump-pp-tokens           Dump expanded preprocessing tokens\n\
   --dump-tokens              Dump converted parser tokens\n\
-  --dump-ast|--dump-ir       Dump frontend representations\n\
+  --dump-ast|--dump-typed-ast|--dump-ir\n\
+                             Dump frontend representations\n\
   --emit=clif                Dump Cranelift IR\n";
 
 static TEMPORARY_ID: AtomicU64 = AtomicU64::new(0);
@@ -169,18 +172,26 @@ fn preprocess_source(options: &DriverOptions) -> Result<PreparedSource, DriverEr
     }
 
     if let Some(header) = unsupported_hosted_header(&options.action, &session.config, &output) {
+        let required = required_compatibility_scope(&options.action);
+        let available = session
+            .config
+            .gnu_profile
+            .as_ref()
+            .map_or(CompatibilityScope::Preprocessing, |profile| profile.scope);
         return Err(with_prior_diagnostics(
             &stderr,
             owner_error(
                 "CCC6004",
                 format!(
-                    "cannot continue into parsing after preprocessing hosted header {}: GNU profile {} certifies header preprocessing only",
+                    "cannot continue through {} after selecting hosted header {}: GNU profile {} is certified through {}",
+                    compatibility_scope_name(required),
                     header.display(),
                     session
                         .config
                         .gnu_profile
                         .as_ref()
-                        .map_or("<none>", |profile| profile.name.as_str())
+                        .map_or("<none>", |profile| profile.name.as_str()),
+                    compatibility_scope_name(available),
                 ),
             ),
         ));
@@ -256,15 +267,12 @@ fn unsupported_hosted_header<'a>(
     config: &EffectiveCompilationConfig,
     output: &'a PreprocessOutput,
 ) -> Option<&'a Path> {
-    let continues_into_parsing = matches!(
-        action,
-        PrimaryAction::Compile { .. }
-            | PrimaryAction::Dump(DumpKind::Ast | DumpKind::Ir | DumpKind::Clif)
-    );
-    if !continues_into_parsing
-        || config.gnu_profile.as_ref().map(|profile| profile.scope)
-            != Some(CompatibilityScope::Preprocessing)
-    {
+    let required = required_compatibility_scope(action);
+    let available = config
+        .gnu_profile
+        .as_ref()
+        .map_or(CompatibilityScope::Preprocessing, |profile| profile.scope);
+    if available.includes(required) {
         return None;
     }
 
@@ -280,6 +288,28 @@ fn unsupported_hosted_header<'a>(
             _ => None,
         }))
         .find(|path| is_toolchain_header(config, path))
+}
+
+fn required_compatibility_scope(action: &PrimaryAction) -> CompatibilityScope {
+    match action {
+        PrimaryAction::Preprocess | PrimaryAction::Dump(DumpKind::PpTokens) => {
+            CompatibilityScope::Preprocessing
+        }
+        PrimaryAction::Dump(DumpKind::Tokens | DumpKind::Ast) => CompatibilityScope::Parsing,
+        PrimaryAction::Dump(DumpKind::TypedAst) => CompatibilityScope::SemanticAnalysis,
+        PrimaryAction::Compile { .. } | PrimaryAction::Dump(DumpKind::Ir | DumpKind::Clif) => {
+            CompatibilityScope::CodeGeneration
+        }
+    }
+}
+
+const fn compatibility_scope_name(scope: CompatibilityScope) -> &'static str {
+    match scope {
+        CompatibilityScope::Preprocessing => "preprocessing",
+        CompatibilityScope::Parsing => "parsing",
+        CompatibilityScope::SemanticAnalysis => "semantic analysis",
+        CompatibilityScope::CodeGeneration => "code generation",
+    }
 }
 
 fn is_toolchain_header(config: &EffectiveCompilationConfig, path: &Path) -> bool {
@@ -490,10 +520,32 @@ fn dump_output(
 
     let stdout = match kind {
         DumpKind::PpTokens => dump_pp_tokens(&prepared.session.sources, &prepared.output.tokens()),
-        DumpKind::Tokens => dump_parser_tokens(&prepared.session.sources, prepared.output.tokens()),
+        DumpKind::Tokens => {
+            let items = convert_pp_items(prepared.output.items).map_err(|error| {
+                with_prior_diagnostics(
+                    &prior_stderr,
+                    diagnostic_error(
+                        &prepared.session.sources,
+                        Diagnostic::error(error.code, error.message)
+                            .with_primary(error.span, "while converting preprocessing tokens"),
+                    ),
+                )
+            })?;
+            dump_frontend_tokens(&prepared.session.sources, &items)
+        }
         DumpKind::Ast => {
-            let parsed = parse_preprocessed(prepared.session, prepared.output, &prior_stderr)?;
-            let mut stdout = dump_ast(&parsed.ast);
+            let parsed =
+                parse_frontend_preprocessed(prepared.session, prepared.output, &prior_stderr)?;
+            let mut stdout = dump_frontend_ast(&parsed.ast);
+            stdout.push_str(&dependency_stdout);
+            return Ok(DriverOutput {
+                stdout,
+                stderr: parsed.stderr,
+            });
+        }
+        DumpKind::TypedAst => {
+            let (parsed, typed) = analyze_frontend_preprocessed(prepared, &prior_stderr)?;
+            let mut stdout = dump_frontend_typed_ast(&typed);
             stdout.push_str(&dependency_stdout);
             return Ok(DriverOutput {
                 stdout,
@@ -501,8 +553,8 @@ fn dump_output(
             });
         }
         DumpKind::Ir => {
-            let (parsed, ir) = lower_preprocessed(prepared, &prior_stderr)?;
-            let mut stdout = ccc_ir::dump(&ir);
+            let (parsed, ir) = lower_frontend_preprocessed(prepared, &prior_stderr)?;
+            let mut stdout = ccc_ir::generic::dump_frontend_ir(&ir);
             stdout.push_str(&dependency_stdout);
             return Ok(DriverOutput {
                 stdout,
@@ -510,9 +562,10 @@ fn dump_output(
             });
         }
         DumpKind::Clif => {
-            let (parsed, ir) = lower_preprocessed(prepared, &prior_stderr)?;
-            let generated = codegen(&ir, &parsed.session.config, true)
-                .map_err(|error| with_prior_diagnostics(&parsed.stderr, error))?;
+            let (parsed, ir) = lower_frontend_preprocessed(prepared, &prior_stderr)?;
+            let generated =
+                codegen_frontend(&ir, &parsed.session.config, &parsed.session.sources, true)
+                    .map_err(|error| with_prior_diagnostics(&parsed.stderr, error))?;
             let mut stdout = generated.clif;
             stdout.push_str(&dependency_stdout);
             return Ok(DriverOutput {
@@ -552,8 +605,8 @@ fn compile_output(
     };
 
     let prior_stderr = prepared.stderr.clone();
-    let (parsed, ir) = lower_preprocessed(prepared, &prior_stderr)?;
-    let generated = codegen(&ir, &parsed.session.config, false)
+    let (parsed, ir) = lower_frontend_preprocessed(prepared, &prior_stderr)?;
+    let generated = codegen_frontend(&ir, &parsed.session.config, &parsed.session.sources, false)
         .map_err(|error| with_prior_diagnostics(&parsed.stderr, error))?;
     if link {
         let mut temporary = TemporaryObject::create()
@@ -682,19 +735,28 @@ fn write_side_effect_dependencies(
         .map(|()| String::new())
 }
 
-struct ParsedSource {
+struct FrontendParsedSource {
     session: Session,
-    ast: TranslationUnit,
+    ast: FrontendTranslationUnit,
     stderr: String,
 }
 
-fn parse_preprocessed(
+fn parse_frontend_preprocessed(
     session: Session,
     output: PreprocessOutput,
     prior_stderr: &str,
-) -> Result<ParsedSource, DriverError> {
-    let tokens = convert_pp_tokens(output.tokens());
-    let ast = parse(&tokens).map_err(|error| {
+) -> Result<FrontendParsedSource, DriverError> {
+    let items = convert_pp_items(output.items).map_err(|error| {
+        with_prior_diagnostics(
+            prior_stderr,
+            diagnostic_error(
+                &session.sources,
+                Diagnostic::error(error.code, error.message)
+                    .with_primary(error.span, "while converting preprocessing tokens"),
+            ),
+        )
+    })?;
+    let ast = parse_frontend_with_mode(&items, session.config.language.mode).map_err(|error| {
         with_prior_diagnostics(
             prior_stderr,
             diagnostic_error(
@@ -704,39 +766,62 @@ fn parse_preprocessed(
             ),
         )
     })?;
-    Ok(ParsedSource {
+    Ok(FrontendParsedSource {
         session,
         ast,
         stderr: prior_stderr.to_owned(),
     })
 }
 
-fn lower_preprocessed(
+fn analyze_frontend_preprocessed(
     prepared: PreparedSource,
     prior_stderr: &str,
-) -> Result<(ParsedSource, Module), DriverError> {
-    let parsed = parse_preprocessed(prepared.session, prepared.output, prior_stderr)?;
-    let typed =
-        analyze_with_config(&parsed.ast, &parsed.session.config).map_err(|diagnostics| {
-            with_prior_diagnostics(
-                prior_stderr,
-                diagnostics_error(&parsed.session.sources, diagnostics),
-            )
-        })?;
-    let ir = ccc_ir::lower(&typed).map_err(|error| {
-        with_prior_diagnostics(prior_stderr, owner_error(error.code, error.message))
+) -> Result<(FrontendParsedSource, FullTypedTranslationUnit), DriverError> {
+    let parsed = parse_frontend_preprocessed(prepared.session, prepared.output, prior_stderr)?;
+    let typed = analyze_frontend(&parsed.ast, &parsed.session.config).map_err(|diagnostics| {
+        with_prior_diagnostics(
+            prior_stderr,
+            diagnostics_error(&parsed.session.sources, diagnostics),
+        )
+    })?;
+    Ok((parsed, typed))
+}
+
+fn lower_frontend_preprocessed(
+    prepared: PreparedSource,
+    prior_stderr: &str,
+) -> Result<(FrontendParsedSource, FullModule), DriverError> {
+    let (parsed, typed) = analyze_frontend_preprocessed(prepared, prior_stderr)?;
+    let ir = ccc_ir::generic::lower_frontend(&typed).map_err(|error| {
+        with_prior_diagnostics(
+            prior_stderr,
+            frontend_ir_error(&parsed.session.sources, error),
+        )
     })?;
     Ok((parsed, ir))
 }
 
-fn codegen(
-    ir: &Module,
+fn frontend_ir_error(sources: &SourceMap, error: FrontendIrError) -> DriverError {
+    let mut diagnostic = Diagnostic::error(error.code, error.message);
+    if let Some(span) = error.span {
+        diagnostic = diagnostic.with_primary(span, "while lowering typed C to IR");
+    }
+    diagnostic_error(sources, diagnostic)
+}
+
+fn codegen_frontend(
+    ir: &FullModule,
     config: &EffectiveCompilationConfig,
+    sources: &SourceMap,
     emit_clif: bool,
 ) -> Result<CodegenOutput, DriverError> {
-    let plan = plan(ir, config).map_err(|error| owner_error(error.code, error.message))?;
-    ccc_codegen::emit(ir, &plan, config, CodegenOptions { emit_clif })
-        .map_err(|error| owner_error(error.code, error.message))
+    ccc_codegen::generic::emit(ir, config, CodegenOptions { emit_clif }).map_err(|error| {
+        let mut diagnostic = Diagnostic::error(error.code, error.message);
+        if let Some(span) = error.span {
+            diagnostic = diagnostic.with_primary(span, "while generating native code");
+        }
+        diagnostic_error(sources, diagnostic)
+    })
 }
 
 fn dump_pp_tokens(sources: &SourceMap, tokens: &[PpToken]) -> String {
@@ -783,23 +868,30 @@ fn dump_pp_tokens(sources: &SourceMap, tokens: &[PpToken]) -> String {
     stdout
 }
 
-fn dump_parser_tokens(sources: &SourceMap, pp_tokens: Vec<PpToken>) -> String {
+fn dump_frontend_tokens(sources: &SourceMap, items: &[FrontendItem]) -> String {
     let mut stdout = String::new();
-    for token in convert_pp_tokens(pp_tokens) {
+    for item in items {
+        let FrontendItem::Token(token) = item else {
+            continue;
+        };
         let start = sources
             .presumed_location(token.span.file, token.span.start)
             .expect("token spans source boundaries");
         let end = sources
             .presumed_location(token.span.file, token.span.end)
             .expect("token spans source boundaries");
+        let kind = match &token.kind {
+            FrontendTokenKind::Keyword(_) => "keyword",
+            FrontendTokenKind::Identifier => "identifier",
+            FrontendTokenKind::Integer(_) => "integer-constant",
+            FrontendTokenKind::Floating(_) => "floating-constant",
+            FrontendTokenKind::Character(_) => "character-constant",
+            FrontendTokenKind::String(_) => "string-literal",
+            FrontendTokenKind::Punctuator(_) => "punctuator",
+        };
         stdout.push_str(&format!(
             "{} {:?} {}:{}-{}:{}\n",
-            token.kind.as_str(),
-            token.spelling,
-            start.line,
-            start.column,
-            end.line,
-            end.column
+            kind, token.spelling, start.line, start.column, end.line, end.column
         ));
     }
     stdout
@@ -902,8 +994,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn refuses_to_parse_headers_selected_by_a_preprocessing_only_hosted_profile() {
+    fn enforces_the_ordered_hosted_header_phase_ceiling() {
         let mut config = EffectiveCompilationConfig::default();
+        config.gnu_profile.as_mut().unwrap().scope = CompatibilityScope::Preprocessing;
         config
             .toolchain
             .system_includes
@@ -929,7 +1022,25 @@ mod tests {
         );
         assert_eq!(
             unsupported_hosted_header(&PrimaryAction::Dump(DumpKind::Tokens), &config, &output),
+            Some(Path::new("/target/include/features.h"))
+        );
+        assert_eq!(
+            unsupported_hosted_header(&PrimaryAction::Dump(DumpKind::PpTokens), &config, &output),
             None
+        );
+
+        config.gnu_profile.as_mut().unwrap().scope = CompatibilityScope::Parsing;
+        assert_eq!(
+            unsupported_hosted_header(&PrimaryAction::Dump(DumpKind::Tokens), &config, &output),
+            None
+        );
+        assert_eq!(
+            unsupported_hosted_header(&PrimaryAction::Dump(DumpKind::Ast), &config, &output),
+            None
+        );
+        assert_eq!(
+            unsupported_hosted_header(&PrimaryAction::Dump(DumpKind::TypedAst), &config, &output),
+            Some(Path::new("/target/include/features.h"))
         );
 
         output.dependencies.edges.clear();
@@ -998,7 +1109,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_ast_ir_and_clif_after_macro_expansion() {
+    fn renders_frontend_and_backend_dumps_after_macro_expansion() {
         let (directory, input) = temporary_source(
             "program.c",
             "#define ANSWER 42\nint main(void) { int x = ANSWER; return x; }",
@@ -1011,7 +1122,16 @@ mod tests {
         ])
         .unwrap()
         .stdout;
-        assert!(ast.contains("function main"));
+        assert!(ast.contains("function-definition main"));
+        let typed_ast = run([
+            "--dump-typed-ast".to_owned(),
+            "-nostdinc".to_owned(),
+            input.clone(),
+        ])
+        .unwrap()
+        .stdout;
+        assert!(typed_ast.contains("function @0 main : int ()"));
+        assert!(typed_ast.contains("constant Signed(42) : int Value"));
         let ir = run([
             "--dump-ir".to_owned(),
             "-nostdinc".to_owned(),
@@ -1019,7 +1139,7 @@ mod tests {
         ])
         .unwrap()
         .stdout;
-        assert!(ir.contains("function @main"));
+        assert!(ir.contains("function f0 @main("));
         let clif = run(["--emit=clif".to_owned(), "-nostdinc".to_owned(), input])
             .unwrap()
             .stdout;
@@ -1062,7 +1182,7 @@ mod tests {
         ])
         .unwrap_err();
         let message = error.to_string();
-        assert!(message.contains("CCC2005"));
+        assert!(message.contains("CCC2274"));
         assert!(message.contains("invalid.c:1:"));
         fs::remove_dir_all(directory).unwrap();
     }
@@ -1071,19 +1191,19 @@ mod tests {
     fn unsupported_programs_do_not_emit_objects() {
         let cases = [
             (
-                "pointer.c",
-                "int main(void) { int *p; return 0; }",
-                "CCC1001",
+                "atomic.c",
+                "int main(void) { _Atomic int value; return value; }",
+                "CCC4011",
             ),
             (
                 "wide-literal.c",
-                "int main(void) { return 2147483648; }",
-                "CCC2004",
+                "int main(void) { return 18446744073709551616ULL; }",
+                "CCC2276",
             ),
             (
                 "wrong-arity.c",
                 "int f(int x) { return x; } int main(void) { return f(); }",
-                "CCC2009",
+                "CCC2300",
             ),
         ];
         for (name, source, code) in cases {
@@ -1132,7 +1252,7 @@ mod tests {
         .unwrap_err()
         .to_string();
         let warning = error.find("CCC1315").expect("preprocessing warning");
-        let semantic = error.find("CCC2005").expect("semantic error");
+        let semantic = error.find("CCC2274").expect("semantic error");
         assert!(warning < semantic, "{error}");
         fs::remove_dir_all(directory).unwrap();
     }

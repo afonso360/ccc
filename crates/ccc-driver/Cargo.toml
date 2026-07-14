@@ -10,7 +10,6 @@ name = "ccc"
 path = "src/main.rs"
 
 [dependencies]
-ccc-abi = { path = "../ccc-abi" }
 ccc-codegen = { path = "../ccc-codegen" }
 ccc-diag = { path = "../ccc-diag" }
 ccc-ir = { path = "../ccc-ir" }
@@ -20,7 +19,6 @@ ccc-sema = { path = "../ccc-sema" }
 ccc-session = { path = "../ccc-session" }
 ccc-syntax = { path = "../ccc-syntax" }
 ccc-target = { path = "../ccc-target" }
-ccc-types = { path = "../ccc-types" }
 object.workspace = true
 
 [lints]
