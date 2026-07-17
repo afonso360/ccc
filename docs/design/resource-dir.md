@@ -5,6 +5,13 @@ optional CCC runtime shims. Its version and target capability manifest are
 checked against the compiler binary; mixing incompatible installations is a
 hard error.
 
+The GNU compatibility tuple, C11 identity, CCC identity, target facts, dynamic
+predicates, and later feature macros together form the
+[effective compiler identity](core-c11-and-gnu-semantics.md#effective-compiler-identity).
+The tuple alone is not historical GCC emulation. A resource-manifest revision
+must enumerate any predicate or macro addition that can select a different
+hosted-header path.
+
 ## Header ownership
 
 Headers are classified rather than all being treated as complete CCC replacements:

@@ -12,7 +12,7 @@ name = "gcc-4.2.1"
 version = "4.2.1"
 scope = "parsing"
 selection_gate = "__GNUC_PREREQ(4, 2)"
-rationale = "This conservative version selects an established GNU declaration surface covered by preprocessing and parser tests while avoiding header gates that infer newer language features such as __VA_OPT__."
+rationale = "This conservative version selects an established GNU declaration surface covered by preprocessing and parser tests while avoiding header gates that infer newer language features such as __VA_OPT__. CCC-specific C11 identity and predicate deviations are enumerated separately and are not attributed to historical GCC 4.2.1."
 capabilities = [
     "computed-includes",
     "function-like-macros",

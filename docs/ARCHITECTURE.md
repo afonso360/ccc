@@ -50,20 +50,21 @@ The fully annotated pipeline — which crate owns each stage, the component brea
 
 ## Design documents
 
-| Document                                                 | Covers                                                                                         |
-| -------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| [Targets & non-goals](design/targets.md)                 | Exact target triples, object formats, ABIs, and what's explicitly out of scope                 |
-| [Conformance policy](design/conformance.md)              | `long double`, `_Complex`, effective implementation-defined behavior, GNU capability registry  |
-| [Frontend capabilities](design/frontend-capabilities.md) | Syntax recognition, GNU declarations, capability states, and hosted-header phase certification |
-| [ABI & variadic functions](design/abi-and-varargs.md)    | ABI plans, aggregate boundaries, variadic call bridges, `va_list`, and target shims            |
-| [Pipeline & crates](design/pipeline-and-crates.md)       | Annotated pipeline, per-component design, workspace/crate layout                               |
-| [CCC-IR invariants](design/ccc-ir.md)                    | Places vs values, aggregates, bitfields, volatile, atomics; sema guarantees                    |
-| [Resource directory](design/resource-dir.md)             | Shipped builtin headers, include search, runtime helper strategy                               |
-| [Driver & CLI](design/driver-cli.md)                     | Flag surface, unknown-flag policy, observability dumps                                         |
-| [Diagnostics](design/diagnostics.md)                     | Spans, macro/include backtraces, parser recovery, warning control                              |
-| [Cranelift risk register](design/cranelift-risks.md)     | The hard backend problems (ABI, varargs, `long double`, inline asm, TLS, …)                    |
-| [Testing strategy](design/testing.md)                    | Snapshot/execution/differential tiers, the ABI oracle, corpus licensing                        |
-| [Toolchain & policy](design/toolchain.md)                | Dependencies, Cranelift pinning, MSRV, lint/dep policy                                         |
+| Document                                                      | Covers                                                                                                  |
+| ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| [Targets & non-goals](design/targets.md)                      | Exact target triples, object formats, ABIs, and what's explicitly out of scope                          |
+| [Conformance policy](design/conformance.md)                   | `long double`, `_Complex`, effective implementation-defined behavior, GNU capability registry           |
+| [Frontend capabilities](design/frontend-capabilities.md)      | Syntax recognition, GNU declarations, capability states, and hosted-header phase certification          |
+| [C11 and GNU semantics](design/core-c11-and-gnu-semantics.md) | Activation contract for selected C11 constructs, GNU expressions, wide integers, builtins, and assembly |
+| [ABI & variadic functions](design/abi-and-varargs.md)         | ABI plans, aggregate boundaries, variadic call bridges, `va_list`, and target shims                     |
+| [Pipeline & crates](design/pipeline-and-crates.md)            | Annotated pipeline, per-component design, workspace/crate layout                                        |
+| [CCC-IR invariants](design/ccc-ir.md)                         | Places vs values, aggregates, bitfields, volatile, atomics; sema guarantees                             |
+| [Resource directory](design/resource-dir.md)                  | Shipped builtin headers, include search, runtime helper strategy                                        |
+| [Driver & CLI](design/driver-cli.md)                          | Flag surface, unknown-flag policy, observability dumps                                                  |
+| [Diagnostics](design/diagnostics.md)                          | Spans, macro/include backtraces, parser recovery, warning control                                       |
+| [Cranelift risk register](design/cranelift-risks.md)          | The hard backend problems (ABI, varargs, `long double`, inline asm, TLS, …)                             |
+| [Testing strategy](design/testing.md)                         | Snapshot/execution/differential tiers, the ABI oracle, corpus licensing                                 |
+| [Toolchain & policy](design/toolchain.md)                     | Dependencies, Cranelift pinning, MSRV, lint/dep policy                                                  |
 
 Project planning is documented separately in [ROADMAP.md]; it is not part of
 the feature design.

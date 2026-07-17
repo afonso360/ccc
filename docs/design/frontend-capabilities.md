@@ -6,6 +6,11 @@ the untyped AST from semantics that reach CCC-IR and object emission. The
 broader architecture documents describe intended invariants; this inventory is
 the authority for what an invocation may rely on today.
 
+The target behavior and evidence required to advance the selected C11 and GNU
+constructs are specified in
+[Core C11 and selected GNU semantics](core-c11-and-gnu-semantics.md). That
+document does not promote a current boundary by itself.
+
 The implementation authorities are
 [`ccc-syntax::frontend`](../../crates/ccc-syntax/src/frontend/mod.rs),
 [`ccc-sema::generic`](../../crates/ccc-sema/src/generic/analyze.rs),

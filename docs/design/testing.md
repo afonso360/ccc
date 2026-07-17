@@ -124,6 +124,29 @@ links a CCC-produced object with an external GCC- and Clang-compatible driver
 and resolves only the declared hosted dependencies. Negative feature-predicate
 tests keep `__builtin_alloca` unavailable for an arena-only profile.
 
+## C11 and GNU capability fixtures
+
+Statement-expression tests distinguish GNU C's three result categories rather
+than treating every closing expression alike. Transparent scalar, aggregate,
+and bit-field places are tested as lvalues, with qualifiers preserved; arrays
+and functions are tested for decay; declaration-bearing and multi-statement
+bodies are tested for value capture; and bodies without a retained final
+expression are tested as `void`. A non-addressable bit-field remains
+non-addressable. GCC's inconsistent same-type-cast generalized-lvalue behavior
+is rejected unless it is adopted by an explicit compatibility decision.
+`_Generic` has a separate matrix proving controlling-expression conversions
+and preservation of the selected association's value category.
+
+Computed-goto fixtures include a positive direct `&&label` pointer table and
+exact `br_table` golden. Negative fixtures diagnose both label subtraction and
+base-label-plus-offset reconstruction before lowering erases label provenance.
+
+Wide-integer proof covers high-bit constants, signed and unsigned arithmetic,
+division and remainder traps, floating conversions, layout, varargs, mixed
+register pressure, and GCC/Clang cross-linking in both directions. Object and
+link-plan checks require the exact `ti` helper symbols selected by each
+operation. No corpus result substitutes for this matrix.
+
 ## Differential testing and undefined behavior
 
 Differential tests compare only outputs whose relevant behavior is defined for the identical effective configuration.
@@ -161,14 +184,20 @@ mutable system header. Parsing success certifies only the advertised parsing
 ceiling; it does not imply semantic analysis or object-emission support for
 parse-only declarations.
 
-Corpus pins encode capability dependencies. SQLite is pinned to 3.47.2. Release
+Corpus pins encode capability dependencies. SQLite is pinned by its
+[corpus manifest](../../test-corpus/sqlite/manifest.toml) to 3.47.2. Release
 3.47.0 removed SQLite's remaining `long double` use by switching that
 calculation to Dekker's algorithm; an earlier release silently requires the f80
-runtime on the primary target. Its gate runs the `veryquick` TCL set through
-`testfixture`, which needs a TCL development environment; the full suite and
-TH3 are out of scope. SQLite core does not exercise VLA objects, computed goto,
-or statement expressions, so its success is integration evidence rather than
-proof of those constructs; their focused execution fixtures remain required.
+runtime on the primary target. This pin is also the last canonical-source
+release before SQLite replaced the classic Autoconf configure/Makefile
+interface with Autosetup in 3.48.0; any later pin requires an adapter-interface
+review as well as a C-surface inventory. Its gate runs the `veryquick` Tcl set
+through `testfixture`, which needs Tcl and zlib development environments; the
+full suite and TH3 are out of scope. Under CCC's effective identity the build
+selects `__sync_synchronize` but no inline assembly, wide integers, VLA objects,
+computed goto, or statement expressions. Its success is integration evidence
+rather than proof of the unselected constructs; their focused fixtures remain
+required.
 Lua's default GNU-profile build exercises `setjmp`/`longjmp` and computed-goto
 dispatch. musl feeds `$CC` assembly files.
 

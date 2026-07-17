@@ -40,6 +40,13 @@ Darwin requires a compatible Apple SDK, deployment target, and Apple-capable lin
 
 Every compiler-emitted helper has a manifest entry containing symbol, exact C/ABI signature, provider preference, target availability, and a conformance test. Providers may be compiler-rt, libgcc, libatomic, libc, or a versioned CCC runtime shim. The link plan names the selected provider; it never assumes the target driver happens to supply a helper with the desired ABI.
 
+The System V AMD64 wide-integer contract reserves direct manifest entries for
+`__divti3`, `__udivti3`, `__modti3`, `__umodti3`, the signed and unsigned
+`ti`-to-`sf`/`df` conversion helpers, and the inverse `sf`/`df`-to-`ti`
+helpers. Cranelift's default libcall table does not contain those symbols in the
+pinned backend. Codegen therefore selects them per operation and carries their
+requirements through object emission, the link plan, and `-###` output.
+
 CCC runtime shims use a versioned symbol namespace except where an external ABI mandates a standard helper name. Runtime objects are selected by target and effective ABI options, including long-double mode, and incompatible CCC objects are diagnosed.
 
 The hosted automatic-storage provider selected by

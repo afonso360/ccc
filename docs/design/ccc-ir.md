@@ -7,7 +7,7 @@ separate immutable [module ABI plan](abi-and-varargs.md#module-abi-plan).
 
 ## Core invariants
 
-- **Places vs values.** A place is an address expression plus type, qualifiers, and an optional bitfield descriptor. Every read is an explicit load and every write an explicit store; lvalue-to-rvalue conversion is never implicit.
+- **Places vs values.** A place is an address expression plus type, qualifiers, and an optional bitfield descriptor. Every read is an explicit load and every write an explicit store; lvalue-to-rvalue conversion is never implicit. A transparent GNU statement expression may forward a final eligible place, including its qualifiers and bit-field descriptor. A body that requires sequencing or scoped declarations captures its result as a value before cleanup instead. `_Generic` independently forwards the selected association's place or value and does not use that materialization rule.
 - **Object identity and address-taking.** Address-taken, volatile, aggregate, atomic, and variably modified objects are materialized in memory. A pre-lowering scan classifies locals before any SSA value is emitted, so later `&local` cannot require retroactive materialization.
 - **Runtime-sized automatic storage.** Runtime extents are explicit values, and
   `AutomaticStorageBegin`/`AutomaticStorageEnd`-class effects delimit each

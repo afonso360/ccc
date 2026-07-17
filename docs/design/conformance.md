@@ -125,6 +125,13 @@ rules are the [frontend capability contract](frontend-capabilities.md). Syntax
 recognition alone does not advance a hosted-header profile beyond its recorded
 phase.
 
+The activation semantics and proof obligations for the selected C11 and GNU
+constructs are defined separately in the
+[C11 and GNU semantics contract](core-c11-and-gnu-semantics.md). In particular,
+the advertised GCC version is only one component of CCC's effective identity;
+CCC-provided predicates and later language facts are enumerated there as
+intentional deviations rather than being attributed to historical GCC 4.2.1.
+
 Layout, calling-convention, visibility, aliasing, section, TLS, cleanup, control-flow, vector, and code-generation attributes can never be classified as no-ops. Unknown attributes are preserved for diagnostics and rejected unless the standard explicitly permits them to be ignored and doing so is behavior-safe.
 
 `__has_attribute`, `__has_builtin`, `__has_feature`, and related predicates
