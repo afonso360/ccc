@@ -224,6 +224,16 @@ fn diagnoses_invalid_variadic_builtin_uses_even_when_unreachable() {
         ),
         vec!["CCC2414"]
     );
+    assert_eq!(
+        diagnostic_codes(
+            "typedef __builtin_va_list va_list;\n\
+             int bad(int count, ...) {\n\
+                 va_list list;\n\
+                 return __builtin_va_arg(list, int (*(*)(void))[count++]) != 0;\n\
+             }"
+        ),
+        vec!["CCC2414"]
+    );
     for parameter in ["float count", "register int count", "int count[1]"] {
         let source = format!(
             "typedef __builtin_va_list va_list;\n\
@@ -439,6 +449,302 @@ fn preserves_unspecified_parameters_and_empty_prototypes() {
         signature("prototype").parameters,
         ccc_types::FunctionParameters::Prototype(ref parameters) if parameters.is_empty()
     ));
+}
+
+#[test]
+fn distinguishes_unspecified_variable_bounds_at_prototype_scope() {
+    let unit = analyze_source(
+        "int inspect(int (*matrix)[*]);\n\
+         int inspect(int (*matrix)[*]);",
+    )
+    .unwrap();
+    let function = unit
+        .functions
+        .iter()
+        .find(|function| function.name == "inspect")
+        .unwrap();
+    let signature = unit.types.function_signature(function.signature).unwrap();
+    let ccc_types::FunctionParameters::Prototype(parameters) = signature.parameters else {
+        panic!("inspect has a prototype")
+    };
+    let TypeKind::Pointer(pointer) = unit.types.kind(parameters[0].ty) else {
+        panic!("matrix is a pointer parameter")
+    };
+    let TypeKind::Array(array) = unit.types.kind(pointer.pointee.ty) else {
+        panic!("matrix points to an array")
+    };
+    assert!(matches!(array.length, ArrayLength::UnspecifiedVariable(_)));
+
+    let expression_prototype = analyze_source("int sized(int n, int (*matrix)[n]);").unwrap();
+    let sized = expression_prototype
+        .functions
+        .iter()
+        .find(|function| function.name == "sized")
+        .unwrap();
+    let signature = expression_prototype
+        .types
+        .function_signature(sized.signature)
+        .unwrap();
+    let ccc_types::FunctionParameters::Prototype(parameters) = signature.parameters else {
+        panic!("sized has a prototype")
+    };
+    let TypeKind::Pointer(pointer) = expression_prototype.types.kind(parameters[1].ty) else {
+        panic!("matrix is a pointer")
+    };
+    let TypeKind::Array(array) = expression_prototype.types.kind(pointer.pointee.ty) else {
+        panic!("matrix points to an array")
+    };
+    assert!(matches!(array.length, ArrayLength::UnspecifiedVariable(_)));
+
+    for source in [
+        "int inspect(int (*matrix)[*]) { return 0; }",
+        "int inspect(void) { int (*matrix)[*]; return 0; }",
+    ] {
+        assert_eq!(diagnostic_codes(source), vec!["CCC2223"]);
+    }
+}
+
+#[test]
+fn retains_parameter_and_local_variable_length_bounds_without_requiring_vla_storage() {
+    assert!(analyze_source("int accepted(int n, int values[n]) { return values[0]; }").is_ok());
+
+    let unit = analyze_source(
+        "int inspect(int n, int (*matrix)[n]) {\n\
+             int (*row)[n++];\n\
+             static int (*saved)[n];\n\
+             return 0;\n\
+         }",
+    )
+    .unwrap();
+    let function = unit
+        .functions
+        .iter()
+        .find(|function| function.name == "inspect")
+        .unwrap();
+
+    let parameter_bound = &function.parameters[1].variable_length_bounds[0];
+    let FullTypedExpressionKind::Conversion { expression, .. } = &parameter_bound.expression.kind
+    else {
+        panic!("parameter bound performs the parameter lvalue conversion")
+    };
+    assert!(matches!(
+        expression.kind,
+        FullTypedExpressionKind::DeclRef(SymbolReference::Local(FullLocalId(0)))
+    ));
+    let TypeKind::Pointer(pointer) = unit.types.kind(function.parameters[1].ty.ty) else {
+        panic!("matrix is a pointer")
+    };
+    let TypeKind::Array(array) = unit.types.kind(pointer.pointee.ty) else {
+        panic!("matrix points to an array")
+    };
+    assert_eq!(array.length, ArrayLength::Variable(parameter_bound.id));
+
+    let FullTypedStatementKind::Compound(items) = &function.body.as_ref().unwrap().kind else {
+        panic!("inspect has a compound body")
+    };
+    let declarations = items
+        .iter()
+        .filter_map(|item| match item {
+            FullTypedBlockItem::Declaration(declaration) => Some(declaration.as_ref()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(declarations.len(), 2);
+    assert!(matches!(
+        declarations[0].variable_length_bounds[0].expression.kind,
+        FullTypedExpressionKind::Increment { .. }
+    ));
+    assert_eq!(declarations[0].duration, StorageDuration::Automatic);
+    assert_eq!(declarations[1].duration, StorageDuration::Static);
+    assert_eq!(declarations[1].variable_length_bounds.len(), 1);
+
+    assert_eq!(
+        diagnostic_codes("int rejected(int n) { int values[2][n]; return 0; }"),
+        vec!["CCC2258"]
+    );
+    assert_eq!(
+        diagnostic_codes("int rejected(int n) { extern int (*value)[n]; return 0; }"),
+        vec!["CCC2415"]
+    );
+    assert_eq!(
+        diagnostic_codes("int rejected(int n) { extern int (*(*value)(void))[n++]; return 0; }"),
+        vec!["CCC2415"]
+    );
+    assert_eq!(
+        diagnostic_codes("int rejected(int n) { typedef int Row[n]; return 0; }"),
+        vec!["CCC2416"]
+    );
+    assert_eq!(
+        diagnostic_codes("void *rejected(int n, void *value) { return (int (*)[n++])value; }"),
+        vec!["CCC2417"]
+    );
+}
+
+#[test]
+fn separates_integer_constant_expression_rules_from_value_folding() {
+    assert!(
+        analyze_source(
+            "_Static_assert((int)4.0 == 4, \"direct floating cast\");\n\
+             _Static_assert(1 ? 4 : (2, 3), \"unselected comma\");\n\
+             _Static_assert(1 || (2, 3), \"short-circuited comma\");\n\
+             _Static_assert(2 || 1 / 0, \"short-circuited division\");\n\
+             _Static_assert(!(0 && 1 / 0), \"short-circuited division\");"
+        )
+        .is_ok()
+    );
+
+    for source in [
+        "_Static_assert((1, 4), \"evaluated comma\");",
+        "_Static_assert((int)(double)4.0 == 4, \"nested floating cast\");",
+        "_Static_assert(0 ? 4 : (2, 3), \"selected comma\");",
+        "_Static_assert(0 || (2, 3), \"evaluated comma\");",
+        "int f(int n) { _Static_assert(1 ? 4 : n++, \"invalid operand\"); return 0; }",
+        "int f(int n) { _Static_assert(1 || n++, \"invalid operand\"); return 0; }",
+        "_Static_assert(1 / 0, \"evaluated division by zero\");",
+    ] {
+        assert_eq!(diagnostic_codes(source), vec!["CCC2338"]);
+    }
+    assert_eq!(
+        diagnostic_codes("extern int (*value)[(1, 4)];"),
+        vec!["CCC2223"]
+    );
+
+    let unit = analyze_source("int f(int n) { int (*value)[(n++, 4)]; return n; }").unwrap();
+    let local = first_local(&unit.functions[0]);
+    assert_eq!(local.variable_length_bounds.len(), 1);
+    let bound = &local.variable_length_bounds[0].expression;
+    assert!(matches!(bound.kind, FullTypedExpressionKind::Comma(_)));
+    assert_eq!(bound.constant, Some(ConstantValue::Signed(4)));
+    assert_eq!(
+        bound.constant_expression_kind,
+        ConstantExpressionKind::Invalid
+    );
+    let dump = dump_frontend_typed_ast(&unit);
+    assert!(dump.contains("variable-length-bound vla"), "{dump}");
+    assert!(dump.contains("comma : int Value"), "{dump}");
+}
+
+#[test]
+fn rejects_incompatible_constant_array_composites() {
+    assert_eq!(
+        diagnostic_codes("extern int values[2]; extern int values[3];"),
+        vec!["CCC2251"]
+    );
+    assert_eq!(
+        diagnostic_codes("int apply(int (*values)[2]); int apply(int (*values)[3]);"),
+        vec!["CCC2248"]
+    );
+}
+
+#[test]
+fn rejects_variably_modified_members_and_block_function_types() {
+    for source in [
+        "int f(int n) { struct S { int values[n]; }; return 0; }",
+        "int f(int n) { struct S { int (*values)[n++]; }; return 0; }",
+        "int f(int n) { struct S { int (*(*value)(void))[n++]; }; return 0; }",
+    ] {
+        assert_eq!(diagnostic_codes(source), vec!["CCC2235"]);
+    }
+
+    assert!(analyze_source("int f(int n) { int nested(int (*values)[n]); return 0; }").is_ok());
+    assert_eq!(
+        diagnostic_codes("int f(int n) { int (*nested(void))[n]; return 0; }"),
+        vec!["CCC2418"]
+    );
+    assert_eq!(
+        diagnostic_codes("void f(int n, struct S { int (*(*value)(void))[n++]; } argument);"),
+        vec!["CCC2235"]
+    );
+    assert!(
+        analyze_source("void f(int n, struct S { int (*callback)(int values[n]); } argument);")
+            .is_ok()
+    );
+    assert!(
+        analyze_source("void f(struct S { int (*callback)(int values[*]); } argument);").is_ok()
+    );
+}
+
+#[test]
+fn prototype_array_context_is_local_to_parameter_declarators() {
+    for source in [
+        "void atomic_star(_Atomic(int (*)[*]) value);",
+        "void enum_star(enum E { X = sizeof(int (*)[*]) } value);",
+        "void nested_size(int values[sizeof(int (*)[*])]);",
+        "void definition(int (*(*callback)(void))[*]) {}",
+    ] {
+        assert_eq!(diagnostic_codes(source), vec!["CCC2223"], "{source}");
+    }
+    assert!(analyze_source("void prototype(int (*(*callback)(void))[*]);").is_ok());
+}
+
+#[test]
+fn function_parameters_share_the_outer_body_scope() {
+    assert_eq!(
+        diagnostic_codes("int f(int value) { int value; return value; }"),
+        vec!["CCC2364"]
+    );
+    assert!(
+        analyze_source("int f(int value) { { int value = 1; (void)value; } return value; }")
+            .is_ok()
+    );
+}
+
+#[test]
+fn definition_parameter_tags_and_enumerators_reach_only_the_function_body() {
+    assert!(
+        analyze_source(
+            "int tagged(struct Tag { int value; } input) {\n\
+                 struct Tag *copy = &input;\n\
+                 return copy->value;\n\
+             }\n\
+             int enumerated(enum Choice { CHOSEN = 7 } input) { return CHOSEN + input; }"
+        )
+        .is_ok()
+    );
+    assert_eq!(
+        diagnostic_codes(
+            "int f(enum Choice { CHOSEN = 7 } input) { return CHOSEN; }\n\
+             int g(void) { return CHOSEN; }"
+        ),
+        vec!["CCC2274"]
+    );
+    assert_eq!(
+        diagnostic_codes(
+            "int f(struct Tag { int value; } input) { return input.value; }\n\
+             struct Tag outside;"
+        ),
+        vec!["CCC2342"]
+    );
+}
+
+#[test]
+fn register_parameters_remain_unaddressable_in_later_bounds() {
+    for source in [
+        "int f(register int n, int (*values)[sizeof &n]);",
+        "int f(register int n, int (*values)[sizeof &n]) { return 0; }",
+    ] {
+        assert_eq!(diagnostic_codes(source), vec!["CCC2277"]);
+    }
+}
+
+#[test]
+fn definition_parameters_come_from_the_function_nearest_the_identifier() {
+    let no_parameters = analyze_source("int (*factory(void))(double value) { return 0; }").unwrap();
+    assert!(no_parameters.functions[0].parameters.is_empty());
+
+    let unit =
+        analyze_source("int (*factory(int n, int (*matrix)[n]))(double value) { return 0; }")
+            .unwrap();
+    let function = &unit.functions[0];
+    assert_eq!(
+        function
+            .parameters
+            .iter()
+            .map(|parameter| parameter.name.as_str())
+            .collect::<Vec<_>>(),
+        ["n", "matrix"]
+    );
+    assert_eq!(function.parameters[1].variable_length_bounds.len(), 1);
 }
 
 #[test]

@@ -14,7 +14,8 @@ use ccc_types::{
 
 use super::model::*;
 use super::scopes::{
-    LabelScope, OrdinaryBindingConflict, OrdinarySymbol, ScopeStack, TagCategory, TagSymbol,
+    DetachedSemanticScope, LabelScope, OrdinaryBindingConflict, OrdinarySymbol, ScopeStack,
+    TagCategory, TagSymbol,
 };
 
 type AnalysisResult<T> = Result<T, ()>;
@@ -53,6 +54,7 @@ struct StringPoolKey {
 struct ResolvedParameter {
     name: Option<String>,
     ty: QualifiedType,
+    variable_length_bounds: Vec<FullTypedVariableLengthBound>,
     span: Span,
     addressable: bool,
     va_start_restriction: Option<&'static str>,
@@ -64,7 +66,30 @@ struct ResolvedDeclarator {
     name_span: Span,
     ty: QualifiedType,
     parameters: Vec<ResolvedParameter>,
+    parameter_list_span: Option<Span>,
+    parameter_scope: Option<DetachedSemanticScope>,
+    variable_length_bounds: Vec<FullTypedVariableLengthBound>,
     attributes: Vec<FullTypedAttribute>,
+}
+
+struct DeclaratorContext {
+    parameters: Vec<ResolvedParameter>,
+    parameter_list_span: Option<Span>,
+    parameter_scope: Option<DetachedSemanticScope>,
+    variable_length_bounds: Vec<FullTypedVariableLengthBound>,
+    prototype_parameter: bool,
+}
+
+impl DeclaratorContext {
+    fn new(prototype_parameter: bool) -> Self {
+        Self {
+            parameters: Vec::new(),
+            parameter_list_span: None,
+            parameter_scope: None,
+            variable_length_bounds: Vec::new(),
+            prototype_parameter,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -141,6 +166,8 @@ struct Analyzer<'a> {
     string_pool: HashMap<StringPoolKey, StringId>,
     scopes: ScopeStack,
     function: Option<FunctionState>,
+    parameter_scope_depth: usize,
+    definition_parameter_list: Option<Span>,
     packing: PackingState,
     diagnostics: Vec<Diagnostic>,
 }
@@ -158,6 +185,8 @@ impl<'a> Analyzer<'a> {
             string_pool: HashMap::new(),
             scopes: ScopeStack::new(),
             function: None,
+            parameter_scope_depth: 0,
+            definition_parameter_list: None,
             packing: PackingState::default(),
             diagnostics: Vec::new(),
         }
@@ -312,7 +341,13 @@ impl<'a> Analyzer<'a> {
                 "old-style function parameter declarations are not semantically supported",
             );
         }
-        let resolved = self.resolve_declarator(info.base, &definition.declarator)?;
+        let previous_definition_parameter_list = self.definition_parameter_list;
+        self.definition_parameter_list =
+            defining_function_parameter_list_span(&definition.declarator);
+        let resolved = self.resolve_declarator(info.base, &definition.declarator);
+        self.definition_parameter_list = previous_definition_parameter_list;
+        let mut resolved = resolved?;
+        let parameter_scope = resolved.parameter_scope.take();
         let Some(name) = resolved.name.clone() else {
             return self.fail(
                 "CCC2206",
@@ -361,7 +396,15 @@ impl<'a> Analyzer<'a> {
             last_named_parameter_restriction: None,
         });
         self.collect_labels(&definition.body);
-        self.push_scope();
+        let Some(parameter_scope) = parameter_scope else {
+            self.function = None;
+            return self.fail(
+                "CCC2207",
+                definition.declarator.span,
+                "a function definition declarator must have a parameter scope",
+            );
+        };
+        self.scopes.push_detached(parameter_scope);
 
         let mut typed_parameters = Vec::new();
         for parameter in &resolved.parameters {
@@ -375,6 +418,12 @@ impl<'a> Analyzer<'a> {
                 );
             };
             let local = self.fresh_local();
+            debug_assert_eq!(
+                local.0,
+                u32::try_from(typed_parameters.len())
+                    .expect("parameter identifier space exhausted"),
+                "resolved parameter bounds must use the definition's stable local IDs",
+            );
             if !parameter.addressable {
                 self.function
                     .as_mut()
@@ -382,15 +431,15 @@ impl<'a> Analyzer<'a> {
                     .unaddressable_locals
                     .insert(local);
             }
-            self.bind_current(
+            self.scopes.replace_current_ordinary(
                 parameter_name.clone(),
                 OrdinarySymbol::Local(local, parameter.ty),
-                parameter.span,
-            )?;
+            );
             typed_parameters.push(FullTypedParameter {
                 local,
                 name: parameter_name,
                 ty: parameter.ty,
+                variable_length_bounds: parameter.variable_length_bounds.clone(),
                 span: parameter.span,
             });
             self.function
@@ -403,7 +452,7 @@ impl<'a> Analyzer<'a> {
                 .last_named_parameter_restriction = parameter.va_start_restriction;
         }
 
-        let body = self.analyze_statement(&definition.body);
+        let body = self.analyze_function_body(&definition.body);
         self.validate_labels();
         self.pop_scope();
         self.function = None;
@@ -649,6 +698,21 @@ impl<'a> Analyzer<'a> {
     }
 
     fn resolve_type_name(&mut self, type_name: &syntax::TypeName) -> AnalysisResult<QualifiedType> {
+        let (ty, variable_length_bounds) = self.resolve_type_name_with_bounds(type_name)?;
+        if !variable_length_bounds.is_empty() {
+            return self.fail(
+                "CCC2417",
+                type_name.span,
+                "variably modified type-name bounds cannot yet be preserved",
+            );
+        }
+        Ok(ty)
+    }
+
+    fn resolve_type_name_with_bounds(
+        &mut self,
+        type_name: &syntax::TypeName,
+    ) -> AnalysisResult<(QualifiedType, Vec<FullTypedVariableLengthBound>)> {
         let info = self.resolve_declaration_specifiers(&type_name.specifiers)?;
         if info.storage.is_some() || info.properties != FunctionProperties::default() {
             return self.fail(
@@ -667,31 +731,46 @@ impl<'a> Analyzer<'a> {
                         "a type name cannot declare an identifier",
                     );
                 }
-                Ok(resolved.ty)
+                Ok((resolved.ty, resolved.variable_length_bounds))
             }
-            None => Ok(info.base),
+            None => Ok((info.base, Vec::new())),
         }
     }
 
     fn resolve_declarator(
         &mut self,
-        mut ty: QualifiedType,
+        ty: QualifiedType,
         declarator: &syntax::Declarator,
     ) -> AnalysisResult<ResolvedDeclarator> {
+        self.resolve_declarator_in_context(ty, declarator, false)
+    }
+
+    fn resolve_declarator_in_context(
+        &mut self,
+        mut ty: QualifiedType,
+        declarator: &syntax::Declarator,
+        prototype_parameter: bool,
+    ) -> AnalysisResult<ResolvedDeclarator> {
+        // Prototype array rules follow the parameter's declarator structure.
+        // Declarators reached through specifiers or bound expressions enter
+        // through `resolve_declarator` and therefore do not inherit them.
         let mut attributes = self.validate_attributes(&declarator.attributes)?;
         for pointer in &declarator.pointers {
             attributes.extend(self.validate_attributes(&pointer.attributes)?);
             let pointer_ty = self.types.pointer(ty);
             ty = QualifiedType::new(pointer_ty, qualifiers(&pointer.qualifiers));
         }
-        let mut parameters = Vec::new();
+        let mut context = DeclaratorContext::new(prototype_parameter);
         let (name, name_span, ty) =
-            self.resolve_direct_declarator(ty, &declarator.direct, &mut parameters)?;
+            self.resolve_direct_declarator(ty, &declarator.direct, &mut context)?;
         Ok(ResolvedDeclarator {
             name,
             name_span,
             ty,
-            parameters,
+            parameters: context.parameters,
+            parameter_list_span: context.parameter_list_span,
+            parameter_scope: context.parameter_scope,
+            variable_length_bounds: context.variable_length_bounds,
             attributes,
         })
     }
@@ -700,7 +779,7 @@ impl<'a> Analyzer<'a> {
         &mut self,
         ty: QualifiedType,
         direct: &syntax::DirectDeclarator,
-        parameters_out: &mut Vec<ResolvedParameter>,
+        context: &mut DeclaratorContext,
     ) -> AnalysisResult<(Option<String>, Span, QualifiedType)> {
         match direct {
             syntax::DirectDeclarator::Identifier(identifier) => {
@@ -708,10 +787,16 @@ impl<'a> Analyzer<'a> {
             }
             syntax::DirectDeclarator::Abstract(span) => Ok((None, *span, ty)),
             syntax::DirectDeclarator::Parenthesized(inner, _) => {
-                let resolved = self.resolve_declarator(ty, inner)?;
-                if parameters_out.is_empty() {
-                    *parameters_out = resolved.parameters;
+                let resolved =
+                    self.resolve_declarator_in_context(ty, inner, context.prototype_parameter)?;
+                if resolved.parameter_list_span.is_some() {
+                    context.parameters = resolved.parameters;
+                    context.parameter_list_span = resolved.parameter_list_span;
+                    context.parameter_scope = resolved.parameter_scope;
                 }
+                context
+                    .variable_length_bounds
+                    .extend(resolved.variable_length_bounds);
                 Ok((resolved.name, resolved.name_span, resolved.ty))
             }
             syntax::DirectDeclarator::Array {
@@ -734,10 +819,19 @@ impl<'a> Analyzer<'a> {
                 let length = match size {
                     syntax::ArraySize::Unspecified => ArrayLength::Incomplete,
                     syntax::ArraySize::Star => {
-                        ArrayLength::Variable(self.types.fresh_variable_length())
+                        if !context.prototype_parameter {
+                            return self.fail(
+                                "CCC2223",
+                                *span,
+                                "`[*]` is only permitted in function prototype scope",
+                            );
+                        }
+                        ArrayLength::UnspecifiedVariable(self.types.fresh_variable_length())
                     }
                     syntax::ArraySize::Expression(expression) => {
-                        match self.try_evaluate_integer_constant(expression)? {
+                        let (typed, constant) =
+                            self.analyze_integer_constant_candidate(expression)?;
+                        match constant {
                             Some(value) if value > 0 => ArrayLength::Constant(value as u64),
                             Some(_) => {
                                 return self.fail(
@@ -747,14 +841,27 @@ impl<'a> Analyzer<'a> {
                                 );
                             }
                             None => {
-                                if self.function.is_none() {
-                                    return self.fail(
-                                        "CCC2223",
-                                        expression.span,
-                                        "a file-scope array bound must be constant",
+                                if context.prototype_parameter {
+                                    ArrayLength::UnspecifiedVariable(
+                                        self.types.fresh_variable_length(),
+                                    )
+                                } else {
+                                    if self.function.is_none() && self.parameter_scope_depth == 0 {
+                                        return self.fail(
+                                            "CCC2223",
+                                            expression.span,
+                                            "a file-scope array bound must be constant",
+                                        );
+                                    }
+                                    let id = self.types.fresh_variable_length();
+                                    context.variable_length_bounds.push(
+                                        FullTypedVariableLengthBound {
+                                            id,
+                                            expression: typed,
+                                        },
                                     );
+                                    ArrayLength::Variable(id)
                                 }
-                                ArrayLength::Variable(self.types.fresh_variable_length())
                             }
                         }
                     }
@@ -765,7 +872,7 @@ impl<'a> Analyzer<'a> {
                 let element = ty;
                 let array =
                     QualifiedType::unqualified(self.types.array(ArrayType { element, length }));
-                self.resolve_direct_declarator(array, inner, parameters_out)
+                self.resolve_direct_declarator(array, inner, context)
             }
             syntax::DirectDeclarator::Function {
                 inner,
@@ -792,10 +899,9 @@ impl<'a> Analyzer<'a> {
                         "a function cannot return an array or function type",
                     );
                 }
-                let mut resolved_parameters = Vec::new();
-                for parameter in parameters {
-                    resolved_parameters.push(self.resolve_parameter(parameter)?);
-                }
+                let is_prototype_scope = self.definition_parameter_list != Some(*span);
+                let (mut resolved_parameters, parameter_scope) =
+                    self.resolve_parameter_list(parameters, is_prototype_scope)?;
                 if resolved_parameters.len() == 1
                     && resolved_parameters[0].name.is_none()
                     && resolved_parameters[0].ty.ty == TypeId::VOID
@@ -827,17 +933,54 @@ impl<'a> Analyzer<'a> {
                     FunctionType::prototype(ty, parameter_types)
                 };
                 let function_ty = QualifiedType::unqualified(self.types.function_type(signature));
-                if parameters_out.is_empty() {
-                    *parameters_out = resolved_parameters;
+                if context.parameter_list_span.is_none() {
+                    context.parameters = resolved_parameters;
+                    context.parameter_list_span = Some(*span);
+                    context.parameter_scope = (!is_prototype_scope).then_some(parameter_scope);
                 }
-                self.resolve_direct_declarator(function_ty, inner, parameters_out)
+                self.resolve_direct_declarator(function_ty, inner, context)
             }
         }
+    }
+
+    fn resolve_parameter_list(
+        &mut self,
+        parameters: &[syntax::ParameterDeclaration],
+        is_prototype_scope: bool,
+    ) -> AnalysisResult<(Vec<ResolvedParameter>, DetachedSemanticScope)> {
+        self.parameter_scope_depth += 1;
+        self.push_scope();
+        let resolved = (|| {
+            let mut resolved = Vec::with_capacity(parameters.len());
+            for (index, parameter) in parameters.iter().enumerate() {
+                let parameter = self.resolve_parameter(parameter, is_prototype_scope)?;
+                if let Some(name) = &parameter.name {
+                    let local = FullLocalId(
+                        u32::try_from(index).expect("parameter identifier space exhausted"),
+                    );
+                    self.bind_current(
+                        name.clone(),
+                        OrdinarySymbol::TemporaryParameter(
+                            local,
+                            parameter.ty,
+                            parameter.addressable,
+                        ),
+                        parameter.span,
+                    )?;
+                }
+                resolved.push(parameter);
+            }
+            Ok(resolved)
+        })();
+        let scope = self.scopes.pop_detached();
+        self.parameter_scope_depth -= 1;
+        resolved.map(|resolved| (resolved, scope))
     }
 
     fn resolve_parameter(
         &mut self,
         parameter: &syntax::ParameterDeclaration,
+        is_prototype_scope: bool,
     ) -> AnalysisResult<ResolvedParameter> {
         let info = self.resolve_declaration_specifiers(&parameter.specifiers)?;
         if !matches!(info.storage, None | Some(syntax::StorageClass::Register)) {
@@ -848,12 +991,19 @@ impl<'a> Analyzer<'a> {
             );
         }
         let register = info.storage == Some(syntax::StorageClass::Register);
-        let (name, mut ty, span) = if let Some(declarator) = &parameter.declarator {
-            let resolved = self.resolve_declarator(info.base, declarator)?;
-            (resolved.name, resolved.ty, resolved.name_span)
-        } else {
-            (None, info.base, parameter.span)
-        };
+        let (name, mut ty, variable_length_bounds, span) =
+            if let Some(declarator) = &parameter.declarator {
+                let resolved =
+                    self.resolve_declarator_in_context(info.base, declarator, is_prototype_scope)?;
+                (
+                    resolved.name,
+                    resolved.ty,
+                    resolved.variable_length_bounds,
+                    resolved.name_span,
+                )
+            } else {
+                (None, info.base, Vec::new(), parameter.span)
+            };
         let declared_kind = self.types.try_kind(ty.ty).cloned();
         let va_start_restriction = if register {
             Some("it has `register` storage class")
@@ -885,6 +1035,7 @@ impl<'a> Analyzer<'a> {
         Ok(ResolvedParameter {
             name,
             ty,
+            variable_length_bounds,
             span,
             addressable: !register,
             va_start_restriction,
@@ -986,12 +1137,17 @@ impl<'a> Analyzer<'a> {
                     }
                     for member in &declaration.declarators {
                         let _ = self.validate_attributes(&member.attributes)?;
-                        let (name, field_ty) = if let Some(declarator) = &member.declarator {
-                            let resolved = self.resolve_declarator(info.base, declarator)?;
-                            (resolved.name, resolved.ty)
-                        } else {
-                            (None, info.base)
-                        };
+                        let (name, field_ty, has_variable_length_bounds) =
+                            if let Some(declarator) = &member.declarator {
+                                let resolved = self.resolve_declarator(info.base, declarator)?;
+                                (
+                                    resolved.name,
+                                    resolved.ty,
+                                    !resolved.variable_length_bounds.is_empty(),
+                                )
+                            } else {
+                                (None, info.base, false)
+                            };
                         if let Some(name) = &name
                             && !field_names.insert(name.clone())
                         {
@@ -1008,6 +1164,13 @@ impl<'a> Analyzer<'a> {
                                 "CCC2235",
                                 member.span,
                                 "a record member must have object type",
+                            );
+                        }
+                        if has_variable_length_bounds || self.is_variably_modified(field_ty.ty) {
+                            return self.fail(
+                                "CCC2235",
+                                member.span,
+                                "a record member cannot have variably modified type",
                             );
                         }
                         if matches!(
@@ -1454,6 +1617,13 @@ impl<'a> Analyzer<'a> {
                         "a typedef cannot have an initializer or assembly label",
                     );
                 }
+                if !resolved.variable_length_bounds.is_empty() {
+                    return self.fail(
+                        "CCC2416",
+                        init.span,
+                        "variably modified typedef bounds cannot yet be preserved",
+                    );
+                }
                 let id = TypedefId(self.typedefs.len() as u32);
                 let typed = FullTypedTypedef {
                     id,
@@ -1468,6 +1638,13 @@ impl<'a> Analyzer<'a> {
                 continue;
             }
             if self.types.function_signature(resolved.ty.ty).is_some() {
+                if !resolved.variable_length_bounds.is_empty() {
+                    return self.fail(
+                        "CCC2418",
+                        init.span,
+                        "a block-scope function declaration cannot have variably modified type",
+                    );
+                }
                 let asm_label = self.resolve_asm_label(init.asm_label.as_ref())?;
                 let id = self.declare_function(
                     name.clone(),
@@ -1489,6 +1666,15 @@ impl<'a> Analyzer<'a> {
                         "CCC2256",
                         init.span,
                         "a block-scope extern declaration cannot have an initializer",
+                    );
+                }
+                if !resolved.variable_length_bounds.is_empty()
+                    || self.is_variably_modified(resolved.ty.ty)
+                {
+                    return self.fail(
+                        "CCC2415",
+                        init.span,
+                        "a block-scope extern declaration cannot have variably modified type",
                     );
                 }
                 let asm_label = self.resolve_asm_label(init.asm_label.as_ref())?;
@@ -1514,11 +1700,11 @@ impl<'a> Analyzer<'a> {
                 );
             }
             self.validate_object_type(resolved.ty, init.span, init.initializer.is_none())?;
-            if self.is_variably_modified(resolved.ty.ty) {
+            if self.requires_runtime_sized_storage(resolved.ty.ty) {
                 return self.fail(
                     "CCC2258",
                     init.span,
-                    "variably modified object storage is not supported",
+                    "variable-length array object storage is unavailable for this configuration",
                 );
             }
             let local = self.fresh_local();
@@ -1603,6 +1789,7 @@ impl<'a> Analyzer<'a> {
                     ty: completed_ty,
                     storage,
                     duration,
+                    variable_length_bounds: resolved.variable_length_bounds,
                     initializer,
                     attributes,
                     emission,
@@ -1878,6 +2065,19 @@ impl<'a> Analyzer<'a> {
         })
     }
 
+    fn analyze_function_body(
+        &mut self,
+        statement: &syntax::Statement,
+    ) -> AnalysisResult<FullTypedStatement> {
+        let syntax::StatementKind::Compound(items) = &statement.kind else {
+            unreachable!("the parser requires a compound statement for a function body")
+        };
+        Ok(FullTypedStatement {
+            kind: FullTypedStatementKind::Compound(self.analyze_compound_items(items)?),
+            span: statement.span,
+        })
+    }
+
     fn analyze_compound_items(
         &mut self,
         items: &[syntax::BlockItem],
@@ -2045,6 +2245,7 @@ impl<'a> Analyzer<'a> {
                     category: ValueCategory::Value,
                     place: None,
                     constant: Some(ConstantValue::Unsigned(u128::from(layout.align))),
+                    constant_expression_kind: ConstantExpressionKind::Integer,
                     span: expression.span,
                 })
             }
@@ -2086,12 +2287,16 @@ impl<'a> Analyzer<'a> {
                 let Some(last) = typed.last() else {
                     return self.fail("CCC2273", expression.span, "an empty comma expression");
                 };
+                let operands = typed.iter().collect::<Vec<_>>();
+                let constant_expression_kind =
+                    unevaluated_operator_constant_expression_kind(&operands);
                 Ok(FullTypedExpression {
                     kind: FullTypedExpressionKind::Comma(typed.clone()),
                     ty: last.ty,
                     category: ValueCategory::Value,
                     place: None,
                     constant: last.constant,
+                    constant_expression_kind,
                     span: expression.span,
                 })
             }
@@ -2172,6 +2377,7 @@ impl<'a> Analyzer<'a> {
             category: ValueCategory::Value,
             place: None,
             constant: None,
+            constant_expression_kind: ConstantExpressionKind::Invalid,
             span,
         })
     }
@@ -2184,9 +2390,9 @@ impl<'a> Analyzer<'a> {
     ) -> AnalysisResult<FullTypedExpression> {
         self.require_builtin("__builtin_va_arg", span)?;
         let list = self.analyze_va_list_operand(list, true)?;
-        let requested = self.resolve_type_name(type_name)?;
+        let (requested, variable_length_bounds) = self.resolve_type_name_with_bounds(type_name)?;
         self.validate_object_type(requested, type_name.span, true)?;
-        if self.is_variably_modified(requested.ty) {
+        if !variable_length_bounds.is_empty() || self.is_variably_modified(requested.ty) {
             return self.fail(
                 "CCC2414",
                 type_name.span,
@@ -2244,6 +2450,7 @@ impl<'a> Analyzer<'a> {
             category: ValueCategory::Value,
             place: None,
             constant: None,
+            constant_expression_kind: ConstantExpressionKind::Invalid,
             span,
         })
     }
@@ -2266,6 +2473,7 @@ impl<'a> Analyzer<'a> {
             category: ValueCategory::Value,
             place: None,
             constant: None,
+            constant_expression_kind: ConstantExpressionKind::Invalid,
             span,
         })
     }
@@ -2285,6 +2493,7 @@ impl<'a> Analyzer<'a> {
             category: ValueCategory::Value,
             place: None,
             constant: None,
+            constant_expression_kind: ConstantExpressionKind::Invalid,
             span,
         })
     }
@@ -2415,6 +2624,13 @@ impl<'a> Analyzer<'a> {
                     None,
                 )
             }
+            OrdinarySymbol::TemporaryParameter(id, ty, addressable) => (
+                SymbolReference::Local(id),
+                ty,
+                ValueCategory::Lvalue,
+                Some(self.object_place(PlaceBase::Local(id), ty, addressable)),
+                None,
+            ),
             OrdinarySymbol::Enumerator(value, ty) => {
                 let constant = if self.is_signed_integer(ty.ty) {
                     ConstantValue::Signed(value)
@@ -2437,12 +2653,18 @@ impl<'a> Analyzer<'a> {
                 );
             }
         };
+        let constant_expression_kind = if matches!(reference, SymbolReference::Enumerator { .. }) {
+            ConstantExpressionKind::Integer
+        } else {
+            ConstantExpressionKind::Invalid
+        };
         Ok(FullTypedExpression {
             kind: FullTypedExpressionKind::DeclRef(reference),
             ty,
             category,
             place,
             constant,
+            constant_expression_kind,
             span: identifier.span,
         })
     }
@@ -2570,6 +2792,7 @@ impl<'a> Analyzer<'a> {
                 addend: 0,
                 one_past: false,
             })),
+            constant_expression_kind: ConstantExpressionKind::Invalid,
             span,
         })
     }
@@ -2631,6 +2854,7 @@ impl<'a> Analyzer<'a> {
                     category: ValueCategory::Value,
                     place: None,
                     constant,
+                    constant_expression_kind: ConstantExpressionKind::Invalid,
                     span,
                 })
             }
@@ -2656,6 +2880,7 @@ impl<'a> Analyzer<'a> {
                     category,
                     place,
                     constant: None,
+                    constant_expression_kind: ConstantExpressionKind::Invalid,
                     span,
                 })
             }
@@ -2664,6 +2889,7 @@ impl<'a> Analyzer<'a> {
                 let constant = operand
                     .constant
                     .map(|value| ConstantValue::Signed(i128::from(value.is_zero())));
+                let constant_expression_kind = integer_constant_expression_kind(&[&operand]);
                 Ok(FullTypedExpression {
                     kind: FullTypedExpressionKind::Unary {
                         operator,
@@ -2673,6 +2899,7 @@ impl<'a> Analyzer<'a> {
                     category: ValueCategory::Value,
                     place: None,
                     constant,
+                    constant_expression_kind,
                     span,
                 })
             }
@@ -2701,6 +2928,7 @@ impl<'a> Analyzer<'a> {
                     }
                     _ => None,
                 });
+                let constant_expression_kind = integer_constant_expression_kind(&[&operand]);
                 Ok(FullTypedExpression {
                     kind: FullTypedExpressionKind::Unary {
                         operator,
@@ -2710,6 +2938,7 @@ impl<'a> Analyzer<'a> {
                     category: ValueCategory::Value,
                     place: None,
                     constant,
+                    constant_expression_kind,
                     span,
                 })
             }
@@ -2732,6 +2961,8 @@ impl<'a> Analyzer<'a> {
             let left = self.convert_to_boolean(left)?;
             let right = self.convert_to_boolean(right)?;
             let constant = evaluate_binary_constant(operator, left.constant, right.constant);
+            let constant_expression_kind =
+                logical_constant_expression_kind(operator, &left, &right);
             return Ok(FullTypedExpression {
                 kind: FullTypedExpressionKind::Binary {
                     operator,
@@ -2742,6 +2973,7 @@ impl<'a> Analyzer<'a> {
                 category: ValueCategory::Value,
                 place: None,
                 constant,
+                constant_expression_kind,
                 span,
             });
         }
@@ -2755,6 +2987,7 @@ impl<'a> Analyzer<'a> {
                     left.ty,
                     operator == B::Subtract,
                 );
+                let constant_expression_kind = integer_constant_expression_kind(&[&left, &right]);
                 return Ok(FullTypedExpression {
                     kind: FullTypedExpressionKind::Binary {
                         operator,
@@ -2765,6 +2998,7 @@ impl<'a> Analyzer<'a> {
                     category: ValueCategory::Value,
                     place: None,
                     constant,
+                    constant_expression_kind,
                     span,
                 });
             }
@@ -2779,6 +3013,7 @@ impl<'a> Analyzer<'a> {
                     right.ty,
                     false,
                 );
+                let constant_expression_kind = integer_constant_expression_kind(&[&left, &right]);
                 return Ok(FullTypedExpression {
                     kind: FullTypedExpressionKind::Binary {
                         operator,
@@ -2789,6 +3024,7 @@ impl<'a> Analyzer<'a> {
                     category: ValueCategory::Value,
                     place: None,
                     constant,
+                    constant_expression_kind,
                     span,
                 });
             }
@@ -2813,6 +3049,7 @@ impl<'a> Analyzer<'a> {
                     category: ValueCategory::Value,
                     place: None,
                     constant: None,
+                    constant_expression_kind: ConstantExpressionKind::Invalid,
                     span,
                 });
             }
@@ -2826,6 +3063,7 @@ impl<'a> Analyzer<'a> {
         {
             let (left, right) = self.convert_pointer_comparison(left, right, span)?;
             let constant = evaluate_binary_constant(operator, left.constant, right.constant);
+            let constant_expression_kind = integer_constant_expression_kind(&[&left, &right]);
             return Ok(FullTypedExpression {
                 kind: FullTypedExpressionKind::Binary {
                     operator,
@@ -2836,6 +3074,7 @@ impl<'a> Analyzer<'a> {
                 category: ValueCategory::Value,
                 place: None,
                 constant,
+                constant_expression_kind,
                 span,
             });
         }
@@ -2847,6 +3086,7 @@ impl<'a> Analyzer<'a> {
             let left = self.integer_promote(left)?;
             let right = self.integer_promote(right)?;
             let constant = evaluate_binary_constant(operator, left.constant, right.constant);
+            let constant_expression_kind = integer_constant_expression_kind(&[&left, &right]);
             return Ok(FullTypedExpression {
                 kind: FullTypedExpressionKind::Binary {
                     operator,
@@ -2857,6 +3097,7 @@ impl<'a> Analyzer<'a> {
                 category: ValueCategory::Value,
                 place: None,
                 constant,
+                constant_expression_kind,
                 span,
             });
         }
@@ -2883,6 +3124,7 @@ impl<'a> Analyzer<'a> {
             common
         };
         let constant = evaluate_binary_constant(operator, left.constant, right.constant);
+        let constant_expression_kind = integer_constant_expression_kind(&[&left, &right]);
         Ok(FullTypedExpression {
             kind: FullTypedExpressionKind::Binary {
                 operator,
@@ -2893,6 +3135,7 @@ impl<'a> Analyzer<'a> {
             category: ValueCategory::Value,
             place: None,
             constant,
+            constant_expression_kind,
             span,
         })
     }
@@ -2944,6 +3187,7 @@ impl<'a> Analyzer<'a> {
             category: ValueCategory::Value,
             place: None,
             constant: None,
+            constant_expression_kind: ConstantExpressionKind::Invalid,
             span,
         })
     }
@@ -3096,6 +3340,7 @@ impl<'a> Analyzer<'a> {
             category: ValueCategory::Value,
             place: None,
             constant: None,
+            constant_expression_kind: ConstantExpressionKind::Invalid,
             span,
         })
     }
@@ -3139,6 +3384,8 @@ impl<'a> Analyzer<'a> {
             Some(_) => then_expression.constant,
             None => None,
         };
+        let constant_expression_kind =
+            conditional_constant_expression_kind(&condition, &then_expression, &else_expression);
         Ok(FullTypedExpression {
             kind: FullTypedExpressionKind::Conditional {
                 condition: Box::new(condition),
@@ -3149,6 +3396,7 @@ impl<'a> Analyzer<'a> {
             category: ValueCategory::Value,
             place: None,
             constant,
+            constant_expression_kind,
             span,
         })
     }
@@ -3185,6 +3433,7 @@ impl<'a> Analyzer<'a> {
             category: ValueCategory::Lvalue,
             place: Some(place),
             constant: None,
+            constant_expression_kind: ConstantExpressionKind::Invalid,
             span,
         })
     }
@@ -3295,6 +3544,7 @@ impl<'a> Analyzer<'a> {
             category,
             place,
             constant: None,
+            constant_expression_kind: ConstantExpressionKind::Invalid,
             span,
         })
     }
@@ -3369,6 +3619,7 @@ impl<'a> Analyzer<'a> {
             category: ValueCategory::Value,
             place: None,
             constant: None,
+            constant_expression_kind: ConstantExpressionKind::Invalid,
             span,
         })
     }
@@ -3394,6 +3645,7 @@ impl<'a> Analyzer<'a> {
             category: ValueCategory::Value,
             place: None,
             constant: Some(ConstantValue::Unsigned(u128::from(layout.size))),
+            constant_expression_kind: ConstantExpressionKind::Integer,
             span,
         })
     }
@@ -3524,6 +3776,7 @@ impl<'a> Analyzer<'a> {
             category: ValueCategory::Value,
             place: None,
             constant: Some(ConstantValue::Unsigned(u128::from(offset))),
+            constant_expression_kind: ConstantExpressionKind::Integer,
             span,
         })
     }
@@ -3570,7 +3823,7 @@ impl<'a> Analyzer<'a> {
                                 "string literal is too long for the initialized array",
                             );
                         }
-                        ArrayLength::Variable(_) => {
+                        ArrayLength::Variable(_) | ArrayLength::UnspecifiedVariable(_) => {
                             return self.fail(
                                 "CCC2314",
                                 expression.span,
@@ -3637,7 +3890,10 @@ impl<'a> Analyzer<'a> {
         entries: &[syntax::InitializerEntry],
         span: Span,
     ) -> AnalysisResult<(FullTypedInitializer, QualifiedType)> {
-        if matches!(array.length, ArrayLength::Variable(_)) {
+        if matches!(
+            array.length,
+            ArrayLength::Variable(_) | ArrayLength::UnspecifiedVariable(_)
+        ) {
             return self.fail(
                 "CCC2316",
                 span,
@@ -4179,13 +4435,28 @@ impl<'a> Analyzer<'a> {
         target: QualifiedType,
         span: Span,
     ) -> AnalysisResult<FullTypedExpression> {
+        let operand_kind = expression.constant_expression_kind;
+        let target_is_integer = self.types.is_integer(target.ty);
+        let mark_explicit_cast = |mut converted: FullTypedExpression| {
+            converted.constant_expression_kind = match (target_is_integer, operand_kind) {
+                (
+                    true,
+                    ConstantExpressionKind::Integer | ConstantExpressionKind::FloatingLiteral,
+                ) => ConstantExpressionKind::Integer,
+                (true, ConstantExpressionKind::UnevaluatedOnly) => {
+                    ConstantExpressionKind::UnevaluatedOnly
+                }
+                _ => ConstantExpressionKind::Invalid,
+            };
+            converted
+        };
         if target.ty == TypeId::VOID {
-            return Ok(self.conversion(
+            return Ok(mark_explicit_cast(self.conversion(
                 ConversionKind::ToVoid,
                 expression,
                 QualifiedType::unqualified(TypeId::VOID),
                 None,
-            ));
+            )));
         }
         self.reject_long_double_operation(&[target, expression.ty], span)?;
         if target.ty == TypeId::BOOL
@@ -4195,15 +4466,17 @@ impl<'a> Analyzer<'a> {
             let constant = expression
                 .constant
                 .and_then(|value| self.convert_constant(value, target.ty));
-            return Ok(self.conversion(
+            return Ok(mark_explicit_cast(self.conversion(
                 ConversionKind::ToBoolean,
                 expression,
                 QualifiedType::unqualified(target.ty),
                 constant,
-            ));
+            )));
         }
         if self.types.is_arithmetic(target.ty) && self.types.is_arithmetic(expression.ty.ty) {
-            return self.arithmetic_conversion(expression, QualifiedType::unqualified(target.ty));
+            let converted =
+                self.arithmetic_conversion(expression, QualifiedType::unqualified(target.ty))?;
+            return Ok(mark_explicit_cast(converted));
         }
         let target_pointer = self.pointer_pointee(target.ty).is_some();
         let source_pointer = self.pointer_pointee(expression.ty.ty).is_some();
@@ -4216,12 +4489,12 @@ impl<'a> Analyzer<'a> {
                 } else {
                     expression.constant
                 };
-            return Ok(self.conversion(
+            return Ok(mark_explicit_cast(self.conversion(
                 ConversionKind::PointerConversion,
                 expression,
                 QualifiedType::unqualified(target.ty),
                 constant,
-            ));
+            )));
         }
         self.fail("CCC2337", span, "invalid cast between these types")
     }
@@ -4250,6 +4523,18 @@ impl<'a> Analyzer<'a> {
     ) -> FullTypedExpression {
         let span = expression.span;
         let inherited = expression.constant;
+        let constant_expression_kind = match kind {
+            ConversionKind::IntegerPromotion
+            | ConversionKind::IntegerConversion
+            | ConversionKind::ToBoolean => match expression.constant_expression_kind {
+                ConstantExpressionKind::Integer => ConstantExpressionKind::Integer,
+                ConstantExpressionKind::UnevaluatedOnly => ConstantExpressionKind::UnevaluatedOnly,
+                ConstantExpressionKind::Invalid | ConstantExpressionKind::FloatingLiteral => {
+                    ConstantExpressionKind::Invalid
+                }
+            },
+            _ => ConstantExpressionKind::Invalid,
+        };
         FullTypedExpression {
             kind: FullTypedExpressionKind::Conversion {
                 kind,
@@ -4266,6 +4551,7 @@ impl<'a> Analyzer<'a> {
                 .then_some(inherited)
                 .flatten()
             }),
+            constant_expression_kind,
             span,
         }
     }
@@ -4276,12 +4562,22 @@ impl<'a> Analyzer<'a> {
         ty: QualifiedType,
         span: Span,
     ) -> FullTypedExpression {
+        let constant_expression_kind = match constant {
+            ConstantValue::Signed(_) | ConstantValue::Unsigned(_) => {
+                ConstantExpressionKind::Integer
+            }
+            ConstantValue::Floating(_) => ConstantExpressionKind::FloatingLiteral,
+            ConstantValue::NullPointer | ConstantValue::Address(_) => {
+                ConstantExpressionKind::Invalid
+            }
+        };
         FullTypedExpression {
             kind: FullTypedExpressionKind::Constant(constant),
             ty,
             category: ValueCategory::Value,
             place: None,
             constant: Some(constant),
+            constant_expression_kind,
             span,
         }
     }
@@ -4304,6 +4600,14 @@ impl<'a> Analyzer<'a> {
         &mut self,
         expression: &syntax::Expression,
     ) -> AnalysisResult<Option<i128>> {
+        let (_, constant) = self.analyze_integer_constant_candidate(expression)?;
+        Ok(constant)
+    }
+
+    fn analyze_integer_constant_candidate(
+        &mut self,
+        expression: &syntax::Expression,
+    ) -> AnalysisResult<(FullTypedExpression, Option<i128>)> {
         let typed = self.analyze_expression(expression)?;
         let typed = self.value_conversion(typed)?;
         if !self.types.is_integer(typed.ty.ty) {
@@ -4313,7 +4617,19 @@ impl<'a> Analyzer<'a> {
                 "constant expression must have integer type",
             );
         }
-        Ok(typed.constant.and_then(ConstantValue::as_i128))
+        let constant = if typed.constant_expression_kind == ConstantExpressionKind::Integer {
+            let Some(constant) = typed.constant.and_then(ConstantValue::as_i128) else {
+                return self.fail(
+                    "CCC2338",
+                    expression.span,
+                    "integer constant expression cannot be evaluated",
+                );
+            };
+            Some(constant)
+        } else {
+            None
+        };
+        Ok((typed, constant))
     }
 
     fn convert_pointer_comparison(
@@ -4648,9 +4964,12 @@ impl<'a> Analyzer<'a> {
             }
             (Some(TypeKind::Array(left)), Some(TypeKind::Array(right))) => {
                 self.types_compatible(left.element, right.element)
-                    && (left.length == right.length
-                        || matches!(left.length, ArrayLength::Incomplete)
-                        || matches!(right.length, ArrayLength::Incomplete))
+                    && match (left.length, right.length) {
+                        (ArrayLength::Constant(left), ArrayLength::Constant(right)) => {
+                            left == right
+                        }
+                        _ => true,
+                    }
             }
             _ => match (
                 self.types.function_signature(left),
@@ -4764,8 +5083,22 @@ impl<'a> Analyzer<'a> {
                 let element = self.composite_type(left.element, right.element)?;
                 let length = match (left.length, right.length) {
                     (ArrayLength::Incomplete, length) | (length, ArrayLength::Incomplete) => length,
-                    (left, right) if left == right => left,
-                    _ => return None,
+                    (ArrayLength::Constant(left), ArrayLength::Constant(right)) => {
+                        if left != right {
+                            return None;
+                        }
+                        ArrayLength::Constant(left)
+                    }
+                    (ArrayLength::Constant(length), _) | (_, ArrayLength::Constant(length)) => {
+                        ArrayLength::Constant(length)
+                    }
+                    (ArrayLength::Variable(bound), _) | (_, ArrayLength::Variable(bound)) => {
+                        ArrayLength::Variable(bound)
+                    }
+                    (
+                        ArrayLength::UnspecifiedVariable(bound),
+                        ArrayLength::UnspecifiedVariable(_),
+                    ) => ArrayLength::UnspecifiedVariable(bound),
                 };
                 Some(self.types.array(ArrayType { element, length }))
             }
@@ -4814,10 +5147,24 @@ impl<'a> Analyzer<'a> {
     fn is_variably_modified(&self, ty: TypeId) -> bool {
         match self.types.try_kind(ty) {
             Some(TypeKind::Array(array)) => {
-                matches!(array.length, ArrayLength::Variable(_))
-                    || self.is_variably_modified(array.element.ty)
+                matches!(
+                    array.length,
+                    ArrayLength::Variable(_) | ArrayLength::UnspecifiedVariable(_)
+                ) || self.is_variably_modified(array.element.ty)
             }
             Some(TypeKind::Pointer(pointer)) => self.is_variably_modified(pointer.pointee.ty),
+            _ => false,
+        }
+    }
+
+    fn requires_runtime_sized_storage(&self, ty: TypeId) -> bool {
+        match self.types.try_kind(ty) {
+            Some(TypeKind::Array(array)) => {
+                matches!(
+                    array.length,
+                    ArrayLength::Variable(_) | ArrayLength::UnspecifiedVariable(_)
+                ) || self.requires_runtime_sized_storage(array.element.ty)
+            }
             _ => false,
         }
     }
@@ -5389,6 +5736,21 @@ impl<'a> Analyzer<'a> {
     }
 }
 
+fn defining_function_parameter_list_span(declarator: &syntax::Declarator) -> Option<Span> {
+    fn find(direct: &syntax::DirectDeclarator) -> Option<Span> {
+        match direct {
+            syntax::DirectDeclarator::Identifier(_) | syntax::DirectDeclarator::Abstract(_) => None,
+            syntax::DirectDeclarator::Parenthesized(declarator, _) => {
+                defining_function_parameter_list_span(declarator)
+            }
+            syntax::DirectDeclarator::Array { inner, .. } => find(inner),
+            syntax::DirectDeclarator::Function { inner, span, .. } => find(inner).or(Some(*span)),
+        }
+    }
+
+    find(&declarator.direct)
+}
+
 fn qualifiers(qualifiers: &[syntax::TypeQualifier]) -> TypeQualifiers {
     qualifiers
         .iter()
@@ -5431,6 +5793,96 @@ fn access_semantics(ty: QualifiedType) -> AccessSemantics {
     AccessSemantics {
         volatile: ty.qualifiers.contains(TypeQualifiers::VOLATILE),
         atomic: ty.qualifiers.contains(TypeQualifiers::ATOMIC),
+    }
+}
+
+fn integer_constant_expression_kind(operands: &[&FullTypedExpression]) -> ConstantExpressionKind {
+    if operands.iter().any(|operand| {
+        matches!(
+            operand.constant_expression_kind,
+            ConstantExpressionKind::Invalid | ConstantExpressionKind::FloatingLiteral
+        )
+    }) {
+        ConstantExpressionKind::Invalid
+    } else if operands
+        .iter()
+        .any(|operand| operand.constant_expression_kind == ConstantExpressionKind::UnevaluatedOnly)
+    {
+        ConstantExpressionKind::UnevaluatedOnly
+    } else {
+        ConstantExpressionKind::Integer
+    }
+}
+
+fn unevaluated_operator_constant_expression_kind(
+    operands: &[&FullTypedExpression],
+) -> ConstantExpressionKind {
+    if operands.iter().any(|operand| {
+        matches!(
+            operand.constant_expression_kind,
+            ConstantExpressionKind::Invalid | ConstantExpressionKind::FloatingLiteral
+        )
+    }) {
+        ConstantExpressionKind::Invalid
+    } else {
+        ConstantExpressionKind::UnevaluatedOnly
+    }
+}
+
+fn logical_constant_expression_kind(
+    operator: syntax::BinaryOperator,
+    left: &FullTypedExpression,
+    right: &FullTypedExpression,
+) -> ConstantExpressionKind {
+    use syntax::BinaryOperator as B;
+
+    let combined = integer_constant_expression_kind(&[left, right]);
+    if combined == ConstantExpressionKind::Invalid {
+        return combined;
+    }
+    if left.constant_expression_kind != ConstantExpressionKind::Integer {
+        return ConstantExpressionKind::UnevaluatedOnly;
+    }
+
+    let right_is_unselected = match (operator, left.constant) {
+        (B::LogicalAnd, Some(value)) => value.is_zero(),
+        (B::LogicalOr, Some(value)) => !value.is_zero(),
+        _ => false,
+    };
+    if right_is_unselected || right.constant_expression_kind == ConstantExpressionKind::Integer {
+        ConstantExpressionKind::Integer
+    } else {
+        ConstantExpressionKind::UnevaluatedOnly
+    }
+}
+
+fn conditional_constant_expression_kind(
+    condition: &FullTypedExpression,
+    then_expression: &FullTypedExpression,
+    else_expression: &FullTypedExpression,
+) -> ConstantExpressionKind {
+    let combined = integer_constant_expression_kind(&[condition, then_expression, else_expression]);
+    if combined == ConstantExpressionKind::Invalid {
+        return combined;
+    }
+    if condition.constant_expression_kind != ConstantExpressionKind::Integer {
+        return ConstantExpressionKind::UnevaluatedOnly;
+    }
+
+    let selected_kind = match condition.constant {
+        Some(value) if value.is_zero() => else_expression.constant_expression_kind,
+        Some(_) => then_expression.constant_expression_kind,
+        None if then_expression.constant_expression_kind == ConstantExpressionKind::Integer
+            && else_expression.constant_expression_kind == ConstantExpressionKind::Integer =>
+        {
+            ConstantExpressionKind::Integer
+        }
+        None => ConstantExpressionKind::UnevaluatedOnly,
+    };
+    if selected_kind == ConstantExpressionKind::Integer {
+        ConstantExpressionKind::Integer
+    } else {
+        ConstantExpressionKind::UnevaluatedOnly
     }
 }
 
@@ -5542,6 +5994,15 @@ fn evaluate_binary_constant(
 ) -> Option<ConstantValue> {
     use syntax::BinaryOperator as B;
     let left = left?;
+    match (operator, left) {
+        (B::LogicalAnd, value) if value.is_zero() => {
+            return Some(ConstantValue::Signed(0));
+        }
+        (B::LogicalOr, value) if !value.is_zero() => {
+            return Some(ConstantValue::Signed(1));
+        }
+        _ => {}
+    }
     let right = right?;
     let boolean = |value: bool| Some(ConstantValue::Signed(i128::from(value)));
     match (left, right) {

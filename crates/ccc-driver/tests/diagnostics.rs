@@ -55,6 +55,12 @@ fn rejected_translations_match_diagnostic_goldens_and_emit_no_object() {
             ),
         },
         Case {
+            name: "variable-length-star",
+            expected: include_str!(
+                "../../../tests/diagnostics/goldens/variable-length-star.stderr"
+            ),
+        },
+        Case {
             name: "long-double-operation",
             expected: include_str!(
                 "../../../tests/diagnostics/goldens/long-double-operation.stderr"

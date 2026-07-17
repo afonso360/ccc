@@ -2,7 +2,7 @@ use ccc_pp::{PragmaEvent, StringLiteralPrefix};
 use ccc_session::Span;
 use ccc_syntax::frontend::{AssignmentOperator, BinaryOperator, UnaryOperator};
 use ccc_target::{CapabilityState, PackingPolicy};
-use ccc_types::{QualifiedType, TypeId, TypeStore};
+use ccc_types::{QualifiedType, TypeId, TypeStore, VariableLengthId};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct GlobalId(pub u32);
@@ -154,12 +154,22 @@ pub struct FullTypedFunction {
     pub span: Span,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct FullTypedParameter {
     pub local: FullLocalId,
     pub name: String,
     pub ty: QualifiedType,
+    /// Runtime bounds evaluated for this parameter declaration. Each entry is
+    /// keyed by the ID assigned before array-parameter adjustment; bounds for
+    /// nested arrays remain embedded in the adjusted pointer type.
+    pub variable_length_bounds: Vec<FullTypedVariableLengthBound>,
     pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FullTypedVariableLengthBound {
+    pub id: VariableLengthId,
+    pub expression: FullTypedExpression,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -187,6 +197,8 @@ pub struct FullTypedLocalDeclaration {
     pub ty: QualifiedType,
     pub storage: SemanticStorageClass,
     pub duration: StorageDuration,
+    /// Runtime bounds evaluated once when this declaration is reached.
+    pub variable_length_bounds: Vec<FullTypedVariableLengthBound>,
     pub initializer: Option<FullTypedInitializer>,
     pub attributes: Vec<FullTypedAttribute>,
     /// Present for static- or thread-duration block objects. These objects are
@@ -272,7 +284,21 @@ pub struct FullTypedExpression {
     pub category: ValueCategory,
     pub place: Option<Place>,
     pub constant: Option<ConstantValue>,
+    /// How this expression may participate in a C integer constant expression.
+    /// `UnevaluatedOnly` has permitted operands but contains an operator that
+    /// C allows only inside a statically unevaluated subexpression. A floating
+    /// literal is tracked separately because C permits it only as the immediate
+    /// operand of an explicit cast to integer type.
+    pub constant_expression_kind: ConstantExpressionKind,
     pub span: Span,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConstantExpressionKind {
+    Invalid,
+    Integer,
+    UnevaluatedOnly,
+    FloatingLiteral,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -202,6 +202,10 @@ pub enum ArrayLength {
     Incomplete,
     Constant(u64),
     Variable(VariableLengthId),
+    /// A `[*]` bound from function prototype scope. Unlike an incomplete
+    /// array bound, this denotes a variable-length array whose bound is
+    /// intentionally unspecified by the declaration.
+    UnspecifiedVariable(VariableLengthId),
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

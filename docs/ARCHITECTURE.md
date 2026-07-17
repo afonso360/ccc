@@ -6,7 +6,7 @@ CCC targets **pragmatic C11 plus a GNU compatibility subset** — a deliberate c
 
 This document is the high-level introduction. Each design area is detailed in its own document under [`docs/design/`](design/); each significant decision is an ADR under [`docs/adr/`](adr/).
 
-Status: design. Last updated 2026-07-13.
+Status: design. Last updated 2026-07-15.
 
 ---
 
@@ -72,14 +72,16 @@ the feature design.
 
 The significant, cross-cutting decisions live as ADRs in [`docs/adr/`](adr/):
 
-| ADR                                                     | Decision                                                                                          |
-| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| [0001](adr/0001-ccc-ir-middle-layer.md)                 | Adopt a CCC-IR middle layer (don't lower AST→CLIF directly)                                       |
-| [0002](adr/0002-syntax-owned-typedef-classification.md) | Syntax owns a shared typedef-classification event model                                           |
-| [0003](adr/0003-first-target-triple.md)                 | First target triple: `x86_64-unknown-linux-gnu`                                                   |
-| [0004](adr/0004-recursive-descent-parser.md)            | Hand-written recursive-descent parser                                                             |
-| [0005](adr/0005-preprocessor-owns-pp-token-lexing.md)   | Preprocessor owns pp-token lexing                                                                 |
-| [0006](adr/0006-link-via-target-driver.md)              | Link via a resolved target compiler driver                                                        |
-| [0007](adr/0007-long-double-and-complex.md)             | Preserve target `long double` ABI; reject unsupported operations, explicit f64 compatibility mode |
-| [0008](adr/0008-pin-cranelift.md)                       | Pin Cranelift; upgrade deliberately                                                               |
-| [0009](adr/0009-shared-type-and-layout-crate.md)        | Shared `ccc-types` crate: one canonical type representation and layout engine                     |
+| ADR                                                              | Decision                                                                                          |
+| ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| [0001](adr/0001-ccc-ir-middle-layer.md)                          | Adopt a CCC-IR middle layer (don't lower AST→CLIF directly)                                       |
+| [0002](adr/0002-syntax-owned-typedef-classification.md)          | Syntax owns a shared typedef-classification event model                                           |
+| [0003](adr/0003-first-target-triple.md)                          | First target triple: `x86_64-unknown-linux-gnu`                                                   |
+| [0004](adr/0004-recursive-descent-parser.md)                     | Hand-written recursive-descent parser                                                             |
+| [0005](adr/0005-preprocessor-owns-pp-token-lexing.md)            | Preprocessor owns pp-token lexing                                                                 |
+| [0006](adr/0006-link-via-target-driver.md)                       | Link via a resolved target compiler driver                                                        |
+| [0007](adr/0007-long-double-and-complex.md)                      | Preserve target `long double` ABI; reject unsupported operations, explicit f64 compatibility mode |
+| [0008](adr/0008-pin-cranelift.md)                                | Pin Cranelift; upgrade deliberately                                                               |
+| [0009](adr/0009-shared-type-and-layout-crate.md)                 | Shared `ccc-types` crate: one canonical type representation and layout engine                     |
+| [0010](adr/0010-generate-abi-bridges-as-assembly.md)             | Generate ABI bridges as auditable target assembly                                                 |
+| [0011](adr/0011-arena-backed-runtime-sized-automatic-storage.md) | Back runtime-sized automatic objects with a scoped arena; keep native-stack builtins gated        |

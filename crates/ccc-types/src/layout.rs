@@ -244,7 +244,7 @@ impl LayoutEngine<'_> {
     fn array_layout(&mut self, id: TypeId, array: ArrayType) -> Result<TypeLayout, LayoutError> {
         let length = match array.length {
             ArrayLength::Incomplete => return Err(LayoutError::IncompleteArray(id)),
-            ArrayLength::Variable(bound) => {
+            ArrayLength::Variable(bound) | ArrayLength::UnspecifiedVariable(bound) => {
                 return Err(LayoutError::VariableLengthArray { ty: id, bound });
             }
             ArrayLength::Constant(length) => length,

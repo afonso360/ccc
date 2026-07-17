@@ -120,6 +120,7 @@ fn dump_function(output: &mut String, unit: &FullTypedTranslationUnit, id: FullF
                 unit.types.display_qualified(parameter.ty)
             ),
         );
+        dump_variable_length_bounds(output, unit, &parameter.variable_length_bounds, 2);
     }
     if let Some(body) = &function.body {
         dump_statement(output, unit, body, 1);
@@ -276,6 +277,12 @@ fn dump_block_item(
                     ),
                 );
             }
+            dump_variable_length_bounds(
+                output,
+                unit,
+                &declaration.variable_length_bounds,
+                indent + 1,
+            );
             if let Some(initializer) = &declaration.initializer {
                 dump_initializer(output, unit, initializer, indent + 1);
             }
@@ -313,6 +320,22 @@ fn dump_block_item(
                 format_args!("pragma {}", render_pragma(pragma)),
             );
         }
+    }
+}
+
+fn dump_variable_length_bounds(
+    output: &mut String,
+    unit: &FullTypedTranslationUnit,
+    bounds: &[FullTypedVariableLengthBound],
+    indent: usize,
+) {
+    for bound in bounds {
+        line(
+            output,
+            indent,
+            format_args!("variable-length-bound vla{}", bound.id.0),
+        );
+        dump_expression(output, unit, &bound.expression, indent + 1);
     }
 }
 

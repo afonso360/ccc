@@ -9,6 +9,15 @@ separate immutable [module ABI plan](abi-and-varargs.md#module-abi-plan).
 
 - **Places vs values.** A place is an address expression plus type, qualifiers, and an optional bitfield descriptor. Every read is an explicit load and every write an explicit store; lvalue-to-rvalue conversion is never implicit.
 - **Object identity and address-taking.** Address-taken, volatile, aggregate, atomic, and variably modified objects are materialized in memory. A pre-lowering scan classifies locals before any SSA value is emitted, so later `&local` cannot require retroactive materialization.
+- **Runtime-sized automatic storage.** Runtime extents are explicit values, and
+  `AutomaticStorageBegin`/`AutomaticStorageEnd`-class effects delimit each
+  dynamic object's lifetime without naming a physical provider. Begin carries
+  checked byte size and required alignment; address formation is valid only
+  while the storage is active. The verifier propagates a LIFO active-region
+  stack, requires equal stacks at CFG merges, and rejects an ordinary return
+  with active storage. Provider-specific arena marks or native stack-save tokens
+  exist only below CCC-IR, as required by
+  [ADR-0011](../adr/0011-arena-backed-runtime-sized-automatic-storage.md).
 - **Pointer operations.** Scaled pointer arithmetic, pointer difference, array/member offsets, null values, and integer/pointer conversions are explicit operations with the source C rules attached. Codegen does not infer pointee size or signedness.
 - **Aggregate value semantics.** Every aggregate rvalue is an immutable owned
   snapshot with compiler-managed backing storage. `AggregateSnapshot` observes

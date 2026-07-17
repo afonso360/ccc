@@ -208,6 +208,10 @@ fn encode_types(encoder: &mut Encoder, types: &TypeStore) -> Result<(), AbiError
                         encoder.tag(2);
                         encoder.u32(id.0);
                     }
+                    ArrayLength::UnspecifiedVariable(id) => {
+                        encoder.tag(3);
+                        encoder.u32(id.0);
+                    }
                 }
             }
             TypeKind::Function(signature) => {

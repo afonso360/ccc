@@ -21,6 +21,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn builtin_ids_and_store_prefix_remain_append_only_and_in_lockstep() {
+        let expected = [
+            (BuiltinType::Void, TypeId::VOID, 0),
+            (BuiltinType::Int, TypeId::INT, 1),
+            (BuiltinType::Bool, TypeId::BOOL, 2),
+            (BuiltinType::Char, TypeId::CHAR, 3),
+            (BuiltinType::SignedChar, TypeId::SIGNED_CHAR, 4),
+            (BuiltinType::UnsignedChar, TypeId::UNSIGNED_CHAR, 5),
+            (BuiltinType::Short, TypeId::SHORT, 6),
+            (BuiltinType::UnsignedShort, TypeId::UNSIGNED_SHORT, 7),
+            (BuiltinType::UnsignedInt, TypeId::UNSIGNED_INT, 8),
+            (BuiltinType::Long, TypeId::LONG, 9),
+            (BuiltinType::UnsignedLong, TypeId::UNSIGNED_LONG, 10),
+            (BuiltinType::LongLong, TypeId::LONG_LONG, 11),
+            (
+                BuiltinType::UnsignedLongLong,
+                TypeId::UNSIGNED_LONG_LONG,
+                12,
+            ),
+            (BuiltinType::Float, TypeId::FLOAT, 13),
+            (BuiltinType::Double, TypeId::DOUBLE, 14),
+            (BuiltinType::LongDouble, TypeId::LONG_DOUBLE, 15),
+        ];
+        assert_eq!(BuiltinType::ALL.len(), expected.len());
+
+        let types = TypeStore::default();
+        for (kind, id, index) in expected {
+            assert!(BuiltinType::ALL.contains(&kind));
+            assert_eq!(id.index(), index);
+            assert_eq!(TypeId::builtin(kind), id);
+            assert_eq!(types.kind(id), &TypeKind::Builtin(kind));
+        }
+    }
+
+    #[test]
     fn interns_canonical_function_types() {
         let mut types = TypeStore::default();
         let signature =

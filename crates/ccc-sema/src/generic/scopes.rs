@@ -12,6 +12,7 @@ pub(super) enum OrdinarySymbol {
     Global(GlobalId, QualifiedType),
     Function(FullFunctionId, TypeId),
     Local(FullLocalId, QualifiedType),
+    TemporaryParameter(FullLocalId, QualifiedType, bool),
     Typedef(TypedefId, QualifiedType),
     Enumerator(i128, QualifiedType),
 }
@@ -29,11 +30,14 @@ pub(super) struct TagSymbol {
     pub ty: TypeId,
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 struct SemanticScope {
     ordinary: HashMap<String, OrdinarySymbol>,
     tags: HashMap<String, TagSymbol>,
 }
+
+#[derive(Clone, Debug)]
+pub(super) struct DetachedSemanticScope(SemanticScope);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum OrdinaryBindingConflict {
@@ -62,8 +66,16 @@ impl ScopeStack {
     }
 
     pub fn pop(&mut self) {
+        let _ = self.pop_detached();
+    }
+
+    pub fn pop_detached(&mut self) -> DetachedSemanticScope {
         assert!(self.scopes.len() > 1, "the file scope is permanent");
-        self.scopes.pop();
+        DetachedSemanticScope(self.scopes.pop().expect("a nested scope exists"))
+    }
+
+    pub fn push_detached(&mut self, scope: DetachedSemanticScope) {
+        self.scopes.push(scope.0);
     }
 
     pub fn current_ordinary(&self, name: &str) -> Option<&OrdinarySymbol> {

@@ -77,6 +77,53 @@ preflights every reference and packaging tool, and invokes each named native
 test binary explicitly. A missing tool or zero-test configuration is a hard
 failure, never an implicit skip.
 
+## Runtime-sized automatic storage
+
+Provider-independent tests first prove that nonconstant array extents are
+evaluated once and retained in the typed AST, including parameter-order binding,
+runtime `sizeof`, and multidimensional pointer strides. Diagnostics distinguish
+prototype-scope `[*]`, legal fixed-size objects with variably modified types,
+runtime-sized objects whose provider is unavailable, invalid bounds, illegal
+storage classes, and control-flow ingress that bypasses a declaration.
+
+Enabling an automatic-storage provider additionally requires exact CCC-IR
+goldens for region entry, allocation, and restoration, plus verifier mutations
+for mismatched merges, address-before-entry, non-LIFO restoration, and return
+with active storage. Execution fixtures cover normal fallthrough, nested
+blocks, `break`, `continue`, outward and backward `goto`, return-value
+evaluation, switch ingress, computed-goto cleanup when both capabilities are
+enabled, recursion, concurrent invocations, and statement-expression lifetime.
+
+Provider tests inject nonpositive bounds, extent and alignment overflow,
+allocation failure, and alignments through over-aligned `_Alignas` declarations.
+On System V AMD64 every VLA allocation is checked for the target's 16-byte
+minimum as well as stronger declared alignment. Long-running loop fixtures
+measure bounded high-water reuse: after restoration, an allocation that fits
+retained capacity must make zero further allocator calls. Each target provider
+descriptor commits maximum allocation-count, hot-call latency-regression, and
+code-size budgets together with the pinned runner class, sampling protocol, and
+tolerance; the benchmark is a failing gate rather than an informational
+recording. Allocator accounting and LeakSanitizer runs cover every ordinary exit
+shape.
+
+The scoped-arena profile has explicit nonlocal-control tests. A same-function
+combination with a returns-twice call remains a compile-fail case until its
+checkpoint protocol is verified. A cross-invocation `longjmp` fixture abandons
+one invocation while another arena is active and proves that the surviving
+arena remains intact. The harness reports the abandoned invocation's expected
+unreclaimed bytes separately so only that specified `longjmp` loss is exempt
+from leak-freedom assertions. Configuration snapshots pin the provider's
+negative async-signal-safety and cross-language-unwind facts; a call that may
+unwind across active arena storage remains diagnosed until cleanup integration
+is proved.
+
+Object and disassembly checks prove that affected user functions keep their
+ordinary Cranelift frame, support definitions have local binding, and the only
+external provider references match the runtime manifest. A mixed-link test
+links a CCC-produced object with an external GCC- and Clang-compatible driver
+and resolves only the declared hosted dependencies. Negative feature-predicate
+tests keep `__builtin_alloca` unavailable for an arena-only profile.
+
 ## Differential testing and undefined behavior
 
 Differential tests compare only outputs whose relevant behavior is defined for the identical effective configuration.
@@ -98,7 +145,11 @@ Every enabled target has a required matrix entry. A target without an execution 
 
 ## Real-code corpus
 
-SQLite, Lua, zlib, musl, tcc, selected libc-header fixtures, c-testsuite, and GCC torture tests exercise drop-in compatibility. Each integration records the exact build command, enabled features, patches if any, expected exclusions, and whether success means preprocess, compile, link, or run. “Builds unmodified” is used only when no source or build-system patch is applied.
+SQLite, Lua, zlib, musl, tcc, selected libc-header fixtures, and c-testsuite
+exercise drop-in compatibility. Each integration records the exact build
+command, enabled features, patches if any, expected exclusions, and whether
+success means preprocess, compile, link, or run. “Builds unmodified” is used
+only when no source or build-system patch is applied.
 
 Hosted-header preprocessing and parsing are separate gates. A licensed, pinned
 glibc-like fixture has both a deterministic preprocessing golden and an AST
@@ -110,7 +161,23 @@ mutable system header. Parsing success certifies only the advertised parsing
 ceiling; it does not imply semantic analysis or object-emission support for
 parse-only declarations.
 
-Corpus pins encode capability dependencies. SQLite is pinned to ≥ 3.45, which removed core `long double` arithmetic — an earlier pin silently requires the f80 runtime on the primary target — and its gate runs the `veryquick` TCL set through `testfixture`, which needs a TCL development environment; the full suite and TH3 are out of scope. Lua's default GNU-profile build exercises `setjmp`/`longjmp` and computed-goto dispatch. musl feeds `$CC` assembly files.
+Corpus pins encode capability dependencies. SQLite is pinned to 3.47.2. Release
+3.47.0 removed SQLite's remaining `long double` use by switching that
+calculation to Dekker's algorithm; an earlier release silently requires the f80
+runtime on the primary target. Its gate runs the `veryquick` TCL set through
+`testfixture`, which needs a TCL development environment; the full suite and
+TH3 are out of scope. SQLite core does not exercise VLA objects, computed goto,
+or statement expressions, so its success is integration evidence rather than
+proof of those constructs; their focused execution fixtures remain required.
+Lua's default GNU-profile build exercises `setjmp`/`longjmp` and computed-goto
+dispatch. musl feeds `$CC` assembly files.
+
+A curated execute-only compiler torture subset may supplement focused fixtures.
+It is fetched rather than vendored, and its corpus manifest records the exact
+upstream revision, selected paths, license, hashes, required language profile,
+and exclusions for undefined or implementation-specific behavior. Passing that
+subset does not replace exact typed-AST, IR, ABI, and execution regressions for
+the supported constructs.
 
 ## Licensing, pinning, and supply-chain policy
 

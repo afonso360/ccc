@@ -1843,8 +1843,10 @@ fn is_void(types: &TypeStore, ty: TypeId) -> bool {
 fn is_variably_modified(types: &TypeStore, ty: TypeId) -> bool {
     match types.try_kind(ty) {
         Some(TypeKind::Array(array)) => {
-            matches!(array.length, ArrayLength::Variable(_))
-                || is_variably_modified(types, array.element.ty)
+            matches!(
+                array.length,
+                ArrayLength::Variable(_) | ArrayLength::UnspecifiedVariable(_)
+            ) || is_variably_modified(types, array.element.ty)
         }
         Some(TypeKind::Pointer(pointer)) => is_variably_modified(types, pointer.pointee.ty),
         _ => false,
@@ -1929,7 +1931,9 @@ fn array_bound(types: &TypeStore, ty: TypeId) -> Option<u64> {
     match types.try_kind(ty) {
         Some(TypeKind::Array(array)) => match array.length {
             ArrayLength::Constant(bound) => Some(bound),
-            ArrayLength::Incomplete | ArrayLength::Variable(_) => None,
+            ArrayLength::Incomplete
+            | ArrayLength::Variable(_)
+            | ArrayLength::UnspecifiedVariable(_) => None,
         },
         _ => None,
     }

@@ -351,6 +351,9 @@ impl TypeStore {
                     crate::ArrayLength::Incomplete => "".to_owned(),
                     crate::ArrayLength::Constant(length) => length.to_string(),
                     crate::ArrayLength::Variable(id) => format!("vla{}", id.0),
+                    crate::ArrayLength::UnspecifiedVariable(id) => {
+                        format!("vla*{}", id.0)
+                    }
                 };
                 format!(
                     "array[{length}] of {}",

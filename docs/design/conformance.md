@@ -69,7 +69,31 @@ A conforming complex implementation represents values as typed real/imaginary pa
 
 ## Variable-length arrays
 
-C11 makes VLAs optional. While a target lacks the [dynamic-stack capability](cranelift-risks.md#dynamic-stack-capability-contract), its configuration defines `__STDC_NO_VLA__` to `1`, and a declaration whose storage requires runtime stack allocation is a hard capability diagnostic — documented conformance, not a deferred bug. Variably modified types remain representable in semantic analysis (runtime `sizeof`, pointers to VLA), matching the general parse-don't-claim policy. When the capability lands for a target, the macro is removed and the execution tests take over.
+C11 makes runtime-sized automatic VLA objects optional and does not require
+their physical storage to reside on the machine stack. Variably modified types
+remain representable independently of that storage capability. Semantic
+analysis distinguishes an expression-bound array from prototype-scope `[*]`,
+retains supported parameter and local-declaration extents, permits fixed-size
+objects such as pointers to VLA where C permits them, and diagnoses illegal
+storage classes. Variably modified typedef and type-name bounds remain explicit
+frontend boundaries until their effects can be represented without loss.
+
+An effective target profile removes `__STDC_NO_VLA__` only after its
+[runtime-sized automatic storage contract](cranelift-risks.md#runtime-sized-automatic-storage-contract)
+has complete semantic, CCC-IR, provider, failure, and execution evidence. A
+profile lacking any part defines the macro to `1` and diagnoses declarations
+that require runtime-sized object storage. This is documented C11 conformance,
+not an implicit promise to use the native stack.
+
+The selected hosted provider is the scoped arena in
+[ADR-0011](../adr/0011-arena-backed-runtime-sized-automatic-storage.md). It
+does not enable `__builtin_alloca` or related native-stack builtins;
+`__has_builtin` reports them as unavailable until the separate
+[native dynamic-stack contract](cranelift-risks.md#native-dynamic-stack-capability-contract)
+is proved. The arena provider documents possible storage loss across nonlocal
+exit and does not claim POSIX async-signal-safe allocation. A GNU statement
+expression does not extend a VLA's lifetime beyond its closing brace, even when
+its result contains a pointer to that storage.
 
 ## Effective implementation-defined behavior
 

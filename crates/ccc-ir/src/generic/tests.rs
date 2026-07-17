@@ -21,6 +21,20 @@ fn lower_source(source: &str) -> FullModule {
 }
 
 #[test]
+fn rejects_unlowered_variable_bound_effects() {
+    for source in [
+        "int f(int n, int (*value)[n]) { return 0; }",
+        "int f(int n) { static int (*value)[n++]; return 0; }",
+        "int f(int n) { int (*value)[(n++, 4)]; return n; }",
+        "int f(int n) { int (*(*value)(void))[n++]; return n; }",
+    ] {
+        let error = lower_frontend(&typed_source(source)).unwrap_err();
+        assert_eq!(error.code, "CCC3101");
+        assert!(error.message.contains("bounds are not yet lowered"));
+    }
+}
+
+#[test]
 fn dumps_explicit_places_compound_updates_and_volatile_effects_exactly() {
     let module = lower_source(
         "volatile int g;\n\

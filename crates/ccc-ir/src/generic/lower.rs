@@ -571,8 +571,10 @@ fn variably_modified(types: &TypeStore, ty: TypeId, active: &mut HashSet<TypeId>
     }
     let result = match types.try_kind(ty) {
         Some(TypeKind::Array(array)) => {
-            matches!(array.length, ArrayLength::Variable(_))
-                || variably_modified(types, array.element.ty, active)
+            matches!(
+                array.length,
+                ArrayLength::Variable(_) | ArrayLength::UnspecifiedVariable(_)
+            ) || variably_modified(types, array.element.ty, active)
         }
         Some(TypeKind::Pointer(pointer)) => variably_modified(types, pointer.pointee.ty, active),
         Some(TypeKind::Function(signature)) => {
@@ -881,6 +883,17 @@ impl<'a> FunctionBuilder<'a> {
         static_data: &'a BTreeMap<(FullFunctionId, FullLocalId), DataId>,
         types: &'a mut TypeStore,
     ) -> Result<FullFunction, IrError> {
+        if let Some(parameter) = source
+            .parameters
+            .iter()
+            .find(|parameter| !parameter.variable_length_bounds.is_empty())
+        {
+            return Err(IrError::lower(
+                LOWERING_ERROR,
+                parameter.span,
+                "runtime variable-length parameter bounds are not yet lowered",
+            ));
+        }
         let signature = types.function_signature(source.signature).ok_or_else(|| {
             IrError::lower(
                 LOWERING_ERROR,
@@ -1769,6 +1782,13 @@ impl FunctionBuilder<'_> {
         &mut self,
         declaration: &FullTypedLocalDeclaration,
     ) -> Result<(), IrError> {
+        if !declaration.variable_length_bounds.is_empty() {
+            return Err(IrError::lower(
+                LOWERING_ERROR,
+                declaration.span,
+                "runtime variable-length declaration bounds are not yet lowered",
+            ));
+        }
         if declaration.duration != StorageDuration::Automatic || self.current.is_none() {
             return Ok(());
         }
@@ -3593,7 +3613,9 @@ fn string_copy_code_units(
     let bound = match types.try_kind(object.ty) {
         Some(TypeKind::Array(array)) => match array.length {
             ArrayLength::Constant(bound) => bound,
-            ArrayLength::Incomplete | ArrayLength::Variable(_) => {
+            ArrayLength::Incomplete
+            | ArrayLength::Variable(_)
+            | ArrayLength::UnspecifiedVariable(_) => {
                 return Err(IrError::lower(
                     LOWERING_ERROR,
                     span,

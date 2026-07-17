@@ -93,7 +93,12 @@ System include directories are obtained from the resolved target toolchain/sysro
 Versioned runtime shims may be resource-owned when a target operation is not
 provided with the required ABI by the selected toolchain. The
 [runtime helper manifest](toolchain.md#runtime-helper-manifest) chooses the
-provider for each such symbol. ABI bridge assembly is not a resource template:
+provider for each such symbol. The hosted scoped-arena provider is different:
+its versioned support functions are local CLIF definitions in the primary
+object, while the manifest records their hosted allocator dependencies. It does
+not require a resource-owned runtime object. A freestanding arena provider may
+be resource-owned and is enabled only for the exact targets listed by that
+manifest. ABI bridge assembly is not a resource template:
 `ccc-link` renders it from the verified `ModuleAbiPlan` for each compilation,
 then assembles, partially links, and exactly localizes it as specified by
 [ADR-0010](../adr/0010-generate-abi-bridges-as-assembly.md).
