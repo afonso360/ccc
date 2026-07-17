@@ -127,15 +127,23 @@ tests keep `__builtin_alloca` unavailable for an arena-only profile.
 ## C11 and GNU capability fixtures
 
 Statement-expression tests distinguish GNU C's three result categories rather
-than treating every closing expression alike. Transparent scalar, aggregate,
-and bit-field places are tested as lvalues, with qualifiers preserved; arrays
-and functions are tested for decay; declaration-bearing and multi-statement
-bodies are tested for value capture; and bodies without a retained final
-expression are tested as `void`. A non-addressable bit-field remains
-non-addressable. GCC's inconsistent same-type-cast generalized-lvalue behavior
-is rejected unless it is adopted by an explicit compatibility decision.
-`_Generic` has a separate matrix proving controlling-expression conversions
-and preservation of the selected association's value category.
+than treating every closing expression alike. Transparent
+top-level-unqualified scalar and aggregate places and eligible bit-field places
+are tested as lvalues. Top-level `const` and `volatile` ordinary finals are
+tested as non-lvalues, including exactly one ordered read when materializing a
+volatile final. Aggregate forwarding is tested for preservation of nested
+member and pointed-to qualifications. Bit-fields declared with access
+qualifiers retain their descriptor and remain non-addressable; modification of
+a forwarded `const` bit-field is diagnosed, while a forwarded `volatile`
+bit-field remains assignable. Separate fixtures select an unqualified bit-field
+through `const`- and `volatile`-qualified aggregate places and require
+non-lvalue results. Arrays and functions are tested for decay;
+declaration-bearing and multi-statement bodies are tested for value capture;
+and bodies without a retained final expression are tested as `void`. GCC's
+inconsistent same-type-cast generalized-lvalue behavior is rejected unless it
+is adopted by an explicit compatibility decision. `_Generic` has a separate
+matrix proving controlling-expression conversions and preservation of the
+selected association's value category.
 
 Computed-goto fixtures include a positive direct `&&label` pointer table and
 exact `br_table` golden. Negative fixtures diagnose both label subtraction and

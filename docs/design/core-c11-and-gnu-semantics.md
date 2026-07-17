@@ -171,20 +171,37 @@ explicitly:
 
 - `void` for a body without a final expression statement;
 - an ordinary non-lvalue value for a scoped or sequenced body whose result must
-  be captured before leaving the block; and
+  be captured before leaving the block, or when the otherwise-transparent final
+  lvalue has a top-level qualification represented on the expression's type
+  rather than solely on a bit-field descriptor; and
 - a transparent lvalue when, after empty statements are discarded, the body
-  contains only one eligible final scalar, aggregate, or bit-field lvalue
-  expression and contains no declarations. Its place retains qualifiers
-  and any bit-field descriptor. Array and function results still undergo decay.
-  CCC does not reproduce GCC's inconsistent generalized-lvalue bugs for casts
-  or other expressions that are not C lvalues.
+  contains only one eligible final lvalue expression and no declarations. An
+  ordinary scalar or aggregate lvalue additionally requires a
+  top-level-unqualified type. A bit-field final with an otherwise
+  top-level-unqualified expression type remains transparent; qualification
+  declared directly on the field remains access metadata in its descriptor.
+  The forwarded bit-field remains non-addressable. Qualification inherited from
+  a qualified containing aggregate is instead top-level expression
+  qualification and suppresses transparency. Qualifiers below an ordinary
+  final's top level, such as a pointed-to type or an aggregate member's type,
+  remain part of those nested types. Array and function results still undergo
+  decay. CCC does not reproduce GCC's inconsistent generalized-lvalue bugs for
+  casts or other expressions that are not C lvalues.
 
 The transparent case is covered by assignment, address, aggregate-member, and
-bit-field probes, including preservation of `const`. Bodies containing
-declarations or earlier statements are covered separately and must materialize
-a non-lvalue result. These are the GCC C frontend's observable rules; the GCC
-manual's explicit returned-by-value wording applies to G++, not GNU C. These
-rules do not reuse `_Generic`'s selected-expression value-category path.
+bit-field probes. Separate negative probes prove that top-level `const` and
+`volatile` ordinary scalar and aggregate finals are non-lvalues: assignment and
+address-taking are rejected, and a volatile final still performs its required
+read. Aggregate probes preserve nested member qualifications. Qualified
+bit-field declaration probes instead preserve the bit-field place behavior: a
+`const` bit-field remains read-only, a `volatile` bit-field remains assignable,
+and neither is addressable. Companion probes select an unqualified bit-field
+through `const`- and `volatile`-qualified aggregate places and require a
+non-lvalue result. Bodies containing declarations or earlier statements are
+covered separately and must materialize a non-lvalue result. These are the GCC
+C frontend's observable rules; the GCC manual's explicit returned-by-value
+wording applies to G++, not GNU C. These rules do not reuse `_Generic`'s
+selected-expression value-category path.
 
 Jumping into a statement expression is rejected. A `case` or `default` outside
 the expression cannot target a label inside it, and a computed jump into it has
