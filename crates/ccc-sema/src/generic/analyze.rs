@@ -112,6 +112,7 @@ struct FunctionState {
     return_ty: QualifiedType,
     next_local: u32,
     unaddressable_locals: HashSet<FullLocalId>,
+    static_duration_locals: HashMap<FullLocalId, StorageDuration>,
     labels: LabelScope,
     loop_depth: usize,
     switches: Vec<SwitchState>,
@@ -256,6 +257,7 @@ impl<'a> Analyzer<'a> {
     ) -> AnalysisResult<()> {
         let info = self.resolve_declaration_specifiers(&declaration.specifiers)?;
         if declaration.declarators.is_empty() {
+            self.reject_weak_attribute(&info.attributes, declaration.span, "a type declaration")?;
             self.external_items
                 .push(FullTypedExternalItem::TypeDeclaration {
                     ty: info.base.ty,
@@ -284,7 +286,14 @@ impl<'a> Analyzer<'a> {
                         "a typedef cannot have an initializer or assembly label",
                     );
                 }
-                self.declare_typedef(name, resolved.ty, attributes, init.span)?;
+                let ty = self.apply_typedef_alignment(
+                    resolved.ty,
+                    &attributes,
+                    declaration.declarators.len() == 1
+                        && defines_inline_anonymous_record(&declaration.specifiers),
+                    init.span,
+                )?;
+                self.declare_typedef(name, ty, attributes, init.span)?;
             } else if self.types.function_signature(resolved.ty.ty).is_some() {
                 if init.initializer.is_some() {
                     return self.fail(
@@ -373,6 +382,15 @@ impl<'a> Analyzer<'a> {
             None,
             definition.span,
         )?;
+        if self.functions[id.0 as usize].binding == SymbolBinding::Weak && signature.variadic {
+            return self.fail(
+                "CCC2423",
+                definition.span,
+                format!(
+                    "weak variadic definition of function `{name}` requires unsupported generated-entry binding semantics"
+                ),
+            );
+        }
         if self.functions[id.0 as usize].body.is_some() {
             return self.fail(
                 "CCC2208",
@@ -388,6 +406,7 @@ impl<'a> Analyzer<'a> {
             return_ty,
             next_local: 0,
             unaddressable_locals: HashSet::new(),
+            static_duration_locals: HashMap::new(),
             labels: LabelScope::default(),
             loop_depth: 0,
             switches: Vec::new(),
@@ -763,6 +782,7 @@ impl<'a> Analyzer<'a> {
         let mut context = DeclaratorContext::new(prototype_parameter);
         let (name, name_span, ty) =
             self.resolve_direct_declarator(ty, &declarator.direct, &mut context)?;
+        let ty = self.apply_declarator_type_attributes(ty, &attributes, declarator.span)?;
         Ok(ResolvedDeclarator {
             name,
             name_span,
@@ -833,6 +853,9 @@ impl<'a> Analyzer<'a> {
                             self.analyze_integer_constant_candidate(expression)?;
                         match constant {
                             Some(value) if value > 0 => ArrayLength::Constant(value as u64),
+                            Some(0) if self.config.language.mode.accepts_gnu_extensions() => {
+                                ArrayLength::Constant(0)
+                            }
                             Some(_) => {
                                 return self.fail(
                                     "CCC2223",
@@ -925,7 +948,10 @@ impl<'a> Analyzer<'a> {
                     // them for accesses inside a definition.
                     .map(|parameter| QualifiedType::unqualified(parameter.ty.ty))
                     .collect::<Vec<_>>();
-                let signature = if !has_parameter_type_list && resolved_parameters.is_empty() {
+                let signature = if !has_parameter_type_list
+                    && resolved_parameters.is_empty()
+                    && is_prototype_scope
+                {
                     FunctionType::unspecified(ty)
                 } else if *variadic {
                     FunctionType::variadic(ty, parameter_types)
@@ -983,6 +1009,7 @@ impl<'a> Analyzer<'a> {
         is_prototype_scope: bool,
     ) -> AnalysisResult<ResolvedParameter> {
         let info = self.resolve_declaration_specifiers(&parameter.specifiers)?;
+        self.reject_weak_attribute(&info.attributes, parameter.span, "a parameter")?;
         if !matches!(info.storage, None | Some(syntax::StorageClass::Register)) {
             return self.fail(
                 "CCC2227",
@@ -995,6 +1022,7 @@ impl<'a> Analyzer<'a> {
             if let Some(declarator) = &parameter.declarator {
                 let resolved =
                     self.resolve_declarator_in_context(info.base, declarator, is_prototype_scope)?;
+                self.reject_weak_attribute(&resolved.attributes, parameter.span, "a parameter")?;
                 (
                     resolved.name,
                     resolved.ty,
@@ -1052,7 +1080,13 @@ impl<'a> Analyzer<'a> {
             RecordKind::Union => TagCategory::Union,
         };
         let tag = specifier.tag.as_ref().map(|tag| tag.name.clone());
-        let existing = tag.as_deref().and_then(|name| self.lookup_tag(name));
+        let existing = tag.as_deref().and_then(|name| {
+            if specifier.items.is_some() {
+                self.current_tag(name)
+            } else {
+                self.lookup_tag(name)
+            }
+        });
         let (record_id, ty) = if let Some(existing) = existing {
             if existing.category != category {
                 return self.fail(
@@ -1084,6 +1118,7 @@ impl<'a> Analyzer<'a> {
         };
 
         let record_attributes = self.validate_attributes(&specifier.attributes)?;
+        self.reject_weak_attribute(&record_attributes, specifier.span, "a record type")?;
         let Some(items) = &specifier.items else {
             return Ok(ty);
         };
@@ -1117,6 +1152,11 @@ impl<'a> Analyzer<'a> {
                 }
                 syntax::RecordItem::Declaration(declaration) => {
                     let info = self.resolve_declaration_specifiers(&declaration.specifiers)?;
+                    self.reject_weak_attribute(
+                        &info.attributes,
+                        declaration.span,
+                        "a record member",
+                    )?;
                     if info.storage.is_some() || info.properties != FunctionProperties::default() {
                         return self.fail(
                             "CCC2232",
@@ -1136,10 +1176,20 @@ impl<'a> Analyzer<'a> {
                         continue;
                     }
                     for member in &declaration.declarators {
-                        let _ = self.validate_attributes(&member.attributes)?;
+                        let member_attributes = self.validate_attributes(&member.attributes)?;
+                        self.reject_weak_attribute(
+                            &member_attributes,
+                            member.span,
+                            "a record member",
+                        )?;
                         let (name, field_ty, has_variable_length_bounds) =
                             if let Some(declarator) = &member.declarator {
                                 let resolved = self.resolve_declarator(info.base, declarator)?;
+                                self.reject_weak_attribute(
+                                    &resolved.attributes,
+                                    member.span,
+                                    "a record member",
+                                )?;
                                 (
                                     resolved.name,
                                     resolved.ty,
@@ -1227,7 +1277,13 @@ impl<'a> Analyzer<'a> {
         specifier: &syntax::EnumSpecifier,
     ) -> AnalysisResult<TypeId> {
         let tag = specifier.tag.as_ref().map(|tag| tag.name.clone());
-        let existing = tag.as_deref().and_then(|name| self.lookup_tag(name));
+        let existing = tag.as_deref().and_then(|name| {
+            if specifier.enumerators.is_some() {
+                self.current_tag(name)
+            } else {
+                self.lookup_tag(name)
+            }
+        });
         let (enum_id, ty) = if let Some(existing) = existing {
             if existing.category != TagCategory::Enum {
                 return self.fail(
@@ -1264,7 +1320,8 @@ impl<'a> Analyzer<'a> {
             }
             (id, ty)
         };
-        let _ = self.validate_attributes(&specifier.attributes)?;
+        let enum_attributes = self.validate_attributes(&specifier.attributes)?;
+        self.reject_weak_attribute(&enum_attributes, specifier.span, "an enum type")?;
         let Some(enumerators) = &specifier.enumerators else {
             return Ok(ty);
         };
@@ -1282,7 +1339,8 @@ impl<'a> Analyzer<'a> {
         let mut next_value = 0_i128;
         let mut typed = Vec::new();
         for enumerator in enumerators {
-            let _ = self.validate_attributes(&enumerator.attributes)?;
+            let enumerator_attributes = self.validate_attributes(&enumerator.attributes)?;
+            self.reject_weak_attribute(&enumerator_attributes, enumerator.span, "an enumerator")?;
             let value = if let Some(expression) = &enumerator.value {
                 self.evaluate_integer_constant(expression)?
             } else {
@@ -1327,6 +1385,7 @@ impl<'a> Analyzer<'a> {
         attributes: Vec<FullTypedAttribute>,
         span: Span,
     ) -> AnalysisResult<TypedefId> {
+        self.reject_weak_attribute(&attributes, span, "a typedef")?;
         if let Some(existing) = self.scopes.current_ordinary(&name).cloned() {
             if let OrdinarySymbol::Typedef(id, existing_ty) = existing
                 && self.types_compatible(existing_ty, ty)
@@ -1358,7 +1417,7 @@ impl<'a> Analyzer<'a> {
         name: String,
         signature: TypeId,
         storage: Option<syntax::StorageClass>,
-        properties: FunctionProperties,
+        mut properties: FunctionProperties,
         attributes: Vec<FullTypedAttribute>,
         asm_label: Option<FullTypedAsmLabel>,
         span: Span,
@@ -1371,6 +1430,20 @@ impl<'a> Analyzer<'a> {
                 "CCC2247",
                 span,
                 "a function may only have `extern` or `static` storage class",
+            );
+        }
+        properties.no_return |= attributes
+            .iter()
+            .any(|attribute| attribute_has_name(attribute, "noreturn"));
+        let declared_binding = attributes
+            .iter()
+            .any(|attribute| attribute_has_name(attribute, "weak"))
+            .then_some(SymbolBinding::Weak);
+        if declared_binding.is_some() && storage == Some(syntax::StorageClass::Static) {
+            return self.fail(
+                "CCC2423",
+                span,
+                format!("weak declaration of function `{name}` must have external linkage"),
             );
         }
         let declared_visibility = self.function_visibility(&attributes, span)?;
@@ -1388,6 +1461,15 @@ impl<'a> Analyzer<'a> {
                         ),
                     );
                 }
+                if declared_binding.is_some() && existing_linkage != Linkage::External {
+                    return self.fail(
+                        "CCC2423",
+                        span,
+                        format!(
+                            "weak declaration of function `{name}` conflicts with its internal linkage"
+                        ),
+                    );
+                }
                 let Some(composite) = self.composite_type_id(existing_signature, signature) else {
                     return self.fail(
                         "CCC2248",
@@ -1395,12 +1477,29 @@ impl<'a> Analyzer<'a> {
                         format!("function `{name}` is redeclared with an incompatible type"),
                     );
                 };
+                if let (Some(existing), Some(incoming)) =
+                    (&self.functions[id.0 as usize].asm_label, asm_label.as_ref())
+                    && existing.symbol != incoming.symbol
+                {
+                    let existing_symbol = existing.symbol.clone();
+                    let incoming_symbol = incoming.symbol.clone();
+                    return self.fail(
+                        "CCC2419",
+                        span,
+                        format!(
+                            "function `{name}` has conflicting assembly labels `{existing_symbol}` and `{incoming_symbol}`"
+                        ),
+                    );
+                }
                 let function = &mut self.functions[id.0 as usize];
                 function.signature = composite;
                 function.properties.inline |= properties.inline;
                 function.properties.no_return |= properties.no_return;
-                if function.asm_label.is_none() {
-                    function.asm_label = asm_label;
+                if let Some(binding) = declared_binding {
+                    function.binding = binding;
+                }
+                if let Some(asm_label) = asm_label {
+                    function.asm_label = Some(asm_label);
                 }
                 if let Some(visibility) = declared_visibility {
                     function.visibility = visibility;
@@ -1433,6 +1532,7 @@ impl<'a> Analyzer<'a> {
             signature,
             storage: semantic_storage,
             linkage,
+            binding: declared_binding.unwrap_or_default(),
             visibility: declared_visibility.unwrap_or_default(),
             properties,
             parameters: Vec::new(),
@@ -1508,6 +1608,17 @@ impl<'a> Analyzer<'a> {
             Some(syntax::StorageClass::ThreadLocal) => SemanticStorageClass::ThreadLocal,
             _ => SemanticStorageClass::Extern,
         };
+        let declared_binding = attributes
+            .iter()
+            .any(|attribute| attribute_has_name(attribute, "weak"))
+            .then_some(SymbolBinding::Weak);
+        if declared_binding.is_some() && linkage != Linkage::External {
+            return self.fail(
+                "CCC2423",
+                span,
+                format!("weak declaration of object `{name}` must have external linkage"),
+            );
+        }
 
         if let Some(existing) = self.lookup_file_ordinary(&name).cloned() {
             if let OrdinarySymbol::Global(id, existing_ty) = existing {
@@ -1523,6 +1634,15 @@ impl<'a> Analyzer<'a> {
                         ),
                     );
                 }
+                if declared_binding.is_some() && existing_linkage != Linkage::External {
+                    return self.fail(
+                        "CCC2423",
+                        span,
+                        format!(
+                            "weak declaration of object `{name}` conflicts with its internal linkage"
+                        ),
+                    );
+                }
                 let Some(composite) = self.composite_type(existing_ty, ty) else {
                     return self.fail(
                         "CCC2251",
@@ -1530,6 +1650,20 @@ impl<'a> Analyzer<'a> {
                         format!("object `{name}` is redeclared with an incompatible type"),
                     );
                 };
+                if let (Some(existing), Some(incoming)) =
+                    (&self.globals[id.0 as usize].asm_label, asm_label.as_ref())
+                    && existing.symbol != incoming.symbol
+                {
+                    let existing_symbol = existing.symbol.clone();
+                    let incoming_symbol = incoming.symbol.clone();
+                    return self.fail(
+                        "CCC2419",
+                        span,
+                        format!(
+                            "object `{name}` has conflicting assembly labels `{existing_symbol}` and `{incoming_symbol}`"
+                        ),
+                    );
+                }
                 let global = &mut self.globals[id.0 as usize];
                 if typed_initializer.is_some() && global.initializer.is_some() {
                     return self.fail(
@@ -1547,6 +1681,19 @@ impl<'a> Analyzer<'a> {
                 {
                     global.tentative = true;
                     global.emission.definition = ObjectDefinitionPolicy::TentativeCommon;
+                }
+                if let Some(asm_label) = asm_label {
+                    global.emission.symbol_name = asm_label.symbol.clone();
+                    global.asm_label = Some(asm_label);
+                }
+                if let Some(binding) = declared_binding {
+                    global.emission.binding = binding;
+                }
+                if global.emission.binding == SymbolBinding::Weak
+                    && global.emission.definition == ObjectDefinitionPolicy::TentativeCommon
+                {
+                    global.tentative = false;
+                    global.emission.definition = ObjectDefinitionPolicy::Definition;
                 }
                 global.ty = composite;
                 self.scopes
@@ -1566,6 +1713,7 @@ impl<'a> Analyzer<'a> {
             .map_or_else(|| name.clone(), |label| label.symbol.clone());
         let mut emission = GlobalEmission {
             symbol_name,
+            binding: declared_binding.unwrap_or_default(),
             visibility: SymbolVisibility::Default,
             section: None,
             requested_alignment: None,
@@ -1573,6 +1721,12 @@ impl<'a> Analyzer<'a> {
             definition,
         };
         self.apply_emission_attributes(&mut emission, &attributes, span)?;
+        let tentative = tentative && emission.binding != SymbolBinding::Weak;
+        if emission.binding == SymbolBinding::Weak
+            && emission.definition == ObjectDefinitionPolicy::TentativeCommon
+        {
+            emission.definition = ObjectDefinitionPolicy::Definition;
+        }
         self.globals.push(FullTypedGlobal {
             id,
             name: name.clone(),
@@ -1610,6 +1764,7 @@ impl<'a> Analyzer<'a> {
             attributes.extend(resolved.attributes);
             attributes.extend(self.validate_attributes(&init.attributes)?);
             if info.storage == Some(syntax::StorageClass::Typedef) {
+                self.reject_weak_attribute(&attributes, init.span, "a typedef")?;
                 if init.initializer.is_some() || init.asm_label.is_some() {
                     return self.fail(
                         "CCC2255",
@@ -1628,11 +1783,17 @@ impl<'a> Analyzer<'a> {
                 let typed = FullTypedTypedef {
                     id,
                     name: name.clone(),
-                    ty: resolved.ty,
+                    ty: self.apply_typedef_alignment(
+                        resolved.ty,
+                        &attributes,
+                        declaration.declarators.len() == 1
+                            && defines_inline_anonymous_record(&declaration.specifiers),
+                        init.span,
+                    )?,
                     attributes,
                     span: init.span,
                 };
-                self.bind_current(name, OrdinarySymbol::Typedef(id, resolved.ty), init.span)?;
+                self.bind_current(name, OrdinarySymbol::Typedef(id, typed.ty), init.span)?;
                 self.typedefs.push(typed.clone());
                 output.push(FullTypedBlockItem::Typedef(Box::new(typed)));
                 continue;
@@ -1692,6 +1853,11 @@ impl<'a> Analyzer<'a> {
                 output.push(FullTypedBlockItem::ExternalObject(id));
                 continue;
             }
+            self.reject_weak_attribute(
+                &attributes,
+                init.span,
+                "an automatic or block-scope static object",
+            )?;
             if init.asm_label.is_some() {
                 return self.fail(
                     "CCC2257",
@@ -1733,6 +1899,13 @@ impl<'a> Analyzer<'a> {
                     unreachable!("rejected with the declaration specifiers")
                 }
             };
+            if duration != StorageDuration::Automatic {
+                self.function
+                    .as_mut()
+                    .expect("block objects occur inside a function")
+                    .static_duration_locals
+                    .insert(local, duration);
+            }
             if storage == SemanticStorageClass::Register {
                 self.function
                     .as_mut()
@@ -1773,6 +1946,7 @@ impl<'a> Analyzer<'a> {
                         "__ccc_block_static.{}.{}.{}.{}",
                         function.name, function.id.0, local.0, name
                     ),
+                    binding: SymbolBinding::Strong,
                     visibility: SymbolVisibility::Internal,
                     section: None,
                     requested_alignment: None,
@@ -1812,7 +1986,8 @@ impl<'a> Analyzer<'a> {
                     statement: nested,
                     attributes,
                 } => {
-                    let _ = self.validate_attributes(attributes)?;
+                    let attributes = self.validate_attributes(attributes)?;
+                    self.reject_weak_attribute(&attributes, statement.span, "a statement label")?;
                     let id = {
                         let labels = &mut self
                             .function
@@ -2314,7 +2489,23 @@ impl<'a> Analyzer<'a> {
                 source,
             } => self.analyze_va_copy(destination, source, expression.span),
             E::BuiltinVaEnd { list } => self.analyze_va_end(list, expression.span),
+            E::BuiltinSyncSynchronize => self.analyze_sync_synchronize(expression.span),
         }
+    }
+
+    fn analyze_sync_synchronize(&mut self, span: Span) -> AnalysisResult<FullTypedExpression> {
+        self.require_builtin("__sync_synchronize", span)?;
+        Ok(FullTypedExpression {
+            kind: FullTypedExpressionKind::MemoryFence {
+                order: MemoryOrder::SequentiallyConsistent,
+            },
+            ty: QualifiedType::unqualified(TypeId::VOID),
+            category: ValueCategory::Value,
+            place: None,
+            constant: None,
+            constant_expression_kind: ConstantExpressionKind::Invalid,
+            span,
+        })
     }
 
     fn analyze_va_start(
@@ -2598,7 +2789,11 @@ impl<'a> Analyzer<'a> {
                 ty,
                 ValueCategory::Lvalue,
                 Some(self.object_place(PlaceBase::Global(id), ty, true)),
-                None,
+                Some(ConstantValue::Address(RelocatableAddress {
+                    base: RelocatableBase::Global(id),
+                    addend: 0,
+                    one_past: false,
+                })),
             ),
             OrdinarySymbol::Function(id, ty) => (
                 SymbolReference::Function(id),
@@ -2612,16 +2807,27 @@ impl<'a> Analyzer<'a> {
                 })),
             ),
             OrdinarySymbol::Local(id, ty) => {
-                let addressable = self
-                    .function
-                    .as_ref()
-                    .is_none_or(|function| !function.unaddressable_locals.contains(&id));
+                let function = self.function.as_ref();
+                let addressable =
+                    function.is_none_or(|function| !function.unaddressable_locals.contains(&id));
+                let constant = function.and_then(|function| {
+                    function.static_duration_locals.get(&id).map(|_| {
+                        ConstantValue::Address(RelocatableAddress {
+                            base: RelocatableBase::BlockStatic {
+                                function: function.id,
+                                local: id,
+                            },
+                            addend: 0,
+                            one_past: false,
+                        })
+                    })
+                });
                 (
                     SymbolReference::Local(id),
                     ty,
                     ValueCategory::Lvalue,
                     Some(self.object_place(PlaceBase::Local(id), ty, addressable)),
-                    None,
+                    constant,
                 )
             }
             OrdinarySymbol::TemporaryParameter(id, ty, addressable) => (
@@ -2824,28 +3030,8 @@ impl<'a> Analyzer<'a> {
                     );
                 }
                 let ty = QualifiedType::unqualified(self.types.pointer(operand.ty));
-                let constant = match &operand.kind {
-                    FullTypedExpressionKind::DeclRef(SymbolReference::Global(id)) => {
-                        Some(ConstantValue::Address(RelocatableAddress {
-                            base: RelocatableBase::Global(*id),
-                            addend: 0,
-                            one_past: false,
-                        }))
-                    }
-                    FullTypedExpressionKind::DeclRef(SymbolReference::Function(id)) => {
-                        Some(ConstantValue::Address(RelocatableAddress {
-                            base: RelocatableBase::Function(*id),
-                            addend: 0,
-                            one_past: false,
-                        }))
-                    }
-                    FullTypedExpressionKind::StringLiteral(id) => {
-                        Some(ConstantValue::Address(RelocatableAddress {
-                            base: RelocatableBase::String(*id),
-                            addend: 0,
-                            one_past: false,
-                        }))
-                    }
+                let constant = match operand.constant {
+                    Some(address @ ConstantValue::Address(_)) => Some(address),
                     _ => None,
                 };
                 Ok(FullTypedExpression {
@@ -3422,6 +3608,8 @@ impl<'a> Analyzer<'a> {
             return self.fail("CCC2291", span, "an array subscript must have integer type");
         }
         let index = self.integer_promote(index)?;
+        let constant =
+            self.evaluate_pointer_arithmetic(base.constant, index.constant, base.ty, false);
         let mut place = self.object_place(PlaceBase::Indirect, element, true);
         place.projections.push(PlaceProjection::Index);
         Ok(FullTypedExpression {
@@ -3432,7 +3620,7 @@ impl<'a> Analyzer<'a> {
             ty: element,
             category: ValueCategory::Lvalue,
             place: Some(place),
-            constant: None,
+            constant,
             constant_expression_kind: ConstantExpressionKind::Invalid,
             span,
         })
@@ -3445,8 +3633,50 @@ impl<'a> Analyzer<'a> {
         indirect: bool,
         span: Span,
     ) -> AnalysisResult<FullTypedExpression> {
+        #[derive(Clone)]
+        struct MemberStep {
+            record_ty: QualifiedType,
+            field_index: usize,
+            field: Field,
+        }
+
+        fn collect_member_paths(
+            types: &ccc_types::TypeStore,
+            record_ty: QualifiedType,
+            member: &str,
+            path: &mut Vec<MemberStep>,
+            matches: &mut Vec<Vec<MemberStep>>,
+        ) {
+            let Some(TypeKind::Record(record_id)) = types.try_kind(record_ty.ty) else {
+                return;
+            };
+            let Some(fields) = types
+                .record(*record_id)
+                .and_then(|record| record.fields.as_ref())
+            else {
+                return;
+            };
+            for (field_index, field) in fields.iter().enumerate() {
+                let result_ty =
+                    QualifiedType::new(field.ty.ty, field.ty.qualifiers | record_ty.qualifiers);
+                path.push(MemberStep {
+                    record_ty,
+                    field_index,
+                    field: field.clone(),
+                });
+                if field.name.as_deref() == Some(member) {
+                    matches.push(path.clone());
+                } else if field.name.is_none()
+                    && matches!(types.try_kind(field.ty.ty), Some(TypeKind::Record(_)))
+                {
+                    collect_member_paths(types, result_ty, member, path, matches);
+                }
+                path.pop();
+            }
+        }
+
         let base = self.analyze_expression(base)?;
-        let (base, record_ty, category, mut place) = if indirect {
+        let (base, record_ty, category, place) = if indirect {
             let base = self.value_conversion(base)?;
             let Some(pointee) = self.pointer_pointee(base.ty.ty) else {
                 return self.fail("CCC2292", span, "`->` requires a pointer to a record");
@@ -3469,84 +3699,107 @@ impl<'a> Analyzer<'a> {
         let Some(record) = self.types.record(record_id).cloned() else {
             return self.fail("CCC2294", span, "member access uses an unknown record type");
         };
-        let Some(fields) = record.fields else {
+        let Some(_fields) = record.fields else {
             return self.fail(
                 "CCC2295",
                 span,
                 "member access uses an incomplete record type",
             );
         };
-        let Some((field_index, field)) = fields
-            .iter()
-            .enumerate()
-            .find(|(_, field)| field.name.as_deref() == Some(member.name.as_str()))
-        else {
+        let mut paths = Vec::new();
+        collect_member_paths(
+            &self.types,
+            record_ty,
+            &member.name,
+            &mut Vec::new(),
+            &mut paths,
+        );
+        if paths.is_empty() {
             return self.fail(
                 "CCC2296",
                 member.span,
                 format!("record has no member named `{}`", member.name),
             );
-        };
-        let result_ty = QualifiedType::new(field.ty.ty, field.ty.qualifiers | record_ty.qualifiers);
-        let member_access = access_semantics(result_ty);
-        let bitfield = if field.bitfield.is_some() {
-            let layout = self
-                .types
-                .layout_of(record_ty.ty, self.config)
-                .map_err(|error| {
-                    self.emit("CCC2297", span, error.to_string());
-                })?;
-            let LayoutShape::Record(layout) = layout.shape else {
-                unreachable!("the queried type is a record")
-            };
-            let field_layout = &layout.fields[field_index];
-            let shared = field_layout
-                .bitfield
-                .expect("a semantic bitfield has a bitfield layout");
-            let storage_offset = shared
-                .storage_offset
-                .checked_sub(field_layout.offset)
-                .expect("bitfield storage begins within its projected field");
-            Some(BitfieldPlace {
-                field_index,
-                storage_offset,
-                storage_size: shared.storage_size,
-                storage_align: shared.storage_align,
-                bit_offset: shared.bit_offset,
-                width: shared.width,
-                signed: self.is_signed_integer(field.ty.ty),
-                access: member_access,
-            })
-        } else {
-            None
-        };
-        if let Some(place) = &mut place {
-            place.projections.push(PlaceProjection::Field {
-                index: field_index,
-                name: field.name.clone(),
-            });
-            place.access = member_access;
-            place.modifiable = self.is_modifiable_type(result_ty);
-            if let Some(descriptor) = bitfield {
-                place.bitfield = Some(descriptor);
-                place.addressable = false;
-            }
         }
-        Ok(FullTypedExpression {
-            kind: FullTypedExpressionKind::Member {
-                base: Box::new(base),
-                field_index,
-                name: member.name.clone(),
-                indirect,
-                bitfield: bitfield.map(Box::new),
-            },
-            ty: result_ty,
-            category,
-            place,
-            constant: None,
-            constant_expression_kind: ConstantExpressionKind::Invalid,
-            span,
-        })
+        if paths.len() != 1 {
+            return self.fail(
+                "CCC2296",
+                member.span,
+                format!(
+                    "member `{}` is ambiguous through anonymous record members",
+                    member.name
+                ),
+            );
+        }
+
+        let mut expression = base;
+        let mut place = place;
+        for (position, step) in paths.pop().unwrap().into_iter().enumerate() {
+            let result_ty = QualifiedType::new(
+                step.field.ty.ty,
+                step.field.ty.qualifiers | step.record_ty.qualifiers,
+            );
+            let member_access = access_semantics(result_ty);
+            let bitfield = if step.field.bitfield.is_some() {
+                let layout = self
+                    .types
+                    .layout_of(step.record_ty.ty, self.config)
+                    .map_err(|error| {
+                        self.emit("CCC2297", span, error.to_string());
+                    })?;
+                let LayoutShape::Record(layout) = layout.shape else {
+                    unreachable!("the queried type is a record")
+                };
+                let field_layout = &layout.fields[step.field_index];
+                let shared = field_layout
+                    .bitfield
+                    .expect("a semantic bitfield has a bitfield layout");
+                let storage_offset = shared
+                    .storage_offset
+                    .checked_sub(field_layout.offset)
+                    .expect("bitfield storage begins within its projected field");
+                Some(BitfieldPlace {
+                    field_index: step.field_index,
+                    storage_offset,
+                    storage_size: shared.storage_size,
+                    storage_align: shared.storage_align,
+                    bit_offset: shared.bit_offset,
+                    width: shared.width,
+                    signed: self.is_signed_integer(step.field.ty.ty),
+                    access: member_access,
+                })
+            } else {
+                None
+            };
+            if let Some(place) = &mut place {
+                place.projections.push(PlaceProjection::Field {
+                    index: step.field_index,
+                    name: step.field.name.clone(),
+                });
+                place.access = member_access;
+                place.modifiable = self.is_modifiable_type(result_ty);
+                if let Some(descriptor) = bitfield {
+                    place.bitfield = Some(descriptor);
+                    place.addressable = false;
+                }
+            }
+            expression = FullTypedExpression {
+                kind: FullTypedExpressionKind::Member {
+                    base: Box::new(expression),
+                    field_index: step.field_index,
+                    name: step.field.name,
+                    indirect: indirect && position == 0,
+                    bitfield: bitfield.map(Box::new),
+                },
+                ty: result_ty,
+                category,
+                place: place.clone(),
+                constant: None,
+                constant_expression_kind: ConstantExpressionKind::Invalid,
+                span,
+            };
+        }
+        Ok(expression)
     }
 
     fn analyze_call(
@@ -3798,7 +4051,14 @@ impl<'a> Analyzer<'a> {
                     else {
                         unreachable!("a string literal has array type")
                     };
-                    if !self.type_ids_compatible(array.element.ty, literal_array.element.ty) {
+                    let ordinary_character_string = literal_array.element.ty == TypeId::CHAR
+                        && matches!(
+                            array.element.ty,
+                            TypeId::CHAR | TypeId::SIGNED_CHAR | TypeId::UNSIGNED_CHAR
+                        );
+                    if !ordinary_character_string
+                        && !self.type_ids_compatible(array.element.ty, literal_array.element.ty)
+                    {
                         return self.fail(
                             "CCC2312",
                             expression.span,
@@ -4664,15 +4924,17 @@ impl<'a> Analyzer<'a> {
             );
             return Ok((left, right));
         }
-        if self.pointer_pointee(left.ty.ty).is_some()
-            && self.pointer_pointee(right.ty.ty).is_some()
-            && self.pointers_assignment_compatible(left.ty.ty, right.ty.ty)
-        {
-            let target = left.ty;
-            let constant = right.constant;
+        if let Some(target) = self.common_pointer_type(left.ty.ty, right.ty.ty) {
+            let left = if left.ty.ty == target.ty {
+                left
+            } else {
+                let constant = left.constant;
+                self.conversion(ConversionKind::PointerConversion, left, target, constant)
+            };
             let right = if right.ty.ty == target.ty {
                 right
             } else {
+                let constant = right.constant;
                 self.conversion(ConversionKind::PointerConversion, right, target, constant)
             };
             return Ok((left, right));
@@ -4682,6 +4944,20 @@ impl<'a> Analyzer<'a> {
             span,
             "comparison uses incompatible pointer types",
         )
+    }
+
+    fn common_pointer_type(&mut self, left: TypeId, right: TypeId) -> Option<QualifiedType> {
+        let left = self.pointer_pointee(left)?;
+        let right = self.pointer_pointee(right)?;
+        let pointee = if self.type_ids_compatible(left.ty, right.ty) {
+            left.ty
+        } else if left.ty == TypeId::VOID || right.ty == TypeId::VOID {
+            TypeId::VOID
+        } else {
+            return None;
+        };
+        let pointee = QualifiedType::new(pointee, left.qualifiers | right.qualifiers);
+        Some(QualifiedType::unqualified(self.types.pointer(pointee)))
     }
 
     fn evaluate_pointer_arithmetic(
@@ -5264,6 +5540,133 @@ impl<'a> Analyzer<'a> {
         }
     }
 
+    fn apply_declarator_type_attributes(
+        &mut self,
+        mut ty: QualifiedType,
+        attributes: &[FullTypedAttribute],
+        span: Span,
+    ) -> AnalysisResult<QualifiedType> {
+        for attribute in attributes {
+            if !attribute_has_name(attribute, "mode") {
+                continue;
+            }
+            let Some(mode) = attribute_argument_identifier(&attribute.arguments) else {
+                return self.fail(
+                    "CCC2421",
+                    span,
+                    "implemented `mode` requires one identifier argument",
+                );
+            };
+            if mode != "word" {
+                return self.fail(
+                    "CCC2421",
+                    span,
+                    format!("integer machine mode `{mode}` is not supported"),
+                );
+            }
+            let Some(kind) = self.types.builtin_type(ty.ty) else {
+                return self.fail(
+                    "CCC2421",
+                    span,
+                    "implemented `mode(word)` requires an integer type",
+                );
+            };
+            if !kind.is_integer() {
+                return self.fail(
+                    "CCC2421",
+                    span,
+                    "implemented `mode(word)` requires an integer type",
+                );
+            }
+            ty.ty = if self.integer_kind_is_signed(kind) {
+                self.signed_integer_for_width(self.config.target.data_layout.pointer_width)
+            } else {
+                self.unsigned_integer_for_width(self.config.target.data_layout.pointer_width)
+            };
+        }
+        Ok(ty)
+    }
+
+    fn apply_typedef_alignment(
+        &mut self,
+        ty: QualifiedType,
+        attributes: &[FullTypedAttribute],
+        defines_private_record: bool,
+        span: Span,
+    ) -> AnalysisResult<QualifiedType> {
+        let mut requested = None;
+        for attribute in attributes {
+            if !attribute_has_name(attribute, "aligned") {
+                continue;
+            }
+            let alignment = if attribute.arguments.is_empty() {
+                self.maximum_supported_alignment()
+            } else if let [argument] = attribute.arguments.as_slice() {
+                let Some(alignment) = argument.parse::<u64>().ok() else {
+                    return self.fail(
+                        "CCC2422",
+                        span,
+                        "implemented typedef `aligned` requires an integer argument",
+                    );
+                };
+                alignment
+            } else {
+                return self.fail(
+                    "CCC2422",
+                    span,
+                    "implemented typedef `aligned` accepts at most one integer argument",
+                );
+            };
+            if !alignment.is_power_of_two() {
+                return self.fail(
+                    "CCC2422",
+                    span,
+                    "requested typedef alignment must be a power of two",
+                );
+            }
+            requested = Some(requested.map_or(alignment, |current: u64| current.max(alignment)));
+        }
+        let Some(alignment) = requested else {
+            return Ok(ty);
+        };
+        if !defines_private_record {
+            return self.fail(
+                "CCC2422",
+                span,
+                "typedef `aligned` is implemented only for a single inline anonymous record",
+            );
+        }
+        let Some(TypeKind::Record(record_id)) = self.types.try_kind(ty.ty).cloned() else {
+            return self.fail(
+                "CCC2422",
+                span,
+                "typedef `aligned` is implemented only for record types",
+            );
+        };
+        let Some(record) = self.types.record(record_id).cloned() else {
+            return self.fail(
+                "CCC2422",
+                span,
+                "aligned typedef refers to an unknown record",
+            );
+        };
+        let Some(fields) = record.fields else {
+            return self.fail(
+                "CCC2422",
+                span,
+                "aligned typedef requires a complete record type",
+            );
+        };
+        let packing = record
+            .packing
+            .combine(PackingPolicy::NATIVE.with_minimum_record_alignment(alignment));
+        let (aligned_record, aligned_ty) = self.types.declare_record(record.kind, None);
+        self.types
+            .complete_record_with_packing(aligned_record, fields, packing)
+            .expect("a newly declared aligned record is incomplete");
+        Ok(QualifiedType::new(aligned_ty, ty.qualifiers))
+    }
+
     fn validate_attributes(
         &mut self,
         attributes: &[syntax::Attribute],
@@ -5300,6 +5703,21 @@ impl<'a> Analyzer<'a> {
                 ),
             );
         }
+        let canonical_name = canonical_gnu_attribute_name(&attribute.name.name);
+        if canonical_name == "noreturn" && !attribute.arguments.is_empty() {
+            return self.fail(
+                "CCC2420",
+                attribute.span,
+                "implemented `noreturn` does not accept arguments",
+            );
+        }
+        if canonical_name == "weak" && !attribute.arguments.is_empty() {
+            return self.fail(
+                "CCC2423",
+                attribute.span,
+                "implemented `weak` does not accept arguments",
+            );
+        }
         Ok(FullTypedAttribute {
             introducer: attribute.introducer.clone(),
             name: attribute.name.name.clone(),
@@ -5310,6 +5728,25 @@ impl<'a> Analyzer<'a> {
                 .collect(),
             capability: state,
         })
+    }
+
+    fn reject_weak_attribute(
+        &mut self,
+        attributes: &[FullTypedAttribute],
+        span: Span,
+        placement: &str,
+    ) -> AnalysisResult<()> {
+        if attributes
+            .iter()
+            .any(|attribute| attribute_has_name(attribute, "weak"))
+        {
+            return self.fail(
+                "CCC2423",
+                span,
+                format!("implemented `weak` cannot be applied to {placement}"),
+            );
+        }
+        Ok(())
     }
 
     fn resolve_asm_label(
@@ -5350,11 +5787,11 @@ impl<'a> Analyzer<'a> {
                     "assembly label contains a code unit outside the byte range",
                 );
             })?;
-        if bytes.contains(&0) {
+        if bytes.is_empty() || bytes.contains(&0) {
             return self.fail(
                 "CCC2349",
                 label.span,
-                "assembly label cannot contain a null byte",
+                "assembly label cannot be empty or contain a null byte",
             );
         }
         let symbol = String::from_utf8(bytes).map_err(|_| {
@@ -5403,14 +5840,19 @@ impl<'a> Analyzer<'a> {
         span: Span,
     ) -> AnalysisResult<()> {
         for attribute in attributes {
-            match attribute.name.as_str() {
+            match canonical_gnu_attribute_name(&attribute.name) {
                 "aligned" => {
-                    let Some(value) = attribute_argument_number(&attribute.arguments) else {
-                        return self.fail(
-                            "CCC2351",
-                            span,
-                            "implemented `aligned` requires an integer argument",
-                        );
+                    let value = if attribute.arguments.is_empty() {
+                        self.maximum_supported_alignment()
+                    } else {
+                        let Some(value) = attribute_argument_number(&attribute.arguments) else {
+                            return self.fail(
+                                "CCC2351",
+                                span,
+                                "implemented `aligned` requires an integer argument",
+                            );
+                        };
+                        value
                     };
                     if !value.is_power_of_two() {
                         return self.fail(
@@ -5464,6 +5906,25 @@ impl<'a> Analyzer<'a> {
             }
         }
         Ok(())
+    }
+
+    fn maximum_supported_alignment(&self) -> u64 {
+        let layout = &self.config.target.data_layout;
+        [
+            layout.bool_align,
+            layout.char_align,
+            layout.short_align,
+            layout.int_align,
+            layout.long_align,
+            layout.long_long_align,
+            layout.pointer_align,
+            layout.float_align,
+            layout.double_align,
+            layout.long_double_align,
+        ]
+        .into_iter()
+        .max()
+        .map_or(1, u64::from)
     }
 
     fn handle_pragma(&mut self, pragma: &PragmaEvent) -> AnalysisResult<()> {
@@ -5718,6 +6179,10 @@ impl<'a> Analyzer<'a> {
 
     fn lookup_tag(&self, name: &str) -> Option<TagSymbol> {
         self.scopes.lookup_tag(name)
+    }
+
+    fn current_tag(&self, name: &str) -> Option<TagSymbol> {
+        self.scopes.current_tag(name)
     }
 
     fn emit(&mut self, code: &'static str, span: Span, message: impl Into<String>) {
@@ -6005,6 +6470,30 @@ fn evaluate_binary_constant(
     }
     let right = right?;
     let boolean = |value: bool| Some(ConstantValue::Signed(i128::from(value)));
+    if matches!(operator, B::LeftShift | B::RightShift) {
+        let count = match right {
+            ConstantValue::Signed(value) => u32::try_from(value).ok()?,
+            ConstantValue::Unsigned(value) => u32::try_from(value).ok()?,
+            ConstantValue::Floating(_) | ConstantValue::NullPointer | ConstantValue::Address(_) => {
+                return None;
+            }
+        };
+        return match (operator, left) {
+            (B::LeftShift, ConstantValue::Signed(value)) => {
+                value.checked_shl(count).map(ConstantValue::Signed)
+            }
+            (B::RightShift, ConstantValue::Signed(value)) => {
+                value.checked_shr(count).map(ConstantValue::Signed)
+            }
+            (B::LeftShift, ConstantValue::Unsigned(value)) => {
+                value.checked_shl(count).map(ConstantValue::Unsigned)
+            }
+            (B::RightShift, ConstantValue::Unsigned(value)) => {
+                value.checked_shr(count).map(ConstantValue::Unsigned)
+            }
+            _ => None,
+        };
+    }
     match (left, right) {
         (ConstantValue::Signed(left), ConstantValue::Signed(right)) => match operator {
             B::Multiply => left.checked_mul(right).map(ConstantValue::Signed),
@@ -6018,14 +6507,7 @@ fn evaluate_binary_constant(
                 .map(ConstantValue::Signed),
             B::Add => left.checked_add(right).map(ConstantValue::Signed),
             B::Subtract => left.checked_sub(right).map(ConstantValue::Signed),
-            B::LeftShift => u32::try_from(right)
-                .ok()
-                .and_then(|right| left.checked_shl(right))
-                .map(ConstantValue::Signed),
-            B::RightShift => u32::try_from(right)
-                .ok()
-                .and_then(|right| left.checked_shr(right))
-                .map(ConstantValue::Signed),
+            B::LeftShift | B::RightShift => unreachable!("shift constants are handled above"),
             B::Less => boolean(left < right),
             B::LessEqual => boolean(left <= right),
             B::Greater => boolean(left > right),
@@ -6044,14 +6526,7 @@ fn evaluate_binary_constant(
             B::Remainder => (right != 0).then_some(ConstantValue::Unsigned(left % right)),
             B::Add => Some(ConstantValue::Unsigned(left.wrapping_add(right))),
             B::Subtract => Some(ConstantValue::Unsigned(left.wrapping_sub(right))),
-            B::LeftShift => u32::try_from(right)
-                .ok()
-                .and_then(|right| left.checked_shl(right))
-                .map(ConstantValue::Unsigned),
-            B::RightShift => u32::try_from(right)
-                .ok()
-                .and_then(|right| left.checked_shr(right))
-                .map(ConstantValue::Unsigned),
+            B::LeftShift | B::RightShift => unreachable!("shift constants are handled above"),
             B::Less => boolean(left < right),
             B::LessEqual => boolean(left <= right),
             B::Greater => boolean(left > right),
@@ -6163,4 +6638,32 @@ fn attribute_argument_string(arguments: &[String]) -> Option<String> {
             .and_then(|argument| argument.strip_suffix('"'))
             .map(str::to_owned)
     })
+}
+
+fn canonical_gnu_attribute_name(name: &str) -> &str {
+    name.strip_prefix("__")
+        .and_then(|name| name.strip_suffix("__"))
+        .unwrap_or(name)
+}
+
+fn defines_inline_anonymous_record(specifiers: &syntax::DeclarationSpecifiers) -> bool {
+    specifiers.items.iter().any(|specifier| {
+        matches!(
+            specifier,
+            syntax::DeclarationSpecifier::Type(
+                syntax::TypeSpecifier::Struct(record) | syntax::TypeSpecifier::Union(record)
+            ) if record.tag.is_none() && record.items.is_some()
+        )
+    })
+}
+
+fn attribute_has_name(attribute: &FullTypedAttribute, name: &str) -> bool {
+    canonical_gnu_attribute_name(&attribute.name) == name
+}
+
+fn attribute_argument_identifier(arguments: &[String]) -> Option<&str> {
+    let [argument] = arguments else {
+        return None;
+    };
+    Some(canonical_gnu_attribute_name(argument))
 }

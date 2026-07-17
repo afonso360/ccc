@@ -199,3 +199,44 @@ fn installed_target_glibc_declarations_reach_the_ast_intact() {
         ],
     );
 }
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn installed_target_glibc_declarations_compile_link_and_execute() {
+    let identity = installed_environment_identity();
+    eprintln!("installed-header code-generation gate: {identity}");
+    let directory = TestDirectory::new("installed-glibc-codegen");
+    let source = directory.write(
+        "installed-codegen.c",
+        concat!(
+            "#define _GNU_SOURCE 1\n",
+            "#include <pthread.h>\n",
+            "#include <stdint.h>\n",
+            "#include <stdlib.h>\n",
+            "#include <string.h>\n",
+            "int main(void) {\n",
+            "    char destination[4];\n",
+            "    void *copied = memcpy(destination, \"ok\", 3);\n",
+            "    return copied != destination || strcmp(destination, \"ok\") != 0;\n",
+            "}\n",
+        ),
+    );
+    let executable = directory.path.join("installed-codegen");
+    let output = directory
+        .command()
+        .arg(source)
+        .args(["-o"])
+        .arg(&executable)
+        .output()
+        .unwrap();
+    assert_success(
+        &output,
+        &format!("installed hosted-header code generation failed for {identity}"),
+    );
+
+    let output = Command::new(&executable).output().unwrap();
+    assert_success(
+        &output,
+        &format!("installed hosted-header executable failed for {identity}"),
+    );
+}

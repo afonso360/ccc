@@ -214,6 +214,107 @@ fn function_visibility_reaches_native_objects_and_variadic_assembly() {
     }
 }
 
+#[test]
+fn weak_binding_reaches_defined_and_undefined_elf_symbols() {
+    const SOURCE: &str = "extern int weak_import(void) __attribute__((__weak__));\n\
+         extern int weak_data_import __attribute__((weak));\n\
+         int weak_function(void) __attribute__((weak));\n\
+         int weak_function(void) { return 7; }\n\
+         int weak_data __attribute__((weak)) = 11;\n\
+         int weak_zero __attribute__((weak));\n\
+         int strong_function(void) { return 13; }\n\
+         int retain_imports(void) { return weak_import() + weak_data_import; }";
+    let module = lower_source(SOURCE);
+    assert_eq!(
+        module
+            .functions
+            .iter()
+            .find(|function| function.name == "weak_function")
+            .unwrap()
+            .binding,
+        SymbolBinding::Weak
+    );
+    assert_eq!(
+        module
+            .globals
+            .iter()
+            .find(|global| global.name == "weak_data")
+            .unwrap()
+            .emission
+            .binding,
+        SymbolBinding::Weak
+    );
+    let output = emit(
+        &module,
+        &EffectiveCompilationConfig::default(),
+        Options { emit_clif: true },
+    )
+    .unwrap();
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    for (name, undefined) in [
+        ("weak_import", true),
+        ("weak_data_import", true),
+        ("weak_function", false),
+        ("weak_data", false),
+        ("weak_zero", false),
+    ] {
+        let symbol = object
+            .symbols()
+            .find(|symbol| symbol.name() == Ok(name))
+            .unwrap_or_else(|| panic!("missing `{name}`"));
+        assert!(symbol.is_weak(), "{name}");
+        assert_eq!(symbol.is_undefined(), undefined, "{name}");
+    }
+    assert!(
+        object
+            .symbol_by_name("strong_function")
+            .unwrap()
+            .is_global()
+    );
+    assert!(!object.symbol_by_name("strong_function").unwrap().is_weak());
+    let weak_zero = object.symbol_by_name("weak_zero").unwrap();
+    let section = object
+        .section_by_index(weak_zero.section_index().expect("weak definition section"))
+        .unwrap();
+    assert_eq!(section.kind(), object::SectionKind::UninitializedData);
+}
+
+#[test]
+fn incomplete_extern_arrays_remain_layout_free_undefined_data() {
+    const SOURCE: &str = "extern const char bytes[];\n\
+         extern int values[];\n\
+         int read_imports(void) { return bytes[0] + values[0]; }";
+    let module = lower_source(SOURCE);
+    for name in ["bytes", "values"] {
+        let global = module
+            .globals
+            .iter()
+            .find(|global| global.name == name)
+            .unwrap();
+        assert_eq!(
+            global.emission.definition,
+            ObjectDefinitionPolicy::Declaration
+        );
+        let ccc_types::TypeKind::Array(array) = module.types.kind(global.ty.ty) else {
+            panic!("{name} should have array type")
+        };
+        assert_eq!(array.length, ccc_types::ArrayLength::Incomplete);
+    }
+
+    let config = EffectiveCompilationConfig::default();
+    ccc_abi::plan_module(&module, &config).unwrap();
+    let output = emit(&module, &config, Options { emit_clif: true }).unwrap();
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    for name in ["bytes", "values"] {
+        let symbol = object
+            .symbol_by_name(name)
+            .unwrap_or_else(|| panic!("missing `{name}`"));
+        assert!(symbol.is_undefined(), "{name}");
+        assert!(symbol.is_global(), "{name}");
+        assert_eq!(symbol.kind(), object::SymbolKind::Data, "{name}");
+    }
+}
+
 fn symbol_bytes(object_bytes: &[u8], name: &str) -> Vec<u8> {
     let file = object::File::parse(object_bytes).unwrap();
     let symbol = file
@@ -279,7 +380,7 @@ fn complete_abi_plan_and_aggregate_clif_have_exact_snapshots() {
     assert!(dump.contains("packaging assembly-units=2"), "{dump}");
     assert_eq!(
         sha256(&dump),
-        "03f37e9d0f6df3a5ebdba7f091a4f77f1d4fbb39dc8242ab39e0e0b384c702a3"
+        "44272afee9e620a37d1a152d7cdb7009226fe58394e981d96b3c57ad753fb66d"
     );
 
     let output = emit(&module, &config, Options { emit_clif: true }).unwrap();
@@ -441,6 +542,21 @@ fn runtime_bool_conversion_normalizes_nonzero_values() {
 }
 
 #[test]
+fn integer_to_pointer_widening_preserves_source_signedness() {
+    let output = emit_source(
+        "void *from_signed(int value) { return (void *)value; }\n\
+         void *from_unsigned(unsigned int value) { return (void *)value; }",
+    );
+    let signed = function_clif(&output.clif, "from_signed");
+    assert!(signed.contains("sextend.i64"), "{signed}");
+    assert!(!signed.contains("uextend.i64"), "{signed}");
+
+    let unsigned = function_clif(&output.clif, "from_unsigned");
+    assert!(unsigned.contains("uextend.i64"), "{unsigned}");
+    assert!(!unsigned.contains("sextend.i64"), "{unsigned}");
+}
+
+#[test]
 fn static_bool_initializers_normalize_and_tentative_data_uses_elf_common() {
     let output = emit_source(
         "static _Bool normalized = 7;\n\
@@ -532,6 +648,35 @@ fn long_double_definitions_are_rejected_while_variadic_calls_use_a_bridge() {
 }
 
 #[test]
+fn unprototyped_calls_use_the_generic_bridge_with_the_promoted_actual_plan() {
+    let module = lower_source(
+        "int legacy();\n\
+         int invoke(float floating, signed char narrow) { return legacy(floating, narrow); }",
+    );
+    let config = EffectiveCompilationConfig::default();
+    let plan = ccc_abi::plan_module(&module, &config).unwrap();
+    let call = plan.calls.values().next().unwrap();
+    assert_eq!(call.promoted_actual_types, [TypeId::DOUBLE, TypeId::INT]);
+    assert_eq!(call.fixed_boundary, 0);
+    let ccc_abi::BoundaryPlan::Bridge(boundary) = &call.boundary else {
+        panic!("unprototyped call must use the assembly bridge")
+    };
+    assert_eq!(boundary.kind, ccc_abi::BridgeKind::UnprototypedCall);
+    assert_eq!(boundary.variadic_sse_count, 1);
+
+    let output = emit(&module, &config, Options { emit_clif: true }).unwrap();
+    assert_eq!(output.assemblies.len(), 1);
+    assert!(
+        output.assemblies[0].source().contains("call *%r11"),
+        "{}",
+        output.assemblies[0].source()
+    );
+    let clif = function_clif(&output.clif, "invoke");
+    assert!(clif.contains("fpromote"), "{clif}");
+    assert!(clif.contains("call fn"), "{clif}");
+}
+
+#[test]
 fn floating_storage_and_a_preallocated_label_keep_the_real_entry_first() {
     let output = emit_source(
         "int classify(float value) {\n\
@@ -584,6 +729,36 @@ fn volatile_scalar_accesses_have_exact_fence_order_in_clif_and_machine_code() {
             .filter(|bytes| *bytes == mfence)
             .count(),
         4
+    );
+}
+
+#[test]
+fn sync_synchronize_is_one_native_full_fence_without_an_external_symbol() {
+    let output = emit_source("void synchronize(void) { __sync_synchronize(); }");
+    let clif = function_clif(&output.clif, "synchronize");
+    assert_eq!(
+        clif.lines().filter(|line| line.trim() == "fence").count(),
+        1,
+        "{clif}"
+    );
+
+    let machine = symbol_bytes(&output.object, "synchronize");
+    let mfence = [0x0f, 0xae, 0xf0];
+    assert_eq!(
+        machine
+            .windows(mfence.len())
+            .filter(|bytes| *bytes == mfence)
+            .count(),
+        1
+    );
+
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    assert!(object.symbol_by_name("__sync_synchronize").is_none());
+    assert!(
+        object
+            .symbols()
+            .filter(|symbol| symbol.is_undefined())
+            .all(|symbol| symbol.name() != Ok("__sync_synchronize"))
     );
 }
 

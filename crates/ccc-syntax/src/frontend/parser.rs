@@ -74,6 +74,11 @@ impl Parser<'_> {
                 items.push(ExternalItem::Pragma(pragma));
                 continue;
             }
+            if self.language_mode == LanguageMode::Gnu11
+                && self.consume_punctuator(Punctuator::Semicolon).is_some()
+            {
+                continue;
+            }
             if self.check_keyword(Keyword::StaticAssert) {
                 let assertion = self.static_assert()?;
                 items.push(ExternalItem::StaticAssert(Box::new(assertion)));
@@ -736,7 +741,7 @@ impl Parser<'_> {
             }
             let specifiers = self.declaration_specifiers()?;
             let start = specifiers.span;
-            let declarator = if self.starts_declarator() {
+            let declarator = if self.starts_declarator() || self.starts_abstract_declarator() {
                 Some(self.declarator(true)?)
             } else {
                 None
@@ -1467,6 +1472,9 @@ impl Parser<'_> {
         if token.spelling == "__builtin_va_end" {
             return self.builtin_va_end();
         }
+        if token.spelling == "__sync_synchronize" {
+            return self.builtin_sync_synchronize();
+        }
         match token.kind {
             TokenKind::Identifier => {
                 self.position += 1;
@@ -1700,6 +1708,26 @@ impl Parser<'_> {
             kind: ExpressionKind::BuiltinVaEnd {
                 list: Box::new(list),
             },
+            span: span_through(builtin.span, right.span),
+        })
+    }
+
+    fn builtin_sync_synchronize(&mut self) -> Result<Expression, ParseError> {
+        let builtin = self
+            .current_token()
+            .expect("caller checked builtin")
+            .clone();
+        self.position += 1;
+        self.expect_punctuator(
+            Punctuator::LeftParen,
+            "expected `(` after `__sync_synchronize`",
+        )?;
+        let right = self.expect_punctuator(
+            Punctuator::RightParen,
+            "`__sync_synchronize` requires exactly zero arguments",
+        )?;
+        Ok(Expression {
+            kind: ExpressionKind::BuiltinSyncSynchronize,
             span: span_through(builtin.span, right.span),
         })
     }

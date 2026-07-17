@@ -514,6 +514,9 @@ fn emits_predefined_dynamic_and_reproducible_macros() {
             "const char *translation_file = __FILE__;\n",
             "int translation_line = __LINE__;\n",
             "int counters[] = { __COUNTER__, __COUNTER__ };\n",
+            "#define CCC_STRINGIFY_INNER(value) #value\n",
+            "#define CCC_STRINGIFY(value) CCC_STRINGIFY_INNER(value)\n",
+            "const char *user_label_prefix = CCC_STRINGIFY(__USER_LABEL_PREFIX__);\n",
             "__SIZE_TYPE__ size_value;\n",
             "__PTRDIFF_TYPE__ difference_value;\n",
             "__WCHAR_TYPE__ wide_value;\n",
@@ -536,6 +539,10 @@ fn emits_predefined_dynamic_and_reproducible_macros() {
     assert!(output.contains("longstandard_version=201112L;"), "{output}");
     assert!(output.contains("intcompatibility=4*100+2;"), "{output}");
     assert!(output.contains("intpointer_size=8;"), "{output}");
+    assert!(
+        output.contains("constchar*user_label_prefix=\"\";"),
+        "{output}"
+    );
     assert!(result.stdout.contains("\"Feb 29 2000\""));
     assert!(result.stdout.contains("\"12:34:56\""));
     assert!(result.stdout.contains(&format!("\"{}\"", source.display())));
@@ -560,6 +567,7 @@ fn emits_predefined_dynamic_and_reproducible_macros() {
         "#define __SIZE_TYPE__ long unsigned int",
         "#define __STDC__ 1",
         "#define __STDC_VERSION__ 201112L",
+        "#define __USER_LABEL_PREFIX__",
         "#define __WCHAR_TYPE__ int",
     ] {
         assert!(

@@ -18,7 +18,8 @@ pub use digest::{abi_config_key, ir_shape_digest, translation_unit_digest};
 pub use model::*;
 pub use module_plan::{dump_module_plan, plan_module};
 pub use sysv_amd64::{
-    classify_type, plan_boundary_type, plan_function_type, plan_va_arg, plan_variadic_call,
+    classify_type, plan_boundary_type, plan_function_type, plan_unprototyped_call, plan_va_arg,
+    plan_variadic_call,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]

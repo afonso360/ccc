@@ -173,6 +173,7 @@ pub struct BridgePiecePlan {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum BridgeKind {
+    UnprototypedCall,
     VariadicCall,
     VariadicEntry,
 }

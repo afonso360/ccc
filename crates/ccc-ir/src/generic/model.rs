@@ -2,7 +2,7 @@ use std::fmt;
 
 use ccc_sema::generic::{
     FullFunctionId, FullLocalId, FunctionProperties, GlobalEmission, GlobalId, Linkage,
-    SemanticStorageClass, StorageDuration, StringId, SymbolVisibility,
+    SemanticStorageClass, StorageDuration, StringId, SymbolBinding, SymbolVisibility,
 };
 use ccc_session::Span;
 use ccc_types::{QualifiedType, TypeId, TypeStore};
@@ -161,6 +161,7 @@ pub struct FullFunction {
     pub signature: TypeId,
     pub storage_class: SemanticStorageClass,
     pub linkage: Linkage,
+    pub binding: SymbolBinding,
     pub visibility: SymbolVisibility,
     pub properties: FunctionProperties,
     pub symbol_name: String,
@@ -353,6 +354,9 @@ pub enum FullInstructionKind {
         arguments: Vec<ValueId>,
         variadic_boundary: usize,
         effects: CallEffects,
+    },
+    MemoryFence {
+        order: MemoryOrder,
     },
     VaStart {
         list: ValueId,

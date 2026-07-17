@@ -9,8 +9,8 @@ use crate::{
     CallBridgeArtifactPlan, CallPlan, CallTarget, DefinitionPlan, LoweredSignaturePlan,
     ModuleAbiPlan, NativePurpose, PackagingPlan, PassingMode, SourceLinkage, SourceVisibility,
     VariadicEntryArtifactPlan, VerifiedModuleAbiPlan, abi_config_key, hex, ir_shape_digest,
-    plan_boundary_type, plan_function_type, plan_va_arg, plan_variadic_call,
-    translation_unit_digest,
+    plan_boundary_type, plan_function_type, plan_unprototyped_call, plan_va_arg,
+    plan_variadic_call, translation_unit_digest,
 };
 
 pub fn plan_module(
@@ -103,7 +103,25 @@ pub fn plan_module(
                             ),
                         )
                     })?;
-                let boundary = if signature_data.variadic {
+                let boundary = if matches!(
+                    signature_data.parameters,
+                    ccc_types::FunctionParameters::Unspecified
+                ) {
+                    if variadic_boundary != 0 {
+                        return Err(AbiError::new(
+                            "CCC3512",
+                            format!(
+                                "unprototyped call instruction {} carries nonzero fixed boundary {variadic_boundary}",
+                                instruction.id.0
+                            ),
+                        )
+                        .with_span_if_none(instruction.span));
+                    }
+                    BoundaryPlan::Bridge(
+                        plan_unprototyped_call(&module.types, signature, &actual_types, config)
+                            .map_err(|error| error.with_span_if_none(instruction.span))?,
+                    )
+                } else if signature_data.variadic {
                     BoundaryPlan::Bridge(
                         plan_variadic_call(
                             &module.types,
@@ -665,6 +683,7 @@ fn dump_boundary(output: &mut String, boundary: &BoundaryPlan, indent: &str) {
                 output,
                 "{indent}transport=bridge kind={} stack-size={} overflow-arg-offset={} gp-used={} xmm-used={} al={} hidden-return={}",
                 match bridge.kind {
+                    crate::BridgeKind::UnprototypedCall => "unprototyped-call",
                     crate::BridgeKind::VariadicCall => "variadic-call",
                     crate::BridgeKind::VariadicEntry => "variadic-entry",
                 },

@@ -226,6 +226,12 @@ impl TargetSpec {
         if self.triple.binary_format == BinaryFormat::Elf {
             facts.insert("__ELF__", "1");
         }
+        if self.triple.architecture == Architecture::X86_64
+            && self.triple.binary_format == BinaryFormat::Elf
+            && self.calling_convention() == Some(CallingConvention::SystemV)
+        {
+            facts.insert("__USER_LABEL_PREFIX__", "");
+        }
         if self.data_layout.pointer_width == 64 && self.data_layout.long_width == 64 {
             facts.insert("__LP64__", "1");
             facts.insert("_LP64", "1");
@@ -733,7 +739,7 @@ mod tests {
         );
         assert_eq!(
             config.gnu_profile.as_ref().map(|profile| profile.scope),
-            Some(CompatibilityScope::Parsing)
+            Some(CompatibilityScope::CodeGeneration)
         );
     }
 
@@ -762,6 +768,7 @@ mod tests {
         assert_eq!(facts.get("__UINT64_MAX__"), Some("18446744073709551615UL"));
         assert_eq!(facts.get("__INT_FAST16_TYPE__"), Some("long int"));
         assert_eq!(facts.get("__BYTE_ORDER__"), Some("__ORDER_LITTLE_ENDIAN__"));
+        assert_eq!(facts.get("__USER_LABEL_PREFIX__"), Some(""));
         assert_eq!(facts.get("__x86_64__"), Some("1"));
         assert_eq!(facts.get("__linux__"), Some("1"));
         assert_eq!(facts.get("linux"), None);

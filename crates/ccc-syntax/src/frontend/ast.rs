@@ -359,6 +359,7 @@ pub enum ExpressionKind {
     BuiltinVaEnd {
         list: Box<Expression>,
     },
+    BuiltinSyncSynchronize,
 }
 
 #[derive(Clone, Debug, PartialEq)]

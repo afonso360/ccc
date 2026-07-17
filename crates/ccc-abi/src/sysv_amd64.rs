@@ -65,6 +65,7 @@ pub fn plan_boundary_type(
         Ok(BoundaryPlan::Bridge(plan_bridge(
             types,
             &signature,
+            parameters,
             &actual,
             parameters.len(),
             BridgeKind::VariadicEntry,
@@ -92,12 +93,44 @@ pub fn plan_variadic_call(
             "a nonvariadic function type does not require a variadic call bridge",
         ));
     }
+    let FunctionParameters::Prototype(fixed) = &signature.parameters else {
+        return Err(AbiError::new(
+            "CCC3506",
+            "a function type without a prototype has no variadic bridge plan",
+        ));
+    };
     plan_bridge(
         types,
         &signature,
+        fixed,
         actual_types,
         variadic_boundary,
         BridgeKind::VariadicCall,
+        config,
+    )
+}
+
+pub fn plan_unprototyped_call(
+    types: &TypeStore,
+    signature: TypeId,
+    promoted_actual_types: &[TypeId],
+    config: &EffectiveCompilationConfig,
+) -> Result<BridgeBoundaryPlan, AbiError> {
+    validate_target(config)?;
+    let signature = function_signature(types, signature)?;
+    if !matches!(signature.parameters, FunctionParameters::Unspecified) || signature.variadic {
+        return Err(AbiError::new(
+            "CCC3511",
+            "a function type with a prototype does not require an unprototyped call bridge",
+        ));
+    }
+    plan_bridge(
+        types,
+        &signature,
+        &[],
+        promoted_actual_types,
+        0,
+        BridgeKind::UnprototypedCall,
         config,
     )
 }
@@ -409,17 +442,12 @@ fn push_native_carrier(
 fn plan_bridge(
     types: &TypeStore,
     signature: &FunctionType,
+    fixed: &[ccc_types::QualifiedType],
     actual_types: &[TypeId],
     variadic_boundary: usize,
     kind: BridgeKind,
     config: &EffectiveCompilationConfig,
 ) -> Result<BridgeBoundaryPlan, AbiError> {
-    let FunctionParameters::Prototype(fixed) = &signature.parameters else {
-        return Err(AbiError::new(
-            "CCC3506",
-            "a function type without a prototype has no variadic bridge plan",
-        ));
-    };
     if variadic_boundary != fixed.len() || actual_types.len() < fixed.len() {
         return Err(AbiError::new(
             "CCC3512",
@@ -1507,6 +1535,33 @@ mod tests {
             let plan = plan_variadic_call(&types, floating_signature, &actual, 0, &config).unwrap();
             assert_eq!(plan.variadic_sse_count, expected);
         }
+    }
+
+    #[test]
+    fn unprototyped_calls_use_the_promoted_actual_signature_and_variadic_register_count() {
+        let mut types = TypeStore::default();
+        let signature = types.function_type(FunctionType::unspecified(TypeId::INT));
+        let actual = [TypeId::INT, TypeId::DOUBLE, TypeId::INT];
+        let config = EffectiveCompilationConfig::default();
+        let plan = plan_unprototyped_call(&types, signature, &actual, &config).unwrap();
+
+        assert_eq!(plan.kind, BridgeKind::UnprototypedCall);
+        assert_eq!(plan.parameters.len(), actual.len());
+        assert_eq!(
+            plan.parameters
+                .iter()
+                .map(|parameter| parameter.ty)
+                .collect::<Vec<_>>(),
+            actual
+        );
+        assert_eq!((plan.gp_used, plan.xmm_used), (2, 1));
+        assert_eq!(plan.variadic_sse_count, 1);
+        assert_eq!(plan.overflow_arg_offset, 0);
+        assert_eq!(plan.stack_size, 0);
+        assert!(plan.parameter_pieces.iter().any(|piece| {
+            piece.source_index == Some(1)
+                && piece.location == BridgeLocation::Sse(SseRegister::Xmm0)
+        }));
     }
 
     #[test]

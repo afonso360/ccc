@@ -363,6 +363,9 @@ impl AstDumper {
                 self.line(indent, "builtin-va-end");
                 self.expression(list, indent + 1);
             }
+            ExpressionKind::BuiltinSyncSynchronize => {
+                self.line(indent, "builtin-sync-synchronize");
+            }
             ExpressionKind::Comma(expressions) => {
                 self.line(indent, "comma");
                 for expression in expressions {

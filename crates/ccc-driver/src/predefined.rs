@@ -115,6 +115,10 @@ mod tests {
         );
         assert_eq!(macros.get("__GNUC__").map(String::as_str), Some("4"));
         assert_eq!(
+            macros.get("__USER_LABEL_PREFIX__").map(String::as_str),
+            Some("")
+        );
+        assert_eq!(
             macros.get("__SIZEOF_POINTER__").map(String::as_str),
             Some("8")
         );

@@ -60,6 +60,13 @@ pub enum Linkage {
     External,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SymbolBinding {
+    #[default]
+    Strong,
+    Weak,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StorageDuration {
     Automatic,
@@ -107,6 +114,7 @@ pub struct FullTypedGlobal {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GlobalEmission {
     pub symbol_name: String,
+    pub binding: SymbolBinding,
     pub visibility: SymbolVisibility,
     pub section: Option<String>,
     pub requested_alignment: Option<u64>,
@@ -145,6 +153,7 @@ pub struct FullTypedFunction {
     pub signature: TypeId,
     pub storage: SemanticStorageClass,
     pub linkage: Linkage,
+    pub binding: SymbolBinding,
     pub visibility: SymbolVisibility,
     pub properties: FunctionProperties,
     pub parameters: Vec<FullTypedParameter>,
@@ -308,6 +317,11 @@ pub enum ValueCategory {
     FunctionDesignator,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MemoryOrder {
+    SequentiallyConsistent,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AccessSemantics {
     pub volatile: bool,
@@ -372,6 +386,10 @@ pub struct RelocatableAddress {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RelocatableBase {
     Global(GlobalId),
+    BlockStatic {
+        function: FullFunctionId,
+        local: FullLocalId,
+    },
     Function(FullFunctionId),
     String(StringId),
 }
@@ -423,7 +441,7 @@ pub enum FullTypedExpressionKind {
     Member {
         base: Box<FullTypedExpression>,
         field_index: usize,
-        name: String,
+        name: Option<String>,
         indirect: bool,
         bitfield: Option<Box<BitfieldPlace>>,
     },
@@ -479,6 +497,9 @@ pub enum FullTypedExpressionKind {
     },
     VaEnd {
         list: Box<FullTypedExpression>,
+    },
+    MemoryFence {
+        order: MemoryOrder,
     },
 }
 

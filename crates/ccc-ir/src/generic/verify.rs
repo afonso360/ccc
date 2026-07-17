@@ -22,6 +22,20 @@ pub fn verify_frontend(module: &FullModule) -> Result<(), IrError> {
     verify_module_arenas(module)?;
     for global in &module.globals {
         verify_type(&module.types, global.ty, "global object")?;
+        if global.emission.binding == ccc_sema::generic::SymbolBinding::Weak {
+            if global.linkage != ccc_sema::generic::Linkage::External {
+                return Err(IrError::verify(
+                    "weak data object does not have external linkage",
+                ));
+            }
+            if global.emission.definition
+                == ccc_sema::generic::ObjectDefinitionPolicy::TentativeCommon
+            {
+                return Err(IrError::verify(
+                    "weak data object cannot use tentative common emission",
+                ));
+            }
+        }
         if let Some(initializer) = &global.initializer {
             verify_initializer(module, initializer, global.ty)?;
         }
@@ -380,6 +394,13 @@ fn initializer_path_type(
 }
 
 fn verify_function(module: &FullModule, function: &FullFunction) -> Result<(), IrError> {
+    if function.binding == ccc_sema::generic::SymbolBinding::Weak
+        && function.linkage != ccc_sema::generic::Linkage::External
+    {
+        return Err(IrError::verify(
+            "weak function does not have external linkage",
+        ));
+    }
     let signature = module
         .types
         .function_signature(function.signature)
@@ -820,13 +841,13 @@ impl FunctionVerifier<'_> {
                 right,
                 element,
             } => {
-                require_address(
+                require_address_ignoring_pointee_qualifiers(
                     types,
                     self.value_type(*left)?,
                     *element,
                     "pointer difference",
                 )?;
-                require_address(
+                require_address_ignoring_pointee_qualifiers(
                     types,
                     self.value_type(*right)?,
                     *element,
@@ -1211,6 +1232,9 @@ impl FunctionVerifier<'_> {
                     instruction,
                 )?;
                 self.verify_noreturn(block, position, effects.no_return)?;
+            }
+            FullInstructionKind::MemoryFence { order: _ } => {
+                require_no_result(result, instruction, "memory fence")?;
             }
             FullInstructionKind::VaStart {
                 list,
@@ -1622,7 +1646,8 @@ fn instruction_operands(kind: &FullInstructionKind) -> Vec<ValueId> {
         | FullInstructionKind::AddressOfGlobal { .. }
         | FullInstructionKind::AddressOfFunction { .. }
         | FullInstructionKind::AddressOfString { .. }
-        | FullInstructionKind::AddressOfStorage { .. } => Vec::new(),
+        | FullInstructionKind::AddressOfStorage { .. }
+        | FullInstructionKind::MemoryFence { .. } => Vec::new(),
         FullInstructionKind::ProjectField { base, .. } => vec![*base],
         FullInstructionKind::PointerOffset { base, index, .. } => vec![*base, *index],
         FullInstructionKind::PointerDifference { left, right, .. }
@@ -1773,6 +1798,22 @@ fn require_address(
     let pointee = pointer_pointee(types, address.ty)
         .ok_or_else(|| IrError::verify(format!("{context} operand is not a pointer")))?;
     if !same_type(pointee, object) {
+        return Err(IrError::verify(format!(
+            "{context} pointer has the wrong pointee type"
+        )));
+    }
+    Ok(())
+}
+
+fn require_address_ignoring_pointee_qualifiers(
+    types: &TypeStore,
+    address: QualifiedType,
+    object: QualifiedType,
+    context: &str,
+) -> Result<(), IrError> {
+    let pointee = pointer_pointee(types, address.ty)
+        .ok_or_else(|| IrError::verify(format!("{context} operand is not a pointer")))?;
+    if pointee.ty != object.ty {
         return Err(IrError::verify(format!(
             "{context} pointer has the wrong pointee type"
         )));

@@ -71,12 +71,17 @@ fn dump_global(output: &mut String, unit: &FullTypedTranslationUnit, id: GlobalI
         output,
         0,
         format_args!(
-            "global @{} {} : {} storage={:?} linkage={:?} duration={:?} symbol={} definition={:?}",
+            "global @{} {} : {} storage={:?} linkage={:?}{} duration={:?} symbol={} definition={:?}",
             id.0,
             global.name,
             unit.types.display_qualified(global.ty),
             global.storage,
             global.linkage,
+            if global.emission.binding == SymbolBinding::Weak {
+                " binding=Weak"
+            } else {
+                ""
+            },
             global.duration,
             global.emission.symbol_name,
             global.emission.definition
@@ -93,12 +98,17 @@ fn dump_function(output: &mut String, unit: &FullTypedTranslationUnit, id: FullF
         output,
         0,
         format_args!(
-            "function @{} {} : {} storage={:?} linkage={:?} visibility={:?} inline={} noreturn={} {}",
+            "function @{} {} : {} storage={:?} linkage={:?}{} visibility={:?} inline={} noreturn={} {}",
             id.0,
             function.name,
             unit.types.display(function.signature),
             function.storage,
             function.linkage,
+            if function.binding == SymbolBinding::Weak {
+                " binding=Weak"
+            } else {
+                ""
+            },
             function.visibility,
             function.properties.inline,
             function.properties.no_return,
@@ -444,6 +454,7 @@ fn dump_expression(
             indirect,
             bitfield,
         } => {
+            let name = name.as_deref().unwrap_or("<anonymous>");
             let bitfield = bitfield.as_deref().map_or_else(String::new, |descriptor| {
                 format!(
                     " bitfield={}:{}:{}/{}",
@@ -599,6 +610,13 @@ fn dump_expression(
         FullTypedExpressionKind::VaEnd { list } => {
             line(output, indent, format_args!("va-end{suffix}"));
             dump_expression(output, unit, list, indent + 1);
+        }
+        FullTypedExpressionKind::MemoryFence { order } => {
+            line(
+                output,
+                indent,
+                format_args!("memory-fence {order:?}{suffix}"),
+            );
         }
     }
 }

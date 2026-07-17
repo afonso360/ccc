@@ -19,12 +19,17 @@ pub fn dump_frontend_ir(module: &FullModule) -> String {
         };
         let _ = writeln!(
             output,
-            "data d{} @{} : {} [{} linkage={:?} duration={:?} visibility={:?} definition={:?}{}{}{}]",
+            "data d{} @{} : {} [{} linkage={:?}{} duration={:?} visibility={:?} definition={:?}{}{}{}]",
             global.id.0,
             global.emission.symbol_name,
             module.types.display_qualified(global.ty),
             origin,
             global.linkage,
+            if global.emission.binding == ccc_sema::generic::SymbolBinding::Weak {
+                " binding=Weak"
+            } else {
+                ""
+            },
             global.duration,
             global.emission.visibility,
             global.emission.definition,
@@ -66,11 +71,16 @@ pub fn dump_frontend_ir(module: &FullModule) -> String {
         if function.entry.is_none() {
             let _ = writeln!(
                 output,
-                "declare f{} @{} : {} [linkage={:?} visibility={:?}]",
+                "declare f{} @{} : {} [linkage={:?}{} visibility={:?}]",
                 function.id.0,
                 function.symbol_name,
                 module.types.display(function.signature),
                 function.linkage,
+                if function.binding == ccc_sema::generic::SymbolBinding::Weak {
+                    " binding=Weak"
+                } else {
+                    ""
+                },
                 function.visibility,
             );
             continue;
@@ -94,13 +104,18 @@ pub fn dump_frontend_ir(module: &FullModule) -> String {
             .join(", ");
         let _ = writeln!(
             output,
-            "function f{} @{}({}) -> {} [signature={} linkage={:?} visibility={:?} inline={} noreturn={}] {{",
+            "function f{} @{}({}) -> {} [signature={} linkage={:?}{} visibility={:?} inline={} noreturn={}] {{",
             function.id.0,
             function.symbol_name,
             parameters,
             module.types.display_qualified(function.result_type),
             module.types.display(function.signature),
             function.linkage,
+            if function.binding == ccc_sema::generic::SymbolBinding::Weak {
+                " binding=Weak"
+            } else {
+                ""
+            },
             function.visibility,
             function.properties.inline,
             function.properties.no_return,
@@ -485,6 +500,9 @@ fn display_instruction(module: &FullModule, kind: &FullInstructionKind) -> Strin
             variadic_boundary,
             display_call_effects(*effects)
         ),
+        FullInstructionKind::MemoryFence { order } => {
+            format!("memory.fence order={order:?}")
+        }
         FullInstructionKind::VaStart {
             list,
             last_named_parameter,

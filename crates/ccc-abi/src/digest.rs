@@ -100,6 +100,7 @@ pub fn ir_shape_digest(
         encoder.tag(global.duration as u8);
         encoder.bool(global.tentative);
         encoder.string(&global.emission.symbol_name);
+        encoder.tag(global.emission.binding as u8);
         encoder.tag(global.emission.visibility as u8);
         encoder.option_string(global.emission.section.as_deref());
         encoder.option_u64(global.emission.requested_alignment);
@@ -140,6 +141,7 @@ pub fn translation_unit_digest(
             (
                 function.symbol_name.as_str(),
                 function.linkage as u8,
+                function.binding as u8,
                 function.visibility as u8,
                 u8::from(function.entry.is_some()),
             )
@@ -148,6 +150,7 @@ pub fn translation_unit_digest(
             (
                 global.emission.symbol_name.as_str(),
                 global.linkage as u8,
+                global.emission.binding as u8,
                 global.emission.visibility as u8,
                 global.emission.definition as u8,
             )
@@ -155,9 +158,10 @@ pub fn translation_unit_digest(
         .collect::<Vec<_>>();
     symbols.sort_unstable();
     encoder.len(symbols.len());
-    for (name, linkage, visibility, policy) in symbols {
+    for (name, linkage, binding, visibility, policy) in symbols {
         encoder.string(name);
         encoder.tag(linkage);
+        encoder.tag(binding);
         encoder.tag(visibility);
         encoder.tag(policy);
     }
@@ -352,6 +356,7 @@ fn encode_function(encoder: &mut Encoder, function: &gir::FullFunction) {
     encoder.type_id(function.signature);
     encoder.tag(function.storage_class as u8);
     encoder.tag(function.linkage as u8);
+    encoder.tag(function.binding as u8);
     encoder.tag(function.visibility as u8);
     encoder.bool(function.properties.inline);
     encoder.bool(function.properties.no_return);
@@ -681,6 +686,10 @@ fn encode_instruction(encoder: &mut Encoder, instruction: &gir::FullInstructionK
         I::VaEnd { list } => {
             encoder.tag(26);
             encoder.u32(list.0);
+        }
+        I::MemoryFence { order } => {
+            encoder.tag(27);
+            encoder.tag(*order as u8);
         }
     }
 }

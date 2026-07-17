@@ -62,6 +62,70 @@ fn dumps_explicit_places_compound_updates_and_volatile_effects_exactly() {
 }
 
 #[test]
+fn pointer_difference_uses_the_unqualified_compatible_element_type() {
+    let module =
+        lower_source("long difference(const char *cursor, char *start) { return cursor - start; }");
+    verify_frontend(&module).unwrap();
+    assert_eq!(
+        dump_frontend_ir(&module),
+        concat!(
+            "function f0 @difference(v0 %cursor: pointer to const char -> ssa, v1 %start: pointer to char -> ssa) -> long int [signature=long int (pointer to const char, pointer to char) linkage=External visibility=Default inline=false noreturn=false] {\n",
+            "  b0(v0: pointer to const char, v1: pointer to char):\n",
+            "    i0: v2: long int = pointer.difference v0, v1 element=char\n",
+            "    return v2\n",
+            "}\n",
+        )
+    );
+}
+
+#[test]
+fn declaration_assembly_labels_are_exact_in_ir_symbols_and_references() {
+    let module = lower_source(
+        "extern int source_object asm(\"linked_object\");\n\
+         extern int source_function(int) asm(\"linked_function\");\n\
+         int invoke(int value) { return source_function(value) + source_object; }",
+    );
+    verify_frontend(&module).unwrap();
+    assert_eq!(
+        dump_frontend_ir(&module),
+        concat!(
+            "data d0 @linked_object : int [file:g0 linkage=External duration=Static visibility=Default definition=Declaration]\n",
+            "declare f0 @linked_function : int (int) [linkage=External visibility=Default]\n",
+            "function f1 @invoke(v0 %value: int -> ssa) -> int [signature=int (int) linkage=External visibility=Default inline=false noreturn=false] {\n",
+            "  b0(v0: int):\n",
+            "    i0: v1: int = call.direct f0 (v0) signature=int (int) variadic-boundary=1 [read=true write=true unwind=true noreturn=false]\n",
+            "    i1: v2: pointer to int = address.data d0\n",
+            "    i2: v3: int = load v2 object=int [plain]\n",
+            "    i3: v4: int = add v1, v3\n",
+            "    return v4\n",
+            "}\n",
+        )
+    );
+}
+
+#[test]
+fn unprototyped_calls_record_default_promotions_and_a_zero_fixed_boundary_exactly() {
+    let module = lower_source(
+        "int legacy();\n\
+         int invoke(float floating, signed char narrow) { return legacy(floating, narrow); }",
+    );
+    verify_frontend(&module).unwrap();
+    assert_eq!(
+        dump_frontend_ir(&module),
+        concat!(
+            "declare f0 @legacy : int () [linkage=External visibility=Default]\n",
+            "function f1 @invoke(v0 %floating: float -> ssa, v1 %narrow: signed char -> ssa) -> int [signature=int (float, signed char) linkage=External visibility=Default inline=false noreturn=false] {\n",
+            "  b0(v0: float, v1: signed char):\n",
+            "    i0: v2: double = convert.floating-conversion v0 float -> double\n",
+            "    i1: v3: int = convert.integer-promotion v1 signed char -> int\n",
+            "    i2: v4: int = call.direct f0 (v2, v3) signature=int () variadic-boundary=0 [read=true write=true unwind=true noreturn=false]\n",
+            "    return v4\n",
+            "}\n",
+        )
+    );
+}
+
+#[test]
 fn golden_covers_data_strings_places_and_cfg() {
     let module = lower_source(
         "char exact[2] = \"xy\";\n\
@@ -292,6 +356,64 @@ fn lowers_variadic_builtins_to_abi_neutral_effects() {
 }
 
 #[test]
+fn lowers_sync_synchronize_to_a_sequentially_consistent_memory_fence() {
+    let module = lower_source("void synchronize(void) { __sync_synchronize(); }");
+    verify_frontend(&module).unwrap();
+    let function = module
+        .functions
+        .iter()
+        .find(|function| function.name == "synchronize")
+        .unwrap();
+    let fences = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.kind {
+            FullInstructionKind::MemoryFence { order } => Some(order),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(fences, [MemoryOrder::SequentiallyConsistent]);
+    let dump = dump_frontend_ir(&module);
+    assert!(
+        dump.contains("memory.fence order=SequentiallyConsistent"),
+        "{dump}"
+    );
+    assert_eq!(
+        module.functions.len(),
+        1,
+        "the builtin must not become a call"
+    );
+}
+
+#[test]
+fn lowers_promoted_anonymous_members_as_each_physical_projection() {
+    let module = lower_source(
+        "struct Usage {
+             int prefix;
+             union { struct { long minor; }; long alternate; };
+         };
+         long read(struct Usage *usage) { return usage->minor; }",
+    );
+    verify_frontend(&module).unwrap();
+    let read = module
+        .functions
+        .iter()
+        .find(|function| function.name == "read")
+        .unwrap();
+    let projected_names = read
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match &instruction.kind {
+            FullInstructionKind::ProjectField { field_name, .. } => Some(field_name.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(projected_names, [None, None, Some("minor".to_owned())]);
+}
+
+#[test]
 fn aggregate_va_arg_results_are_owned_projection_roots() {
     let module = lower_source(
         "typedef __builtin_va_list va_list;\n\
@@ -508,6 +630,72 @@ fn lowers_consecutive_equal_array_elements_to_one_repeated_fragment() {
         graph.nodes[graph.root.0 as usize].kind,
         InitializerNodeKind::Aggregate(_)
     ));
+}
+
+#[test]
+fn lowers_static_array_addresses_decay_and_mixed_shift_constants() {
+    let module = lower_source(
+        "int values[4];\n\
+         int *selected = &values[2];\n\
+         const char text[] = \"named\";\n\
+         const char *text_pointer = text;\n\
+         unsigned long long high_bit = (unsigned long long)1 << 40;",
+    );
+    verify_frontend(&module).unwrap();
+
+    let selected = module.globals[1].initializer.as_ref().unwrap();
+    assert_eq!(
+        selected.nodes[selected.root.0 as usize].kind,
+        InitializerNodeKind::Relocation {
+            target: RelocationTarget::Object(DataId(0)),
+            addend: 8,
+            one_past: false,
+            kind: RelocationKind::ObjectAddress,
+        }
+    );
+    let text_pointer = module.globals[3].initializer.as_ref().unwrap();
+    assert_eq!(
+        text_pointer.nodes[text_pointer.root.0 as usize].kind,
+        InitializerNodeKind::Relocation {
+            target: RelocationTarget::Object(DataId(2)),
+            addend: 0,
+            one_past: false,
+            kind: RelocationKind::ObjectAddress,
+        }
+    );
+    let high_bit = module.globals[4].initializer.as_ref().unwrap();
+    assert_eq!(
+        high_bit.nodes[high_bit.root.0 as usize].kind,
+        InitializerNodeKind::Scalar(ScalarConstant::Unsigned(1_u128 << 40))
+    );
+}
+
+#[test]
+fn lowers_block_static_addresses_in_block_static_initializers() {
+    let module = lower_source(
+        "void *address(void) {\n\
+             static int target;\n\
+             static void *pointer = &target;\n\
+             return pointer;\n\
+         }",
+    );
+    verify_frontend(&module).unwrap();
+
+    assert_eq!(module.globals.len(), 2);
+    assert!(matches!(
+        module.globals[0].source,
+        DataOrigin::BlockStatic { .. }
+    ));
+    let pointer = module.globals[1].initializer.as_ref().unwrap();
+    assert_eq!(
+        pointer.nodes[pointer.root.0 as usize].kind,
+        InitializerNodeKind::Relocation {
+            target: RelocationTarget::Object(DataId(0)),
+            addend: 0,
+            one_past: false,
+            kind: RelocationKind::ObjectAddress,
+        }
+    );
 }
 
 #[test]

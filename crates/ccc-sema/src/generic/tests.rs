@@ -4,8 +4,8 @@ use ccc_pp::{
 };
 use ccc_session::{Session, SourceMap};
 use ccc_syntax::frontend::{self as syntax, ExternalItem};
-use ccc_target::{CapabilityKind, CapabilityState, EffectiveCompilationConfig};
-use ccc_types::{ArrayLength, TypeKind, TypeQualifiers};
+use ccc_target::{CapabilityKind, CapabilityState, EffectiveCompilationConfig, LanguageMode};
+use ccc_types::{ArrayLength, TypeId, TypeKind, TypeQualifiers};
 
 use super::*;
 
@@ -83,6 +83,34 @@ fn analyze_resource_source(
 }
 
 #[test]
+fn zero_length_arrays_are_limited_to_gnu_language_mode() {
+    let unit = analyze_source("struct FileHandle { unsigned char bytes[0]; };").unwrap();
+    let FullTypedExternalItem::TypeDeclaration { ty, .. } = unit.external_items[0] else {
+        panic!("expected a type declaration");
+    };
+    let TypeKind::Record(record) = unit.types.kind(ty) else {
+        panic!("expected a record declaration");
+    };
+    let definition = unit.types.record(*record).unwrap();
+    let fields = definition.fields.as_ref().unwrap();
+    let TypeKind::Array(array) = unit.types.kind(fields[0].ty.ty) else {
+        panic!("expected an array field");
+    };
+    assert_eq!(array.length, ArrayLength::Constant(0));
+
+    let diagnostics = analyze_source_with_config(
+        "struct FileHandle { unsigned char bytes[0]; };",
+        &EffectiveCompilationConfig::default().with_language_mode(LanguageMode::C11),
+    )
+    .unwrap_err();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CCC2223")
+    );
+}
+
+#[test]
 fn function_visibility_attributes_survive_redeclarations() {
     let unit = analyze_source(
         "int hidden(int) __attribute__((visibility(\"hidden\")));\n\
@@ -103,6 +131,297 @@ fn function_visibility_attributes_survive_redeclarations() {
         .find(|function| function.name == "protected_fn")
         .unwrap();
     assert_eq!(protected.visibility, SymbolVisibility::Protected);
+}
+
+#[test]
+fn weak_symbol_binding_is_sticky_across_redeclarations() {
+    let unit = analyze_source(
+        "extern int weak_function(void);\n\
+         extern int weak_function(void) __attribute__((__weak__));\n\
+         int weak_function(void) { return 7; }\n\
+         extern int weak_object __attribute__((weak));\n\
+         int weak_object;",
+    )
+    .unwrap();
+
+    let function = unit
+        .functions
+        .iter()
+        .find(|function| function.name == "weak_function")
+        .unwrap();
+    assert_eq!(function.binding, SymbolBinding::Weak);
+    assert!(function.body.is_some());
+
+    let object = unit
+        .globals
+        .iter()
+        .find(|global| global.name == "weak_object")
+        .unwrap();
+    assert_eq!(object.emission.binding, SymbolBinding::Weak);
+    assert_eq!(
+        object.emission.definition,
+        ObjectDefinitionPolicy::Definition
+    );
+    assert!(!object.tentative);
+    let dump = dump_frontend_typed_ast(&unit);
+    assert!(
+        dump.contains("weak_function") && dump.contains("binding=Weak"),
+        "{dump}"
+    );
+}
+
+#[test]
+fn weak_attribute_rejects_non_symbol_and_internal_linkage_placements() {
+    for source in [
+        "static int object __attribute__((weak));",
+        "static int function(void) __attribute__((__weak__));",
+        "typedef int alias __attribute__((weak));",
+        "int function(void) { int local __attribute__((weak)); return local; }",
+        "int function(int value __attribute__((weak))) { return value; }",
+        "int function(void) { static int local __attribute__((weak)); return local; }",
+        "int function(int marker, ...) __attribute__((weak)); int function(int marker, ...) { return marker; }",
+        "extern int object __attribute__((weak(1)));",
+    ] {
+        assert_eq!(diagnostic_codes(source), vec!["CCC2423"], "{source}");
+    }
+}
+
+#[test]
+fn assembly_labels_preserve_source_names_and_merge_redeclarations() {
+    let unit = analyze_source(
+        "extern int source_object __asm__(\"linked_object\");\n\
+         extern int source_object;\n\
+         extern int source_function(int) asm(\"linked_function\");\n\
+         int source_function(int value) { return source_object + value; }\n\
+         int use_block_declarations(void) {\n\
+             extern int block_object asm(\"linked_block_object\");\n\
+             extern int block_function(void) asm(\"linked_block_function\");\n\
+             return block_object + block_function();\n\
+         }",
+    )
+    .unwrap();
+
+    let source_object = unit
+        .globals
+        .iter()
+        .find(|global| global.name == "source_object")
+        .unwrap();
+    assert_eq!(source_object.emission.symbol_name, "linked_object");
+    assert_eq!(
+        source_object.asm_label.as_ref().unwrap().symbol,
+        "linked_object"
+    );
+    assert_eq!(
+        unit.globals
+            .iter()
+            .find(|global| global.name == "block_object")
+            .unwrap()
+            .emission
+            .symbol_name,
+        "linked_block_object"
+    );
+
+    let source_function = unit
+        .functions
+        .iter()
+        .find(|function| function.name == "source_function")
+        .unwrap();
+    assert_eq!(source_function.name, "source_function");
+    assert_eq!(
+        source_function.asm_label.as_ref().unwrap().symbol,
+        "linked_function"
+    );
+    assert!(source_function.body.is_some());
+    assert_eq!(
+        unit.functions
+            .iter()
+            .find(|function| function.name == "block_function")
+            .unwrap()
+            .asm_label
+            .as_ref()
+            .unwrap()
+            .symbol,
+        "linked_block_function"
+    );
+}
+
+#[test]
+fn assembly_labels_reject_conflicts_and_unsupported_storage() {
+    for source in [
+        "extern int function(void) asm(\"first\"); extern int function(void) asm(\"second\");",
+        "extern int object asm(\"first\"); extern int object asm(\"second\");",
+    ] {
+        assert!(diagnostic_codes(source).contains(&"CCC2419".to_owned()));
+    }
+    assert!(
+        diagnostic_codes("int f(void) { int local asm(\"linked\"); return local; }")
+            .contains(&"CCC2257".to_owned())
+    );
+    assert!(
+        diagnostic_codes("int f(void) { static int local asm(\"linked\"); return local; }")
+            .contains(&"CCC2257".to_owned())
+    );
+    assert!(diagnostic_codes("extern int object asm(\"\");").contains(&"CCC2349".to_owned()));
+}
+
+#[test]
+fn accepts_function_inlining_attributes_as_behavior_compatible_no_ops() {
+    let unit = analyze_source(
+        "static __attribute__((always_inline)) inline int fast(int value) { return value + 1; }\n\
+         static int __attribute__((__always_inline__)) fast_alias(int value) { return value + 2; }\n\
+         static __attribute__((noinline)) int slow(int value) { return value - 1; }\n\
+         static int __attribute__((__noinline__)) slow_alias(int value) { return value - 2; }",
+    )
+    .unwrap();
+
+    for (name, attribute_name) in [
+        ("fast", "always_inline"),
+        ("fast_alias", "__always_inline__"),
+        ("slow", "noinline"),
+        ("slow_alias", "__noinline__"),
+    ] {
+        let function = unit
+            .functions
+            .iter()
+            .find(|function| function.name == name)
+            .unwrap();
+        let attribute = function
+            .attributes
+            .iter()
+            .find(|attribute| attribute.name == attribute_name)
+            .unwrap();
+        assert_eq!(
+            attribute.capability,
+            CapabilityState::BehaviorCompatibleNoOp
+        );
+    }
+}
+
+#[test]
+fn accepts_hosted_header_diagnostic_and_optimization_attributes_as_no_ops() {
+    let unit = analyze_source(
+        "extern void *allocate(const char *format, ...)\n\
+         __attribute__((__const__, __malloc__, __format__(__printf__, 1, 2),\n\
+                        __nonnull__(1), __warn_unused_result__, __deprecated__));",
+    )
+    .unwrap();
+    let function = unit
+        .functions
+        .iter()
+        .find(|function| function.name == "allocate")
+        .unwrap();
+    for name in [
+        "__const__",
+        "__malloc__",
+        "__format__",
+        "__nonnull__",
+        "__warn_unused_result__",
+        "__deprecated__",
+    ] {
+        let attribute = function
+            .attributes
+            .iter()
+            .find(|attribute| attribute.name == name)
+            .unwrap();
+        assert_eq!(
+            attribute.capability,
+            CapabilityState::BehaviorCompatibleNoOp,
+            "unexpected state for {name}"
+        );
+    }
+}
+
+#[test]
+fn gnu_noreturn_attribute_updates_function_control_flow_properties() {
+    let unit = analyze_source(
+        "extern void stop(void) __attribute__((__noreturn__));\n\
+         void stop(void) { for (;;) {} }",
+    )
+    .unwrap();
+    let function = unit
+        .functions
+        .iter()
+        .find(|function| function.name == "stop")
+        .unwrap();
+    assert!(function.properties.no_return);
+    assert_eq!(
+        function
+            .attributes
+            .iter()
+            .find(|attribute| attribute.name == "__noreturn__")
+            .unwrap()
+            .capability,
+        CapabilityState::Implemented
+    );
+}
+
+#[test]
+fn word_mode_uses_the_target_pointer_width_and_preserves_signedness() {
+    let unit = analyze_source(
+        "typedef int register_t __attribute__((__mode__(__word__)));\n\
+         typedef unsigned int unsigned_register_t __attribute__((mode(word)));\n\
+         register_t signed_value;\n\
+         unsigned_register_t unsigned_value;",
+    )
+    .unwrap();
+    let signed_value = unit
+        .globals
+        .iter()
+        .find(|global| global.name == "signed_value")
+        .unwrap();
+    let unsigned_value = unit
+        .globals
+        .iter()
+        .find(|global| global.name == "unsigned_value")
+        .unwrap();
+    assert_eq!(signed_value.ty.ty, ccc_types::TypeId::LONG);
+    assert_eq!(unsigned_value.ty.ty, ccc_types::TypeId::UNSIGNED_LONG);
+    assert!(
+        diagnostic_codes("typedef int unsupported_mode __attribute__((mode(__QI__)));")
+            .contains(&"CCC2421".to_owned())
+    );
+}
+
+#[test]
+fn aligned_attribute_preserves_object_and_private_typedef_alignment() {
+    let unit = analyze_source(
+        "int object __attribute__((__aligned__(32)));\n\
+         int maximum_aligned __attribute__((__aligned__));\n\
+         typedef struct { char byte; } aligned_record_t __attribute__((__aligned__));\n\
+         aligned_record_t record;",
+    )
+    .unwrap();
+    let object = unit
+        .globals
+        .iter()
+        .find(|global| global.name == "object")
+        .unwrap();
+    assert_eq!(object.emission.requested_alignment, Some(32));
+    let maximum_aligned = unit
+        .globals
+        .iter()
+        .find(|global| global.name == "maximum_aligned")
+        .unwrap();
+    assert_eq!(maximum_aligned.emission.requested_alignment, Some(16));
+    let record = unit
+        .globals
+        .iter()
+        .find(|global| global.name == "record")
+        .unwrap();
+    let layout = unit
+        .types
+        .layout_of(record.ty.ty, &EffectiveCompilationConfig::default())
+        .unwrap();
+    assert_eq!(layout.align, 16);
+    assert_eq!(layout.size, 16);
+
+    assert!(
+        diagnostic_codes(
+            "typedef struct { char byte; } base_t;\n\
+         typedef base_t unsafe_alias_t __attribute__((aligned));"
+        )
+        .contains(&"CCC2422".to_owned())
+    );
 }
 
 fn diagnostic_codes(source: &str) -> Vec<String> {
@@ -157,6 +476,56 @@ fn types_target_va_list_and_variadic_builtins_without_exposing_layout_in_syntax(
     assert!(dump.contains("va-arg requested=int"), "{dump}");
     assert!(dump.contains("va-copy"), "{dump}");
     assert_eq!(dump.matches("va-end").count(), 2, "{dump}");
+}
+
+#[test]
+fn types_sync_synchronize_as_a_registry_gated_sequentially_consistent_fence() {
+    let unit = analyze_preprocessed_source(
+        "sync-synchronize.c",
+        "#if !__has_builtin(__sync_synchronize)\n\
+         #error missing synchronization builtin\n\
+         #endif\n\
+         void synchronize(void) { __sync_synchronize(); }",
+    )
+    .unwrap();
+    let function = unit
+        .functions
+        .iter()
+        .find(|function| function.name == "synchronize")
+        .unwrap();
+    let FullTypedStatementKind::Compound(items) = &function.body.as_ref().unwrap().kind else {
+        panic!("synchronize has a compound body")
+    };
+    let FullTypedBlockItem::Statement(statement) = &items[0] else {
+        panic!("synchronize contains an expression statement")
+    };
+    let FullTypedStatementKind::Expression(Some(expression)) = &statement.kind else {
+        panic!("synchronize contains a fence expression")
+    };
+    assert_eq!(expression.ty.ty, ccc_types::TypeId::VOID);
+    assert_eq!(
+        expression.kind,
+        FullTypedExpressionKind::MemoryFence {
+            order: MemoryOrder::SequentiallyConsistent,
+        }
+    );
+
+    let mut config = EffectiveCompilationConfig::default();
+    config.capabilities.insert(
+        CapabilityKind::Builtin,
+        "__sync_synchronize",
+        CapabilityState::ParseOnly,
+    );
+    let diagnostics =
+        analyze_source_with_config("void synchronize(void) { __sync_synchronize(); }", &config)
+            .unwrap_err();
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code.as_str())
+            .collect::<Vec<_>>(),
+        ["CCC2407"]
+    );
 }
 
 #[test]
@@ -447,6 +816,21 @@ fn preserves_unspecified_parameters_and_empty_prototypes() {
     ));
     assert!(matches!(
         signature("prototype").parameters,
+        ccc_types::FunctionParameters::Prototype(ref parameters) if parameters.is_empty()
+    ));
+}
+
+#[test]
+fn empty_identifier_list_definition_has_a_fixed_zero_parameter_boundary() {
+    let unit = analyze_source("int answer() { return 42; }").unwrap();
+    let function = unit
+        .functions
+        .iter()
+        .find(|function| function.name == "answer")
+        .unwrap();
+    let signature = unit.types.function_signature(function.signature).unwrap();
+    assert!(matches!(
+        signature.parameters,
         ccc_types::FunctionParameters::Prototype(ref parameters) if parameters.is_empty()
     ));
 }
@@ -884,6 +1268,37 @@ fn completes_string_initialized_arrays_before_requiring_layout() {
 }
 
 #[test]
+fn ordinary_strings_initialize_all_character_array_types() {
+    let unit =
+        analyze_source("unsigned char bytes[] = \"xy\"; signed char signed_bytes[] = \"z\";")
+            .unwrap();
+    for (name, expected_element, expected_length) in [
+        ("bytes", TypeId::UNSIGNED_CHAR, 3),
+        ("signed_bytes", TypeId::SIGNED_CHAR, 2),
+    ] {
+        let global = unit
+            .globals
+            .iter()
+            .find(|global| global.name == name)
+            .unwrap();
+        let TypeKind::Array(array) = unit.types.kind(global.ty.ty) else {
+            panic!("{name} should have array type")
+        };
+        assert_eq!(array.element.ty, expected_element);
+        assert_eq!(array.length, ArrayLength::Constant(expected_length));
+        assert!(matches!(
+            global
+                .initializer
+                .as_ref()
+                .map(|initializer| &initializer.kind),
+            Some(FullTypedInitializerKind::String(_))
+        ));
+    }
+
+    assert!(diagnostic_codes("unsigned short words[] = \"xy\";").contains(&"CCC2312".to_owned()));
+}
+
+#[test]
 fn static_block_objects_are_data_and_require_constant_initializers() {
     let unit = analyze_source("int f(int x) { static int saved = 3; return saved + x; }").unwrap();
     let local = first_local(&unit.functions[0]);
@@ -899,6 +1314,60 @@ fn static_block_objects_are_data_and_require_constant_initializers() {
     assert!(
         diagnostic_codes("int f(int x) { static int bad = x; return bad; }")
             .contains(&"CCC2367".to_owned())
+    );
+
+    let unit = analyze_source(
+        "void *f(void) { static int target; static void *pointer = &target; return pointer; }",
+    )
+    .unwrap();
+    let body = unit.functions[0].body.as_ref().unwrap();
+    let FullTypedStatementKind::Compound(items) = &body.kind else {
+        panic!("function body is compound")
+    };
+    let pointer = items
+        .iter()
+        .filter_map(|item| match item {
+            FullTypedBlockItem::Declaration(declaration) => Some(declaration.as_ref()),
+            _ => None,
+        })
+        .find(|declaration| declaration.name == "pointer")
+        .unwrap();
+    let FullTypedInitializerKind::Scalar(initializer) = &pointer.initializer.as_ref().unwrap().kind
+    else {
+        panic!("pointer initializer is scalar")
+    };
+    assert_eq!(
+        initializer.constant,
+        Some(ConstantValue::Address(RelocatableAddress {
+            base: RelocatableBase::BlockStatic {
+                function: unit.functions[0].id,
+                local: FullLocalId(0),
+            },
+            addend: 0,
+            one_past: false,
+        }))
+    );
+}
+
+#[test]
+fn tagged_definitions_shadow_outer_tags_without_permitting_same_scope_redefinition() {
+    analyze_source(
+        "struct Item { int outer; };\n\
+         int use(void) {\n\
+             struct Item { char *inner; };\n\
+             struct Item item;\n\
+             item.inner = 0;\n\
+             return item.inner == 0;\n\
+         }\n\
+         struct Item outside;",
+    )
+    .unwrap();
+
+    assert!(
+        diagnostic_codes(
+            "int use(void) { struct Item { int first; }; struct Item { int second; }; }"
+        )
+        .contains(&"CCC2231".to_owned())
     );
 }
 
@@ -985,6 +1454,39 @@ fn aggregate_rvalue_members_retain_bitfield_layout() {
 }
 
 #[test]
+fn resolves_members_promoted_through_nested_anonymous_records() {
+    let unit = analyze_source(
+        "struct Usage {
+             int prefix;
+             union { struct { volatile long minor; }; long alternate; };
+         };
+         long read(struct Usage *usage) { return usage->minor; }",
+    )
+    .unwrap();
+    let dump = dump_frontend_typed_ast(&unit);
+    assert!(
+        dump.contains("member #0 minor indirect=false : volatile long int Lvalue"),
+        "{dump}"
+    );
+    assert!(
+        dump.contains("member #0 <anonymous> indirect=false"),
+        "{dump}"
+    );
+    assert!(
+        dump.contains("member #1 <anonymous> indirect=true"),
+        "{dump}"
+    );
+
+    assert!(
+        diagnostic_codes(
+            "struct Ambiguous { struct { int value; }; union { int value; }; };
+             int read(struct Ambiguous *object) { return object->value; }",
+        )
+        .contains(&"CCC2296".to_owned())
+    );
+}
+
+#[test]
 fn compound_assignment_has_a_single_evaluation_plan() {
     let unit = analyze_source("int f(int *p) { return *p += 2; }").unwrap();
     let body = unit.functions[0].body.as_ref().unwrap();
@@ -1037,6 +1539,126 @@ fn global_addresses_are_relocation_bearing_constants() {
             one_past: false,
         }))
     );
+}
+
+#[test]
+fn static_initializers_fold_array_addresses_decay_and_mixed_shift_counts() {
+    let unit = analyze_source(
+        "int values[4];\n\
+         int *selected = &values[2];\n\
+         const char text[] = \"named\";\n\
+         const char *text_pointer = text;\n\
+         unsigned long long high_bit = (unsigned long long)1 << 40;",
+    )
+    .unwrap();
+    let global = |name: &str| {
+        unit.globals
+            .iter()
+            .find(|global| global.name == name)
+            .unwrap()
+    };
+    let scalar_constant = |name: &str| {
+        let FullTypedInitializerKind::Scalar(expression) =
+            &global(name).initializer.as_ref().unwrap().kind
+        else {
+            panic!("{name} has a scalar initializer")
+        };
+        expression.constant
+    };
+
+    assert_eq!(
+        scalar_constant("selected"),
+        Some(ConstantValue::Address(RelocatableAddress {
+            base: RelocatableBase::Global(global("values").id),
+            addend: 8,
+            one_past: false,
+        }))
+    );
+    assert_eq!(
+        scalar_constant("text_pointer"),
+        Some(ConstantValue::Address(RelocatableAddress {
+            base: RelocatableBase::Global(global("text").id),
+            addend: 0,
+            one_past: false,
+        }))
+    );
+    assert_eq!(
+        scalar_constant("high_bit"),
+        Some(ConstantValue::Unsigned(1_u128 << 40))
+    );
+}
+
+#[test]
+fn pointer_comparison_and_conditionals_merge_pointed_to_qualifiers() {
+    let unit = analyze_source(
+        "int compare(char *plain, const char *qualified) {\n\
+             return plain == qualified && qualified == plain;\n\
+         }\n\
+         const char *select(int choose, char *plain, const char *qualified) {\n\
+             return choose ? plain : qualified;\n\
+         }\n\
+         const char *reverse(int choose, char *plain, const char *qualified) {\n\
+             return choose ? qualified : plain;\n\
+         }",
+    )
+    .unwrap();
+
+    for name in ["select", "reverse"] {
+        let function = unit
+            .functions
+            .iter()
+            .find(|function| function.name == name)
+            .unwrap();
+        let FullTypedStatementKind::Compound(items) = &function.body.as_ref().unwrap().kind else {
+            panic!("{name} has a compound body")
+        };
+        let FullTypedBlockItem::Statement(statement) = &items[0] else {
+            panic!("{name} contains a return statement")
+        };
+        let FullTypedStatementKind::Return(Some(expression)) = &statement.kind else {
+            panic!("{name} returns a value")
+        };
+        let TypeKind::Pointer(pointer) = unit.types.kind(expression.ty.ty) else {
+            panic!("{name} returns a pointer")
+        };
+        assert!(pointer.pointee.qualifiers.contains(TypeQualifiers::CONST));
+    }
+}
+
+#[test]
+fn pointer_subtraction_accepts_different_pointee_qualifiers() {
+    let unit = analyze_source(
+        "long difference(const char *cursor, char *start) { return cursor - start; }",
+    )
+    .unwrap();
+    let body = unit.functions[0].body.as_ref().unwrap();
+    let FullTypedStatementKind::Compound(items) = &body.kind else {
+        panic!("body is compound")
+    };
+    let FullTypedBlockItem::Statement(statement) = &items[0] else {
+        panic!("body contains a return statement")
+    };
+    let FullTypedStatementKind::Return(Some(expression)) = &statement.kind else {
+        panic!("statement returns a value")
+    };
+    let FullTypedExpressionKind::Binary {
+        operator: syntax::BinaryOperator::Subtract,
+        left,
+        right,
+    } = &expression.kind
+    else {
+        panic!("return expression is pointer subtraction")
+    };
+    assert_eq!(expression.ty.ty, TypeId::LONG);
+    let TypeKind::Pointer(left) = unit.types.kind(left.ty.ty) else {
+        panic!("left operand is a pointer")
+    };
+    let TypeKind::Pointer(right) = unit.types.kind(right.ty.ty) else {
+        panic!("right operand is a pointer")
+    };
+    assert!(left.pointee.qualifiers.contains(TypeQualifiers::CONST));
+    assert!(right.pointee.qualifiers.is_empty());
+    assert_eq!(left.pointee.ty, right.pointee.ty);
 }
 
 #[test]
@@ -1214,7 +1836,19 @@ fn rejects_unsupported_semantics_and_storage_but_allows_long_double_layout() {
             .iter()
             .any(|diagnostic| diagnostic.code == "CCC2345")
     );
-    assert!(diagnostic_codes("int value __asm__(\"renamed\");").contains(&"CCC2346".to_owned()));
+    let parsed = parse_source("extern int value __asm__(\"renamed\");");
+    let mut config = EffectiveCompilationConfig::default();
+    config.capabilities.insert(
+        CapabilityKind::Extension,
+        "gnu-declaration-asm-labels",
+        CapabilityState::ParseOnly,
+    );
+    let diagnostics = analyze_frontend(&parsed, &config).unwrap_err();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CCC2346")
+    );
     assert!(diagnostic_codes("__thread int value;").contains(&"CCC2374".to_owned()));
     assert!(
         diagnostic_codes("struct Packet { unsigned long length; char bytes[]; };")

@@ -6,8 +6,8 @@ use ccc_sema::generic::{
     FullFunctionId, FullLocalId, FullTypedBlockItem, FullTypedExpression, FullTypedExpressionKind,
     FullTypedForInitializer, FullTypedFunction, FullTypedInitializer, FullTypedInitializerKind,
     FullTypedLocalDeclaration, FullTypedStatement, FullTypedStatementKind,
-    FullTypedTranslationUnit, GlobalId, InitializerPathElement, LabelId, Linkage, Place, PlaceBase,
-    StorageDuration, StringId, SymbolReference,
+    FullTypedTranslationUnit, GlobalId, InitializerPathElement, LabelId, Linkage,
+    MemoryOrder as TypedMemoryOrder, Place, PlaceBase, StorageDuration, StringId, SymbolReference,
 };
 use ccc_session::Span;
 use ccc_syntax::frontend::{
@@ -46,7 +46,10 @@ pub fn lower_frontend(unit: &FullTypedTranslationUnit) -> Result<FullModule, IrE
         .map(|(index, (function, declaration))| {
             (
                 (*function, declaration.local),
-                DataId((unit.globals.len() + index) as u32),
+                (
+                    DataId((unit.globals.len() + index) as u32),
+                    declaration.duration,
+                ),
             )
         })
         .collect::<BTreeMap<_, _>>();
@@ -64,7 +67,9 @@ pub fn lower_frontend(unit: &FullTypedTranslationUnit) -> Result<FullModule, IrE
             initializer: global
                 .initializer
                 .as_ref()
-                .map(|initializer| lower_initializer_graph(initializer, &file_data, unit))
+                .map(|initializer| {
+                    lower_initializer_graph(initializer, &file_data, &static_data, unit)
+                })
                 .transpose()?,
             tentative: global.tentative,
             emission: global.emission.clone(),
@@ -83,7 +88,7 @@ pub fn lower_frontend(unit: &FullTypedTranslationUnit) -> Result<FullModule, IrE
             ));
         };
         globals.push(FullGlobal {
-            id: static_data[&(function, declaration.local)],
+            id: static_data[&(function, declaration.local)].0,
             source: DataOrigin::BlockStatic {
                 function,
                 local: declaration.local,
@@ -96,7 +101,9 @@ pub fn lower_frontend(unit: &FullTypedTranslationUnit) -> Result<FullModule, IrE
             initializer: declaration
                 .initializer
                 .as_ref()
-                .map(|initializer| lower_initializer_graph(initializer, &file_data, unit))
+                .map(|initializer| {
+                    lower_initializer_graph(initializer, &file_data, &static_data, unit)
+                })
                 .transpose()?,
             tentative: false,
             emission,
@@ -218,17 +225,20 @@ fn collect_static_declarations_in_statement<'a>(
 struct InitializerBuilder<'a> {
     nodes: Vec<InitializerNode>,
     file_data: &'a BTreeMap<GlobalId, DataId>,
+    static_data: &'a BTreeMap<(FullFunctionId, FullLocalId), (DataId, StorageDuration)>,
     unit: &'a FullTypedTranslationUnit,
 }
 
 fn lower_initializer_graph(
     initializer: &FullTypedInitializer,
     file_data: &BTreeMap<GlobalId, DataId>,
+    static_data: &BTreeMap<(FullFunctionId, FullLocalId), (DataId, StorageDuration)>,
     unit: &FullTypedTranslationUnit,
 ) -> Result<InitializerGraph, IrError> {
     let mut builder = InitializerBuilder {
         nodes: Vec::new(),
         file_data,
+        static_data,
         unit,
     };
     let root = builder.initializer(initializer)?;
@@ -263,7 +273,13 @@ impl InitializerBuilder<'_> {
                         "static initializer did not retain a constant value",
                     ));
                 };
-                constant_initializer(constant, self.file_data, self.unit, expression.span)?
+                constant_initializer(
+                    constant,
+                    self.file_data,
+                    self.static_data,
+                    self.unit,
+                    expression.span,
+                )?
             }
             FullTypedInitializerKind::Aggregate(entries) => {
                 if let Some((element, count)) = repeated_array_element(entries) {
@@ -354,6 +370,7 @@ fn same_constant_value(left: Option<ConstantValue>, right: Option<ConstantValue>
 fn constant_initializer(
     constant: ConstantValue,
     file_data: &BTreeMap<GlobalId, DataId>,
+    static_data: &BTreeMap<(FullFunctionId, FullLocalId), (DataId, StorageDuration)>,
     unit: &FullTypedTranslationUnit,
     span: Span,
 ) -> Result<InitializerNodeKind, IrError> {
@@ -386,6 +403,29 @@ fn constant_initializer(
                         RelocationKind::ObjectAddress
                     },
                 ),
+                ccc_sema::generic::RelocatableBase::BlockStatic { function, local } => {
+                    let (data, duration) = static_data
+                        .get(&(function, local))
+                        .copied()
+                        .ok_or_else(|| {
+                            IrError::lower(
+                                LOWERING_ERROR,
+                                span,
+                                format!(
+                                    "initializer references unknown block-static object {}:{}",
+                                    function.0, local.0
+                                ),
+                            )
+                        })?;
+                    (
+                        RelocationTarget::Object(data),
+                        if duration == StorageDuration::Thread {
+                            RelocationKind::ThreadLocalAddress
+                        } else {
+                            RelocationKind::ObjectAddress
+                        },
+                    )
+                }
                 ccc_sema::generic::RelocatableBase::Function(function) => (
                     RelocationTarget::Function(function),
                     RelocationKind::FunctionAddress,
@@ -789,7 +829,8 @@ fn scan_expression_for_address_taken(
         | E::DeclRef(_)
         | E::Sizeof { .. }
         | E::Alignof { .. }
-        | E::Offsetof { .. } => {}
+        | E::Offsetof { .. }
+        | E::MemoryFence { .. } => {}
     }
 }
 
@@ -812,7 +853,7 @@ struct LoweredPlace {
 enum PendingAggregateProjection<'a> {
     Field {
         index: usize,
-        name: &'a str,
+        name: Option<&'a str>,
         bitfield: Option<BitfieldDescriptor>,
     },
     Index {
@@ -835,7 +876,7 @@ fn collect_aggregate_projection<'a>(
             let root = collect_aggregate_projection(base, projections).unwrap_or(base);
             projections.push(PendingAggregateProjection::Field {
                 index: *field_index,
-                name,
+                name: name.as_deref(),
                 bitfield: bitfield.as_deref().map(bitfield_descriptor),
             });
             Some(root)
@@ -864,7 +905,7 @@ struct SwitchContext {
 struct FunctionBuilder<'a> {
     unit: &'a FullTypedTranslationUnit,
     file_data: &'a BTreeMap<GlobalId, DataId>,
-    static_data: &'a BTreeMap<(FullFunctionId, FullLocalId), DataId>,
+    static_data: &'a BTreeMap<(FullFunctionId, FullLocalId), (DataId, StorageDuration)>,
     types: &'a mut TypeStore,
     function: FullFunction,
     current: Option<BlockId>,
@@ -880,7 +921,7 @@ impl<'a> FunctionBuilder<'a> {
         source: &FullTypedFunction,
         unit: &'a FullTypedTranslationUnit,
         file_data: &'a BTreeMap<GlobalId, DataId>,
-        static_data: &'a BTreeMap<(FullFunctionId, FullLocalId), DataId>,
+        static_data: &'a BTreeMap<(FullFunctionId, FullLocalId), (DataId, StorageDuration)>,
         types: &'a mut TypeStore,
     ) -> Result<FullFunction, IrError> {
         if let Some(parameter) = source
@@ -953,6 +994,7 @@ impl<'a> FunctionBuilder<'a> {
                 signature: source.signature,
                 storage_class: source.storage,
                 linkage: source.linkage,
+                binding: source.binding,
                 visibility: source.visibility,
                 properties: source.properties,
                 symbol_name,
@@ -1505,7 +1547,8 @@ fn remap_instruction_values(
         | FullInstructionKind::AddressOfGlobal { .. }
         | FullInstructionKind::AddressOfFunction { .. }
         | FullInstructionKind::AddressOfString { .. }
-        | FullInstructionKind::AddressOfStorage { .. } => {}
+        | FullInstructionKind::AddressOfStorage { .. }
+        | FullInstructionKind::MemoryFence { .. } => {}
         FullInstructionKind::ProjectField { base, .. } => map(base)?,
         FullInstructionKind::PointerOffset { base, index, .. } => {
             map(base)?;
@@ -2381,6 +2424,13 @@ impl FunctionBuilder<'_> {
                     expression.span,
                 )
                 .map(Some),
+            E::MemoryFence { order } => {
+                let order = match order {
+                    TypedMemoryOrder::SequentiallyConsistent => MemoryOrder::SequentiallyConsistent,
+                };
+                self.emit_effect(FullInstructionKind::MemoryFence { order }, expression.span)?;
+                Ok(None)
+            }
             E::VaStart {
                 list,
                 last_named_parameter,
@@ -2488,6 +2538,23 @@ impl FunctionBuilder<'_> {
                                 format!("constant references unknown global {}", global.0),
                             )
                         })?)
+                    }
+                    ccc_sema::generic::RelocatableBase::BlockStatic { function, local } => {
+                        RelocationTarget::Object(
+                            self.static_data
+                                .get(&(function, local))
+                                .map(|(data, _)| *data)
+                                .ok_or_else(|| {
+                                    IrError::lower(
+                                        LOWERING_ERROR,
+                                        span,
+                                        format!(
+                                            "constant references unknown block-static object {}:{}",
+                                            function.0, local.0
+                                        ),
+                                    )
+                                })?,
+                        )
                     }
                     ccc_sema::generic::RelocatableBase::Function(function) => {
                         RelocationTarget::Function(function)
@@ -2636,7 +2703,7 @@ impl FunctionBuilder<'_> {
                         projected_bitfield = bitfield;
                         AggregateProjection::Field {
                             index,
-                            name: Some(name.to_owned()),
+                            name: name.map(str::to_owned),
                             bitfield,
                         }
                     }
@@ -2689,7 +2756,11 @@ impl FunctionBuilder<'_> {
                 self.address_of_data(data, expression.ty, expression.span)?
             }
             FullTypedExpressionKind::DeclRef(SymbolReference::Local(local)) => {
-                if let Some(data) = self.static_data.get(&(self.function.id, *local)).copied() {
+                if let Some(data) = self
+                    .static_data
+                    .get(&(self.function.id, *local))
+                    .map(|(data, _)| *data)
+                {
                     self.address_of_data(data, expression.ty, expression.span)?
                 } else {
                     let storage = *self.storage_by_local.get(local).ok_or_else(|| {
@@ -2748,7 +2819,7 @@ impl FunctionBuilder<'_> {
                         base: base_address,
                         record,
                         field_index: *field_index,
-                        field_name: Some(name.clone()),
+                        field_name: name.clone(),
                     },
                     QualifiedType::unqualified(pointer),
                     expression.span,
@@ -3163,7 +3234,10 @@ impl FunctionBuilder<'_> {
                     FullInstructionKind::PointerDifference {
                         left,
                         right,
-                        element,
+                        // Pointer subtraction permits qualified and unqualified
+                        // versions of compatible object types. Qualifiers do not
+                        // affect the element stride carried by the IR.
+                        element: QualifiedType::unqualified(element.ty),
                     },
                     result_ty,
                     span,

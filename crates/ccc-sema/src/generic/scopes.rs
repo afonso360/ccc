@@ -141,6 +141,10 @@ impl ScopeStack {
         Ok(())
     }
 
+    pub fn current_tag(&self, name: &str) -> Option<TagSymbol> {
+        self.current().tags.get(name).copied()
+    }
+
     pub fn lookup_tag(&self, name: &str) -> Option<TagSymbol> {
         self.scopes
             .iter()
@@ -223,7 +227,7 @@ impl LabelScope {
     pub fn undefined_uses(&self) -> Vec<(String, Span)> {
         self.labels
             .iter()
-            .filter(|(_, label)| label.definition.is_none() && !label.uses.is_empty())
+            .filter(|(_, label)| label.id == LabelId(u32::MAX) && !label.uses.is_empty())
             .map(|(name, label)| (name.clone(), label.uses[0]))
             .collect()
     }
@@ -293,6 +297,7 @@ mod tests {
 
         labels.reserve_definition("forward");
         let forward = labels.note_use("forward", first);
+        assert!(labels.undefined_uses().is_empty());
         assert_eq!(labels.define("forward", second), Ok(forward));
         labels.note_use("missing", first);
         labels.note_use("missing", second);

@@ -182,15 +182,15 @@ command, enabled features, patches if any, expected exclusions, and whether
 success means preprocess, compile, link, or run. “Builds unmodified” is used
 only when no source or build-system patch is applied.
 
-Hosted-header preprocessing and parsing are separate gates. A licensed, pinned
-glibc-like fixture has both a deterministic preprocessing golden and an AST
-surface check. On x86-64 Linux, installed glibc feature, definition, integer,
-type, unistd, and string headers are also exercised by separate preprocessing
-and parsing tests. The installed-header tests record compiler, target, and libc
-identity and assert stable sentinel properties rather than snapshotting a
-mutable system header. Parsing success certifies only the advertised parsing
-ceiling; it does not imply semantic analysis or object-emission support for
-parse-only declarations.
+Hosted-header preprocessing, parsing, and code generation are separate gates.
+A licensed, pinned glibc-like fixture has both a deterministic preprocessing
+golden and an AST surface check. On x86-64 Linux, installed glibc feature,
+definition, integer, type, unistd, string, and pthread headers are exercised by
+preprocessing and parsing tests plus a compile-link-execute sentinel. The
+installed-header tests record compiler, target, and libc identity and assert
+stable sentinel properties rather than snapshotting a mutable system header.
+Parse-only declarations remain confined to the AST fixture; the execution
+sentinel independently proves the supported declaration subset.
 
 Corpus pins encode capability dependencies. SQLite is pinned by its
 [corpus manifest](../../test-corpus/sqlite/manifest.toml) to 3.47.2. Release

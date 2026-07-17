@@ -158,6 +158,35 @@ mod tests {
     }
 
     #[test]
+    fn accepts_empty_file_scope_declarations_only_in_gnu_mode() {
+        let unit = parse_source_with_mode("; int value; ;", LanguageMode::Gnu11).unwrap();
+        assert_eq!(unit.items.len(), 1);
+        assert!(matches!(unit.items[0], ExternalItem::Declaration(_)));
+
+        let error = parse_source_with_mode(";", LanguageMode::C11).unwrap_err();
+        assert_eq!(error.code, "CCC1020");
+    }
+
+    #[test]
+    fn parses_unnamed_array_parameters() {
+        let unit = parse_source("extern char *tmpnam(char[20]);").unwrap();
+        let ExternalItem::Declaration(declaration) = &unit.items[0] else {
+            panic!("expected a declaration");
+        };
+        let DirectDeclarator::Function { parameters, .. } =
+            &declaration.declarators[0].declarator.direct
+        else {
+            panic!("expected a function declarator");
+        };
+        let DirectDeclarator::Array { inner, .. } =
+            &parameters[0].declarator.as_ref().unwrap().direct
+        else {
+            panic!("expected an unnamed array declarator");
+        };
+        assert!(matches!(inner.as_ref(), DirectDeclarator::Abstract(_)));
+    }
+
+    #[test]
     fn parses_remaining_statements_and_expression_operators() {
         parse_source(
             "int f(int n) {\n\
@@ -302,6 +331,24 @@ mod tests {
         assert!(dump.contains("builtin-va-arg"), "{dump}");
         assert!(dump.contains("builtin-va-copy"), "{dump}");
         assert_eq!(dump.matches("builtin-va-end").count(), 2, "{dump}");
+    }
+
+    #[test]
+    fn parses_sync_synchronize_only_with_exact_zero_argument_syntax() {
+        let unit = parse_source("void synchronize(void) { __sync_synchronize(); }").unwrap();
+        let dump = dump_ast(&unit);
+        assert!(dump.contains("builtin-sync-synchronize"), "{dump}");
+
+        for source in [
+            "void synchronize(void) { __sync_synchronize(1); }",
+            "void synchronize(void) { __sync_synchronize; }",
+        ] {
+            let error = parse_source(source).unwrap_err();
+            assert!(
+                error.message.contains("__sync_synchronize"),
+                "{source}: {error}"
+            );
+        }
     }
 
     #[test]

@@ -7,7 +7,7 @@ use ccc_target::GnuCompatibilityProfile;
 const RESOURCE_FORMAT_VERSION: u64 = 2;
 const GNU_PROFILE_NAME: &str = "gcc-4.2.1";
 const GNU_PROFILE_VERSION: &str = "4.2.1";
-const GNU_PROFILE_SCOPE: &str = "parsing";
+const GNU_PROFILE_SCOPE: &str = "code-generation";
 const GNU_PROFILE_SELECTION_GATE: &str = "__GNUC_PREREQ(4, 2)";
 const GNU_PROFILE_CAPABILITIES: &[&str] = &[
     "computed-includes",
@@ -612,7 +612,7 @@ mod tests {
         "[hosted_header_profile]\n",
         "name = \"gcc-4.2.1\"\n",
         "version = \"4.2.1\"\n",
-        "scope = \"parsing\"\n",
+        "scope = \"code-generation\"\n",
         "selection_gate = \"__GNUC_PREREQ(4, 2)\"\n",
         "rationale = \"The conservative gate selects a tested preprocessing and declaration-parsing surface without implying newer GNU features.\"\n",
         "capabilities = [\n",

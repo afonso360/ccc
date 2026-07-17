@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 
 use ccc_ir::generic as gir;
 use ccc_sema::generic::{
-    Linkage as CLinkage, ObjectDefinitionPolicy, StorageDuration, SymbolVisibility,
+    Linkage as CLinkage, ObjectDefinitionPolicy, StorageDuration, SymbolBinding, SymbolVisibility,
 };
 use ccc_target::{EffectiveCompilationConfig, RelocationModel};
 use ccc_types::{
@@ -187,6 +187,7 @@ fn emit_inner(
         };
         let symbol = product.function_symbol(id);
         let symbol = product.object.symbol_mut(symbol);
+        symbol.weak = function.binding == SymbolBinding::Weak;
         set_elf_symbol_visibility(symbol, function.visibility);
     }
     for global in module
@@ -199,6 +200,7 @@ fn emit_inner(
         };
         let symbol = product.data_symbol(declaration.id);
         let symbol = product.object.symbol_mut(symbol);
+        symbol.weak = global.emission.binding == SymbolBinding::Weak;
         set_elf_symbol_visibility(symbol, global.emission.visibility);
     }
     unwind.emit(&mut product).map_err(error)?;
@@ -499,8 +501,6 @@ fn declare_module(
     let mut globals = HashMap::with_capacity(module.globals.len());
     let mut commons = Vec::new();
     for global in &module.globals {
-        let layout = object_layout(&module.types, global.ty, config)
-            .map_err(|error| error.with_span_if_none(global.span))?;
         let tls = global.duration == StorageDuration::Thread || global.emission.tls.is_some();
         let is_external_common = global.emission.definition
             == ObjectDefinitionPolicy::TentativeCommon
@@ -528,6 +528,8 @@ fn declare_module(
             );
         }
         if is_external_common {
+            let layout = object_layout(&module.types, global.ty, config)
+                .map_err(|error| error.with_span_if_none(global.span))?;
             commons.push(CommonDefinition {
                 id,
                 size: layout.size,

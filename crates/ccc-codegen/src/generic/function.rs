@@ -848,6 +848,12 @@ impl FunctionState<'_> {
                     arguments,
                     *variadic_boundary,
                 ),
+                I::MemoryFence {
+                    order: gir::MemoryOrder::SequentiallyConsistent,
+                } => {
+                    builder.ins().fence();
+                    Ok(None)
+                }
                 I::VaStart {
                     list,
                     last_named_parameter: _,
@@ -1418,10 +1424,12 @@ impl FunctionState<'_> {
             ccc_abi::BoundaryPlan::Native(plan) => plan.parameters.len(),
             ccc_abi::BoundaryPlan::Bridge(plan) => plan.parameters.len(),
         };
-        let boundary_matches = if planned_signature.variadic {
-            variadic_boundary <= arguments.len()
-        } else {
-            variadic_boundary == arguments.len()
+        let boundary_matches = match &planned_signature.parameters {
+            ccc_types::FunctionParameters::Unspecified => variadic_boundary == 0,
+            ccc_types::FunctionParameters::Prototype(_) if planned_signature.variadic => {
+                variadic_boundary <= arguments.len()
+            }
+            ccc_types::FunctionParameters::Prototype(_) => variadic_boundary == arguments.len(),
         };
         if parameter_count != arguments.len() || !boundary_matches {
             return Err(error(format!(
@@ -2410,9 +2418,16 @@ fn lower_conversion(
     let value = match kind {
         gir::ScalarConversion::ArrayToPointer
         | gir::ScalarConversion::FunctionToPointer
-        | gir::ScalarConversion::PointerConversion
         | gir::ScalarConversion::QualificationAdjustment => {
             coerce_value(builder, operand, destination, false)?
+        }
+        gir::ScalarConversion::PointerConversion => {
+            let signed = if types.is_integer(from.ty) {
+                is_signed(types, from, config)?
+            } else {
+                false
+            };
+            coerce_value(builder, operand, destination, signed)?
         }
         gir::ScalarConversion::IntegerPromotion | gir::ScalarConversion::IntegerConversion => {
             coerce_integer(

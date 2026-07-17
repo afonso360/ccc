@@ -155,6 +155,11 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
             "-w" => suppress_warnings = true,
             "-Werror" => warnings_as_errors = true,
             "-Wno-error" => warnings_as_errors = false,
+            // CCC currently has one baseline code-generation profile and does
+            // not emit debug information. These explicitly allowlisted quality
+            // options therefore cannot change language semantics, ABI,
+            // predefined macros, or the generated object.
+            "-g" | "-O" | "-O0" | "-O1" | "-O2" | "-O3" | "-Os" | "-Oz" => {}
             "-M" => select_dependency_mode(
                 &mut dependencies.mode,
                 DependencyMode::Only {
@@ -239,6 +244,7 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
             _ if let Some(value) = argument.strip_prefix("-ferror-limit=") => {
                 error_limit = Some(parse_limit(value, "-ferror-limit")?);
             }
+            _ if is_debug_level_option(&argument) => {}
             _ if let Some(value) = argument.strip_prefix("-D") => {
                 require_joined_value(value, "-D")?;
                 macro_actions.push(MacroAction::Define(value.to_owned()));
@@ -392,6 +398,12 @@ fn parse_limit(value: &str, option: &str) -> Result<usize, String> {
         .map_err(|_| format!("ccc: `{option}` requires a non-negative integer"))
 }
 
+fn is_debug_level_option(argument: &str) -> bool {
+    argument
+        .strip_prefix("-g")
+        .is_some_and(|level| !level.is_empty() && level.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -523,5 +535,33 @@ mod tests {
             options(&["-ferror-limit=0", "input.c"]).error_limit,
             Some(0)
         );
+    }
+
+    #[test]
+    fn accepts_allowlisted_debug_and_optimization_options() {
+        for argument in [
+            "-g", "-g0", "-g1", "-g2", "-g3", "-g17", "-O", "-O0", "-O1", "-O2", "-O3", "-Os",
+            "-Oz",
+        ] {
+            let options = options(&[argument, "input.c"]);
+            assert_eq!(options.input, PathBuf::from("input.c"), "{argument}");
+        }
+    }
+
+    #[test]
+    fn rejects_unlisted_debug_and_optimization_options() {
+        for argument in [
+            "-ggdb",
+            "-gline-tables-only",
+            "-g-1",
+            "-Og",
+            "-O4",
+            "-Ofast",
+        ] {
+            assert!(
+                parse([argument.to_owned(), "input.c".to_owned()]).is_err(),
+                "{argument} must remain an unsupported option"
+            );
+        }
     }
 }

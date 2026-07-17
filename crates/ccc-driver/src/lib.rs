@@ -47,6 +47,8 @@ pub use empty_object::is_empty_elf64_relocatable;
 const HELP: &str = "Usage: ccc [options] <input.c>\n\
   -c                         Compile without linking\n\
   -E [-P]                    Preprocess only; -P suppresses linemarkers\n\
+  -O|-O0|-O1|-O2|-O3|-Os|-Oz\n\
+  -g|-gN                     Accepted compatibility options; currently no code-generation effect\n\
   -Dname[=value] -Uname      Define or undefine a macro\n\
   -I dir -iquote dir         Add user include search paths\n\
   -isystem dir -idirafter dir Add system include search paths\n\

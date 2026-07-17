@@ -8,6 +8,11 @@ int *global_pointer = &global_counter;
 static int static_values[4] = {[3] = 13, [0] = 7, [2] = 11, [1] = 5};
 static struct Pair static_pair = {.right = 19, .left = 17};
 static int zero_initialized;
+static int address_values[4] = {3, 5, 7, 11};
+static int *offset_pointer = &address_values[2];
+static const char name_storage[] = "named";
+static const char *name_pointer = name_storage;
+static unsigned long long high_bit = (unsigned long long)1 << 40;
 
 static int next_call_value(void) {
     static int value = 2;
@@ -28,6 +33,21 @@ int main(void) {
         return 3;
     if (zero_initialized != 0)
         return 4;
+    if (offset_pointer != &address_values[2] || *offset_pointer != 7)
+        return 7;
+    if (name_pointer != name_storage || name_pointer[4] != 'd')
+        return 8;
+    if (high_bit != 1099511627776ULL)
+        return 9;
+
+    {
+        char value = 'x';
+        char *plain = &value;
+        const char *qualified = &value;
+        const char *selected = global_counter ? plain : qualified;
+        if (plain != qualified || qualified != plain || selected != &value)
+            return 10;
+    }
 
     first_call = next_call_value();
     second_call = next_call_value();

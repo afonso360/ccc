@@ -73,12 +73,6 @@ fn rejected_translations_match_diagnostic_goldens_and_emit_no_object() {
             ),
         },
         Case {
-            name: "unspecified-call-boundary",
-            expected: include_str!(
-                "../../../tests/diagnostics/goldens/unspecified-call-boundary.stderr"
-            ),
-        },
-        Case {
             name: "invalid-va-start",
             expected: include_str!("../../../tests/diagnostics/goldens/invalid-va-start.stderr"),
         },
