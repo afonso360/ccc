@@ -20,23 +20,50 @@ the repository.
 
 Configuration is out of tree and uses the classic Autoconf-generated
 `configure` plus Makefile interface. Host build tools are compiled with GCC
-through `BUILD_CC`; target objects and `testfixture` are compiled and linked
-with CCC through `CC`. Optional readline, shared-library, and load-extension
-paths are disabled explicitly so installed host packages cannot silently alter
-the selected C surface. Tcl and zlib discovery must nevertheless succeed and
-is recorded in `config.log`.
+through SQLite's `BCC` Make variable; target objects and `testfixture` are
+compiled with CCC through `CC`, then linked by the configured native driver.
+Optional readline, shared-library, and load-extension paths are disabled
+explicitly so installed host packages cannot silently alter the selected C
+surface. Tcl and zlib discovery must nevertheless succeed and is recorded in
+`config.log`.
 
-The adapter builds `testfixture` and runs the Makefile-owned test target:
+The adapter pins `ac_cv_func_isnan=no`. A link-only Autoconf probe finds the
+host `isnan` symbol, but glibc exposes the source interface as a type-generic
+macro whose expansion references `__isnanl` even when its operand is `double`.
+That source interface therefore requires an ABI CCC does not advertise. The
+cache decision selects SQLite's own binary64 bit test, which is the intended
+fallback when the host interface is unusable; it does not patch SQLite source.
+
+The adapter builds `testfixture` and runs the Makefile-owned serial target that
+invokes `test/veryquick.test`:
 
 ```text
-make veryquick
+make -j1 tcltest
 ```
+
+Run [`run.sh`](run.sh) on x86-64 Linux with `CCC` set to the compiler binary.
+`ccc-cc` is a transparent compiler-driver adapter: every C input is compiled by
+CCC, while the configured native toolchain performs only the final link. It
+never retries a failed translation with another C compiler. Pass a previously
+downloaded archive with `--archive`, or let the adapter populate its disposable
+cache after verifying the pinned hashes.
+
+Run the adapter as a non-root user on a native Linux filesystem. SQLite's Tcl
+suite deliberately checks that a mode-`0000` file is unreadable; it rejects UID
+0, and Docker Desktop bind mounts backed by macOS do not provide the required
+permission semantics. For containerized validation, use a Linux Docker volume
+owned by the non-root container user for the complete work directory.
 
 The checked-in expected inventory is evaluated under CCC's effective compiler
 identity, never under the host GCC or Clang identity. It selects the full
 barrier builtin `__sync_synchronize` and no inline assembly. The latter remains
 true only while `VDBE_PROFILE`, `SQLITE_PERFORMANCE_TRACE`, and
 `SQLITE_ENABLE_STMT_SCANSTATUS` are absent.
+
+`effective-macros.txt` is CCC's complete predefined-macro dump for the run.
+`predicate-probe.txt` records the version and feature predicates that select
+SQLite's compiler-specific paths. The adapter rejects a run when those
+decisions differ from the pinned inventory.
 
 ## Updating the pin
 

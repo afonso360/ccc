@@ -20,7 +20,9 @@ gnu_compatibility_tuple = "4.2.1"
 build_interface = "classic-autoconf-make"
 configure_entrypoint = "./configure"
 build_target = "testfixture"
-test_command = "make veryquick"
+test_target = "tcltest"
+test_script = "test/veryquick.test"
+test_command = "make -j1 tcltest"
 build_compiler = "gcc"
 target_compiler = "ccc"
 configure_arguments = [
@@ -28,12 +30,34 @@ configure_arguments = [
     "--disable-readline",
     "--disable-load-extension",
 ]
-required_tools = ["gcc", "clang", "make", "pkg-config", "tclsh"]
+configure_cache = ["ac_cv_func_isnan=no"]
+required_tools = [
+    "awk",
+    "bash",
+    "curl",
+    "find",
+    "gcc",
+    "grep",
+    "id",
+    "make",
+    "mktemp",
+    "openssl",
+    "pkg-config",
+    "sed",
+    "tclsh",
+    "tee",
+    "tr",
+    "unzip",
+    "wc",
+]
 required_development_packages = ["tcl", "zlib"]
+requires_non_root_user = true
+requires_native_linux_filesystem = true
 
 pin_rationales = [
     "Release 3.47.0 removed SQLite's remaining long double use by switching that calculation to Dekker's algorithm.",
     "Release 3.47.2 is the final canonical-source release before the configure and Makefile interface migrated from Autoconf to Autosetup in 3.48.0.",
+    "The isnan configure cache decision selects SQLite's binary64 implementation because glibc's type-generic macro references the unavailable long double ABI even for double operands.",
 ]
 
 [expected_inventory]
@@ -66,4 +90,5 @@ retain = [
     "compile-commands.txt",
     "capability-inventory.txt",
     "test-out.txt",
+    "test-run.log",
 ]
