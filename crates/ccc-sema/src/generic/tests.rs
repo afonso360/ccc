@@ -894,6 +894,10 @@ fn types_legacy_sync_operations_with_native_scalar_and_pointer_contracts() {
             "CCC2434",
         ),
         (
+            "__int128 x; __int128 f(void) { return __sync_fetch_and_add(&x, 1); }",
+            "CCC2434",
+        ),
+        (
             "struct Pair { int x; }; struct Pair value; int f(void) { return __sync_bool_compare_and_swap(&value, value, value); }",
             "CCC2434",
         ),
