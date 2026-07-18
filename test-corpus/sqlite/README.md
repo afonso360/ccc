@@ -34,11 +34,11 @@ complete `--version` output, and predefined macros are retained with the run.
 Ambient GNU Make injection through `MAKEFILES` or `GNUMAKEFLAGS` is cleared
 with the other build and configure overrides before configuration.
 
-CCC emits static-model objects, while current Linux GCC drivers commonly link
-position-independent executables by default. Configuration therefore pins
-`LDFLAGS=-no-pie`. The adapter requires the resulting `testfixture` to be an
-ELF `EXEC` file and rejects dynamic text relocations, preventing an apparently
-successful host link from weakening the executable contract.
+CCC emits position-independent objects, and the configured native driver links
+them using its normal executable defaults. The adapter requires the resulting
+`testfixture` to be an ELF `DYN` file and rejects dynamic text relocations,
+preventing an apparently successful host link from weakening the executable
+contract.
 
 Every CCC translation receives an explicit leading `-std=gnu11`, matching the
 manifest even if CCC's driver default changes. The wrapper evaluates all
@@ -133,9 +133,10 @@ compares the recorded CCC inputs with the configured Makefile's
 translation units: archive sources plus the verified generated `sqlite3.c`.
 The wrapper rejects sources outside those provenance roots, and the audit
 requires one CCC command per source followed by exactly one source-free native
-link. `-no-pie`, `-Wl,*`, and library arguments are retained only for that
-native link. Command and source logging each append a complete record in one
-operation, so concurrent Make jobs cannot splice partial records together.
+link. `-Wl,*` and library arguments are retained only for that native link;
+the adapter does not add relocation-model flags. Command and source logging
+each append a complete record in one operation, so concurrent Make jobs cannot
+splice partial records together.
 The sorted expected and observed source sets are retained with the build
 artifacts. Suite-specific targets may subsequently compile additional archive
 sources or generated C files such as `sqlite3_analyzer.c`; those inputs remain
@@ -147,7 +148,7 @@ After the selected suite returns, the adapter rechecks the canonical
 `sqlite3.c` hash and rejects any native link record that contains C or
 preprocessed-C input. For `full`, it additionally requires both `fuzzcheck` and
 `sessionfuzz` and retains separate ELF header and dynamic-tag evidence proving
-that each is a non-PIE `EXEC` file without dynamic text relocations.
+that each is a PIE `DYN` file without dynamic text relocations.
 
 Run the adapter as a non-root user on a native Linux filesystem. SQLite's Tcl
 suite deliberately checks that a mode-`0000` file is unreadable; it rejects UID

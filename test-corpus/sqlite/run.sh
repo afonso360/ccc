@@ -30,7 +30,7 @@ require_tool() {
   command -v "$1" >/dev/null 2>&1 || die "required tool is not available: $1"
 }
 
-verify_non_pie_executable() {
+verify_pie_executable() {
   local program=$1
   local header_artifact=$2
   local dynamic_artifact=$3
@@ -40,8 +40,8 @@ verify_non_pie_executable() {
   readelf --file-header "$program" >"$header_artifact"
   readelf --dynamic "$program" >"$dynamic_artifact"
   program_type=$(awk '/^[[:space:]]*Type:/{print $2; exit}' "$header_artifact")
-  [[ "$program_type" == EXEC ]] ||
-    die "SQLite $program is $program_type rather than the pinned non-PIE executable type"
+  [[ "$program_type" == DYN ]] ||
+    die "SQLite $program is $program_type rather than the required PIE executable type"
   if grep -Eq '\(TEXTREL\)|FLAGS.*TEXTREL' "$dynamic_artifact"; then
     die "SQLite $program contains dynamic text relocations"
   fi
@@ -246,7 +246,6 @@ cd "$build_directory"
 # so the configure link probe is not a sufficient test of whether that macro is
 # usable. Selecting SQLite's own binary64 test keeps the configured surface
 # aligned with the compiler's advertised ABI without changing production C.
-LDFLAGS=-no-pie \
 ac_cv_func_isnan=no \
   CC="$script_directory/ccc-cc" \
   "$source_directory/configure" \
@@ -410,15 +409,13 @@ ccc_command_count=$(grep -c '^ccc ' "$CCC_SQLITE_COMMAND_LOG" || true)
 link_command_count=$(grep -c '^link ' "$CCC_SQLITE_COMMAND_LOG" || true)
 [[ "$link_command_count" == 1 ]] ||
   die "SQLite testfixture build used $link_command_count native link commands; expected 1"
-if grep -Eq '^ccc .* -no-pie( |$)' "$CCC_SQLITE_COMMAND_LOG"; then
-  die "SQLite linker-only -no-pie flag leaked into a CCC translation"
+if grep -Eq '^(ccc|link) .* -no-pie( |$)' "$CCC_SQLITE_COMMAND_LOG"; then
+  die "SQLite build unexpectedly disabled PIE"
 fi
-grep -Eq '^link .* -no-pie( |$)' "$CCC_SQLITE_COMMAND_LOG" ||
-  die "SQLite testfixture native link did not use -no-pie"
 if grep -Eq '^link .*\.(c|i)( |$)' "$CCC_SQLITE_COMMAND_LOG"; then
   die "SQLite native link received a C or preprocessed-C input"
 fi
-verify_non_pie_executable testfixture elf-headers.txt elf-dynamic-tags.txt
+verify_pie_executable testfixture elf-headers.txt elf-dynamic-tags.txt
 
 {
   run_sqlite_suite "$source_directory" "$CCC_LINK_CC" \
@@ -438,9 +435,9 @@ if grep -Eq '^link .*\.(c|i)( |$)' "$CCC_SQLITE_COMMAND_LOG"; then
 fi
 
 if [[ "$suite" == full ]]; then
-  verify_non_pie_executable \
+  verify_pie_executable \
     fuzzcheck fuzzcheck-elf-headers.txt fuzzcheck-elf-dynamic-tags.txt
-  verify_non_pie_executable \
+  verify_pie_executable \
     sessionfuzz sessionfuzz-elf-headers.txt sessionfuzz-elf-dynamic-tags.txt
 fi
 
