@@ -75,11 +75,10 @@ run_ccc() {
   local source=unknown
   local source_parent absolute_source generated_root
   local argument
-  local compiler_arguments=(-std=gnu11 "$@")
+  local compiler_arguments=("$@")
 
-  # Make the manifest's default language mode explicit on every translation.
-  # Later -std options retain the normal compiler-driver "last option wins"
-  # rule.
+  # CCC defaults to the manifest's GNU C11 mode. Explicit supported -std
+  # options retain the normal compiler-driver "last option wins" rule.
   for argument in "${compiler_arguments[@]}"; do
     case "$argument" in
       -DSQLITE_OSS_FUZZ | -DSQLITE_OSS_FUZZ=*)
@@ -177,6 +176,9 @@ for ((index = 0; index < ${#arguments[@]}; index++)); do
       ;;
     -c)
       compile_only=true
+      ;;
+    -std=c99 | -std=gnu99)
+      # The supported GNU C11 default is the upstream-compatible superset.
       ;;
     -E | -M | -MM | --dump-* | --emit=*)
       frontend_only=true

@@ -87,8 +87,8 @@ export CCC_REDIS_PREPROCESS_DIR="$temporary_directory/preprocessed"
 [[ -f "$temporary_directory/a.o" ]]
 [[ "$(grep -c '^ccc ' "$TRACE")" == 2 ]]
 ! grep -q '^link ' "$TRACE"
-grep -q -- ' -std=gnu11' "$TRACE"
-! grep -Eq -- '-std=c99|-ggdb|-pedantic|-fPIC' "$TRACE"
+! grep -Eq -- '-std=|-ggdb|-pedantic' "$TRACE"
+grep -q -- ' -fPIC' "$TRACE"
 grep -q -- ' -DREDIS_TEST_FLAG=1' "$TRACE"
 [[ "$(grep -c '^ccc ' "$CCC_REDIS_COMMAND_LOG")" == 1 ]]
 [[ "$(grep -c '^preprocess ' "$CCC_REDIS_COMMAND_LOG")" == 1 ]]
@@ -105,15 +105,15 @@ grep -Fxq "$source_directory/a.c" "$CCC_REDIS_SOURCE_LOG"
 : >"$TRACE"
 : >"$CCC_REDIS_COMMAND_LOG"
 : >"$CCC_REDIS_SOURCE_LOG"
-"$script_directory/ccc-cc" -std=gnu11 \
+"$script_directory/ccc-cc" -std=gnu99 \
   "$source_directory/a.c" "$source_directory/b.c" \
-  -o "$temporary_directory/program" -no-pie -L. -lhiredis
+  -o "$temporary_directory/program" -L. -lhiredis
 [[ -f "$temporary_directory/program" ]]
 [[ "$(grep -c '^ccc ' "$TRACE")" == 4 ]]
 [[ "$(grep -c '^link ' "$TRACE")" == 1 ]]
 ! grep '^link ' "$TRACE" | grep -Eq '\.(c|i)( |$)'
-! grep '^ccc ' "$CCC_REDIS_COMMAND_LOG" | grep -Eq -- '-no-pie|-L\.|-lhiredis'
-grep '^link ' "$CCC_REDIS_COMMAND_LOG" | grep -q -- ' -no-pie'
+! grep '^ccc ' "$CCC_REDIS_COMMAND_LOG" | grep -Eq -- '-std=|-L\.|-lhiredis'
+! grep '^link ' "$CCC_REDIS_COMMAND_LOG" | grep -Eq -- ' -pie( |$)| -no-pie( |$)'
 grep '^link ' "$CCC_REDIS_COMMAND_LOG" | grep -Fq -- ' -L.'
 grep '^link ' "$CCC_REDIS_COMMAND_LOG" | grep -q -- ' -lhiredis'
 [[ "$(grep -c '^ccc ' "$CCC_REDIS_COMMAND_LOG")" == 2 ]]

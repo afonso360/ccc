@@ -10,7 +10,9 @@ source is not committed to this repository.
 
 The adapter uses the upstream GNU Make interface on x86-64 Linux. Every C
 translation that produces the `zstd` command-line program or its `datagen` test
-helper goes through CCC in GNU C11 mode. The native GCC driver receives only
+helper goes through CCC using its GNU C11 driver default. The wrapper filters
+upstream C99, GNU99, and GNU C11 overrides instead of injecting a replacement
+standard flag. The native GCC driver receives only
 objects for final links; it never receives C, preprocessed C, assembly,
 or response-file inputs and is never used as a retry path. The adapter derives
 the selected upstream source multiset from the release Makefile, appends the
@@ -41,10 +43,10 @@ creation mask are pinned. The resolved native link driver must
 identify as GCC for an x86-64 Linux GNU target; its identity and predefined
 macros are retained.
 
-CCC emits static-model objects, while current Linux GCC drivers default to
-position-independent executables. All native links therefore receive `-no-pie`.
-The adapter requires the resulting `zstd` and `datagen` files to be ELF `EXEC`
-binaries and rejects dynamic text relocations.
+CCC emits position-independent objects, and the native GCC links use their
+platform defaults without an adapter-supplied relocation option. The adapter
+requires the resulting `zstd` and `datagen` files to be PIE executables with
+ELF type `DYN` and the PIE dynamic flag, and rejects dynamic text relocations.
 
 ## Portable no-assembly configuration
 

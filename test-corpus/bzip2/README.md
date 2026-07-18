@@ -19,9 +19,8 @@ subdirectory retain their upstream license information.
 The adapter uses bzip2's upstream Makefile on x86-64 Linux. It builds
 `libbz2.a`, `bzip2`, and `bzip2recover` with the following owned inputs:
 
-- `CC="ccc-cc -std=gnu11"`;
+- `CC=ccc-cc`, relying on CCC's documented GNU C11 driver default;
 - `CFLAGS="-Wall -Winline -O2 -g -D_FILE_OFFSET_BITS=64"`;
-- `LDFLAGS=-no-pie`;
 - resolved native `ar` and `ranlib` programs.
 
 CCC compiles all nine C translation units selected by those targets: the seven
@@ -39,10 +38,10 @@ rejected. The adapter verifies the native driver is GCC rather than Clang,
 targets the GNU x86-64 Linux ABI, and records its resolved path, version,
 target, complete identity output, and predefined macros.
 
-CCC currently emits static-model objects, while contemporary Linux GCC
-drivers normally produce position-independent executables. Both links
-therefore receive `-no-pie`. The resulting programs must be ELF `EXEC` files
-without dynamic text relocations. Exact compilation and link commands, source
+CCC emits position-independent objects, and the native GCC links use their
+platform defaults without an adapter-supplied relocation option. The resulting
+programs must be PIE executables with ELF type `DYN`, the PIE dynamic flag, and
+no dynamic text relocations. Exact compilation and link commands, source
 inputs, ELF headers, and dynamic tags remain in the retained work directory.
 
 Ambient Make injection and build flags are cleared before invoking the

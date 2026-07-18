@@ -84,7 +84,7 @@ verify_archive() {
     die "Redis archive SHA3-256 mismatch"
 }
 
-verify_non_pie_executable() {
+verify_pie_executable() {
   local label=$1
   local program=$2
   local header_artifact=$3
@@ -95,8 +95,10 @@ verify_non_pie_executable() {
   readelf --file-header "$program" >"$header_artifact"
   readelf --dynamic "$program" >"$dynamic_artifact"
   program_type=$(awk '/^[[:space:]]*Type:/{print $2; exit}' "$header_artifact")
-  [[ "$program_type" == EXEC ]] ||
-    die "$label is $program_type rather than the pinned non-PIE executable type"
+  [[ "$program_type" == DYN ]] ||
+    die "$label is $program_type rather than the required PIE executable type"
+  grep -Eq '\(FLAGS_1\).*PIE' "$dynamic_artifact" ||
+    die "$label does not carry the PIE dynamic flag"
   if grep -Eq '\(TEXTREL\)|FLAGS.*TEXTREL' "$dynamic_artifact"; then
     die "$label contains dynamic text relocations"
   fi
@@ -373,9 +375,9 @@ unset CCC_REDIS_PREPROCESS_DIR CCC_REDIS_SOURCE_LOG CCC_REDIS_SOURCE_ROOT
 export LC_ALL=C TZ=UTC SOURCE_DATE_EPOCH=1779667200
 
 : >"$CCC_REDIS_COMMAND_LOG"
-"$script_directory/ccc-cc" -std=gnu11 -dM -E \
+"$script_directory/ccc-cc" -dM -E \
   "$script_directory/predicate-probe.c" >"$work_directory/effective-macros.txt"
-"$script_directory/ccc-cc" -std=gnu11 -P -E \
+"$script_directory/ccc-cc" -P -E \
   "$script_directory/predicate-probe.c" >"$work_directory/predicate-probe.txt"
 
 grep -Fxq '#define __GNUC__ 4' "$work_directory/effective-macros.txt" ||
@@ -443,7 +445,7 @@ LC_ALL=C sort "$expected_source_inputs" >"$expected_source_inputs.sorted"
 mv "$expected_source_inputs.sorted" "$expected_source_inputs"
 
 compiler_adapter="$script_directory/ccc-cc"
-redis_std="-std=gnu11 -DREDIS_STATIC=''"
+redis_std="-DREDIS_STATIC=''"
 redis_warn='-Wall -W -Wno-missing-field-initializers -Werror=deprecated-declarations -Wstrict-prototypes'
 
 build_redis_settings=(
@@ -456,7 +458,7 @@ build_redis_settings=(
   ENABLE_LTO=
   DEBUG=
   CFLAGS=
-  LDFLAGS=-no-pie
+  LDFLAGS=
   REDIS_CFLAGS=
   REDIS_LDFLAGS=
   MALLOC=libc
@@ -487,11 +489,11 @@ build_redis_settings=(
 
   make -C "$source_directory/deps/hdr_histogram" -j"$jobs" libhdrhistogram.a \
     CC="$compiler_adapter" AR="$archiver" ARFLAGS=rcs \
-    STD=-std=gnu11 OPT=-O2 DEBUG= CFLAGS= LDFLAGS=
+    STD= OPT=-O2 DEBUG= CFLAGS= LDFLAGS=
 
   make -C "$source_directory/deps/fpconv" -j"$jobs" libfpconv.a \
     CC="$compiler_adapter" AR="$archiver" ARFLAGS=rcs \
-    STD=-std=gnu11 OPT=-O2 DEBUG= CFLAGS= LDFLAGS=
+    STD= OPT=-O2 DEBUG= CFLAGS= LDFLAGS=
 
   make -C "$source_directory/deps/xxhash" -j"$jobs" libxxhash.a \
     CC="$compiler_adapter" AR="$archiver" \
@@ -500,7 +502,7 @@ build_redis_settings=(
 
   make -C "$source_directory/deps/tre" -j"$jobs" libtre.a \
     CC="$compiler_adapter" AR="$archiver" ARFLAGS=rcs \
-    STD=-std=gnu11 OPT=-O2 DEBUG= CFLAGS= LDFLAGS=
+    STD= OPT=-O2 DEBUG= CFLAGS= LDFLAGS=
 
   # Avoid Redis's developer-only multi-source dependency scan. Per-object MMD
   # inputs remain on every audited CCC translation command.
@@ -673,13 +675,14 @@ link_commands=$(grep -c '^link ' "$CCC_REDIS_COMMAND_LOG" || true)
 if grep '^link ' "$CCC_REDIS_COMMAND_LOG" | grep -Eq '\.(c|i)( |$)'; then
   die "Redis native link command received a C source input"
 fi
-non_pie_links=$(grep '^link ' "$CCC_REDIS_COMMAND_LOG" | grep -c -- ' -no-pie' || true)
-[[ "$non_pie_links" == "$expected_native_links" ]] ||
-  die "Redis native links did not all receive the pinned -no-pie option"
-
-gnu11_translations=$(grep '^ccc ' "$CCC_REDIS_COMMAND_LOG" | grep -c -- ' -std=gnu11' || true)
-[[ "$gnu11_translations" == "$expected_translation_units" ]] ||
-  die "Redis C translations did not all use the pinned GNU language mode"
+if grep '^link ' "$CCC_REDIS_COMMAND_LOG" | \
+  grep -Eq -- ' -pie( |$)| -no-pie( |$)'; then
+  die "Redis native links unexpectedly overrode the platform PIE default"
+fi
+explicit_standard_translations=$(grep '^ccc ' "$CCC_REDIS_COMMAND_LOG" | \
+  grep -Ec -- ' -std=' || true)
+[[ "$explicit_standard_translations" == 0 ]] ||
+  die "Redis C translations unexpectedly overrode CCC's default GNU language mode"
 if grep '^ccc ' "$CCC_REDIS_COMMAND_LOG" | grep -Fq -- ' -DNDEBUG'; then
   die "Redis C translations unexpectedly disabled assertions"
 fi
@@ -709,11 +712,11 @@ for builtin in \
     die "CCC does not provide Redis's selected builtin: $builtin"
 done
 
-verify_non_pie_executable \
+verify_pie_executable \
   redis-server "$server" \
   "$work_directory/redis-server-elf-header.txt" \
   "$work_directory/redis-server-elf-dynamic.txt"
-verify_non_pie_executable \
+verify_pie_executable \
   redis-cli "$client" \
   "$work_directory/redis-cli-elf-header.txt" \
   "$work_directory/redis-cli-elf-dynamic.txt"

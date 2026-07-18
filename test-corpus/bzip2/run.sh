@@ -302,9 +302,9 @@ unset BZIP BZIP2
 export LC_ALL=C TZ=UTC
 
 : >"$CCC_BZIP2_COMMAND_LOG"
-"$script_directory/ccc-cc" -std=gnu11 -dM -E \
+"$script_directory/ccc-cc" -dM -E \
   "$script_directory/predicate-probe.c" >"$work_directory/effective-macros.txt"
-"$script_directory/ccc-cc" -std=gnu11 -P -E \
+"$script_directory/ccc-cc" -P -E \
   "$script_directory/predicate-probe.c" >"$work_directory/predicate-probe.txt"
 
 grep -Fxq '#define __GNUC__ 4' "$work_directory/effective-macros.txt" ||
@@ -356,11 +356,10 @@ expected_source_count=$(wc -l <"$expected_source_inputs" | tr -d '[:space:]')
 
 make -C "$source_directory" -j"$jobs" \
   libbz2.a bzip2 bzip2recover \
-  CC="$script_directory/ccc-cc -std=gnu11" \
+  CC="$script_directory/ccc-cc" \
   AR="$archiver" \
   RANLIB="$archive_indexer" \
   CFLAGS='-Wall -Winline -O2 -g -D_FILE_OFFSET_BITS=64' \
-  LDFLAGS=-no-pie \
   2>&1 | tee "$work_directory/build.log"
 
 [[ -f "$source_directory/libbz2.a" ]] || die "bzip2 static library was not produced"
@@ -380,12 +379,14 @@ fi
 link_commands=$(grep -c '^link ' "$CCC_BZIP2_COMMAND_LOG" || true)
 [[ "$link_commands" == "$expected_links" ]] ||
   die "bzip2 build invoked $link_commands native links; expected $expected_links"
-non_pie_links=$(grep '^link ' "$CCC_BZIP2_COMMAND_LOG" | grep -c -- ' -no-pie' || true)
-[[ "$non_pie_links" == "$expected_links" ]] ||
-  die "bzip2 native links did not all receive the pinned -no-pie option"
-gnu11_translations=$(grep '^ccc ' "$CCC_BZIP2_COMMAND_LOG" | grep -c -- ' -std=gnu11' || true)
-[[ "$gnu11_translations" == "$expected_build_sources" ]] ||
-  die "bzip2 C translations did not all use the pinned GNU language mode"
+if grep '^link ' "$CCC_BZIP2_COMMAND_LOG" | \
+  grep -Eq -- ' -pie( |$)| -no-pie( |$)'; then
+  die "bzip2 native links unexpectedly overrode the platform PIE default"
+fi
+explicit_standard_translations=$(grep '^ccc ' "$CCC_BZIP2_COMMAND_LOG" | \
+  grep -Ec -- ' -std=' || true)
+[[ "$explicit_standard_translations" == 0 ]] ||
+  die "bzip2 C translations unexpectedly overrode CCC's default GNU language mode"
 large_file_translations=$(grep '^ccc ' "$CCC_BZIP2_COMMAND_LOG" | grep -c -- ' -D_FILE_OFFSET_BITS=64' || true)
 [[ "$large_file_translations" == "$expected_build_sources" ]] ||
   die "bzip2 C translations did not all use the pinned large-file interface"
@@ -403,8 +404,10 @@ for executable in bzip2 bzip2recover; do
     readelf --dynamic "$binary"
   } >>"$work_directory/elf-dynamic-tags.txt"
   elf_type=$(readelf --file-header "$binary" | awk '/^[[:space:]]*Type:/{print $2; exit}')
-  [[ "$elf_type" == EXEC ]] ||
-    die "bzip2 $executable is $elf_type rather than the pinned non-PIE executable type"
+  [[ "$elf_type" == DYN ]] ||
+    die "bzip2 $executable is $elf_type rather than the required PIE executable type"
+  readelf --dynamic "$binary" | grep -Eq '\(FLAGS_1\).*PIE' ||
+    die "bzip2 $executable does not carry the PIE dynamic flag"
   if readelf --dynamic "$binary" | grep -Eq '\(TEXTREL\)|FLAGS.*TEXTREL'; then
     die "bzip2 $executable contains dynamic text relocations"
   fi
@@ -418,11 +421,10 @@ grep -Fq "bzip2, a block-sorting file compressor.  Version $version" \
   die "built bzip2 executable reports an unexpected version"
 
 make -C "$source_directory" -j1 check \
-  CC="$script_directory/ccc-cc -std=gnu11" \
+  CC="$script_directory/ccc-cc" \
   AR="$archiver" \
   RANLIB="$archive_indexer" \
   CFLAGS='-Wall -Winline -O2 -g -D_FILE_OFFSET_BITS=64' \
-  LDFLAGS=-no-pie \
   2>&1 | tee "$work_directory/upstream-test.log"
 [[ "$(grep -c '^ccc ' "$CCC_BZIP2_COMMAND_LOG" || true)" == "$expected_build_sources" ]] ||
   die "bzip2 upstream test unexpectedly rebuilt a C input"

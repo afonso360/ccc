@@ -357,7 +357,7 @@ make -C "$source_directory" -j"$jobs" check \
   HAVE_LZMA=0 \
   HAVE_LZ4=0 \
   ALIGN_LOOP= \
-  MOREFLAGS="-DMEM_FORCE_MEMORY_ACCESS=0 -DXXH_FORCE_MEMORY_ACCESS=0 -no-pie" \
+  MOREFLAGS="-DMEM_FORCE_MEMORY_ACCESS=0 -DXXH_FORCE_MEMORY_ACCESS=0" \
   2>&1 | tee "$work_directory/build-test.log"
 
 grep -Fq "$success_marker" "$work_directory/build-test.log" ||
@@ -386,9 +386,14 @@ actual_probe_link_commands=$(grep '^link ' "$CCC_ZSTD_COMMAND_LOG" |
   grep -c -- ' -o have_pthread ' || true)
 [[ "$actual_probe_link_commands" == "$expected_probe_link_commands" ]] ||
   die "zstd build invoked $actual_probe_link_commands pthread probe links; expected $expected_probe_link_commands"
-non_pie_links=$(grep '^link ' "$CCC_ZSTD_COMMAND_LOG" | grep -c -- ' -no-pie' || true)
-[[ "$non_pie_links" == "$expected_link_commands" ]] ||
-  die "zstd native links did not all receive the pinned -no-pie option"
+if grep '^link ' "$CCC_ZSTD_COMMAND_LOG" | \
+  grep -Eq -- ' -pie( |$)| -no-pie( |$)'; then
+  die "zstd native links unexpectedly overrode the platform PIE default"
+fi
+explicit_standard_translations=$(grep '^ccc ' "$CCC_ZSTD_COMMAND_LOG" | \
+  grep -Ec -- ' -std=' || true)
+[[ "$explicit_standard_translations" == 0 ]] ||
+  die "zstd C translations unexpectedly overrode CCC's default GNU language mode"
 for option in \
   ' -DZSTD_DISABLE_ASM' \
   ' -DMEM_FORCE_MEMORY_ACCESS=0' \
@@ -414,8 +419,10 @@ for executable in programs/zstd tests/datagen; do
     readelf --dynamic "$binary"
   } >>"$work_directory/elf-dynamic-tags.txt"
   elf_type=$(readelf --file-header "$binary" | awk '/^[[:space:]]*Type:/{print $2; exit}')
-  [[ "$elf_type" == EXEC ]] ||
-    die "zstd $executable is $elf_type rather than the pinned non-PIE executable type"
+  [[ "$elf_type" == DYN ]] ||
+    die "zstd $executable is $elf_type rather than the required PIE executable type"
+  readelf --dynamic "$binary" | grep -Eq '\(FLAGS_1\).*PIE' ||
+    die "zstd $executable does not carry the PIE dynamic flag"
   if readelf --dynamic "$binary" | grep -Eq '\(TEXTREL\)|FLAGS.*TEXTREL'; then
     die "zstd $executable contains dynamic text relocations"
   fi

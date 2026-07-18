@@ -100,10 +100,17 @@ capture_preprocessed_source() {
     esac
   done
 
-  log_command preprocess "$CCC" -resource-dir "$CCC_RESOURCE_DIR" \
-    "${filtered[@]}" -E -P "$source"
-  "$CCC" -resource-dir "$CCC_RESOURCE_DIR" \
-    "${filtered[@]}" -E -P "$source" >"$destination"
+  if ((${#filtered[@]})); then
+    log_command preprocess "$CCC" -resource-dir "$CCC_RESOURCE_DIR" \
+      "${filtered[@]}" -E -P "$source"
+    "$CCC" -resource-dir "$CCC_RESOURCE_DIR" \
+      "${filtered[@]}" -E -P "$source" >"$destination"
+  else
+    log_command preprocess "$CCC" -resource-dir "$CCC_RESOURCE_DIR" \
+      -E -P "$source"
+    "$CCC" -resource-dir "$CCC_RESOURCE_DIR" \
+      -E -P "$source" >"$destination"
+  fi
 }
 
 run_ccc() {
@@ -118,9 +125,9 @@ run_linker() {
 
 arguments=("$@")
 sources=()
-# Redis and its bundled dependencies request both C99 and GNU C11. CCC's
-# supported GNU C11 mode is the selected superset for every translation.
-compile_arguments=(-std=gnu11)
+# Redis and its bundled dependencies request C99, GNU99, and GNU C11. Filter
+# those upstream selections and use CCC's GNU C11 driver default.
+compile_arguments=()
 output=
 compile_only=false
 frontend_only=false
@@ -142,7 +149,7 @@ for ((index = 0; index < ${#arguments[@]}; index++)); do
     -c)
       compile_only=true
       ;;
-    -std=c99 | -std=gnu11)
+    -std=c99 | -std=gnu99 | -std=gnu11)
       ;;
     -pedantic | -ggdb)
       ;;
@@ -153,10 +160,6 @@ for ((index = 0; index < ${#arguments[@]}; index++)); do
       fi
       compile_arguments+=("$argument" "${arguments[index + 1]}")
       ((index += 1))
-      ;;
-    -fPIC)
-      # The selected build links static dependency archives into non-PIE
-      # executables, so dependency-local PIC requests are unnecessary.
       ;;
     -E | -M | -MM | --dump-* | --emit=*)
       frontend_only=true
@@ -244,7 +247,11 @@ objects=()
 for ((index = 0; index < ${#sources[@]}; index++)); do
   source=${sources[index]}
   record_source "$source"
-  capture_preprocessed_source "$source" "${compile_arguments[@]}"
+  if ((${#compile_arguments[@]})); then
+    capture_preprocessed_source "$source" "${compile_arguments[@]}"
+  else
+    capture_preprocessed_source "$source"
+  fi
   if $compile_only; then
     if [[ -n "$output" ]]; then
       object=$output

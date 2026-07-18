@@ -76,7 +76,7 @@ export CCC_ZSTD_PROBE_HASH_LOG="$temporary_directory/probe-hashes"
 : >"$TRACE"
 : >"$CCC_ZSTD_COMMAND_LOG"
 : >"$CCC_ZSTD_SOURCE_LOG"
-"$script_directory/ccc-cc" -std=gnu11 -c "$source_directory/lib/a.c" \
+"$script_directory/ccc-cc" -c "$source_directory/lib/a.c" \
   -MMD -MP -MF "$temporary_directory/a.d" -MT dependency-target.o \
   -o "$temporary_directory/a.o"
 [[ -f "$temporary_directory/a.o" ]]
@@ -85,13 +85,15 @@ export CCC_ZSTD_PROBE_HASH_LOG="$temporary_directory/probe-hashes"
 grep -Fxq "$source_directory/lib/a.c" "$CCC_ZSTD_SOURCE_LOG"
 grep '^ccc ' "$CCC_ZSTD_COMMAND_LOG" | grep -Fq -- ' -MMD -MP -MF'
 grep '^ccc ' "$CCC_ZSTD_COMMAND_LOG" | grep -Fq -- ' -MT dependency-target.o'
+! grep '^ccc ' "$CCC_ZSTD_COMMAND_LOG" | grep -q -- ' -std='
 
 : >"$TRACE"
 : >"$CCC_ZSTD_COMMAND_LOG"
 : >"$CCC_ZSTD_SOURCE_LOG"
 : >"$CCC_ZSTD_PROBE_HASH_LOG"
-"$script_directory/ccc-cc" -std=gnu11 -c "$source_directory/have_pthread.c" \
+"$script_directory/ccc-cc" -std=gnu99 -c "$source_directory/have_pthread.c" \
   -o "$temporary_directory/have_pthread.o"
+! grep '^ccc ' "$CCC_ZSTD_COMMAND_LOG" | grep -q -- ' -std='
 grep -Fxq \
   "$CCC_ZSTD_PTHREAD_PROBE_SHA256  $CCC_ZSTD_PTHREAD_PROBE" \
   "$CCC_ZSTD_PROBE_HASH_LOG"
@@ -99,7 +101,7 @@ grep -Fxq \
 printf '#include <pthread.h>\nint main(void) { return 1; }' >"$CCC_ZSTD_PTHREAD_PROBE"
 : >"$TRACE"
 set +e
-probe_failure_output=$("$script_directory/ccc-cc" -std=gnu11 -c \
+probe_failure_output=$("$script_directory/ccc-cc" -std=gnu99 -c \
   "$CCC_ZSTD_PTHREAD_PROBE" -o "$temporary_directory/rejected-probe.o" 2>&1)
 probe_failure_status=$?
 set -e
@@ -115,15 +117,15 @@ set -e
   "$source_directory/tests/b.c" -o "$temporary_directory/program" \
   -I"$source_directory/lib" \
   -include "$source_directory/lib/deps.h" \
-  -pthread -no-pie -Wl,-z,now -z relro -lm
+  -pthread -Wl,-z,now -z relro -lm
 [[ -f "$temporary_directory/program" ]]
 [[ "$(grep -c '^ccc ' "$TRACE")" == 2 ]]
 [[ "$(grep -c '^link ' "$TRACE")" == 1 ]]
 ! grep '^link ' "$TRACE" | grep -Eq '\.(c|i)( |$)'
-! grep '^ccc ' "$CCC_ZSTD_COMMAND_LOG" | grep -Eq -- '-pthread|-no-pie|-Wl,|-z relro|-lm'
+! grep '^ccc ' "$CCC_ZSTD_COMMAND_LOG" | grep -Eq -- '-std=|-pthread|-Wl,|-z relro|-lm'
 [[ "$(grep '^ccc ' "$CCC_ZSTD_COMMAND_LOG" | grep -Fc -- " -include $quoted_dependency_override")" == 2 ]]
 grep '^link ' "$CCC_ZSTD_COMMAND_LOG" | grep -q -- ' -pthread'
-grep '^link ' "$CCC_ZSTD_COMMAND_LOG" | grep -q -- ' -no-pie'
+! grep '^link ' "$CCC_ZSTD_COMMAND_LOG" | grep -Eq -- ' -pie( |$)| -no-pie( |$)'
 grep '^link ' "$CCC_ZSTD_COMMAND_LOG" | grep -Fq -- ' -Wl\,-z\,now'
 ! grep '^link ' "$CCC_ZSTD_COMMAND_LOG" | grep -Fq -- "$source_directory/lib/deps.h"
 ! grep '^link ' "$CCC_ZSTD_COMMAND_LOG" | grep -Fq -- "$source_directory/lib"

@@ -250,9 +250,9 @@ CC="$script_directory/ccc-cc" \
 grep -Fq '#define HAVE_ISNAN 1' sqlite_cfg.h ||
   die "SQLite configure did not detect the hosted isnan interface"
 
-"$script_directory/ccc-cc" -std=gnu11 -dM -E \
+"$script_directory/ccc-cc" -dM -E \
   "$script_directory/predicate-probe.c" >effective-macros.txt
-"$script_directory/ccc-cc" -std=gnu11 -P -E \
+"$script_directory/ccc-cc" -P -E \
   "$script_directory/predicate-probe.c" >predicate-probe.txt
 
 grep -Fxq '#define __GNUC__ 4' effective-macros.txt ||
@@ -398,6 +398,9 @@ cmp -s "$expected_source_inputs" "$actual_source_inputs" ||
 ccc_command_count=$(grep -c '^ccc ' "$CCC_SQLITE_COMMAND_LOG" || true)
 [[ "$ccc_command_count" == "$expected_testfixture_translation_units" ]] ||
   die "SQLite command log contains $ccc_command_count CCC translations; expected $expected_testfixture_translation_units"
+if grep '^ccc ' "$CCC_SQLITE_COMMAND_LOG" | grep -Eq -- ' -std='; then
+  die "SQLite C translations unexpectedly overrode CCC's default GNU language mode"
+fi
 link_command_count=$(grep -c '^link ' "$CCC_SQLITE_COMMAND_LOG" || true)
 [[ "$link_command_count" == 1 ]] ||
   die "SQLite testfixture build used $link_command_count native link commands; expected 1"

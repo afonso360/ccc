@@ -15,6 +15,7 @@ fetched_not_vendored = true
 
 target = "x86_64-unknown-linux-gnu"
 language_mode = "gnu11"
+language_mode_selection = "driver-default"
 gnu_compatibility_tuple = "4.2.1"
 build_interface = "upstream-make-component-targets"
 build_targets = ["redis-server", "redis-cli"]
@@ -22,7 +23,7 @@ source_translation_units = 178
 target_compiler = "ccc"
 link_driver = "gcc"
 native_link_commands = 2
-link_mode = "non-pie-executable"
+link_mode = "platform-default-pie-executable"
 
 allocator = "libc"
 tls = false

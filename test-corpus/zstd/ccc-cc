@@ -123,6 +123,9 @@ for ((index = 0; index < ${#arguments[@]}; index++)); do
     -c)
       compile_only=true
       ;;
+    -std=c99 | -std=gnu99 | -std=gnu11)
+      # CCC's default GNU C11 mode is the supported superset.
+      ;;
     -E | -M | -MM | --dump-* | --emit=*)
       frontend_only=true
       compile_arguments+=("$argument")

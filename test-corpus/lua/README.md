@@ -12,8 +12,9 @@ committed to the repository.
 ## Build interface
 
 The adapter uses Lua's upstream `make linux` interface on x86-64 Linux. It
-overrides the default `gcc -std=gnu99` command with `ccc-cc -std=gnu11`, the GNU
-language mode CCC supports. All 34 C translation units that produce `liblua.a`,
+overrides the default `gcc -std=gnu99` command with `ccc-cc`; CCC's documented
+driver default selects GNU C11 without an adapter flag. All 34 C translation
+units that produce `liblua.a`,
 `lua`, and `luac` are compiled by CCC. The native GCC driver receives only
 already-produced objects and archives for the two final links; the adapter
 never retries a failed translation with another compiler. A source-input log is
@@ -50,8 +51,9 @@ or `GNUMAKEFLAGS` is cleared with the other build flags. Exact compiler and
 linker commands are retained in `compile-commands.txt`; logging is one complete append per command so
 parallel builds cannot splice records together. The run rejects any native link
 command containing a C source input, requires exactly the two upstream program
-links, and verifies that every C command retained both `-std=gnu11` and
-`LUA_USE_LINUX` without disabling compiler-selected builtins or jump tables.
+links, and verifies that no C command injects a `-std=` override while every
+translation retains `LUA_USE_LINUX` without disabling compiler-selected
+builtins or jump tables.
 
 ## Official test profiles
 

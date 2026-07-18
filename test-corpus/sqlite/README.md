@@ -40,11 +40,11 @@ them using its normal executable defaults. The adapter requires the resulting
 preventing an apparently successful host link from weakening the executable
 contract.
 
-Every CCC translation receives an explicit leading `-std=gnu11`, matching the
-manifest even if CCC's driver default changes. The wrapper evaluates all
-`-std=` arguments in command order and records the last, effective choice plus
-the scoped hardware-timing predicate state for each translation in
-`language-modes.txt`.
+Every normal CCC translation uses the documented GNU C11 driver default without
+an adapter-supplied standard option. The wrapper filters upstream C99 and GNU99
+requests to that supported superset; explicit supported `-std=` arguments still
+follow command order. It records the effective choice plus the scoped
+hardware-timing predicate state for each translation in `language-modes.txt`.
 
 Configuration detects `isnan` without a cache override. The compiler's hosted
 `math.h` wrapper delegates declarations and constants to libc, then supplies a

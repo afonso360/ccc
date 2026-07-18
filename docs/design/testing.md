@@ -224,8 +224,9 @@ generated `sqlite3.c` translation, the wrapper defines the upstream
 zero-valued hardware timing fallback instead of the GNU x86-64 `rdtsc`
 inline-assembly path. In this release that predicate also suppresses only the
 `SQLITE_INLINE` optimization hint. The eight fuzzcheck support inputs,
-`alltest`, and `sessionfuzz` receive no override. The wrapper audits the last
-effective `-std` option and predicate state for every translation. Corpus
+`alltest`, and `sessionfuzz` receive no override. Normal translations use
+CCC's GNU11 driver default, while the wrapper audits the effective language
+mode and predicate state for every translation. Corpus
 success is integration evidence rather than proof of the unselected constructs;
 their focused fixtures remain required.
 
@@ -240,12 +241,12 @@ so passing the corpus cannot hide unimplemented GNU payload encoding.
 
 Lua is pinned by its [corpus manifest](../../test-corpus/lua/manifest.toml) to
 the official 5.5.0 source and matching test archives. The adapter uses the
-upstream Linux make target in GNU11 mode and requires all 34 `.c` files in the
-source directory to appear exactly once in CCC's source-input log. GCC receives
-only CCC-produced objects and archives for the two final program links. Because
-CCC's selected relocation model is static, both links use Lua's
-`MYLDFLAGS=-no-pie` hook and the gate verifies ELF `EXEC` type plus the absence
-of dynamic text relocations.
+upstream Linux make target with CCC's GNU11 driver default and requires all 34
+`.c` files in the source directory to appear exactly once in CCC's source-input
+log. GCC receives
+only CCC-produced objects and archives for the two final program links. Those
+links use the platform default without an adapter relocation flag, and the gate
+verifies PIE ELF type `DYN` plus the absence of dynamic text relocations.
 
 Under the pinned GNU 4.2.1 identity, Lua selects `__builtin_expect`, internal
 visibility and noreturn attributes, `__extension__`, and computed-goto VM
@@ -263,9 +264,11 @@ Redis is pinned by its [corpus manifest](../../test-corpus/redis/manifest.toml)
 to the official 8.8.0 core archive. The selected upstream build produces
 `redis-server` and `redis-cli` with the libc allocator while disabling TLS,
 systemd, optional vector sets, bundled data-type modules, and link-time
-optimization. All 178 selected C translation units pass through CCC in GNU11
-mode; native GCC receives only the resulting objects and archives for two
-non-PIE links. The wrapper mirrors each real translation with a preprocessing
+optimization. All 178 selected C translation units pass through CCC using its
+GNU11 default; native GCC receives only the resulting objects and archives for
+two platform-default PIE links. The wrapper filters upstream C99, GNU99, and
+GNU11 selections rather than injecting a replacement standard flag. It mirrors
+each real translation with a preprocessing
 pass under the same effective language, macro, include, warning, and
 optimization arguments. The adapter requires exactly 178 nonempty captures,
 compares their relative paths to the pinned source set, and records exact
@@ -273,18 +276,14 @@ expanded-builtin counts. It also audits the complete compiled source multiset,
 compiler identity, link inputs, ELF executable type, and absence of dynamic
 text relocations.
 
-Redis assertions remain enabled. A forced compatibility `assert.h` selects
-glibc's standard-C macro and uses the C11 `__func__` identifier for the
-diagnostic function name, then restores GNU mode for the source build. Six
-exact-hash source adjustments express Redis's expression-valued sync-CAS loop
-through a standard-C helper, replace the bundled HDR Histogram x86 atomic
-assembly with the selected sequentially consistent legacy builtins, and express
-binary64 classification in hiredis and the bundled Lua extensions without
-semantically visiting glibc's native-`long double` generic arms. The sixth
-selects a behavior-compatible standard-C no-op for xxHash's compiler guard
-under CCC instead of the GNU inline-assembly guard chosen by the compatibility
-tuple. The adapter
-audits each removed construct and its replacement count explicitly.
+Redis assertions remain enabled through the unmodified system header; CCC
+implements its GNU statement expression and `__PRETTY_FUNCTION__` surface.
+The hosted `math.h` wrapper supplies single-evaluation binary64 classification
+macros without exposing unselected native-`long double` arms. Two exact-hash
+source adjustments replace the bundled HDR Histogram x86 atomic assembly with
+the selected sequentially consistent legacy builtins and select a
+behavior-compatible C no-op for xxHash's compiler guard. The adapter audits
+each remaining adjustment and its replacement count explicitly.
 
 The Redis execution profile starts the CCC-built server on a private Unix
 domain socket and drives `PING`, string, counter, list, hash, Lua `EVAL`, and
@@ -296,8 +295,9 @@ to the official 1.0.8 archive and a full commit and tree from the official
 `bzip2-tests` repository. The upstream Makefile selects nine of the archive's
 13 C files to build `libbz2.a`, `bzip2`, and `bzip2recover`; CCC must compile
 each selected input exactly once, and native GCC performs only the two
-source-free non-PIE program links. The build inventory also proves that the
-four developer utilities were not silently substituted into the product set.
+source-free platform-default PIE program links. The build inventory also proves
+that the four developer utilities were not silently substituted into the
+product set.
 
 The bzip2 execution gate combines the six byte-for-byte comparisons from
 upstream `make check`, an independent level-9 integrity/round-trip fixture,
@@ -315,10 +315,11 @@ are enabled; optional zlib, liblzma, and liblz4 format wrappers, stand-alone
 assembly, and host-dependent unaligned scalar accesses are disabled.
 
 The zstd adapter applies an exact-hash extension of upstream's no-assembly
-guards to existing generic C fallbacks, supplies the documented
-`ZSTD_DEPS_COMMON` libc-memory boundary, and forces a portable assertion header
-without changing GNU identity. Every adjustment and compatibility header is
-hashed and audited on each run. Upstream's bounded quick smoke target covers
+guards to existing generic C fallbacks. Its unmodified dependency and system
+assertion headers use CCC's native memory builtins, GNU statement expressions,
+and function-name aliases. Every remaining source adjustment is hashed and
+audited on each run. Native links use the platform PIE default without a
+relocation flag. Upstream's bounded quick smoke target covers
 compression, decompression, streaming, dictionaries, file handling, corruption
 rejection, sparse files, and the selected threaded path; deterministic file and
 stream round trips add byte-for-byte checks. Long-running fuzz and stress

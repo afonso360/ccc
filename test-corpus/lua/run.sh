@@ -236,11 +236,11 @@ unset CFLAGS CPPFLAGS LDFLAGS LIBS
 unset MYCFLAGS MYLDFLAGS MYLIBS MYOBJS SYSCFLAGS SYSLDFLAGS SYSLIBS
 
 : >"$CCC_LUA_COMMAND_LOG"
-"$script_directory/ccc-cc" -std=gnu11 -dM -E \
+"$script_directory/ccc-cc" -dM -E \
   "$script_directory/predicate-probe.c" >"$work_directory/effective-macros.txt"
-"$script_directory/ccc-cc" -std=gnu11 -P -E \
+"$script_directory/ccc-cc" -P -E \
   "$script_directory/predicate-probe.c" >"$work_directory/predicate-probe.txt"
-"$script_directory/ccc-cc" -std=gnu11 -P -E \
+"$script_directory/ccc-cc" -P -E \
   "$script_directory/hosted-probe.c" | grep '^selected_' \
   >"$work_directory/hosted-probe.txt"
 
@@ -293,7 +293,7 @@ expected_source_count=$(wc -l <"$expected_source_inputs" | tr -d '[:space:]')
 [[ "$expected_source_count" == "$expected_translation_units" ]] ||
   die "Lua source archive contains $expected_source_count C inputs; expected $expected_translation_units"
 make -C "$source_directory" -j"$jobs" linux \
-  CC="$script_directory/ccc-cc -std=gnu11" \
+  CC="$script_directory/ccc-cc" \
   2>&1 | tee "$work_directory/build.log"
 
 [[ -x "$source_directory/src/lua" ]] || die "Lua interpreter was not produced"
@@ -320,10 +320,10 @@ linux_translations=$(grep '^ccc ' "$CCC_LUA_COMMAND_LOG" | \
   grep -c -- ' -DLUA_USE_LINUX' || true)
 [[ "$linux_translations" == "$expected_translation_units" ]] ||
   die "Lua C translations did not all select the pinned Linux profile"
-gnu11_translations=$(grep '^ccc ' "$CCC_LUA_COMMAND_LOG" | \
-  grep -c -- ' -std=gnu11' || true)
-[[ "$gnu11_translations" == "$expected_translation_units" ]] ||
-  die "Lua C translations did not all use the pinned GNU language mode"
+explicit_standard_translations=$(grep '^ccc ' "$CCC_LUA_COMMAND_LOG" | \
+  grep -Ec -- ' -std=' || true)
+[[ "$explicit_standard_translations" == 0 ]] ||
+  die "Lua C translations unexpectedly overrode CCC's default GNU language mode"
 if grep '^ccc ' "$CCC_LUA_COMMAND_LOG" | \
   grep -Eq -- '-DLUA_NOBUILTIN|-DLUA_USE_JUMPTABLE=0'; then
   die "Lua C translations disabled a compiler-selected source path"

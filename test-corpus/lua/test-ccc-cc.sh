@@ -76,13 +76,14 @@ export CCC_LUA_SOURCE_LOG="$temporary_directory/sources"
 [[ "$(grep -c '^ccc ' "$TRACE")" == 1 ]]
 ! grep -q '^link ' "$TRACE"
 [[ "$(grep -c '^ccc ' "$CCC_LUA_COMMAND_LOG")" == 1 ]]
+! grep '^ccc ' "$CCC_LUA_COMMAND_LOG" | grep -q -- ' -std='
 [[ "$(wc -l <"$CCC_LUA_SOURCE_LOG" | tr -d '[:space:]')" == 1 ]]
 grep -Fxq "$source_directory/a.c" "$CCC_LUA_SOURCE_LOG"
 
 : >"$TRACE"
 : >"$CCC_LUA_COMMAND_LOG"
 : >"$CCC_LUA_SOURCE_LOG"
-"$script_directory/ccc-cc" "$source_directory/a.c" \
+"$script_directory/ccc-cc" -std=gnu99 "$source_directory/a.c" \
   "$source_directory/b.c" -o "$temporary_directory/program" \
   -Wl,-E -ldl -lm
 [[ -f "$temporary_directory/program" ]]
@@ -91,6 +92,7 @@ grep -Fxq "$source_directory/a.c" "$CCC_LUA_SOURCE_LOG"
 ! grep '^link ' "$TRACE" | grep -Eq '\.(c|i)( |$)'
 ! grep '^ccc ' "$CCC_LUA_COMMAND_LOG" | grep -Eq -- '-no-pie|-Wl,-E|-ldl|-lm'
 ! grep '^link ' "$CCC_LUA_COMMAND_LOG" | grep -q -- ' -no-pie'
+! grep '^ccc ' "$CCC_LUA_COMMAND_LOG" | grep -q -- ' -std='
 grep '^link ' "$CCC_LUA_COMMAND_LOG" | grep -Fq -- ' -Wl\,-E'
 grep '^link ' "$CCC_LUA_COMMAND_LOG" | grep -q -- ' -ldl'
 [[ "$(grep -c '^ccc ' "$CCC_LUA_COMMAND_LOG")" == 2 ]]

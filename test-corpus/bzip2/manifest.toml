@@ -26,16 +26,17 @@ test_imported_licenses = "recorded-per-source-subdirectory"
 
 target = "x86_64-unknown-linux-gnu"
 language_mode = "gnu11"
+language_mode_selection = "driver-default"
 gnu_compatibility_tuple = "4.2.1"
 build_interface = "upstream-make"
 build_targets = "libbz2.a bzip2 bzip2recover"
-build_command = "make -j<JOBS> libbz2.a bzip2 bzip2recover CC='<ccc-adapter> -std=gnu11' CFLAGS='-Wall -Winline -O2 -g -D_FILE_OFFSET_BITS=64' LDFLAGS=-no-pie"
+build_command = "make -j<JOBS> libbz2.a bzip2 bzip2recover CC=<ccc-adapter> CFLAGS='-Wall -Winline -O2 -g -D_FILE_OFFSET_BITS=64'"
 archive_c_translation_units = 13
 build_translation_units = 9
 native_link_commands = 2
 target_compiler = "ccc"
 link_driver = "gcc"
-link_mode = "non-pie-executable"
+link_mode = "platform-default-pie-executable"
 
 upstream_test_target = "check"
 upstream_test_command = "make -j1 check"

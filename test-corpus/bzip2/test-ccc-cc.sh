@@ -70,30 +70,32 @@ export CCC_BZIP2_SOURCE_LOG="$temporary_directory/sources"
 : >"$TRACE"
 : >"$CCC_BZIP2_COMMAND_LOG"
 : >"$CCC_BZIP2_SOURCE_LOG"
-"$script_directory/ccc-cc" -std=gnu11 -c "$source_directory/a.c" \
+"$script_directory/ccc-cc" -c "$source_directory/a.c" \
   -o "$temporary_directory/a.o"
 [[ -f "$temporary_directory/a.o" ]]
 [[ "$(grep -c '^ccc ' "$TRACE")" == 1 ]]
 ! grep -q '^link ' "$TRACE"
 [[ "$(grep -c '^ccc ' "$CCC_BZIP2_COMMAND_LOG")" == 1 ]]
+! grep '^ccc ' "$CCC_BZIP2_COMMAND_LOG" | grep -q -- ' -std='
 [[ "$(wc -l <"$CCC_BZIP2_SOURCE_LOG" | tr -d '[:space:]')" == 1 ]]
 grep -Fxq "$source_directory/a.c" "$CCC_BZIP2_SOURCE_LOG"
 
 : >"$TRACE"
 : >"$CCC_BZIP2_COMMAND_LOG"
 : >"$CCC_BZIP2_SOURCE_LOG"
-"$script_directory/ccc-cc" -std=gnu11 \
+"$script_directory/ccc-cc" -std=c99 \
   "$source_directory/a.c" "$source_directory/b.c" \
-  -o "$temporary_directory/program" -no-pie -L. -lbz2
+  -o "$temporary_directory/program" -L. -lbz2
 [[ -f "$temporary_directory/program" ]]
 [[ "$(grep -c '^ccc ' "$TRACE")" == 2 ]]
 [[ "$(grep -c '^link ' "$TRACE")" == 1 ]]
 ! grep '^link ' "$TRACE" | grep -Eq '\.(c|i)( |$)'
-! grep '^ccc ' "$CCC_BZIP2_COMMAND_LOG" | grep -Eq -- '-no-pie|-L\.|-lbz2'
-grep '^link ' "$CCC_BZIP2_COMMAND_LOG" | grep -q -- ' -no-pie'
+! grep '^ccc ' "$CCC_BZIP2_COMMAND_LOG" | grep -Eq -- '-std=|-L\.|-lbz2'
+! grep '^link ' "$CCC_BZIP2_COMMAND_LOG" | grep -Eq -- ' -pie( |$)| -no-pie( |$)'
 grep '^link ' "$CCC_BZIP2_COMMAND_LOG" | grep -Fq -- ' -L.'
 grep '^link ' "$CCC_BZIP2_COMMAND_LOG" | grep -q -- ' -lbz2'
 [[ "$(grep -c '^ccc ' "$CCC_BZIP2_COMMAND_LOG")" == 2 ]]
+! grep '^ccc ' "$CCC_BZIP2_COMMAND_LOG" | grep -q -- ' -std='
 [[ "$(grep -c '^link ' "$CCC_BZIP2_COMMAND_LOG")" == 1 ]]
 [[ "$(wc -l <"$CCC_BZIP2_SOURCE_LOG" | tr -d '[:space:]')" == 2 ]]
 

@@ -89,7 +89,7 @@ export CCC_SQLITE_FUZZCHECK_HWTIME_FALLBACK=1
 [[ "$(wc -l <"$CCC_SQLITE_SOURCE_LOG" | tr -d '[:space:]')" == 1 ]]
 grep -Fxq "$source_directory/src/a.c" "$CCC_SQLITE_SOURCE_LOG"
 grep -Eq '^gnu11 ordinary strict-ansi=absent ' "$CCC_SQLITE_LANGUAGE_MODE_LOG"
-grep '^ccc ' "$CCC_SQLITE_COMMAND_LOG" | grep -q -- ' -std=gnu11'
+! grep '^ccc ' "$CCC_SQLITE_COMMAND_LOG" | grep -q -- ' -std='
 
 : >"$TRACE"
 : >"$CCC_SQLITE_COMMAND_LOG"

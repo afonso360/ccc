@@ -33,9 +33,10 @@ The compiler wrapper sends every C input to CCC. Native GCC receives only
 objects and static archives for exactly two final links; a failed CCC
 translation is never retried with another compiler. The adapter records the
 resolved GCC path, version, target, complete identity output, and predefined
-macros. CCC currently emits static-model objects, so both final links use
-`-no-pie`; the resulting programs must be ELF `EXEC` files without dynamic
-text relocations.
+macros. CCC emits position-independent objects, and both final links use their
+normal platform defaults without an adapter-supplied relocation option.
+The resulting programs must be PIE executables with ELF type `DYN`, the PIE
+dynamic flag, and no dynamic text relocations.
 
 The profile selects the system allocator and disables TLS, systemd, link-time
 optimization, vector sets, and the external module bundle. Redis's C11 atomic
@@ -46,8 +47,10 @@ pulling C11 or `__atomic_*` support into the build.
 
 Ambient Make variables and package-manager flags are cleared before any
 upstream target runs. The locale, timezone, and source-date epoch are fixed,
-and all required dependency targets receive the same language, assertion, and
-optimization profile.
+and all required dependency targets rely on CCC's GNU C11 driver default while
+receiving the same assertion and optimization profile. Upstream C99, GNU99,
+and GNU C11 selection flags are filtered rather than replaced with another
+adapter-injected standard flag.
 
 ## Hosted assertions
 
