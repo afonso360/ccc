@@ -5,12 +5,12 @@ use ccc_target::EffectiveCompilationConfig;
 use sha2::{Digest as _, Sha256};
 
 use crate::{
-    AbiCarrier, AbiClass, AbiError, BoundaryPlan, BridgeArtifactPlan, BridgeLocation,
-    CallBridgeArtifactPlan, CallPlan, CallTarget, DefinitionPlan, LoweredSignaturePlan,
-    ModuleAbiPlan, NativePurpose, PackagingPlan, PassingMode, SourceLinkage, SourceVisibility,
-    TlsAccessorArtifactPlan, VariadicEntryArtifactPlan, VerifiedModuleAbiPlan, abi_config_key, hex,
-    ir_shape_digest, plan_boundary_type, plan_function_type, plan_unprototyped_call, plan_va_arg,
-    plan_variadic_call, translation_unit_digest,
+    AbiCarrier, AbiClass, AbiError, BoundaryPlan, BridgeArtifactPlan, BridgeEntryArtifactPlan,
+    BridgeLocation, CallBridgeArtifactPlan, CallPlan, CallTarget, DefinitionPlan,
+    LoweredSignaturePlan, ModuleAbiPlan, NativePurpose, PackagingPlan, PassingMode, SourceBinding,
+    SourceLinkage, SourceVisibility, TlsAccessorArtifactPlan, VerifiedModuleAbiPlan,
+    abi_config_key, hex, ir_shape_digest, plan_boundary_type, plan_fixed_call, plan_function_type,
+    plan_unprototyped_call, plan_va_arg, plan_variadic_call, translation_unit_digest,
 };
 
 pub fn plan_module(
@@ -146,6 +146,11 @@ pub fn plan_module(
                         )
                         .map_err(|error| error.with_span_if_none(instruction.span))?,
                     )
+                } else if function_signature_contains_int128(&module.types, signature) {
+                    BoundaryPlan::Bridge(
+                        plan_fixed_call(&module.types, signature, &actual_types, config)
+                            .map_err(|error| error.with_span_if_none(instruction.span))?,
+                    )
                 } else {
                     let plan = plan_function_type(&module.types, signature, config)
                         .map_err(|error| error.with_span_if_none(instruction.span))?;
@@ -207,6 +212,53 @@ pub fn plan_module(
     })
 }
 
+fn function_signature_contains_int128(
+    types: &ccc_types::TypeStore,
+    signature: ccc_types::TypeId,
+) -> bool {
+    fn contains(
+        types: &ccc_types::TypeStore,
+        ty: ccc_types::TypeId,
+        active: &mut Vec<ccc_types::TypeId>,
+    ) -> bool {
+        if matches!(
+            types.builtin_type(ty),
+            Some(ccc_types::BuiltinType::Int128 | ccc_types::BuiltinType::UnsignedInt128)
+        ) {
+            return true;
+        }
+        if active.contains(&ty) {
+            return false;
+        }
+        active.push(ty);
+        let result = match types.try_kind(ty) {
+            Some(ccc_types::TypeKind::Array(array)) => contains(types, array.element.ty, active),
+            Some(ccc_types::TypeKind::Record(id)) => types
+                .record(*id)
+                .and_then(|record| record.fields.as_ref())
+                .is_some_and(|fields| {
+                    fields
+                        .iter()
+                        .any(|field| contains(types, field.ty.ty, active))
+                }),
+            _ => false,
+        };
+        active.pop();
+        result
+    }
+
+    let Some(signature) = types.function_signature(signature) else {
+        return false;
+    };
+    contains(types, signature.result.ty, &mut Vec::new())
+        || match signature.parameters {
+            ccc_types::FunctionParameters::Prototype(parameters) => parameters
+                .iter()
+                .any(|parameter| contains(types, parameter.ty, &mut Vec::new())),
+            ccc_types::FunctionParameters::Unspecified => false,
+        }
+}
+
 fn plan_artifacts(
     module: &gir::FullModule,
     definitions: &std::collections::BTreeMap<ccc_sema::generic::FullFunctionId, DefinitionPlan>,
@@ -238,10 +290,19 @@ fn plan_artifacts(
         },
     });
 
-    let mut variadic_entries = std::collections::BTreeMap::new();
+    let mut bridge_entries = std::collections::BTreeMap::new();
     for (function, definition) in definitions {
-        if !matches!(definition.boundary, BoundaryPlan::Bridge(_)) {
+        let BoundaryPlan::Bridge(boundary) = &definition.boundary else {
             continue;
+        };
+        if !matches!(
+            boundary.kind,
+            crate::BridgeKind::FixedEntry | crate::BridgeKind::VariadicEntry
+        ) {
+            return Err(AbiError::new(
+                "CCC3515",
+                "a bridged definition has a call-side bridge kind",
+            ));
         }
         let source = module
             .functions
@@ -267,17 +328,27 @@ fn plan_artifacts(
             ccc_sema::generic::SymbolVisibility::Protected => SourceVisibility::Protected,
             ccc_sema::generic::SymbolVisibility::Internal => SourceVisibility::Internal,
         };
-        variadic_entries.insert(
+        let source_binding = match source.binding {
+            ccc_sema::generic::SymbolBinding::Strong => SourceBinding::Strong,
+            ccc_sema::generic::SymbolBinding::Weak => SourceBinding::Weak,
+        };
+        bridge_entries.insert(
             *function,
-            VariadicEntryArtifactPlan {
+            BridgeEntryArtifactPlan {
                 function: *function,
+                kind: boundary.kind,
                 public_symbol: source.symbol_name.clone(),
                 public_symbol_is_exact: source.symbol_name_is_exact,
                 source_linkage,
                 source_visibility,
+                source_binding,
                 body_symbol: generated_symbol_for(
                     translation_unit_digest,
-                    "variadic_body",
+                    match boundary.kind {
+                        crate::BridgeKind::FixedEntry => "fixed_body",
+                        crate::BridgeKind::VariadicEntry => "variadic_body",
+                        _ => unreachable!(),
+                    },
                     *function,
                     None,
                 ),
@@ -350,7 +421,7 @@ fn plan_artifacts(
     if let Some(call_bridge) = &call_bridge {
         exact_localization_symbols.push(call_bridge.helper_symbol.clone());
     }
-    for entry in variadic_entries.values() {
+    for entry in bridge_entries.values() {
         exact_localization_symbols.push(entry.body_symbol.clone());
         if matches!(
             entry.source_linkage,
@@ -373,13 +444,13 @@ fn plan_artifacts(
     exact_localization_symbols.sort();
     exact_localization_symbols.dedup();
     let generated_assembly_units = u32::try_from(
-        usize::from(call_bridge.is_some()) + variadic_entries.len() + tls_accessors.len(),
+        usize::from(call_bridge.is_some()) + bridge_entries.len() + tls_accessors.len(),
     )
     .map_err(|_| AbiError::new("CCC3503", "generated assembly unit count overflow"))?;
     let needs_packaging = generated_assembly_units != 0;
     Ok(BridgeArtifactPlan {
         call_bridge,
-        variadic_entries,
+        bridge_entries,
         tls_accessors,
         packaging: PackagingPlan {
             generated_assembly_units,
@@ -642,15 +713,24 @@ fn dump_artifacts(output: &mut String, artifacts: &BridgeArtifactPlan) {
     } else {
         writeln!(output, "call-bridge none").unwrap();
     }
-    for entry in artifacts.variadic_entries.values() {
+    for entry in artifacts.bridge_entries.values() {
         writeln!(
             output,
-            "variadic-entry function={} public={} exact={} linkage={} visibility={} body={} frame-version={} va-state-version={}",
+            "bridge-entry function={} kind={} public={} exact={} linkage={} visibility={} binding={} body={} frame-version={} va-state-version={}",
             entry.function.0,
+            match entry.kind {
+                crate::BridgeKind::FixedEntry => "fixed-entry",
+                crate::BridgeKind::VariadicEntry => "variadic-entry",
+                _ => "invalid-call-side-kind",
+            },
             entry.public_symbol,
             entry.public_symbol_is_exact,
             source_linkage_name(entry.source_linkage),
             source_visibility_name(entry.source_visibility),
+            match entry.source_binding {
+                SourceBinding::Strong => "strong",
+                SourceBinding::Weak => "weak",
+            },
             entry.body_symbol,
             entry.frame_version,
             entry.va_state_version
@@ -848,6 +928,8 @@ fn dump_boundary(output: &mut String, boundary: &BoundaryPlan, indent: &str) {
                     crate::BridgeKind::UnprototypedCall => "unprototyped-call",
                     crate::BridgeKind::VariadicCall => "variadic-call",
                     crate::BridgeKind::VariadicEntry => "variadic-entry",
+                    crate::BridgeKind::FixedCall => "fixed-call",
+                    crate::BridgeKind::FixedEntry => "fixed-entry",
                 },
                 bridge.stack_size,
                 bridge.overflow_arg_offset,

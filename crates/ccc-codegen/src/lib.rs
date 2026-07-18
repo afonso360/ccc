@@ -16,7 +16,7 @@ pub struct Output {
     pub object: Vec<u8>,
     pub clif: String,
     pub assemblies: Vec<ccc_link::bridge::GeneratedAssembly>,
-    pub manifest: ccc_link::artifact::BridgeManifestV1,
+    pub manifest: ccc_link::artifact::BridgeManifestV2,
 }
 
 impl Output {

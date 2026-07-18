@@ -5,8 +5,8 @@ pub mod bridge;
 mod package;
 
 pub use artifact::{
-    ArtifactBundle, BridgeManifestV1, GeneratedSymbol, GeneratedSymbolOwner,
-    GeneratedSymbolVisibility, VerifiedArtifactBundle,
+    ArtifactBundle, BridgeManifestV2, GeneratedSymbol, GeneratedSymbolBinding,
+    GeneratedSymbolOwner, GeneratedSymbolVisibility, VerifiedArtifactBundle,
 };
 pub use package::{
     PackagingReport, PackagingToolIdentity, package_artifact_bundle,
@@ -25,9 +25,198 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ccc_target::{
-    Architecture, EffectiveCompilationConfig, OperatingSystem, RelocationModel, SystemIncludeEntry,
-    SystemIncludeKind, ToolCommandSpec, ToolchainFingerprint, ToolchainSpec, Triple,
+    Architecture, EffectiveCompilationConfig, OperatingSystem, RelocationModel,
+    RuntimeHelperProvider, SystemIncludeEntry, SystemIncludeKind, ToolCommandSpec,
+    ToolchainFingerprint, ToolchainSpec, Triple,
 };
+use object::read::archive::ArchiveFile;
+use object::read::{Object as _, ObjectSymbol as _};
+
+/// Observable provider and command-line contribution for target runtime
+/// helpers. The helper symbols themselves remain defined by the target
+/// manifest; this plan records how the final link resolves them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RuntimeHelperLinkPlan {
+    pub provider: RuntimeHelperProvider,
+    pub symbols: Vec<&'static str>,
+}
+
+pub fn runtime_helper_link_plan(
+    config: &EffectiveCompilationConfig,
+) -> Option<RuntimeHelperLinkPlan> {
+    let manifest = config.target.abi.runtime_helper_manifest();
+    let provider = manifest.first()?.provider;
+    debug_assert!(manifest.iter().all(|entry| entry.provider == provider));
+    Some(RuntimeHelperLinkPlan {
+        provider,
+        symbols: manifest.iter().map(|entry| entry.symbol).collect(),
+    })
+}
+
+fn runtime_helper_link_plan_for_object(
+    object: &Path,
+    config: &EffectiveCompilationConfig,
+) -> Result<Option<RuntimeHelperLinkPlan>, LinkError> {
+    let manifest = config.target.abi.runtime_helper_manifest();
+    if manifest.is_empty() {
+        return Ok(None);
+    }
+    let bytes = fs::read(object).map_err(|error| LinkError {
+        code: "CCC5008",
+        message: format!(
+            "cannot inspect `{}` for runtime-helper requirements: {error}",
+            object.display()
+        ),
+    })?;
+    let parsed = object::File::parse(bytes.as_slice()).map_err(|error| LinkError {
+        code: "CCC5008",
+        message: format!(
+            "cannot parse `{}` for runtime-helper requirements: {error}",
+            object.display()
+        ),
+    })?;
+    let undefined = parsed
+        .symbols()
+        .filter(|symbol| symbol.is_undefined())
+        .filter_map(|symbol| symbol.name().ok())
+        .collect::<HashSet<_>>();
+    let required = manifest
+        .iter()
+        .filter(|entry| undefined.contains(entry.symbol))
+        .collect::<Vec<_>>();
+    let Some(first) = required.first() else {
+        return Ok(None);
+    };
+    let provider = first.provider;
+    if required.iter().any(|entry| entry.provider != provider) {
+        return Err(LinkError {
+            code: "CCC5008",
+            message: "runtime-helper requirements select multiple providers".to_owned(),
+        });
+    }
+    Ok(Some(RuntimeHelperLinkPlan {
+        provider,
+        symbols: required.iter().map(|entry| entry.symbol).collect(),
+    }))
+}
+
+fn resolve_runtime_helper_provider(
+    driver: &ToolCommandSpec,
+    plan: &RuntimeHelperLinkPlan,
+) -> Result<PathBuf, LinkError> {
+    let RuntimeHelperProvider::CompilerBuiltins = plan.provider;
+    // Both GCC and Clang implement this historical query. Depending on the
+    // driver's configured runtime, its result can be libgcc or compiler-rt.
+    let output = tool_command(driver)
+        .arg("-print-libgcc-file-name")
+        .output()
+        .map_err(|error| LinkError {
+            code: "CCC5008",
+            message: format!(
+                "cannot query runtime-helper provider from `{}`: {error}",
+                driver.display()
+            ),
+        })?;
+    if !output.status.success() {
+        return Err(LinkError {
+            code: "CCC5008",
+            message: format!(
+                "target compiler driver `{}` cannot resolve its compiler builtins archive: {}",
+                driver.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        });
+    }
+    let reported = String::from_utf8_lossy(&output.stdout);
+    let path = PathBuf::from(reported.trim());
+    if path.as_os_str().is_empty() {
+        return Err(LinkError {
+            code: "CCC5008",
+            message: format!(
+                "target compiler driver `{}` reported an empty compiler builtins path",
+                driver.display()
+            ),
+        });
+    }
+    verify_runtime_helper_archive(&path, plan)?;
+    fs::canonicalize(&path).map_err(|error| LinkError {
+        code: "CCC5008",
+        message: format!(
+            "resolved compiler builtins provider `{}` cannot be canonicalized: {error}",
+            path.display()
+        ),
+    })
+}
+
+fn verify_runtime_helper_archive(
+    path: &Path,
+    plan: &RuntimeHelperLinkPlan,
+) -> Result<(), LinkError> {
+    let bytes = fs::read(path).map_err(|error| LinkError {
+        code: "CCC5008",
+        message: format!(
+            "resolved compiler builtins provider `{}` cannot be read: {error}",
+            path.display()
+        ),
+    })?;
+    let archive = ArchiveFile::parse(bytes.as_slice()).map_err(|error| LinkError {
+        code: "CCC5008",
+        message: format!(
+            "resolved compiler builtins provider `{}` is not a readable archive: {error}",
+            path.display()
+        ),
+    })?;
+    let symbols = archive
+        .symbols()
+        .map_err(|error| LinkError {
+            code: "CCC5008",
+            message: format!(
+                "cannot read symbols from compiler builtins provider `{}`: {error}",
+                path.display()
+            ),
+        })?
+        .ok_or_else(|| LinkError {
+            code: "CCC5008",
+            message: format!(
+                "compiler builtins provider `{}` has no archive symbol index",
+                path.display()
+            ),
+        })?
+        .map(|symbol| symbol.map(|symbol| String::from_utf8_lossy(symbol.name()).into_owned()))
+        .collect::<Result<HashSet<_>, _>>()
+        .map_err(|error| LinkError {
+            code: "CCC5008",
+            message: format!(
+                "cannot read symbols from compiler builtins provider `{}`: {error}",
+                path.display()
+            ),
+        })?;
+    verify_runtime_helper_symbols(path, &symbols, plan)
+}
+
+fn verify_runtime_helper_symbols(
+    path: &Path,
+    symbols: &HashSet<String>,
+    plan: &RuntimeHelperLinkPlan,
+) -> Result<(), LinkError> {
+    let missing = plan
+        .symbols
+        .iter()
+        .copied()
+        .filter(|symbol| !symbols.contains(*symbol))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(LinkError {
+            code: "CCC5008",
+            message: format!(
+                "compiler builtins provider `{}` is missing required runtime helpers: {}",
+                path.display(),
+                missing.join(", ")
+            ),
+        });
+    }
+    Ok(())
+}
 
 #[derive(Debug)]
 pub struct LinkError {
@@ -1112,6 +1301,12 @@ pub fn link_executable_with_toolchain(
         })?;
     let mut command = tool_command(driver);
     command.arg(object).arg("-o").arg(output);
+    if let Some(runtime_helpers) = runtime_helper_link_plan_for_object(object, config)? {
+        let provider = resolve_runtime_helper_provider(driver, &runtime_helpers)?;
+        // Link the exact archive that was inspected. A generic `-l` argument
+        // could resolve a different provider after user-supplied search paths.
+        command.arg(provider);
+    }
     command.arg(relocation_link_argument(config));
     let result = command.output().map_err(|error| LinkError {
         code: "CCC5003",
@@ -1575,6 +1770,57 @@ mod tests {
         let mut unsupported = darwin;
         unsupported.relocation_model = RelocationModel::Static;
         assert!(unsupported.validate_target_profile_options().is_err());
+    }
+
+    #[test]
+    fn runtime_helper_link_plan_names_the_provider_and_symbols() {
+        let linux = EffectiveCompilationConfig::x86_64_unknown_linux_gnu();
+        let plan = runtime_helper_link_plan(&linux).unwrap();
+        assert_eq!(plan.provider, RuntimeHelperProvider::CompilerBuiltins);
+        assert_eq!(plan.symbols.len(), 12);
+        assert!(plan.symbols.contains(&"__divti3"));
+        assert!(plan.symbols.contains(&"__fixunsdfti"));
+
+        let darwin = EffectiveCompilationConfig::aarch64_apple_darwin();
+        assert_eq!(runtime_helper_link_plan(&darwin), None);
+    }
+
+    #[test]
+    fn runtime_helper_provider_diagnostics_are_deterministic_for_bad_archives() {
+        let plan = RuntimeHelperLinkPlan {
+            provider: RuntimeHelperProvider::CompilerBuiltins,
+            symbols: vec!["__divti3", "__fixdfti"],
+        };
+        let missing = verify_runtime_helper_symbols(
+            Path::new("/fixture/compiler-builtins.a"),
+            &HashSet::new(),
+            &plan,
+        )
+        .unwrap_err();
+        assert_eq!(missing.code, "CCC5008");
+        assert_eq!(
+            missing.message,
+            "compiler builtins provider `/fixture/compiler-builtins.a` is missing required runtime helpers: __divti3, __fixdfti"
+        );
+
+        let path = env::temp_dir().join(format!(
+            "ccc-malformed-builtins-{}-{}.a",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, b"not an archive").unwrap();
+        let malformed = verify_runtime_helper_archive(&path, &plan).unwrap_err();
+        fs::remove_file(&path).unwrap();
+        assert_eq!(malformed.code, "CCC5008");
+        assert!(
+            malformed
+                .message
+                .starts_with("resolved compiler builtins provider `")
+        );
+        assert!(malformed.message.contains("is not a readable archive:"));
     }
 
     #[test]

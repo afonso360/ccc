@@ -262,19 +262,26 @@ when detectable.
 ### Wide integer extension
 
 `__int128` and `unsigned __int128` are distinct 128-bit integer types with the
-usual integer operations, conversions, qualifiers, pointers, arrays, and object
-layout. Their built-in type IDs are appended after the existing built-in prefix;
+usual integer operations, conversions, `const`/`volatile` qualification,
+pointers, arrays, and object layout. Atomic-qualified 128-bit objects and
+operations remain explicitly rejected. Their built-in type IDs are appended
+after the existing built-in prefix;
 the hand-assigned constants, `BuiltinType` ordering, and `TypeStore`
 initialization order remain in lockstep and no existing ID is renumbered.
 
 On System V AMD64, a wide integer boundary is classified as two `INTEGER`
 eightbytes with whole-argument register rollback and the target-required memory
 alignment. Calls, returns, variadic arguments, and mixed register pressure are
-cross-linked in both directions with GCC and Clang. No other target advertises
-the type until its own layout and ABI evidence exists.
+cross-linked in both directions with GCC and Clang. Other enabled targets retain
+the type's syntax and object layout but reject value operations and boundaries;
+they do not define `__SIZEOF_INT128__` until their own ABI evidence exists.
 
 Cranelift operations are used only where the pinned backend proves native
-lowering. Wide division, remainder, and integer/floating conversions are
+lowering. Its native System V `i128` signature lowering fails the mixed-pressure
+whole-argument rollback contract, so source-visible fixed boundaries use CCC's
+verified uniform-frame bridge while body values remain native. Fixed entries
+save planned SSE inputs without consulting undefined variadic metadata. Wide
+division, remainder, and integer/floating conversions are
 operation-sensitive compiler-emitted helper calls. The runtime-helper manifest
 pre-budgets these symbol families:
 

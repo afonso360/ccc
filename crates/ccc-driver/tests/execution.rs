@@ -346,6 +346,59 @@ int main(void) {
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
+fn wide_integer_runtime_helpers_resolve_through_the_ccc_link_path() {
+    let directory = test_directory("wide-runtime-provider");
+    let source = directory.join("wide-runtime-provider.c");
+    fs::write(
+        &source,
+        r#"
+typedef __int128 i128;
+
+static i128 divide(i128 left, i128 right) { return left / right; }
+static i128 remainder(i128 left, i128 right) { return left % right; }
+static double to_double(i128 value) { return (double)value; }
+static i128 from_double(double value) { return (i128)value; }
+
+int main(void) {
+    i128 value = ((i128)1 << 100) + 12345;
+    i128 divisor = 97;
+    i128 quotient = divide(value, divisor);
+    i128 residual = remainder(value, divisor);
+    if (quotient * divisor + residual != value) return 1;
+    if (from_double(to_double((i128)1 << 100)) != ((i128)1 << 100)) return 2;
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+
+    for compiler in ["gcc", "clang"] {
+        let executable = directory.join(format!("program-{compiler}"));
+        let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+            .env("CCC_CC", compiler)
+            .arg("--target=x86_64-unknown-linux-gnu")
+            .arg(&source)
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .unwrap();
+        assert!(
+            compilation.status.success(),
+            "CCC link through {compiler} failed: {}",
+            String::from_utf8_lossy(&compilation.stderr)
+        );
+        let execution = Command::new(&executable).output().unwrap();
+        assert!(
+            execution.status.success(),
+            "program linked through {compiler} failed: {}",
+            String::from_utf8_lossy(&execution.stderr)
+        );
+    }
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
 fn thread_local_objects_are_isolated_in_pthreads_and_pie() {
     use object::{Object as _, ObjectKind};
 

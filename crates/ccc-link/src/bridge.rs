@@ -164,6 +164,8 @@ pub enum GeneratedSymbolKind {
     VariadicEntry,
     VariadicBody,
     Support,
+    FixedEntry,
+    FixedBody,
 }
 
 impl GeneratedSymbolKind {
@@ -176,6 +178,8 @@ impl GeneratedSymbolKind {
             Self::VariadicEntry => "variadic-entry",
             Self::VariadicBody => "variadic-body",
             Self::Support => "support",
+            Self::FixedEntry => "fixed-entry",
+            Self::FixedBody => "fixed-body",
         }
     }
 
@@ -188,6 +192,8 @@ impl GeneratedSymbolKind {
             Self::VariadicEntry => "variadic_entry",
             Self::VariadicBody => "variadic_body",
             Self::Support => "support",
+            Self::FixedEntry => "fixed_entry",
+            Self::FixedBody => "fixed_body",
         }
     }
 }
@@ -325,6 +331,8 @@ pub(crate) fn is_bridge_generated_symbol(symbol: &str) -> bool {
         "__ccc_tls_object_",
         "__ccc_variadic_entry_",
         "__ccc_variadic_body_",
+        "__ccc_fixed_entry_",
+        "__ccc_fixed_body_",
         "__ccc_support_",
     ]
     .iter()
@@ -399,6 +407,7 @@ pub fn render_tls_accessor(plan: &TlsAccessorPlan) -> Result<GeneratedAssembly, 
     function_header(
         &plan.helper_symbol,
         AssemblyFunctionLinkage::ExternalHidden,
+        false,
         &mut source,
     );
     match plan.model {
@@ -453,22 +462,30 @@ pub enum AssemblyFunctionLinkage {
     Internal,
 }
 
-fn function_header(symbol: &str, linkage: AssemblyFunctionLinkage, output: &mut String) {
+fn function_header(
+    symbol: &str,
+    linkage: AssemblyFunctionLinkage,
+    weak: bool,
+    output: &mut String,
+) {
     output.push_str(".p2align 4\n");
+    let mut external_binding = || {
+        writeln!(output, "{} {symbol}", if weak { ".weak" } else { ".globl" }).unwrap();
+    };
     match linkage {
         AssemblyFunctionLinkage::ExternalDefault => {
-            writeln!(output, ".globl {symbol}").unwrap();
+            external_binding();
         }
         AssemblyFunctionLinkage::ExternalHidden => {
-            writeln!(output, ".globl {symbol}").unwrap();
+            external_binding();
             writeln!(output, ".hidden {symbol}").unwrap();
         }
         AssemblyFunctionLinkage::ExternalProtected => {
-            writeln!(output, ".globl {symbol}").unwrap();
+            external_binding();
             writeln!(output, ".protected {symbol}").unwrap();
         }
         AssemblyFunctionLinkage::ExternalInternal => {
-            writeln!(output, ".globl {symbol}").unwrap();
+            external_binding();
             writeln!(output, ".internal {symbol}").unwrap();
         }
         AssemblyFunctionLinkage::Internal => {
@@ -507,6 +524,7 @@ fn target_function_header(
     symbol: &str,
     symbol_is_exact: bool,
     linkage: AssemblyFunctionLinkage,
+    weak: bool,
     abi: AbiIdentity,
     output: &mut String,
 ) {
@@ -520,24 +538,47 @@ fn target_function_header(
             // private external until the relocatable link resolves the pair.
             writeln!(output, ".globl {assembly_symbol}").unwrap();
         }
+        if weak {
+            writeln!(output, ".weak_definition {assembly_symbol}").unwrap();
+        }
         if linkage != AssemblyFunctionLinkage::ExternalDefault {
             writeln!(output, ".private_extern {assembly_symbol}").unwrap();
         }
     } else {
         match linkage {
             AssemblyFunctionLinkage::ExternalDefault => {
-                writeln!(output, ".globl {assembly_symbol}").unwrap();
+                writeln!(
+                    output,
+                    "{} {assembly_symbol}",
+                    if weak { ".weak" } else { ".globl" }
+                )
+                .unwrap();
             }
             AssemblyFunctionLinkage::ExternalHidden | AssemblyFunctionLinkage::Internal => {
-                writeln!(output, ".globl {assembly_symbol}").unwrap();
+                writeln!(
+                    output,
+                    "{} {assembly_symbol}",
+                    if weak { ".weak" } else { ".globl" }
+                )
+                .unwrap();
                 writeln!(output, ".hidden {assembly_symbol}").unwrap();
             }
             AssemblyFunctionLinkage::ExternalProtected => {
-                writeln!(output, ".globl {assembly_symbol}").unwrap();
+                writeln!(
+                    output,
+                    "{} {assembly_symbol}",
+                    if weak { ".weak" } else { ".globl" }
+                )
+                .unwrap();
                 writeln!(output, ".protected {assembly_symbol}").unwrap();
             }
             AssemblyFunctionLinkage::ExternalInternal => {
-                writeln!(output, ".globl {assembly_symbol}").unwrap();
+                writeln!(
+                    output,
+                    "{} {assembly_symbol}",
+                    if weak { ".weak" } else { ".globl" }
+                )
+                .unwrap();
                 writeln!(output, ".internal {assembly_symbol}").unwrap();
             }
         }
@@ -568,7 +609,12 @@ pub fn render_generic_call_helper(symbol: &str) -> Result<GeneratedAssembly, Lin
     validate_symbol(symbol)?;
     let mut source = String::new();
     assembly_prelude(&mut source);
-    function_header(symbol, AssemblyFunctionLinkage::ExternalHidden, &mut source);
+    function_header(
+        symbol,
+        AssemblyFunctionLinkage::ExternalHidden,
+        false,
+        &mut source,
+    );
     source.push_str(
         "pushq %rbp\n\
          .cfi_def_cfa_offset 16\n\
@@ -649,6 +695,7 @@ fn render_arm64_call_helper(
         symbol,
         false,
         AssemblyFunctionLinkage::ExternalHidden,
+        false,
         abi,
         &mut source,
     );
@@ -728,6 +775,7 @@ fn render_riscv64_call_helper(symbol: &str) -> Result<GeneratedAssembly, LinkErr
         symbol,
         false,
         AssemblyFunctionLinkage::ExternalHidden,
+        false,
         AbiIdentity::RiscvLp64d,
         &mut source,
     );
@@ -808,15 +856,16 @@ fn render_riscv64_call_helper(symbol: &str) -> Result<GeneratedAssembly, LinkErr
     )
 }
 
-/// Precomputed information needed to render a public variadic entry.
+/// Precomputed information needed to render a public uniform-frame entry.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct VariadicEntryPlan {
+pub struct BridgeEntryPlan {
     pub public_symbol: String,
     /// The public spelling is an explicit object-file symbol from a
     /// declaration assembly label and must bypass target C-name mangling.
     pub public_symbol_is_exact: bool,
     pub hidden_body_symbol: String,
     pub linkage: AssemblyFunctionLinkage,
+    pub weak: bool,
     pub fixed_gp_used: u8,
     pub fixed_sse_used: u8,
     /// Offset from the incoming stack argument area to the first variadic item.
@@ -830,13 +879,18 @@ pub struct VariadicEntryPlan {
     pub logical_line: u32,
 }
 
-impl VariadicEntryPlan {
+impl BridgeEntryPlan {
     fn validate(&self, abi: AbiIdentity) -> Result<(), LinkError> {
         validate_symbol(&self.public_symbol)?;
         validate_symbol(&self.hidden_body_symbol)?;
         if self.public_symbol == self.hidden_body_symbol {
             return Err(artifact_error(
-                "a variadic entry and its hidden body must use distinct symbols",
+                "a bridge entry and its hidden body must use distinct symbols",
+            ));
+        }
+        if self.weak && self.linkage == AssemblyFunctionLinkage::Internal {
+            return Err(artifact_error(
+                "an internal bridge entry cannot have weak binding",
             ));
         }
         let gp_limit = if abi == AbiIdentity::SysvAmd64Lp64 {
@@ -846,12 +900,12 @@ impl VariadicEntryPlan {
         };
         if self.fixed_gp_used > gp_limit || self.fixed_sse_used > 8 {
             return Err(artifact_error(
-                "variadic fixed-prefix register counts exceed the target register areas",
+                "bridge-entry register counts exceed the target register areas",
             ));
         }
         if !self.overflow_arg_offset.is_multiple_of(8) {
             return Err(artifact_error(
-                "the variadic overflow argument offset must be eight-byte aligned",
+                "the bridge-entry overflow argument offset must be eight-byte aligned",
             ));
         }
         let float_result_limit =
@@ -862,12 +916,12 @@ impl VariadicEntryPlan {
             };
         if self.gp_results > 2 || self.xmm_results > float_result_limit {
             return Err(artifact_error(
-                "a variadic entry result exceeds the target register banks",
+                "a bridge-entry result exceeds the target register banks",
             ));
         }
         if self.hidden_return && (self.gp_results != 0 || self.xmm_results != 0) {
             return Err(artifact_error(
-                "an indirect variadic result cannot also request register results",
+                "an indirect bridge-entry result cannot also request register results",
             ));
         }
         Ok(())
@@ -875,19 +929,19 @@ impl VariadicEntryPlan {
 }
 
 /// Renders the public assembly entry for a compiler-defined variadic function.
-pub fn render_variadic_entry(plan: &VariadicEntryPlan) -> Result<GeneratedAssembly, LinkError> {
+pub fn render_variadic_entry(plan: &BridgeEntryPlan) -> Result<GeneratedAssembly, LinkError> {
     render_target_variadic_entry(plan, AbiIdentity::SysvAmd64Lp64)
 }
 
 /// Renders a public variadic entry for the selected CCC ABI identity.
 pub fn render_target_variadic_entry(
-    plan: &VariadicEntryPlan,
+    plan: &BridgeEntryPlan,
     abi: AbiIdentity,
 ) -> Result<GeneratedAssembly, LinkError> {
     plan.validate(abi)?;
 
     match abi {
-        AbiIdentity::SysvAmd64Lp64 => render_sysv_amd64_variadic_entry(plan),
+        AbiIdentity::SysvAmd64Lp64 => render_sysv_amd64_entry(plan, EntryKind::Variadic),
         AbiIdentity::Aapcs64Lp64 | AbiIdentity::DarwinArm64 => {
             render_arm64_variadic_entry(plan, abi)
         }
@@ -895,12 +949,36 @@ pub fn render_target_variadic_entry(
     }
 }
 
-fn render_sysv_amd64_variadic_entry(
-    plan: &VariadicEntryPlan,
+/// Renders a public fixed-signature wide-integer entry for x86-64 System V.
+///
+/// Unlike a variadic entry, an ordinary call does not define `%al`. The fixed
+/// renderer therefore saves every planned SSE input unconditionally.
+pub fn render_target_fixed_entry(
+    plan: &BridgeEntryPlan,
+    abi: AbiIdentity,
+) -> Result<GeneratedAssembly, LinkError> {
+    plan.validate(abi)?;
+    if abi != AbiIdentity::SysvAmd64Lp64 {
+        return Err(artifact_error(
+            "fixed uniform-frame entries are enabled only for x86-64 System V",
+        ));
+    }
+    render_sysv_amd64_entry(plan, EntryKind::Fixed)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EntryKind {
+    Fixed,
+    Variadic,
+}
+
+fn render_sysv_amd64_entry(
+    plan: &BridgeEntryPlan,
+    kind: EntryKind,
 ) -> Result<GeneratedAssembly, LinkError> {
     let mut source = String::new();
     assembly_prelude(&mut source);
-    function_header(&plan.public_symbol, plan.linkage, &mut source);
+    function_header(&plan.public_symbol, plan.linkage, plan.weak, &mut source);
     source.push_str(
         "pushq %rbp\n\
          .cfi_def_cfa_offset 16\n\
@@ -912,11 +990,11 @@ fn render_sysv_amd64_variadic_entry(
     // void`. The body reconstructs fixed values from this frame, so assembly
     // never has to duplicate Cranelift's native aggregate signature.
     source.push_str("subq $256, %rsp\n");
-    // `%al` is caller-owned variadic metadata and must be captured before any
-    // instruction reuses `%rax`. A zero count lets the entry avoid reading
-    // undefined incoming XMM registers while the pre-zeroed save area remains
-    // deterministic.
-    source.push_str("movzbl %al, %r11d\n");
+    if kind == EntryKind::Variadic {
+        // `%al` is caller-owned variadic metadata and must be captured before
+        // any instruction reuses `%rax`.
+        source.push_str("movzbl %al, %r11d\n");
+    }
     for (register, offset) in [
         ("%rdi", 32),
         ("%rsi", 40),
@@ -931,16 +1009,27 @@ fn render_sysv_amd64_variadic_entry(
     for index in 0..8 {
         writeln!(source, "movdqu %xmm15, {}(%rsp)", 80 + index * 16).unwrap();
     }
-    source.push_str("cmpb $8, %r11b\njbe 0f\nmovb $8, %r11b\n0:\n");
-    for index in 0..8 {
-        writeln!(
-            source,
-            "cmpb ${index}, %r11b\njbe 1f\nmovdqu %xmm{index}, {}(%rsp)",
-            80 + index * 16
-        )
-        .unwrap();
+    match kind {
+        EntryKind::Variadic => {
+            // A zero count avoids reading undefined incoming XMM registers;
+            // the pre-zeroed save area remains deterministic.
+            source.push_str("cmpb $8, %r11b\njbe 0f\nmovb $8, %r11b\n0:\n");
+            for index in 0..8 {
+                writeln!(
+                    source,
+                    "cmpb ${index}, %r11b\njbe 1f\nmovdqu %xmm{index}, {}(%rsp)",
+                    80 + index * 16
+                )
+                .unwrap();
+            }
+            source.push_str("1:\n");
+        }
+        EntryKind::Fixed => {
+            for index in 0..usize::from(plan.fixed_sse_used) {
+                writeln!(source, "movdqu %xmm{index}, {}(%rsp)", 80 + index * 16).unwrap();
+            }
+        }
     }
-    source.push_str("1:\n");
     writeln!(
         source,
         "movl ${BRIDGE_MAGIC}, 0(%rsp)",
@@ -967,8 +1056,7 @@ fn render_sysv_amd64_variadic_entry(
     )
     .unwrap();
     source.push_str("movq %r10, 16(%rsp)\nleaq 32(%rsp), %r10\nmovq %r10, 24(%rsp)\n");
-    // Initialize result storage deterministically after consuming the `%al`
-    // snapshot used by the register-save guard.
+    // Initialize result storage deterministically after the register saves.
     source.push_str(
         "xorq %r11, %r11\n\
          movq %r11, 208(%rsp)\n\
@@ -999,7 +1087,14 @@ fn render_sysv_amd64_variadic_entry(
     source.push_str("leave\n.cfi_def_cfa %rsp, 8\nret\n");
     function_footer(&plan.public_symbol, &mut source);
     GeneratedAssembly::new(
-        format!("variadic-entry-{}", short_stem(&plan.public_symbol)),
+        format!(
+            "{}-entry-{}",
+            match kind {
+                EntryKind::Fixed => "fixed",
+                EntryKind::Variadic => "variadic",
+            },
+            short_stem(&plan.public_symbol)
+        ),
         source,
         vec![plan.public_symbol.clone()],
         vec![LogicalDebugLocation::generated(plan.logical_line.max(1))],
@@ -1007,7 +1102,7 @@ fn render_sysv_amd64_variadic_entry(
 }
 
 fn render_arm64_variadic_entry(
-    plan: &VariadicEntryPlan,
+    plan: &BridgeEntryPlan,
     abi: AbiIdentity,
 ) -> Result<GeneratedAssembly, LinkError> {
     let mut source = String::new();
@@ -1015,6 +1110,7 @@ fn render_arm64_variadic_entry(
         &plan.public_symbol,
         plan.public_symbol_is_exact,
         plan.linkage,
+        plan.weak,
         abi,
         &mut source,
     );
@@ -1130,13 +1226,14 @@ fn render_arm64_variadic_entry(
     )
 }
 
-fn render_riscv64_variadic_entry(plan: &VariadicEntryPlan) -> Result<GeneratedAssembly, LinkError> {
+fn render_riscv64_variadic_entry(plan: &BridgeEntryPlan) -> Result<GeneratedAssembly, LinkError> {
     let abi = AbiIdentity::RiscvLp64d;
     let mut source = String::new();
     target_function_header(
         &plan.public_symbol,
         plan.public_symbol_is_exact,
         plan.linkage,
+        plan.weak,
         abi,
         &mut source,
     );
@@ -1420,11 +1517,12 @@ mod tests {
 
     #[test]
     fn variadic_entry_builds_the_public_va_list_view() {
-        let assembly = render_variadic_entry(&VariadicEntryPlan {
+        let assembly = render_variadic_entry(&BridgeEntryPlan {
             public_symbol: "consume".to_owned(),
             public_symbol_is_exact: false,
             hidden_body_symbol: "__ccc_variadic_body_test".to_owned(),
             linkage: AssemblyFunctionLinkage::ExternalHidden,
+            weak: false,
             fixed_gp_used: 2,
             fixed_sse_used: 1,
             overflow_arg_offset: 16,
@@ -1450,12 +1548,43 @@ mod tests {
     }
 
     #[test]
+    fn fixed_entry_saves_planned_sse_inputs_without_reading_variadic_metadata() {
+        let assembly = render_target_fixed_entry(
+            &BridgeEntryPlan {
+                public_symbol: "fixed_wide".to_owned(),
+                public_symbol_is_exact: false,
+                hidden_body_symbol: "__ccc_fixed_body_test".to_owned(),
+                linkage: AssemblyFunctionLinkage::ExternalDefault,
+                weak: true,
+                fixed_gp_used: 2,
+                fixed_sse_used: 2,
+                overflow_arg_offset: 0,
+                gp_results: 2,
+                xmm_results: 0,
+                hidden_return: false,
+                logical_line: 1,
+            },
+            AbiIdentity::SysvAmd64Lp64,
+        )
+        .unwrap();
+        let source = assembly.source();
+        assert!(source.contains(".weak fixed_wide"), "{source}");
+        assert!(!source.contains(".globl fixed_wide"), "{source}");
+        assert!(!source.contains("%al"), "{source}");
+        assert!(!source.contains("%r11b"), "{source}");
+        assert!(source.contains("movdqu %xmm0, 80(%rsp)"), "{source}");
+        assert!(source.contains("movdqu %xmm1, 96(%rsp)"), "{source}");
+        assert!(!source.contains("movdqu %xmm2, 112(%rsp)"), "{source}");
+    }
+
+    #[test]
     fn variadic_entry_rejects_conflicting_indirect_and_register_results() {
-        let error = render_variadic_entry(&VariadicEntryPlan {
+        let error = render_variadic_entry(&BridgeEntryPlan {
             public_symbol: "consume".to_owned(),
             public_symbol_is_exact: false,
             hidden_body_symbol: "hidden".to_owned(),
             linkage: AssemblyFunctionLinkage::Internal,
+            weak: false,
             fixed_gp_used: 2,
             fixed_sse_used: 0,
             overflow_arg_offset: 0,
@@ -1474,11 +1603,12 @@ mod tests {
 
     #[test]
     fn variadic_entry_retains_internal_source_linkage() {
-        let assembly = render_variadic_entry(&VariadicEntryPlan {
+        let assembly = render_variadic_entry(&BridgeEntryPlan {
             public_symbol: "local_consume".to_owned(),
             public_symbol_is_exact: false,
             hidden_body_symbol: "__ccc_variadic_body_local".to_owned(),
             linkage: AssemblyFunctionLinkage::Internal,
+            weak: false,
             fixed_gp_used: 0,
             fixed_sse_used: 0,
             overflow_arg_offset: 0,
@@ -1509,11 +1639,12 @@ mod tests {
                 Some(".internal consume"),
             ),
         ] {
-            let assembly = render_variadic_entry(&VariadicEntryPlan {
+            let assembly = render_variadic_entry(&BridgeEntryPlan {
                 public_symbol: "consume".to_owned(),
                 public_symbol_is_exact: false,
                 hidden_body_symbol: "__ccc_variadic_body_visibility".to_owned(),
                 linkage,
+                weak: false,
                 fixed_gp_used: 0,
                 fixed_sse_used: 0,
                 overflow_arg_offset: 0,
@@ -1539,11 +1670,12 @@ mod tests {
     fn darwin_variadic_entry_preserves_exact_assembly_label_spelling() {
         let render = |public_symbol: &str, public_symbol_is_exact: bool| {
             render_target_variadic_entry(
-                &VariadicEntryPlan {
+                &BridgeEntryPlan {
                     public_symbol: public_symbol.to_owned(),
                     public_symbol_is_exact,
                     hidden_body_symbol: "__ccc_variadic_body_darwin_label".to_owned(),
                     linkage: AssemblyFunctionLinkage::ExternalDefault,
+                    weak: false,
                     fixed_gp_used: 1,
                     fixed_sse_used: 0,
                     overflow_arg_offset: 0,
@@ -1562,6 +1694,19 @@ mod tests {
         assert!(exact.source().contains("_physical_variadic:\n"));
         assert!(!exact.source().contains("__physical_variadic"));
 
+        let exact_without_prefix = render("physical_variadic", true);
+        assert!(
+            exact_without_prefix
+                .source()
+                .contains(".globl physical_variadic\n")
+        );
+        assert!(
+            exact_without_prefix
+                .source()
+                .contains("physical_variadic:\n")
+        );
+        assert!(!exact_without_prefix.source().contains("_physical_variadic"));
+
         let ordinary = render("_ordinary_variadic", false);
         assert!(ordinary.source().contains(".globl __ordinary_variadic\n"));
         assert!(ordinary.source().contains("__ordinary_variadic:\n"));
@@ -1569,11 +1714,12 @@ mod tests {
 
     #[test]
     fn variadic_entry_guards_each_xmm_save_with_the_incoming_al_bound() {
-        let assembly = render_variadic_entry(&VariadicEntryPlan {
+        let assembly = render_variadic_entry(&BridgeEntryPlan {
             public_symbol: "consume".to_owned(),
             public_symbol_is_exact: false,
             hidden_body_symbol: "__ccc_variadic_body_al_bound".to_owned(),
             linkage: AssemblyFunctionLinkage::ExternalDefault,
+            weak: false,
             fixed_gp_used: 0,
             fixed_sse_used: 0,
             overflow_arg_offset: 0,

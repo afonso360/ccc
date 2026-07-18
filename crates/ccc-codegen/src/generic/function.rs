@@ -1,4 +1,4 @@
-use super::data::{low_mask, scalar_constant_bits, string_unit_bytes};
+use super::data::{low_mask_u128, scalar_constant_bits, string_unit_bytes};
 use super::*;
 
 pub(super) struct FunctionReferences {
@@ -8,6 +8,7 @@ pub(super) struct FunctionReferences {
     call_helper: Option<ir::FuncRef>,
     runtime_realloc: Option<ir::FuncRef>,
     runtime_free: Option<ir::FuncRef>,
+    runtime_helpers: HashMap<&'static str, ir::FuncRef>,
 }
 
 #[derive(Clone, Copy)]
@@ -88,6 +89,11 @@ pub(super) fn declare_function_references(
     let runtime_free = declarations
         .runtime_free
         .map(|id| object_module.declare_func_in_func(id, function));
+    let runtime_helpers = declarations
+        .runtime_helpers
+        .iter()
+        .map(|(symbol, id)| (*symbol, object_module.declare_func_in_func(*id, function)))
+        .collect();
     FunctionReferences {
         functions,
         globals,
@@ -95,6 +101,7 @@ pub(super) fn declare_function_references(
         call_helper,
         runtime_realloc,
         runtime_free,
+        runtime_helpers,
     }
 }
 
@@ -968,6 +975,7 @@ impl FunctionState<'_> {
                     *from,
                     *to,
                     self.config,
+                    &self.references.runtime_helpers,
                 ),
                 I::Unary { operator, operand } => Ok(Some(lower_unary(
                     builder,
@@ -1003,6 +1011,7 @@ impl FunctionState<'_> {
                         floating,
                         signed,
                         result,
+                        &self.references.runtime_helpers,
                     )?))
                 }
                 I::IntegerIntrinsic { operation, operand } => {
@@ -1758,9 +1767,12 @@ impl FunctionState<'_> {
                 .ins()
                 .ushr_imm(unit, i64::from(descriptor.bit_offset))
         };
-        let masked = builder
-            .ins()
-            .band_imm(shifted, low_mask(descriptor.width) as i64);
+        let masked = integer_and_mask(
+            builder,
+            shifted,
+            storage_ty,
+            low_mask_u128(descriptor.width),
+        );
         let normalized = if descriptor.signed && descriptor.width != 0 {
             let shift = storage_ty.bits() - descriptor.width;
             if shift == 0 {
@@ -1803,10 +1815,10 @@ impl FunctionState<'_> {
         let old = builder.ins().load(storage_ty, MemFlags::new(), address, 0);
         let value_ty = builder.func.dfg.value_type(value);
         let value = coerce_integer(builder, value, value_ty, storage_ty, descriptor.signed);
-        let value_mask = low_mask(descriptor.width);
+        let value_mask = low_mask_u128(descriptor.width);
         let field_mask = value_mask.checked_shl(descriptor.bit_offset).unwrap_or(0);
-        let retained = builder.ins().band_imm(old, (!field_mask) as i64);
-        let value = builder.ins().band_imm(value, value_mask as i64);
+        let retained = integer_and_mask(builder, old, storage_ty, !field_mask);
+        let value = integer_and_mask(builder, value, storage_ty, value_mask);
         let value = if descriptor.bit_offset == 0 {
             value
         } else {
@@ -2058,6 +2070,20 @@ impl FunctionState<'_> {
             if classified.passing == ccc_abi::PassingMode::Scalar {
                 let mut value = self.value(argument_id)?;
                 let value_type = builder.func.dfg.value_type(value);
+                if value_type == ir::types::I128 {
+                    let (low, high) = builder.ins().isplit(value);
+                    let piece_value = match piece.piece.index {
+                        0 => low,
+                        1 => high,
+                        _ => {
+                            return Err(error(
+                                "wide scalar bridge has an invalid physical piece index",
+                            ));
+                        }
+                    };
+                    store_value(builder, destination, 0, piece_value)?;
+                    continue;
+                }
                 if value_type.is_int() && value_type.bits() < 32 {
                     value = coerce_integer(
                         builder,
@@ -2636,7 +2662,11 @@ impl FunctionState<'_> {
                 let selector_ty = builder.func.dfg.value_type(selector);
                 for case in cases {
                     let next = builder.create_block();
-                    let constant = builder.ins().iconst(selector_ty, case.value as i64);
+                    let constant = if selector_ty == ir::types::I128 {
+                        i128_constant(builder, case.value)
+                    } else {
+                        builder.ins().iconst(selector_ty, case.value as u64 as i64)
+                    };
                     let matches = builder.ins().icmp(IntCC::Equal, selector, constant);
                     let arguments = self.edge_arguments(&case.edge)?;
                     builder.ins().brif(
@@ -3060,12 +3090,16 @@ pub(super) fn scalar_type(
             span: None,
         }),
         Some(TypeKind::Builtin(BuiltinType::Int128 | BuiltinType::UnsignedInt128)) => {
-            Err(CodegenError {
-                code: "CCC3517",
-                message: "128-bit integer values require an enabled transport capability"
-                    .to_owned(),
-                span: None,
-            })
+            if config.target.abi.supports_int128_values() {
+                Ok(ir::types::I128)
+            } else {
+                Err(CodegenError {
+                    code: "CCC3517",
+                    message: "128-bit integer values require an enabled transport capability"
+                        .to_owned(),
+                    span: None,
+                })
+            }
         }
         Some(TypeKind::Builtin(_)) => {
             let layout = object_layout(types, ty, config)?;
@@ -3102,6 +3136,7 @@ fn integer_type_for_size(size: u64, class: &str) -> Result<ir::Type, CodegenErro
         2 => Ok(ir::types::I16),
         4 => Ok(ir::types::I32),
         8 => Ok(ir::types::I64),
+        16 => Ok(ir::types::I128),
         _ => Err(error(format!("unsupported {class} size {size}"))),
     }
 }
@@ -3125,14 +3160,8 @@ fn is_signed(
             | BuiltinType::UnsignedInt
             | BuiltinType::UnsignedLong
             | BuiltinType::UnsignedLongLong => false,
-            BuiltinType::Int128 | BuiltinType::UnsignedInt128 => {
-                return Err(CodegenError {
-                    code: "CCC3517",
-                    message: "128-bit integer values require an enabled transport capability"
-                        .to_owned(),
-                    span: None,
-                });
-            }
+            BuiltinType::Int128 => true,
+            BuiltinType::UnsignedInt128 => false,
             BuiltinType::Void
             | BuiltinType::Float16
             | BuiltinType::Float
@@ -3185,6 +3214,12 @@ fn lower_constant(
         return Ok(builder.ins().iconst(ir::types::I8, normalized));
     }
     match constant {
+        gir::ScalarConstant::Signed(value) if clif_ty == ir::types::I128 => {
+            Ok(i128_constant(builder, value as u128))
+        }
+        gir::ScalarConstant::Unsigned(value) if clif_ty == ir::types::I128 => {
+            Ok(i128_constant(builder, value))
+        }
         gir::ScalarConstant::Signed(value) => Ok(builder.ins().iconst(clif_ty, value as i64)),
         gir::ScalarConstant::Unsigned(value) => Ok(builder.ins().iconst(clif_ty, value as i64)),
         gir::ScalarConstant::Floating(value) => match clif_ty {
@@ -3200,6 +3235,28 @@ fn lower_constant(
             }
             Ok(builder.ins().iconst(ir::types::I64, 0))
         }
+    }
+}
+
+fn i128_constant(builder: &mut FunctionBuilder<'_>, value: u128) -> ir::Value {
+    let low = builder.ins().iconst(ir::types::I64, value as u64 as i64);
+    let high = builder
+        .ins()
+        .iconst(ir::types::I64, (value >> 64) as u64 as i64);
+    builder.ins().iconcat(low, high)
+}
+
+fn integer_and_mask(
+    builder: &mut FunctionBuilder<'_>,
+    value: ir::Value,
+    ty: ir::Type,
+    mask: u128,
+) -> ir::Value {
+    if ty == ir::types::I128 {
+        let mask = i128_constant(builder, mask);
+        builder.ins().band(value, mask)
+    } else {
+        builder.ins().band_imm(value, mask as u64 as i64)
     }
 }
 
@@ -3323,7 +3380,7 @@ fn copy_memory(
 }
 
 fn validate_bitfield(descriptor: gir::BitfieldDescriptor) -> Result<(), CodegenError> {
-    if !matches!(descriptor.storage_size, 1 | 2 | 4 | 8) {
+    if !matches!(descriptor.storage_size, 1 | 2 | 4 | 8 | 16) {
         return Err(error(format!(
             "bitfield {} uses unsupported storage size {}",
             descriptor.field_index, descriptor.storage_size
@@ -3343,6 +3400,7 @@ fn validate_bitfield(descriptor: gir::BitfieldDescriptor) -> Result<(), CodegenE
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_conversion(
     builder: &mut FunctionBuilder<'_>,
     types: &TypeStore,
@@ -3351,6 +3409,7 @@ fn lower_conversion(
     from: QualifiedType,
     to: QualifiedType,
     config: &EffectiveCompilationConfig,
+    runtime_helpers: &HashMap<&'static str, ir::FuncRef>,
 ) -> Result<Option<ir::Value>, CodegenError> {
     if kind == gir::ScalarConversion::ToVoid {
         return Ok(None);
@@ -3398,14 +3457,34 @@ fn lower_conversion(
             _ => return Err(error("invalid floating conversion types")),
         },
         gir::ScalarConversion::IntegerToFloating => {
-            if is_signed(types, from, config)? {
+            let signed = is_signed(types, from, config)?;
+            if source == ir::types::I128 {
+                let symbol = match (signed, destination) {
+                    (true, ir::types::F32) => "__floattisf",
+                    (true, ir::types::F64) => "__floattidf",
+                    (false, ir::types::F32) => "__floatuntisf",
+                    (false, ir::types::F64) => "__floatuntidf",
+                    _ => return Err(error("invalid wide integer-to-floating conversion")),
+                };
+                runtime_helper_call(builder, runtime_helpers, symbol, &[operand])?
+            } else if signed {
                 builder.ins().fcvt_from_sint(destination, operand)
             } else {
                 builder.ins().fcvt_from_uint(destination, operand)
             }
         }
         gir::ScalarConversion::FloatingToInteger => {
-            if is_signed(types, to, config)? {
+            let signed = is_signed(types, to, config)?;
+            if destination == ir::types::I128 {
+                let symbol = match (signed, source) {
+                    (true, ir::types::F32) => "__fixsfti",
+                    (true, ir::types::F64) => "__fixdfti",
+                    (false, ir::types::F32) => "__fixunssfti",
+                    (false, ir::types::F64) => "__fixunsdfti",
+                    _ => return Err(error("invalid floating-to-wide-integer conversion")),
+                };
+                runtime_helper_call(builder, runtime_helpers, symbol, &[operand])?
+            } else if signed {
                 builder.ins().fcvt_to_sint(destination, operand)
             } else {
                 builder.ins().fcvt_to_uint(destination, operand)
@@ -3525,6 +3604,7 @@ fn lower_unary(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_binary(
     builder: &mut FunctionBuilder<'_>,
     operator: gir::BinaryOperation,
@@ -3533,6 +3613,7 @@ fn lower_binary(
     floating: bool,
     signed: bool,
     result: ir::Type,
+    runtime_helpers: &HashMap<&'static str, ir::FuncRef>,
 ) -> Result<ir::Value, CodegenError> {
     let comparison = matches!(
         operator,
@@ -3585,6 +3666,21 @@ fn lower_binary(
             ))),
         };
     }
+    if result == ir::types::I128
+        && matches!(
+            operator,
+            gir::BinaryOperation::Divide | gir::BinaryOperation::Remainder
+        )
+    {
+        let symbol = match (operator, signed) {
+            (gir::BinaryOperation::Divide, true) => "__divti3",
+            (gir::BinaryOperation::Divide, false) => "__udivti3",
+            (gir::BinaryOperation::Remainder, true) => "__modti3",
+            (gir::BinaryOperation::Remainder, false) => "__umodti3",
+            _ => unreachable!(),
+        };
+        return runtime_helper_call(builder, runtime_helpers, symbol, &[left, right]);
+    }
     Ok(match operator {
         gir::BinaryOperation::Multiply => builder.ins().imul(left, right),
         gir::BinaryOperation::Divide if signed => builder.ins().sdiv(left, right),
@@ -3601,6 +3697,27 @@ fn lower_binary(
         gir::BinaryOperation::BitwiseOr => builder.ins().bor(left, right),
         _ => unreachable!(),
     })
+}
+
+fn runtime_helper_call(
+    builder: &mut FunctionBuilder<'_>,
+    runtime_helpers: &HashMap<&'static str, ir::FuncRef>,
+    symbol: &'static str,
+    arguments: &[ir::Value],
+) -> Result<ir::Value, CodegenError> {
+    let reference = runtime_helpers.get(symbol).copied().ok_or_else(|| {
+        error(format!(
+            "runtime helper `{symbol}` has no target manifest entry"
+        ))
+    })?;
+    let call = builder.ins().call(reference, arguments);
+    match builder.inst_results(call) {
+        [result] => Ok(*result),
+        results => Err(error(format!(
+            "runtime helper `{symbol}` produced {} results",
+            results.len()
+        ))),
+    }
 }
 
 fn value_type(

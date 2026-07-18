@@ -291,7 +291,7 @@ impl<'a> InitializerWriter<'a> {
         let layout = object_layout(&self.module.types, ty, self.config)?;
         let size = usize::try_from(layout.size)
             .map_err(|_| error("scalar initializer size does not fit in memory"))?;
-        if !matches!(size, 1 | 2 | 4 | 8) {
+        if !matches!(size, 1 | 2 | 4 | 8 | 16) {
             return Err(error(format!(
                 "scalar initializer for `{}` has unsupported size {size}",
                 self.module.types.display(ty.ty)
@@ -309,7 +309,7 @@ impl<'a> InitializerWriter<'a> {
         descriptor: gir::BitfieldDescriptor,
         raw: u128,
     ) -> Result<(), CodegenError> {
-        if !matches!(descriptor.storage_size, 1 | 2 | 4 | 8) {
+        if !matches!(descriptor.storage_size, 1 | 2 | 4 | 8 | 16) {
             return Err(error(format!(
                 "bitfield {} uses unsupported storage size {}",
                 descriptor.field_index, descriptor.storage_size
@@ -330,13 +330,13 @@ impl<'a> InitializerWriter<'a> {
             .checked_add(descriptor.storage_offset)
             .ok_or_else(|| error("bitfield initializer offset overflow"))?;
         let range = self.range(offset, descriptor.storage_size)?;
-        let mut encoded = [0_u8; 8];
+        let mut encoded = [0_u8; 16];
         encoded[..range.len()].copy_from_slice(&self.bytes[range.clone()]);
-        let mut unit = u64::from_le_bytes(encoded);
-        let value_mask = low_mask(descriptor.width);
+        let mut unit = u128::from_le_bytes(encoded);
+        let value_mask = low_mask_u128(descriptor.width);
         let field_mask = value_mask.checked_shl(descriptor.bit_offset).unwrap_or(0);
         unit = (unit & !field_mask)
-            | (((raw as u64) & value_mask)
+            | ((raw & value_mask)
                 .checked_shl(descriptor.bit_offset)
                 .unwrap_or(0));
         self.bytes[range].copy_from_slice(&unit.to_le_bytes()[..descriptor.storage_size as usize]);
@@ -612,12 +612,12 @@ pub(super) fn scalar_constant_bits(
     }
 }
 
-pub(super) fn low_mask(width: u32) -> u64 {
-    if width == 64 {
-        u64::MAX
+pub(super) fn low_mask_u128(width: u32) -> u128 {
+    if width >= 128 {
+        u128::MAX
     } else if width == 0 {
         0
     } else {
-        (1_u64 << width) - 1
+        (1_u128 << width) - 1
     }
 }

@@ -895,6 +895,10 @@ fn types_legacy_sync_operations_with_native_scalar_and_pointer_contracts() {
             "CCC2434",
         ),
         (
+            "__int128 x; __int128 f(void) { return __sync_fetch_and_add(&x, 1); }",
+            "CCC2434",
+        ),
+        (
             "struct Pair { int x; }; struct Pair value; int f(void) { return __sync_bool_compare_and_swap(&value, value, value); }",
             "CCC2434",
         ),
@@ -3166,6 +3170,7 @@ fn target_specific_tls_and_variadic_alignment_gates_are_exact() {
            __builtin_va_start(list, count);\n\
            return __builtin_va_arg(list, struct Pair); }";
     for config in [
+        EffectiveCompilationConfig::default(),
         EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
         EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
         EffectiveCompilationConfig::aarch64_apple_darwin(),
@@ -3177,7 +3182,13 @@ fn target_specific_tls_and_variadic_alignment_gates_are_exact() {
             )
         });
     }
-    let diagnostics = analyze_source(aligned_va_arg).unwrap_err();
+
+    let over_aligned_va_arg = "typedef __builtin_va_list va_list;\n\
+         struct Pair { _Alignas(32) long first; long second; };\n\
+         struct Pair read(int count, ...) { va_list list;\n\
+           __builtin_va_start(list, count);\n\
+           return __builtin_va_arg(list, struct Pair); }";
+    let diagnostics = analyze_source(over_aligned_va_arg).unwrap_err();
     assert!(
         diagnostics
             .iter()
@@ -3222,9 +3233,8 @@ fn linux_binary128_operations_and_variadic_fetches_fail_explicitly() {
 }
 
 #[test]
-fn compiler_128_bit_integers_support_layout_without_value_transport() {
-    analyze_source(
-        "static __int128 signed_file;\n\
+fn compiler_128_bit_integers_have_target_gated_value_transport() {
+    let storage_source = "static __int128 signed_file;\n\
          static unsigned __int128 unsigned_file;\n\
          static __int128_t signed_alias;\n\
          static __uint128_t unsigned_alias;\n\
@@ -3244,30 +3254,91 @@ fn compiler_128_bit_integers_support_layout_without_value_transport() {
              (void)pointer;\n\
              (void)first;\n\
          }\n\
-         __int128 declaration_only(__uint128_t);",
+         __int128 declaration_only(__uint128_t);";
+    for config in [
+        EffectiveCompilationConfig::default(),
+        EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+        EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
+        EffectiveCompilationConfig::aarch64_apple_darwin(),
+    ] {
+        analyze_source_with_config(storage_source, &config).unwrap_or_else(|diagnostics| {
+            panic!(
+                "{} rejected layout-only 128-bit storage: {diagnostics:#?}",
+                config.target.triple
+            )
+        });
+    }
+
+    analyze_source(
+        "__int128 value = 0;\n\
+         struct Wide { __int128 value; };\n\
+         struct Wide object = { 1 };\n\
+         __int128 calculate(__int128 left, unsigned __int128 right) {\n\
+             __int128 converted = (__int128)right;\n\
+             object.value = left + converted;\n\
+             return object.value / 3;\n\
+         }\n\
+         int compare(__int128 left, __int128 right) { return left == right; }\n\
+         typedef __builtin_va_list va_list;\n\
+         unsigned __int128 read(int count, ...) {\n\
+             va_list list;\n\
+             __builtin_va_start(list, count);\n\
+             return __builtin_va_arg(list, unsigned __int128);\n\
+         }\n\
+         _Static_assert(sizeof(18446744073709551616) == 16, \"decimal rank\");\n\
+         _Static_assert(sizeof(18446744073709551616U) == 16, \"unsigned suffix\");\n\
+         _Static_assert(sizeof(0xffffffffffffffffffffffffffffffff) == 16, \"hex rank\");",
     )
     .unwrap();
 
-    for source in [
-        "__int128 value = 0;",
-        "void assign(void) { __int128 left, right; left = right; }",
-        "void add(void) { __int128 left, right; (void)(left + right); }",
-        "int compare(void) { __int128 left, right; return left == right; }",
-        "struct Wide { __int128 value; }; struct Wide object = {};",
-        "int convert(void) { return (int)(__int128)1; }",
-        "__int128 defined(void) { __int128 value; return value; }",
-        "void defined(__uint128_t value) { (void)&value; }",
-        "struct Wide { __int128 value; }; void defined(struct Wide value) { (void)&value; }",
-        "__int128 declaration_only(void); void call(void) { (void)declaration_only(); }",
-        "typedef __builtin_va_list va_list; void read(int count, ...) { va_list list; __builtin_va_start(list, count); (void)__builtin_va_arg(list, __uint128_t); }",
+    for config in [
+        EffectiveCompilationConfig::default(),
+        EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+        EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
+        EffectiveCompilationConfig::aarch64_apple_darwin(),
     ] {
-        let diagnostics = analyze_source(source).unwrap_err();
-        assert!(
-            diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.code == "CCC2443"),
-            "missing explicit 128-bit capability diagnostic for `{source}`: {diagnostics:#?}"
-        );
+        for source in [
+            "_Atomic(__int128) value;",
+            "_Atomic unsigned __int128 value;",
+        ] {
+            let diagnostics = analyze_source_with_config(source, &config).unwrap_err();
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "CCC2443"),
+                "{} did not reject unsupported atomic wide storage for `{source}`: {diagnostics:#?}",
+                config.target.triple
+            );
+        }
+    }
+
+    for config in [
+        EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+        EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
+        EffectiveCompilationConfig::aarch64_apple_darwin(),
+    ] {
+        for source in [
+            "__int128 value = 0;",
+            "void assign(void) { __int128 left, right; left = right; }",
+            "void add(void) { __int128 left, right; (void)(left + right); }",
+            "int compare(void) { __int128 left, right; return left == right; }",
+            "struct Wide { __int128 value; }; struct Wide object = {};",
+            "int convert(void) { return (int)(__int128)1; }",
+            "__int128 defined(void) { __int128 value; return value; }",
+            "void defined(__uint128_t value) { (void)&value; }",
+            "struct Wide { __int128 value; }; void defined(struct Wide value) { (void)&value; }",
+            "__int128 declaration_only(void); void call(void) { (void)declaration_only(); }",
+            "typedef __builtin_va_list va_list; void read(int count, ...) { va_list list; __builtin_va_start(list, count); (void)__builtin_va_arg(list, __uint128_t); }",
+        ] {
+            let diagnostics = analyze_source_with_config(source, &config).unwrap_err();
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "CCC2443"),
+                "{} did not reject unsupported 128-bit value transport for `{source}`: {diagnostics:#?}",
+                config.target.triple
+            );
+        }
     }
 
     for source in [

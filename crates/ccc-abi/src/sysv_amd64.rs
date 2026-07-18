@@ -22,6 +22,12 @@ pub fn plan_function_type(
             "a variadic boundary must use an explicit bridge plan",
         ));
     }
+    if signature_contains_int128(types, &signature) {
+        return Err(AbiError::new(
+            "CCC3510",
+            "a fixed wide-integer boundary requires the explicit System V bridge plan",
+        ));
+    }
     plan_native_signature(types, &signature, config)
 }
 
@@ -52,11 +58,68 @@ pub fn plan_boundary_type(
             BridgeKind::VariadicEntry,
             config,
         )?))
+    } else if signature_contains_int128(types, &signature) {
+        let FunctionParameters::Prototype(parameters) = &signature.parameters else {
+            return Err(AbiError::new(
+                "CCC3506",
+                "a function type without a prototype has no fixed ABI plan",
+            ));
+        };
+        let actual = parameters
+            .iter()
+            .map(|parameter| parameter.ty)
+            .collect::<Vec<_>>();
+        Ok(BoundaryPlan::Bridge(plan_bridge(
+            types,
+            &signature,
+            parameters,
+            &actual,
+            parameters.len(),
+            BridgeKind::FixedEntry,
+            config,
+        )?))
     } else {
         Ok(BoundaryPlan::Native(plan_native_signature(
             types, &signature, config,
         )?))
     }
+}
+
+pub fn plan_fixed_call(
+    types: &TypeStore,
+    signature: TypeId,
+    actual_types: &[TypeId],
+    config: &EffectiveCompilationConfig,
+) -> Result<BridgeBoundaryPlan, AbiError> {
+    validate_target(config)?;
+    let signature = function_signature(types, signature)?;
+    if signature.variadic {
+        return Err(AbiError::new(
+            "CCC3511",
+            "a variadic function type requires a variadic call plan",
+        ));
+    }
+    let FunctionParameters::Prototype(fixed) = &signature.parameters else {
+        return Err(AbiError::new(
+            "CCC3506",
+            "a function type without a prototype has no fixed call plan",
+        ));
+    };
+    if !signature_contains_int128(types, &signature) {
+        return Err(AbiError::new(
+            "CCC3511",
+            "a fixed call bridge is reserved for a wide-integer boundary",
+        ));
+    }
+    plan_bridge(
+        types,
+        &signature,
+        fixed,
+        actual_types,
+        fixed.len(),
+        BridgeKind::FixedCall,
+        config,
+    )
 }
 
 pub fn plan_variadic_call(
@@ -145,7 +208,7 @@ pub fn plan_va_arg(
         .filter(|piece| matches!(piece.class, AbiClass::Sse | AbiClass::SseUp))
         .count() as u8;
     let overflow_align = classified.align.max(8);
-    if overflow_align > 8 {
+    if overflow_align > 16 {
         return Err(AbiError::new(
             "CCC3513",
             format!(
@@ -210,6 +273,43 @@ fn function_signature(types: &TypeStore, signature: TypeId) -> Result<FunctionTy
     })
 }
 
+fn signature_contains_int128(types: &TypeStore, signature: &FunctionType) -> bool {
+    fn contains(types: &TypeStore, ty: TypeId, active: &mut Vec<TypeId>) -> bool {
+        if matches!(
+            types.builtin_type(ty),
+            Some(BuiltinType::Int128 | BuiltinType::UnsignedInt128)
+        ) {
+            return true;
+        }
+        if active.contains(&ty) {
+            return false;
+        }
+        active.push(ty);
+        let result = match types.try_kind(ty) {
+            Some(TypeKind::Array(array)) => contains(types, array.element.ty, active),
+            Some(TypeKind::Record(id)) => types
+                .record(*id)
+                .and_then(|record| record.fields.as_ref())
+                .is_some_and(|fields| {
+                    fields
+                        .iter()
+                        .any(|field| contains(types, field.ty.ty, active))
+                }),
+            _ => false,
+        };
+        active.pop();
+        result
+    }
+
+    contains(types, signature.result.ty, &mut Vec::new())
+        || match &signature.parameters {
+            FunctionParameters::Prototype(parameters) => parameters
+                .iter()
+                .any(|parameter| contains(types, parameter.ty, &mut Vec::new())),
+            FunctionParameters::Unspecified => false,
+        }
+}
+
 fn plan_native_signature(
     types: &TypeStore,
     signature: &FunctionType,
@@ -257,7 +357,7 @@ fn plan_native_signature(
             PassingMode::Scalar => {
                 let scalar = boundary_scalar(types, parameter.ty, config, "parameter")?;
                 let class = scalar_class(scalar);
-                consume_scalar_register(class, &mut gp_used, &mut sse_used);
+                consume_scalar_register(scalar, &mut gp_used, &mut sse_used);
                 carrier_indices.push(push_native_carrier(
                     &mut clif_parameters,
                     Some(source_index),
@@ -645,17 +745,35 @@ fn classify(
         let class = scalar_class(scalar);
         let valid_bytes = u8::try_from(layout.size)
             .map_err(|_| AbiError::new("CCC3503", "scalar ABI width is too large"))?;
-        return Ok(ClassifiedType {
-            ty,
-            size: layout.size,
-            align: layout.align,
-            classes: vec![class],
-            pieces: vec![AbiPiece {
+        let pieces = if layout.size == 16 && class == AbiClass::Integer {
+            vec![
+                AbiPiece {
+                    index: 0,
+                    offset: 0,
+                    valid_bytes: 8,
+                    class,
+                },
+                AbiPiece {
+                    index: 1,
+                    offset: 8,
+                    valid_bytes: 8,
+                    class,
+                },
+            ]
+        } else {
+            vec![AbiPiece {
                 index: 0,
                 offset: 0,
                 valid_bytes,
                 class,
-            }],
+            }]
+        };
+        return Ok(ClassifiedType {
+            ty,
+            size: layout.size,
+            align: layout.align,
+            classes: vec![class; pieces.len()],
+            pieces,
             passing: PassingMode::Scalar,
         });
     }
@@ -877,7 +995,7 @@ fn reject_unsupported_recursive(
             ),
         ));
     }
-    if layout.align > 8 {
+    if layout.align > 16 {
         return Err(AbiError::new(
             "CCC3513",
             format!(
@@ -998,7 +1116,8 @@ fn builtin_scalar(
                 | BuiltinType::Short
                 | BuiltinType::Int
                 | BuiltinType::Long
-                | BuiltinType::LongLong => true,
+                | BuiltinType::LongLong
+                | BuiltinType::Int128 => true,
                 _ => false,
             };
             Ok(if signed {
@@ -1074,10 +1193,11 @@ fn register_counts(classified: &ClassifiedType) -> (u8, u8) {
     (gp, sse)
 }
 
-fn consume_scalar_register(class: AbiClass, gp_used: &mut u8, sse_used: &mut u8) {
-    match class {
-        AbiClass::Integer if *gp_used < 6 => *gp_used += 1,
-        AbiClass::Sse if *sse_used < 8 => *sse_used += 1,
+fn consume_scalar_register(scalar: AbiScalar, gp_used: &mut u8, sse_used: &mut u8) {
+    match (scalar_class(scalar), scalar_size(scalar)) {
+        (AbiClass::Integer, 16) if *gp_used <= 4 => *gp_used += 2,
+        (AbiClass::Integer, _) if *gp_used < 6 => *gp_used += 1,
+        (AbiClass::Sse, _) if *sse_used < 8 => *sse_used += 1,
         _ => {}
     }
 }
@@ -1108,6 +1228,7 @@ fn scalar_carrier(scalar: AbiScalar) -> AbiCarrier {
             16 => AbiCarrier::I16,
             32 => AbiCarrier::I32,
             64 => AbiCarrier::I64,
+            128 => AbiCarrier::I128,
             _ => unreachable!("unsupported scalar width"),
         },
         AbiScalar::Float32 => AbiCarrier::F32,
@@ -1569,5 +1690,74 @@ mod tests {
                 .code,
             "CCC3504"
         );
+    }
+
+    #[test]
+    fn wide_scalar_has_two_integer_eightbytes_and_va_arg_alignment() {
+        let types = TypeStore::default();
+        let config = EffectiveCompilationConfig::default();
+        let classified = classify_type(&types, TypeId::UNSIGNED_INT128, &config).unwrap();
+        assert_eq!(classified.size, 16);
+        assert_eq!(classified.align, 16);
+        assert_eq!(classified.passing, PassingMode::Scalar);
+        assert_eq!(classified.classes, [AbiClass::Integer, AbiClass::Integer]);
+        assert_eq!(
+            classified
+                .pieces
+                .iter()
+                .map(|piece| (piece.index, piece.offset, piece.valid_bytes, piece.class))
+                .collect::<Vec<_>>(),
+            [(0, 0, 8, AbiClass::Integer), (1, 8, 8, AbiClass::Integer),]
+        );
+
+        let va_arg = plan_va_arg(&types, TypeId::UNSIGNED_INT128, &config).unwrap();
+        assert_eq!((va_arg.gp_slots, va_arg.sse_slots), (2, 0));
+        assert_eq!((va_arg.overflow_size, va_arg.overflow_align), (16, 16));
+    }
+
+    #[test]
+    fn wide_fixed_bridge_rolls_back_the_pair_and_reuses_the_stranded_gp_register() {
+        let mut types = TypeStore::default();
+        let mut parameters = vec![TypeId::LONG.into(); 5];
+        parameters.push(TypeId::UNSIGNED_INT128.into());
+        parameters.push(TypeId::LONG.into());
+        let signature =
+            types.function_type(FunctionType::prototype(TypeId::UNSIGNED_INT128, parameters));
+        let config = EffectiveCompilationConfig::default();
+        let BoundaryPlan::Bridge(entry) = plan_boundary_type(&types, signature, &config).unwrap()
+        else {
+            panic!("wide fixed definition did not select the explicit bridge");
+        };
+        assert_eq!(entry.kind, BridgeKind::FixedEntry);
+        assert_eq!(entry.result.classes, [AbiClass::Integer, AbiClass::Integer]);
+        assert_eq!(entry.stack_size, 16);
+        assert!(entry.parameter_pieces.iter().any(|piece| {
+            piece.source_index == Some(5)
+                && piece.piece.index == 0
+                && piece.location == BridgeLocation::Stack { offset: 0 }
+        }));
+        assert!(entry.parameter_pieces.iter().any(|piece| {
+            piece.source_index == Some(5)
+                && piece.piece.index == 1
+                && piece.location == BridgeLocation::Stack { offset: 8 }
+        }));
+        assert!(entry.parameter_pieces.iter().any(|piece| {
+            piece.source_index == Some(6)
+                && piece.location == BridgeLocation::Register(RegisterSlot::integer(5))
+        }));
+
+        let actual = [
+            TypeId::LONG,
+            TypeId::LONG,
+            TypeId::LONG,
+            TypeId::LONG,
+            TypeId::LONG,
+            TypeId::UNSIGNED_INT128,
+            TypeId::LONG,
+        ];
+        let call = plan_fixed_call(&types, signature, &actual, &config).unwrap();
+        assert_eq!(call.kind, BridgeKind::FixedCall);
+        assert_eq!(call.parameter_pieces, entry.parameter_pieces);
+        assert_eq!(call.result_pieces, entry.result_pieces);
     }
 }

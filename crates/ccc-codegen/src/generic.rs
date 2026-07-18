@@ -12,7 +12,10 @@ use ccc_ir::generic as gir;
 use ccc_sema::generic::{
     Linkage as CLinkage, ObjectDefinitionPolicy, StorageDuration, SymbolBinding, SymbolVisibility,
 };
-use ccc_target::{AbiIdentity, BinaryFormat, EffectiveCompilationConfig, RelocationModel};
+use ccc_target::{
+    AbiIdentity, BinaryFormat, EffectiveCompilationConfig, RelocationModel, RuntimeHelperContract,
+    RuntimeHelperValue,
+};
 use ccc_types::{
     ArrayLength, BuiltinType, LayoutShape, QualifiedType, TypeId, TypeKind, TypeQualifiers,
     TypeStore,
@@ -31,6 +34,7 @@ use cranelift_module::{
     DataDescription, DataId as ClifDataId, FuncId, Linkage, Module as _, default_libcall_names,
 };
 use cranelift_object::{ObjectBuilder, ObjectModule};
+use object::read::{Object as _, ObjectSymbol as _};
 use object::write::SymbolSection;
 use object::{SymbolFlags, SymbolKind, SymbolScope};
 
@@ -105,7 +109,14 @@ fn emit_inner(
         }
     }
     flag_builder
-        .set("enable_llvm_abi_extensions", "false")
+        .set(
+            "enable_llvm_abi_extensions",
+            if config.target.abi.supports_int128_values() {
+                "true"
+            } else {
+                "false"
+            },
+        )
         .map_err(module_error)?;
     flag_builder
         .set("enable_multi_ret_implicit_sret", "false")
@@ -290,6 +301,12 @@ fn emit_inner(
     }
     unwind.emit(&mut product).map_err(error)?;
     let object = product.emit().map_err(module_error)?;
+    validate_runtime_helper_symbols(
+        &object,
+        module,
+        config,
+        declarations.runtime_helpers.keys().copied(),
+    )?;
     let (assemblies, manifest) = generated_bridge_artifacts(
         module,
         config,
@@ -303,6 +320,57 @@ fn emit_inner(
         assemblies,
         manifest,
     })
+}
+
+fn validate_runtime_helper_symbols<'a>(
+    object_bytes: &[u8],
+    module: &gir::FullModule,
+    config: &EffectiveCompilationConfig,
+    selected: impl IntoIterator<Item = &'a str>,
+) -> Result<(), CodegenError> {
+    let selected = selected.into_iter().collect::<HashSet<_>>();
+    let manifest = config
+        .target
+        .abi
+        .runtime_helper_manifest()
+        .iter()
+        .map(|entry| entry.symbol)
+        .collect::<HashSet<_>>();
+    let source_symbols = module
+        .functions
+        .iter()
+        .map(|function| function.symbol_name.as_str())
+        .collect::<HashSet<_>>();
+    let object = object::File::parse(object_bytes).map_err(module_error)?;
+    let undefined = object
+        .symbols()
+        .filter(|symbol| symbol.is_undefined())
+        .filter_map(|symbol| symbol.name().ok())
+        .collect::<HashSet<_>>();
+    for symbol in &undefined {
+        let looks_like_wide_helper = manifest.contains(symbol)
+            || (symbol.starts_with("__")
+                && (symbol.ends_with("ti2") || symbol.ends_with("ti3") || symbol.contains("tif")));
+        if looks_like_wide_helper && !selected.contains(symbol) && !source_symbols.contains(symbol)
+        {
+            return Err(error(format!(
+                "backend emitted undeclared wide-integer runtime helper `{symbol}`"
+            )));
+        }
+    }
+    for symbol in selected {
+        if !manifest.contains(symbol) {
+            return Err(error(format!(
+                "selected runtime helper `{symbol}` is absent from the target manifest"
+            )));
+        }
+        if !undefined.contains(symbol) && !source_symbols.contains(symbol) {
+            return Err(error(format!(
+                "selected runtime helper `{symbol}` is absent from the emitted object"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn darwin_build_version(
@@ -361,14 +429,14 @@ fn generated_bridge_artifacts(
 ) -> Result<
     (
         Vec<ccc_link::bridge::GeneratedAssembly>,
-        ccc_link::artifact::BridgeManifestV1,
+        ccc_link::artifact::BridgeManifestV2,
     ),
     CodegenError,
 > {
-    use ccc_link::artifact::{BridgeManifestV1, GeneratedSymbol, GeneratedSymbolOwner};
+    use ccc_link::artifact::{BridgeManifestV2, GeneratedSymbol, GeneratedSymbolOwner};
     use ccc_link::bridge::{
-        AssemblyFunctionLinkage, ElfTlsAccessModel, ElfTlsSymbolVisibility, GeneratedSymbolKind,
-        TlsAccessorPlan, VariadicEntryPlan, render_target_call_helper,
+        AssemblyFunctionLinkage, BridgeEntryPlan, ElfTlsAccessModel, ElfTlsSymbolVisibility,
+        GeneratedSymbolKind, TlsAccessorPlan, render_target_call_helper, render_target_fixed_entry,
         render_target_variadic_entry, render_tls_accessor,
     };
 
@@ -384,26 +452,26 @@ fn generated_bridge_artifacts(
         ));
         assemblies.push(assembly);
     }
-    for (function, artifact) in &abi_plan.plan().artifacts.variadic_entries {
+    for (function, artifact) in &abi_plan.plan().artifacts.bridge_entries {
         let definition = abi_plan
             .plan()
             .definitions
             .get(function)
-            .ok_or_else(|| error("variadic entry artifact has no definition plan"))?;
+            .ok_or_else(|| error("bridge entry artifact has no definition plan"))?;
         let ccc_abi::BoundaryPlan::Bridge(plan) = &definition.boundary else {
             return Err(error(
-                "variadic entry artifact references a native definition plan",
+                "bridge entry artifact references a native definition plan",
             ));
         };
         let hidden_body = hidden_body_symbols.get(&function.0).ok_or_else(|| {
             error(format!(
-                "variadic function {} has no hidden body symbol",
+                "bridged function {} has no hidden body symbol",
                 function.0
             ))
         })?;
         if hidden_body != &artifact.body_symbol {
             return Err(error(
-                "declared variadic body symbol differs from the module ABI plan",
+                "declared bridge body symbol differs from the module ABI plan",
             ));
         }
         let public_symbol = &artifact.public_symbol;
@@ -423,57 +491,88 @@ fn generated_bridge_artifacts(
             .filter(|piece| piece.piece.class == ccc_abi::AbiClass::Integer)
             .count() as u8;
         let xmm_results = plan.result_pieces.len() as u8 - gp_results;
-        let assembly = render_target_variadic_entry(
-            &VariadicEntryPlan {
-                public_symbol: public_symbol.clone(),
-                public_symbol_is_exact: artifact.public_symbol_is_exact,
-                hidden_body_symbol: hidden_body.clone(),
-                linkage,
-                fixed_gp_used: plan.gp_used,
-                fixed_sse_used: plan.xmm_used,
-                overflow_arg_offset: plan.overflow_arg_offset,
-                gp_results,
-                xmm_results,
-                hidden_return: plan.hidden_return,
-                logical_line: 1,
-            },
-            config.target.abi,
-        )
+        let entry_plan = BridgeEntryPlan {
+            public_symbol: public_symbol.clone(),
+            public_symbol_is_exact: artifact.public_symbol_is_exact,
+            hidden_body_symbol: hidden_body.clone(),
+            linkage,
+            weak: artifact.source_binding == ccc_abi::SourceBinding::Weak,
+            fixed_gp_used: plan.gp_used,
+            fixed_sse_used: plan.xmm_used,
+            overflow_arg_offset: plan.overflow_arg_offset,
+            gp_results,
+            xmm_results,
+            hidden_return: plan.hidden_return,
+            logical_line: 1,
+        };
+        let assembly = match plan.kind {
+            ccc_abi::BridgeKind::FixedEntry => {
+                render_target_fixed_entry(&entry_plan, config.target.abi)
+            }
+            ccc_abi::BridgeKind::VariadicEntry => {
+                render_target_variadic_entry(&entry_plan, config.target.abi)
+            }
+            ccc_abi::BridgeKind::FixedCall
+            | ccc_abi::BridgeKind::VariadicCall
+            | ccc_abi::BridgeKind::UnprototypedCall => Err(ccc_link::LinkError {
+                code: "CCC5008",
+                message: "a definition artifact has a call-side bridge kind".to_owned(),
+            }),
+        }
         .map_err(module_error)?;
+        if artifact.kind != plan.kind {
+            return Err(error(
+                "bridge entry artifact kind differs from its definition plan",
+            ));
+        }
+        let (entry_kind, body_kind) = match plan.kind {
+            ccc_abi::BridgeKind::FixedEntry => (
+                GeneratedSymbolKind::FixedEntry,
+                GeneratedSymbolKind::FixedBody,
+            ),
+            ccc_abi::BridgeKind::VariadicEntry => (
+                GeneratedSymbolKind::VariadicEntry,
+                GeneratedSymbolKind::VariadicBody,
+            ),
+            _ => unreachable!(),
+        };
         let mut entry_symbol = match linkage {
             AssemblyFunctionLinkage::ExternalDefault => GeneratedSymbol::public(
                 public_symbol,
-                GeneratedSymbolKind::VariadicEntry,
+                entry_kind,
                 GeneratedSymbolOwner::AssemblyUnit(assembly.stem().to_owned()),
             ),
             AssemblyFunctionLinkage::Internal => GeneratedSymbol::source_internal(
                 public_symbol,
-                GeneratedSymbolKind::VariadicEntry,
+                entry_kind,
                 GeneratedSymbolOwner::AssemblyUnit(assembly.stem().to_owned()),
             ),
             AssemblyFunctionLinkage::ExternalHidden => GeneratedSymbol::source_hidden(
                 public_symbol,
-                GeneratedSymbolKind::VariadicEntry,
+                entry_kind,
                 GeneratedSymbolOwner::AssemblyUnit(assembly.stem().to_owned()),
             ),
             AssemblyFunctionLinkage::ExternalProtected => GeneratedSymbol::source_protected(
                 public_symbol,
-                GeneratedSymbolKind::VariadicEntry,
+                entry_kind,
                 GeneratedSymbolOwner::AssemblyUnit(assembly.stem().to_owned()),
             ),
             AssemblyFunctionLinkage::ExternalInternal => GeneratedSymbol::source_elf_internal(
                 public_symbol,
-                GeneratedSymbolKind::VariadicEntry,
+                entry_kind,
                 GeneratedSymbolOwner::AssemblyUnit(assembly.stem().to_owned()),
             ),
         };
+        if artifact.source_binding == ccc_abi::SourceBinding::Weak {
+            entry_symbol = entry_symbol.with_weak_binding();
+        }
         if artifact.public_symbol_is_exact {
             entry_symbol = entry_symbol.with_exact_object_name();
         }
         symbols.push(entry_symbol);
         symbols.push(GeneratedSymbol::internal(
             hidden_body,
-            GeneratedSymbolKind::VariadicBody,
+            body_kind,
             GeneratedSymbolOwner::PrimaryObject,
         ));
         assemblies.push(assembly);
@@ -535,7 +634,7 @@ fn generated_bridge_artifacts(
         }
         assemblies.push(assembly);
     }
-    let manifest = BridgeManifestV1::new(abi_plan.plan().translation_unit_digest.0, symbols);
+    let manifest = BridgeManifestV2::new(abi_plan.plan().translation_unit_digest.0, symbols);
     let actual_localization = manifest.localization_symbols();
     let expected_localization = &abi_plan
         .plan()
@@ -569,6 +668,7 @@ struct Declarations {
     call_helper_symbol: Option<String>,
     runtime_realloc: Option<FuncId>,
     runtime_free: Option<FuncId>,
+    runtime_helpers: HashMap<&'static str, FuncId>,
     globals: HashMap<u32, DataDeclaration>,
     strings: HashMap<u32, ClifDataId>,
     commons: Vec<CommonDefinition>,
@@ -671,9 +771,9 @@ fn declare_module(
                     let hidden_symbol = abi_plan
                         .plan()
                         .artifacts
-                        .variadic_entries
+                        .bridge_entries
                         .get(&function.id)
-                        .ok_or_else(|| error("variadic definition has no artifact plan"))?
+                        .ok_or_else(|| error("bridged definition has no artifact plan"))?
                         .body_symbol
                         .clone();
                     let hidden_signature = variadic_body_signature(config)?;
@@ -727,6 +827,27 @@ fn declare_module(
     } else {
         (None, None)
     };
+
+    let required_runtime_helpers = required_runtime_helper_symbols(module);
+    let mut runtime_helpers = HashMap::new();
+    for contract in config
+        .target
+        .abi
+        .runtime_helper_manifest()
+        .iter()
+        .filter(|contract| required_runtime_helpers.contains(contract.symbol))
+    {
+        let signature = runtime_helper_signature(object_module, contract);
+        let id = object_module
+            .declare_function(contract.symbol, Linkage::Import, &signature)
+            .map_err(module_error)?;
+        if runtime_helpers.insert(contract.symbol, id).is_some() {
+            return Err(error(format!(
+                "duplicate runtime-helper manifest symbol `{}`",
+                contract.symbol
+            )));
+        }
+    }
 
     let tls_accessor_signature = tls_accessor_signature(config)?;
     let mut tls_accessors = HashMap::with_capacity(abi_plan.plan().artifacts.tls_accessors.len());
@@ -835,10 +956,127 @@ fn declare_module(
         call_helper_symbol,
         runtime_realloc,
         runtime_free,
+        runtime_helpers,
         globals,
         strings,
         commons,
     })
+}
+
+fn runtime_helper_signature(
+    object_module: &ObjectModule,
+    contract: &RuntimeHelperContract,
+) -> ir::Signature {
+    let mut signature = object_module.make_signature();
+    signature.params.extend(
+        contract
+            .parameters
+            .iter()
+            .copied()
+            .map(runtime_helper_abi_param),
+    );
+    signature
+        .returns
+        .push(runtime_helper_abi_param(contract.result));
+    signature
+}
+
+fn runtime_helper_abi_param(value: RuntimeHelperValue) -> ir::AbiParam {
+    ir::AbiParam::new(match value {
+        RuntimeHelperValue::SignedInt128 | RuntimeHelperValue::UnsignedInt128 => ir::types::I128,
+        RuntimeHelperValue::Float32 => ir::types::F32,
+        RuntimeHelperValue::Float64 => ir::types::F64,
+    })
+}
+
+fn required_runtime_helper_symbols(module: &gir::FullModule) -> HashSet<&'static str> {
+    let mut required = HashSet::new();
+    for function in &module.functions {
+        for instruction in function.blocks.iter().flat_map(|block| &block.instructions) {
+            match instruction.kind {
+                gir::FullInstructionKind::Binary { operator, left, .. }
+                    if matches!(
+                        operator,
+                        gir::BinaryOperation::Divide | gir::BinaryOperation::Remainder
+                    ) =>
+                {
+                    let Some(ty) = function.value_types.get(left.0 as usize).copied() else {
+                        continue;
+                    };
+                    let symbol = match (module.types.builtin_type(ty), operator) {
+                        (Some(BuiltinType::Int128), gir::BinaryOperation::Divide) => "__divti3",
+                        (Some(BuiltinType::UnsignedInt128), gir::BinaryOperation::Divide) => {
+                            "__udivti3"
+                        }
+                        (Some(BuiltinType::Int128), gir::BinaryOperation::Remainder) => "__modti3",
+                        (Some(BuiltinType::UnsignedInt128), gir::BinaryOperation::Remainder) => {
+                            "__umodti3"
+                        }
+                        _ => continue,
+                    };
+                    required.insert(symbol);
+                }
+                gir::FullInstructionKind::Convert { kind, from, to, .. }
+                    if matches!(
+                        kind,
+                        gir::ScalarConversion::IntegerToFloating
+                            | gir::ScalarConversion::FloatingToInteger
+                    ) =>
+                {
+                    let symbol = match (
+                        kind,
+                        module.types.builtin_type(from.ty),
+                        module.types.builtin_type(to.ty),
+                    ) {
+                        (
+                            gir::ScalarConversion::IntegerToFloating,
+                            Some(BuiltinType::Int128),
+                            Some(BuiltinType::Float),
+                        ) => "__floattisf",
+                        (
+                            gir::ScalarConversion::IntegerToFloating,
+                            Some(BuiltinType::Int128),
+                            Some(BuiltinType::Double | BuiltinType::LongDouble),
+                        ) => "__floattidf",
+                        (
+                            gir::ScalarConversion::IntegerToFloating,
+                            Some(BuiltinType::UnsignedInt128),
+                            Some(BuiltinType::Float),
+                        ) => "__floatuntisf",
+                        (
+                            gir::ScalarConversion::IntegerToFloating,
+                            Some(BuiltinType::UnsignedInt128),
+                            Some(BuiltinType::Double | BuiltinType::LongDouble),
+                        ) => "__floatuntidf",
+                        (
+                            gir::ScalarConversion::FloatingToInteger,
+                            Some(BuiltinType::Float),
+                            Some(BuiltinType::Int128),
+                        ) => "__fixsfti",
+                        (
+                            gir::ScalarConversion::FloatingToInteger,
+                            Some(BuiltinType::Double | BuiltinType::LongDouble),
+                            Some(BuiltinType::Int128),
+                        ) => "__fixdfti",
+                        (
+                            gir::ScalarConversion::FloatingToInteger,
+                            Some(BuiltinType::Float),
+                            Some(BuiltinType::UnsignedInt128),
+                        ) => "__fixunssfti",
+                        (
+                            gir::ScalarConversion::FloatingToInteger,
+                            Some(BuiltinType::Double | BuiltinType::LongDouble),
+                            Some(BuiltinType::UnsignedInt128),
+                        ) => "__fixunsdfti",
+                        _ => continue,
+                    };
+                    required.insert(symbol);
+                }
+                _ => {}
+            }
+        }
+    }
+    required
 }
 
 fn module_uses_runtime_sized_storage(module: &gir::FullModule) -> bool {

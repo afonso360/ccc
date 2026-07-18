@@ -33,6 +33,12 @@ pub enum GeneratedSymbolVisibility {
     Internal,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum GeneratedSymbolBinding {
+    Strong,
+    Weak,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GeneratedSymbol {
     pub name: String,
@@ -42,6 +48,7 @@ pub struct GeneratedSymbol {
     pub kind: GeneratedSymbolKind,
     pub owner: GeneratedSymbolOwner,
     pub visibility: GeneratedSymbolVisibility,
+    pub binding: GeneratedSymbolBinding,
 }
 
 impl GeneratedSymbol {
@@ -56,6 +63,7 @@ impl GeneratedSymbol {
             kind,
             owner,
             visibility: GeneratedSymbolVisibility::Internal,
+            binding: GeneratedSymbolBinding::Strong,
         }
     }
 
@@ -70,6 +78,7 @@ impl GeneratedSymbol {
             kind,
             owner,
             visibility: GeneratedSymbolVisibility::Public,
+            binding: GeneratedSymbolBinding::Strong,
         }
     }
 
@@ -84,6 +93,7 @@ impl GeneratedSymbol {
             kind,
             owner,
             visibility: GeneratedSymbolVisibility::SourceHidden,
+            binding: GeneratedSymbolBinding::Strong,
         }
     }
 
@@ -98,6 +108,7 @@ impl GeneratedSymbol {
             kind,
             owner,
             visibility: GeneratedSymbolVisibility::SourceInternal,
+            binding: GeneratedSymbolBinding::Strong,
         }
     }
 
@@ -112,6 +123,7 @@ impl GeneratedSymbol {
             kind,
             owner,
             visibility: GeneratedSymbolVisibility::SourceElfInternal,
+            binding: GeneratedSymbolBinding::Strong,
         }
     }
 
@@ -126,7 +138,13 @@ impl GeneratedSymbol {
             kind,
             owner,
             visibility: GeneratedSymbolVisibility::SourceProtected,
+            binding: GeneratedSymbolBinding::Strong,
         }
+    }
+
+    pub fn with_weak_binding(mut self) -> Self {
+        self.binding = GeneratedSymbolBinding::Weak;
+        self
     }
 
     pub fn with_exact_object_name(mut self) -> Self {
@@ -145,13 +163,13 @@ impl GeneratedSymbol {
 
 /// Versioned ownership and visibility contract for generated symbols.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct BridgeManifestV1 {
+pub struct BridgeManifestV2 {
     translation_unit_digest: [u8; 32],
     symbols: Vec<GeneratedSymbol>,
 }
 
-impl BridgeManifestV1 {
-    pub const VERSION: u16 = 1;
+impl BridgeManifestV2 {
+    pub const VERSION: u16 = 2;
 
     pub fn empty(translation_unit_digest: [u8; 32]) -> Self {
         Self {
@@ -273,6 +291,18 @@ impl BridgeManifestV1 {
     fn verify_primary_object(&self, primary_object: &[u8]) -> Result<(), LinkError> {
         let object = parse_relocatable(primary_object, "primary object")?;
         let format = object.format();
+        let mut physical_manifest_names = BTreeMap::<String, &str>::new();
+        for symbol in &self.symbols {
+            let object_name = symbol.object_name(format).into_owned();
+            if let Some(previous) =
+                physical_manifest_names.insert(object_name.clone(), &symbol.name)
+            {
+                return Err(artifact_error(format!(
+                    "generated symbols `{previous}` and `{}` map to the same physical object symbol `{object_name}`",
+                    symbol.name
+                )));
+            }
+        }
         let mut defined = BTreeMap::<String, SymbolScope>::new();
         let mut undefined = BTreeSet::<String>::new();
         for symbol in object.symbols() {
@@ -342,7 +372,7 @@ pub(crate) fn canonical_symbol_name(format: BinaryFormat, name: &str) -> &str {
 pub struct ArtifactBundle {
     primary_object: Vec<u8>,
     assemblies: Vec<GeneratedAssembly>,
-    manifest: BridgeManifestV1,
+    manifest: BridgeManifestV2,
 }
 
 impl ArtifactBundle {
@@ -350,14 +380,14 @@ impl ArtifactBundle {
         Self {
             primary_object,
             assemblies: Vec::new(),
-            manifest: BridgeManifestV1::empty(translation_unit_digest),
+            manifest: BridgeManifestV2::empty(translation_unit_digest),
         }
     }
 
     pub fn new(
         primary_object: Vec<u8>,
         assemblies: Vec<GeneratedAssembly>,
-        manifest: BridgeManifestV1,
+        manifest: BridgeManifestV2,
     ) -> Self {
         Self {
             primary_object,
@@ -374,7 +404,7 @@ impl ArtifactBundle {
         &self.assemblies
     }
 
-    pub fn manifest(&self) -> &BridgeManifestV1 {
+    pub fn manifest(&self) -> &BridgeManifestV2 {
         &self.manifest
     }
 
@@ -402,7 +432,7 @@ impl VerifiedArtifactBundle {
         self.0.assemblies()
     }
 
-    pub fn manifest(&self) -> &BridgeManifestV1 {
+    pub fn manifest(&self) -> &BridgeManifestV2 {
         self.0.manifest()
     }
 
@@ -471,6 +501,17 @@ mod tests {
         object.write().unwrap()
     }
 
+    fn empty_macho_object() -> Vec<u8> {
+        let mut object = Object::new(
+            BinaryFormat::MachO,
+            Architecture::Aarch64,
+            Endianness::Little,
+        );
+        let text = object.section_id(StandardSection::Text);
+        object.append_section_data(text, &[0xc0, 0x03, 0x5f, 0xd6], 4);
+        object.write().unwrap()
+    }
+
     #[test]
     fn bridge_free_bundle_verifies_without_a_manifest_surface() {
         let bundle = ArtifactBundle::bridge_free(object_with_symbols(&[("main", true)]), [7; 32]);
@@ -485,7 +526,7 @@ mod tests {
         let assembly =
             GeneratedAssembly::new("helper", ".text\n", vec![helper.to_owned()], Vec::new())
                 .unwrap();
-        let manifest = BridgeManifestV1::new(
+        let manifest = BridgeManifestV2::new(
             [9; 32],
             vec![GeneratedSymbol::internal(
                 helper,
@@ -508,7 +549,7 @@ mod tests {
         let entry = "variadic_internal";
         let assembly =
             GeneratedAssembly::new("entry", ".text\n", vec![entry.to_owned()], Vec::new()).unwrap();
-        let manifest = BridgeManifestV1::new(
+        let manifest = BridgeManifestV2::new(
             [8; 32],
             vec![GeneratedSymbol::source_elf_internal(
                 entry,
@@ -527,6 +568,25 @@ mod tests {
     }
 
     #[test]
+    fn exact_source_internal_macho_name_is_localized_without_c_mangling() {
+        let manifest = BridgeManifestV2::new(
+            [4; 32],
+            vec![
+                GeneratedSymbol::source_internal(
+                    "physical_local",
+                    GeneratedSymbolKind::VariadicEntry,
+                    GeneratedSymbolOwner::AssemblyUnit("entry".to_owned()),
+                )
+                .with_exact_object_name(),
+            ],
+        );
+        assert_eq!(
+            manifest.localization_object_symbols(BinaryFormat::MachO),
+            [Cow::Borrowed("physical_local")]
+        );
+    }
+
+    #[test]
     fn manifest_rejects_an_assembly_collision_in_the_primary_object() {
         let helper = "__ccc_call_helper_collision";
         let assembly =
@@ -535,7 +595,7 @@ mod tests {
         let error = ArtifactBundle::new(
             object_with_symbols(&[(helper, true)]),
             vec![assembly],
-            BridgeManifestV1::new(
+            BridgeManifestV2::new(
                 [0; 32],
                 vec![GeneratedSymbol::internal(
                     helper,
@@ -547,5 +607,37 @@ mod tests {
         .verify()
         .unwrap_err();
         assert!(error.message.contains("collides"));
+    }
+
+    #[test]
+    fn manifest_rejects_distinct_logical_names_that_collide_on_macho() {
+        let ordinary =
+            GeneratedAssembly::new("ordinary", ".text\n", vec!["foo".to_owned()], Vec::new())
+                .unwrap();
+        let exact = GeneratedAssembly::new("exact", ".text\n", vec!["_foo".to_owned()], Vec::new())
+            .unwrap();
+        let error = ArtifactBundle::new(
+            empty_macho_object(),
+            vec![ordinary, exact],
+            BridgeManifestV2::new(
+                [0; 32],
+                vec![
+                    GeneratedSymbol::public(
+                        "foo",
+                        GeneratedSymbolKind::VariadicEntry,
+                        GeneratedSymbolOwner::AssemblyUnit("ordinary".to_owned()),
+                    ),
+                    GeneratedSymbol::public(
+                        "_foo",
+                        GeneratedSymbolKind::VariadicEntry,
+                        GeneratedSymbolOwner::AssemblyUnit("exact".to_owned()),
+                    )
+                    .with_exact_object_name(),
+                ],
+            ),
+        )
+        .verify()
+        .unwrap_err();
+        assert!(error.message.contains("same physical object symbol `_foo`"));
     }
 }

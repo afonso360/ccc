@@ -597,7 +597,7 @@ pub struct FullEdge {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SwitchEdge {
-    pub value: i128,
+    pub value: u128,
     pub edge: FullEdge,
 }
 

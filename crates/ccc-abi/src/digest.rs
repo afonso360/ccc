@@ -71,7 +71,7 @@ pub fn abi_config_key(config: &EffectiveCompilationConfig) -> Result<AbiConfigKe
     let (boundary_profile, classifier_revision, specification_revision, specification_digest) =
         match config.target.abi {
             AbiIdentity::SysvAmd64Lp64 => {
-                ("sysv-amd64-lp64-v1", 1, PSABI_COMMIT, PSABI_SOURCE_SHA256)
+                ("sysv-amd64-lp64-v2", 2, PSABI_COMMIT, PSABI_SOURCE_SHA256)
             }
             AbiIdentity::Aapcs64Lp64 => {
                 ("aapcs64-lp64-v1", 1, AAPCS64_COMMIT, AAPCS64_SOURCE_SHA256)
@@ -99,7 +99,12 @@ pub fn abi_config_key(config: &EffectiveCompilationConfig) -> Result<AbiConfigKe
         classifier_revision,
         specification_revision,
         specification_source_sha256: specification_digest,
-        backend_profile: "cranelift-0.132.0-no-llvm-extensions-no-implicit-sret",
+        backend_profile: match config.target.abi {
+            AbiIdentity::SysvAmd64Lp64 => "cranelift-0.132.0-llvm-abi-extensions-no-implicit-sret",
+            AbiIdentity::Aapcs64Lp64 | AbiIdentity::RiscvLp64d | AbiIdentity::DarwinArm64 => {
+                "cranelift-0.132.0-no-llvm-extensions-no-implicit-sret"
+            }
+        },
         normalized_target_arch: config.normalized_target_arch(),
         normalized_target_abi: config.normalized_target_abi(),
         normalized_target_cpu: config.normalized_target_cpu(),
@@ -125,6 +130,9 @@ pub fn sysv_amd64_v1_config_fingerprint(
     }
     let mut key = abi_config_key(config)?;
     key.schema = "ccc-abi-config-v1";
+    key.boundary_profile = "sysv-amd64-lp64-v1";
+    key.classifier_revision = 1;
+    key.backend_profile = "cranelift-0.132.0-no-llvm-extensions-no-implicit-sret";
     let mut encoder = Encoder { bytes: Vec::new() };
     encode_config_key_v1(&mut encoder, &key);
     Ok(Sha256::digest(encoder.finish()).into())
@@ -134,7 +142,7 @@ pub fn ir_shape_digest(
     module: &gir::FullModule,
     key: &AbiConfigKey,
 ) -> Result<IrShapeDigest, AbiError> {
-    let mut encoder = Encoder::new(b"ccc-ir-shape-v1");
+    let mut encoder = Encoder::new(b"ccc-ir-shape-v2");
     encode_config_key(&mut encoder, key);
     encode_types(&mut encoder, &module.types)?;
     encoder.len(module.globals.len());
@@ -190,7 +198,7 @@ pub fn translation_unit_digest(
     key: &AbiConfigKey,
     ir: IrShapeDigest,
 ) -> TranslationUnitDigest {
-    let mut encoder = Encoder::new(b"ccc-translation-unit-v1");
+    let mut encoder = Encoder::new(b"ccc-translation-unit-v2");
     encode_config_key(&mut encoder, key);
     encoder.bytes(&ir.0);
     let mut symbols = module
@@ -929,7 +937,7 @@ fn encode_terminator(encoder: &mut Encoder, terminator: &gir::FullTerminator) {
             encoder.u32(selector.0);
             encoder.len(cases.len());
             for case in cases {
-                encoder.i128(case.value);
+                encoder.u128(case.value);
                 encode_edge(encoder, &case.edge);
             }
             encode_edge(encoder, default);
@@ -1123,7 +1131,7 @@ mod tests {
             (
                 EffectiveCompilationConfig::x86_64_unknown_linux_gnu(),
                 AbiIdentity::SysvAmd64Lp64,
-                "sysv-amd64-lp64-v1",
+                "sysv-amd64-lp64-v2",
                 "x86-64",
                 "lp64",
             ),
@@ -1157,6 +1165,22 @@ mod tests {
             assert_eq!(key.normalized_target_abi, abi);
             assert_eq!(key.normalized_target_cpu, "generic");
             assert_eq!(
+                key.backend_profile,
+                if identity == AbiIdentity::SysvAmd64Lp64 {
+                    "cranelift-0.132.0-llvm-abi-extensions-no-implicit-sret"
+                } else {
+                    "cranelift-0.132.0-no-llvm-extensions-no-implicit-sret"
+                }
+            );
+            assert_eq!(
+                key.classifier_revision,
+                if identity == AbiIdentity::SysvAmd64Lp64 {
+                    2
+                } else {
+                    1
+                }
+            );
+            assert_eq!(
                 key.normalized_deployment_target,
                 if identity == AbiIdentity::DarwinArm64 {
                     "11.0"
@@ -1185,6 +1209,27 @@ mod tests {
         assert_eq!(
             crate::hex(&fingerprint),
             "430708c07b263997a5f6db5759624d2c42f0f3d68396cd9fd111b2c84db6ded8"
+        );
+    }
+
+    #[test]
+    fn empty_module_v2_digests_are_locked() {
+        let module = gir::FullModule {
+            types: TypeStore::default(),
+            globals: Vec::new(),
+            strings: Vec::new(),
+            functions: Vec::new(),
+        };
+        let key = abi_config_key(&EffectiveCompilationConfig::x86_64_unknown_linux_gnu()).unwrap();
+        let ir = ir_shape_digest(&module, &key).unwrap();
+        let translation_unit = translation_unit_digest(&module, &key, ir);
+        assert_eq!(
+            crate::hex(&ir.0),
+            "f89ea5d276f2c628e75874271d7cf43fc3dce97a1c52114148486e491af892cc"
+        );
+        assert_eq!(
+            crate::hex(&translation_unit.0),
+            "403fcbbf0155eff8563cc1ae9cdc4adc7791a1ced4a6301e40555e7f6ed9b77d"
         );
     }
 }

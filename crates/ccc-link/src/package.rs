@@ -14,8 +14,8 @@ use object::read::{Object as _, ObjectSection as _, ObjectSymbol as _};
 use sha2::{Digest as _, Sha256};
 
 use crate::artifact::{
-    ArtifactBundle, GeneratedSymbolOwner, GeneratedSymbolVisibility, VerifiedArtifactBundle,
-    canonical_symbol_name, parse_relocatable,
+    ArtifactBundle, GeneratedSymbolBinding, GeneratedSymbolOwner, GeneratedSymbolVisibility,
+    VerifiedArtifactBundle, canonical_symbol_name, parse_relocatable,
 };
 use crate::bridge::is_bridge_generated_symbol;
 use crate::{
@@ -629,6 +629,12 @@ fn inspect_combined_object(
                 expected.name
             ))
         })?;
+        if facts.weak != (expected.binding == GeneratedSymbolBinding::Weak) {
+            return Err(artifact_error(format!(
+                "generated symbol `{}` has the wrong weak binding: expected {:?}, observed weak={}",
+                expected.name, expected.binding, facts.weak
+            )));
+        }
         if localized
             && expected.visibility == GeneratedSymbolVisibility::Internal
             && if object.format() == object::BinaryFormat::MachO {
@@ -909,7 +915,7 @@ mod tests {
     };
 
     use crate::ProbeOutput;
-    use crate::artifact::{BridgeManifestV1, GeneratedSymbol, GeneratedSymbolOwner};
+    use crate::artifact::{BridgeManifestV2, GeneratedSymbol, GeneratedSymbolOwner};
     use crate::bridge::{GeneratedSymbolKind, render_generic_call_helper};
 
     use super::*;
@@ -1317,7 +1323,7 @@ mod tests {
                 ("__ccc_string_0", true, SymbolScope::Compilation),
             ]),
             vec![assembly],
-            BridgeManifestV1::new(
+            BridgeManifestV2::new(
                 [1; 32],
                 vec![GeneratedSymbol::internal(
                     helper,
@@ -1373,43 +1379,54 @@ mod tests {
     }
 
     #[test]
-    fn packaged_variadic_entries_keep_all_external_elf_visibilities() {
-        use crate::bridge::{AssemblyFunctionLinkage, VariadicEntryPlan, render_variadic_entry};
+    fn packaged_bridge_entries_keep_all_external_elf_visibilities() {
+        use crate::bridge::{
+            AssemblyFunctionLinkage, BridgeEntryPlan, render_target_fixed_entry,
+            render_variadic_entry,
+        };
 
         let directory = test_directory("entry-visibilities");
         let output = directory.join("result.o");
         let entries = [
             (
-                "variadic_default",
+                "fixed_default",
                 AssemblyFunctionLinkage::ExternalDefault,
                 object::elf::STV_DEFAULT,
+                true,
             ),
             (
                 "variadic_hidden",
                 AssemblyFunctionLinkage::ExternalHidden,
                 object::elf::STV_HIDDEN,
+                false,
             ),
             (
                 "variadic_protected",
                 AssemblyFunctionLinkage::ExternalProtected,
                 object::elf::STV_PROTECTED,
+                false,
             ),
             (
                 "variadic_internal",
                 AssemblyFunctionLinkage::ExternalInternal,
                 object::elf::STV_INTERNAL,
+                false,
             ),
         ];
         let mut assemblies = Vec::new();
         let mut manifest_symbols = Vec::new();
         let mut primary_symbols = Vec::new();
-        for (index, (public, linkage, _)) in entries.iter().enumerate() {
-            let body = format!("__ccc_variadic_body_visibility_{index}");
-            let assembly = render_variadic_entry(&VariadicEntryPlan {
+        for (index, (public, linkage, _, fixed)) in entries.iter().enumerate() {
+            let body = format!(
+                "__ccc_{}_body_visibility_{index}",
+                if *fixed { "fixed" } else { "variadic" }
+            );
+            let plan = BridgeEntryPlan {
                 public_symbol: (*public).to_owned(),
                 public_symbol_is_exact: false,
                 hidden_body_symbol: body.clone(),
                 linkage: *linkage,
+                weak: false,
                 fixed_gp_used: 1,
                 fixed_sse_used: 0,
                 overflow_arg_offset: 0,
@@ -1417,34 +1434,43 @@ mod tests {
                 xmm_results: 0,
                 hidden_return: false,
                 logical_line: 1,
-            })
+            };
+            let assembly = if *fixed {
+                render_target_fixed_entry(&plan, ccc_target::AbiIdentity::SysvAmd64Lp64)
+            } else {
+                render_variadic_entry(&plan)
+            }
             .unwrap();
+            let entry_kind = if *fixed {
+                GeneratedSymbolKind::FixedEntry
+            } else {
+                GeneratedSymbolKind::VariadicEntry
+            };
+            let body_kind = if *fixed {
+                GeneratedSymbolKind::FixedBody
+            } else {
+                GeneratedSymbolKind::VariadicBody
+            };
             let owner = GeneratedSymbolOwner::AssemblyUnit(assembly.stem().to_owned());
             let entry = match linkage {
                 AssemblyFunctionLinkage::ExternalDefault => {
-                    GeneratedSymbol::public(*public, GeneratedSymbolKind::VariadicEntry, owner)
+                    GeneratedSymbol::public(*public, entry_kind, owner)
                 }
-                AssemblyFunctionLinkage::ExternalHidden => GeneratedSymbol::source_hidden(
-                    *public,
-                    GeneratedSymbolKind::VariadicEntry,
-                    owner,
-                ),
-                AssemblyFunctionLinkage::ExternalProtected => GeneratedSymbol::source_protected(
-                    *public,
-                    GeneratedSymbolKind::VariadicEntry,
-                    owner,
-                ),
-                AssemblyFunctionLinkage::ExternalInternal => GeneratedSymbol::source_elf_internal(
-                    *public,
-                    GeneratedSymbolKind::VariadicEntry,
-                    owner,
-                ),
+                AssemblyFunctionLinkage::ExternalHidden => {
+                    GeneratedSymbol::source_hidden(*public, entry_kind, owner)
+                }
+                AssemblyFunctionLinkage::ExternalProtected => {
+                    GeneratedSymbol::source_protected(*public, entry_kind, owner)
+                }
+                AssemblyFunctionLinkage::ExternalInternal => {
+                    GeneratedSymbol::source_elf_internal(*public, entry_kind, owner)
+                }
                 AssemblyFunctionLinkage::Internal => unreachable!(),
             };
             manifest_symbols.push(entry);
             manifest_symbols.push(GeneratedSymbol::internal(
                 &body,
-                GeneratedSymbolKind::VariadicBody,
+                body_kind,
                 GeneratedSymbolOwner::PrimaryObject,
             ));
             primary_symbols.push(((*public).to_owned(), false, SymbolScope::Unknown));
@@ -1459,7 +1485,7 @@ mod tests {
             ArtifactBundle::new(
                 make_object(&primary_symbols),
                 assemblies,
-                BridgeManifestV1::new([6; 32], manifest_symbols),
+                BridgeManifestV2::new([6; 32], manifest_symbols),
             ),
             &output,
             &EffectiveCompilationConfig::x86_64_unknown_linux_gnu(),
@@ -1470,7 +1496,7 @@ mod tests {
 
         let bytes = fs::read(&output).unwrap();
         let object = object::File::parse(bytes.as_slice()).unwrap();
-        for (name, _, visibility) in entries {
+        for (name, _, visibility, _) in entries {
             let symbol = object
                 .symbols()
                 .find(|symbol| symbol.name() == Ok(name))
@@ -1529,7 +1555,7 @@ mod tests {
             let bundle = ArtifactBundle::new(
                 make_object(&[(helper, false, SymbolScope::Unknown)]),
                 vec![render_generic_call_helper(helper).unwrap()],
-                BridgeManifestV1::new(
+                BridgeManifestV2::new(
                     [2; 32],
                     vec![GeneratedSymbol::internal(
                         helper,
@@ -1565,7 +1591,7 @@ mod tests {
             ArtifactBundle::new(
                 make_object(&[(helper, false, SymbolScope::Unknown)]),
                 vec![render_generic_call_helper(helper).unwrap()],
-                BridgeManifestV1::new(
+                BridgeManifestV2::new(
                     [3; 32],
                     vec![GeneratedSymbol::internal(
                         helper,
@@ -1665,11 +1691,12 @@ mod tests {
         let output = directory.join("result.o");
         let public_symbol = "local_variadic";
         let hidden_body = "__ccc_variadic_body_local_test";
-        let assembly = crate::bridge::render_variadic_entry(&crate::bridge::VariadicEntryPlan {
+        let assembly = crate::bridge::render_variadic_entry(&crate::bridge::BridgeEntryPlan {
             public_symbol: public_symbol.to_owned(),
             public_symbol_is_exact: false,
             hidden_body_symbol: hidden_body.to_owned(),
             linkage: crate::bridge::AssemblyFunctionLinkage::Internal,
+            weak: false,
             fixed_gp_used: 0,
             fixed_sse_used: 0,
             overflow_arg_offset: 0,
@@ -1691,7 +1718,7 @@ mod tests {
         let bundle = ArtifactBundle::new(
             primary,
             vec![assembly],
-            BridgeManifestV1::new(
+            BridgeManifestV2::new(
                 [4; 32],
                 vec![
                     GeneratedSymbol::source_internal(
