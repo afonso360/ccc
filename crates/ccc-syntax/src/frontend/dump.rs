@@ -376,6 +376,13 @@ impl AstDumper {
             ExpressionKind::BuiltinHugeVal => {
                 self.line(indent, "builtin-huge-val");
             }
+            ExpressionKind::BuiltinInfF => {
+                self.line(indent, "builtin-inff");
+            }
+            ExpressionKind::BuiltinNanF { payload } => {
+                self.line(indent, "builtin-nanf");
+                self.expression(payload, indent + 1);
+            }
             ExpressionKind::BuiltinSyncSynchronize => {
                 self.line(indent, "builtin-sync-synchronize");
             }

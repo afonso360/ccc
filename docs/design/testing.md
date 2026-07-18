@@ -220,6 +220,16 @@ inline-assembly path. In this release that predicate also suppresses only the
 effective `-std` option and predicate state for every translation. Corpus
 success is integration evidence rather than proof of the unselected constructs;
 their focused fixtures remain required.
+
+The `all` and `full` Make targets also build SQLite's command-line shell. Its
+`NAN` use expands through the hosted glibc `<math.h>` to
+`__builtin_nanf("")`; the same header surface exposes `INFINITY` through
+`__builtin_inff()`. Focused typed-AST, exact CCC-IR, and execution fixtures
+prove that these calls are constant expressions with canonical binary32 quiet
+NaN and positive-infinity bits. The NaN contract accepts only an empty ordinary
+or UTF-8 string literal. Nonliteral, wide, and nonempty payloads are rejected,
+so passing the corpus cannot hide unimplemented GNU payload encoding.
+
 Lua is pinned by its [corpus manifest](../../test-corpus/lua/manifest.toml) to
 the official 5.5.0 source and matching test archives. The adapter uses the
 upstream Linux make target in GNU11 mode and requires all 34 `.c` files in the

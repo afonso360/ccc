@@ -93,6 +93,15 @@ Select a checked upstream suite with `--suite`:
 | `all`       | `make -j1 alltest` → `test/all.test`            | The full Tcl permutation matrix selected by the upstream Makefile.                                                                           |
 | `full`      | `make -j1 fulltest` → `alltest` plus `fuzztest` | The `all` matrix followed by SQLite's Makefile-owned fuzz targets; its amalgamation selects the no-assembly timing fallback described below. |
 
+The `all` and `full` Makefile targets also build SQLite's command-line shell.
+With glibc and CCC's pinned GNU compatibility identity, the shell's `NAN` and
+`INFINITY` constants select `__builtin_nanf("")` and `__builtin_inff()`.
+The capability probe records both hosted builtins before the suite starts;
+the focused compiler regressions verify their exact binary32 constants. The
+NaN contract accepts only an empty ordinary or `u8` string literal. Runtime,
+wide, and nonempty payloads are rejected because CCC does not claim GNU payload
+encoding.
+
 SQLite 3.47.2's target named `quicktest` actually invokes
 `test/extraquick.test`, a smaller subset than `veryquick`. The adapter therefore
 builds `testfixture` and invokes the pinned `test/quick.test` entrypoint directly
@@ -148,9 +157,10 @@ owned by the non-root container user for the complete work directory.
 
 The checked-in expected inventory is evaluated under CCC's effective compiler
 identity, never under the host GCC or Clang identity. It selects the full
-barrier builtin `__sync_synchronize` and no inline assembly. `testfixture` and
-the Tcl suites keep `VDBE_PROFILE`, `SQLITE_PERFORMANCE_TRACE`, and
-`SQLITE_ENABLE_STMT_SCANSTATUS` absent.
+barrier builtin `__sync_synchronize`, exposes the hosted binary32 constants
+required by the command-line shell, and selects no inline assembly.
+`testfixture` and the Tcl suites keep `VDBE_PROFILE`,
+`SQLITE_PERFORMANCE_TRACE`, and `SQLITE_ENABLE_STMT_SCANSTATUS` absent.
 
 The upstream fuzzcheck profile deliberately enables
 `SQLITE_ENABLE_STMT_SCANSTATUS`. In GNU mode on x86-64, that feature includes

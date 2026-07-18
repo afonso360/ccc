@@ -1500,6 +1500,12 @@ impl Parser<'_> {
         if token.spelling == "__builtin_huge_val" {
             return self.builtin_huge_val();
         }
+        if token.spelling == "__builtin_inff" {
+            return self.builtin_inff();
+        }
+        if token.spelling == "__builtin_nanf" {
+            return self.builtin_nanf();
+        }
         if token.spelling == "__sync_synchronize" {
             return self.builtin_sync_synchronize();
         }
@@ -1782,6 +1788,43 @@ impl Parser<'_> {
         )?;
         Ok(Expression {
             kind: ExpressionKind::BuiltinHugeVal,
+            span: span_through(builtin.span, right.span),
+        })
+    }
+
+    fn builtin_inff(&mut self) -> Result<Expression, ParseError> {
+        let builtin = self
+            .current_token()
+            .expect("caller checked builtin")
+            .clone();
+        self.position += 1;
+        self.expect_punctuator(Punctuator::LeftParen, "expected `(` after `__builtin_inff`")?;
+        let right = self.expect_punctuator(
+            Punctuator::RightParen,
+            "`__builtin_inff` requires exactly zero arguments",
+        )?;
+        Ok(Expression {
+            kind: ExpressionKind::BuiltinInfF,
+            span: span_through(builtin.span, right.span),
+        })
+    }
+
+    fn builtin_nanf(&mut self) -> Result<Expression, ParseError> {
+        let builtin = self
+            .current_token()
+            .expect("caller checked builtin")
+            .clone();
+        self.position += 1;
+        self.expect_punctuator(Punctuator::LeftParen, "expected `(` after `__builtin_nanf`")?;
+        let payload = self.assignment_expression()?;
+        let right = self.expect_punctuator(
+            Punctuator::RightParen,
+            "`__builtin_nanf` requires exactly one argument",
+        )?;
+        Ok(Expression {
+            kind: ExpressionKind::BuiltinNanF {
+                payload: Box::new(payload),
+            },
             span: span_through(builtin.span, right.span),
         })
     }

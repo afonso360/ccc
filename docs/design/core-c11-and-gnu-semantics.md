@@ -76,6 +76,7 @@ surface under CCC's identity:
 | `GCC_VERSION >= 4007000` or `__has_extension(c_atomic)`                        | `__atomic_load_n` and `__atomic_store_n` are not selected because the version test and predicate are both false.                               |
 | `GCC_VERSION >= 5004000`                                                       | Overflow and count-leading-zero builtins are not selected.                                                                                     |
 | `VDBE_PROFILE`, `SQLITE_PERFORMANCE_TRACE`, or `SQLITE_ENABLE_STMT_SCANSTATUS` | None is enabled by the pinned test adapter, so `src/hwtime.h` contributes no inline assembly.                                                  |
+| glibc `<math.h>` constants in the SQLite command-line shell                    | `NAN` and `INFINITY` select `__builtin_nanf("")` and `__builtin_inff()`; CCC folds them to canonical binary32 constants.                       |
 
 The builtin registry admits `__sync_synchronize` independently and does not
 infer support for any other `__sync_*`, `__atomic_*`, byte-swap, overflow, or
@@ -271,6 +272,12 @@ feature-predicate answer. Family resemblance never admits another spelling.
 Compiler barriers and hardware fences are represented as effects in CCC-IR so
 optimization cannot move memory operations across them.
 
+The hosted scalar-constant surface admits zero-argument `__builtin_inff()` and
+empty-literal `__builtin_nanf("")`/`__builtin_nanf(u8"")`. They fold to positive
+binary32 infinity and quiet-NaN bits `0x7fc00000`, respectively, without a
+runtime helper. Nonliteral, wide, and nonempty NaN payloads are diagnosed; CCC
+does not silently discard a payload whose GNU encoding it has not implemented.
+
 Inline assembly is retained losslessly through parsing: template, operands,
 constraints and alternatives, ties, early-clobber markers, clobbers,
 volatility, and goto labels. Emission is enabled only for an inventory-derived
@@ -283,15 +290,15 @@ assembly unavailable; it does not turn a parse-only construct into a no-op.
 The work is divided by technical dependency so one proof source cannot mask
 another:
 
-| Capability group                        | Required evidence                                                                                  | Relationship to SQLite                                                                 |
-| --------------------------------------- | -------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
-| Predefined identity and inventory       | Macro dump, explicit predicate probe, selected-branch inventory, registry snapshot                 | Determines the actual program SQLite asks CCC to compile.                              |
-| Corpus-selected builtins                | Exact CCC-IR effect, machine-code inspection, concurrency execution                                | SQLite directly requires `__sync_synchronize`.                                         |
-| Standard frontend semantics             | Typed-AST and CCC-IR goldens, diagnostics, execution fixtures                                      | SQLite is integration evidence only where its selected sources exercise the construct. |
-| Statement expressions and computed goto | Focused value-category, cleanup, provenance, and `br_table` fixtures                               | The pinned SQLite sources do not exercise them.                                        |
-| Wide integers                           | Layout, arithmetic, conversion, helper, varargs, and two-way ABI oracle                            | SQLite supplies no evidence.                                                           |
-| Inline assembly                         | Exact selected-form inventory and a form-specific certifier                                        | The pinned adapter's inventory is empty.                                               |
-| Corpus adapter                          | Source/hash verification, deterministic configure surface, build transcript, `veryquick` execution | Proves integration but does not replace any focused fixture above.                     |
+| Capability group                        | Required evidence                                                                                  | Relationship to SQLite                                                                                             |
+| --------------------------------------- | -------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| Predefined identity and inventory       | Macro dump, explicit predicate probe, selected-branch inventory, registry snapshot                 | Determines the actual program SQLite asks CCC to compile.                                                          |
+| Corpus-selected builtins                | Exact CCC-IR effect, machine-code inspection, concurrency execution                                | SQLite requires `__sync_synchronize` in its library plus `__builtin_nanf("")` and `__builtin_inff()` in its shell. |
+| Standard frontend semantics             | Typed-AST and CCC-IR goldens, diagnostics, execution fixtures                                      | SQLite is integration evidence only where its selected sources exercise the construct.                             |
+| Statement expressions and computed goto | Focused value-category, cleanup, provenance, and `br_table` fixtures                               | The pinned SQLite sources do not exercise them.                                                                    |
+| Wide integers                           | Layout, arithmetic, conversion, helper, varargs, and two-way ABI oracle                            | SQLite supplies no evidence.                                                                                       |
+| Inline assembly                         | Exact selected-form inventory and a form-specific certifier                                        | The pinned adapter's inventory is empty.                                                                           |
+| Corpus adapter                          | Source/hash verification, deterministic configure surface, build transcript, `veryquick` execution | Proves integration but does not replace any focused fixture above.                                                 |
 
 The corpus adapter may be developed and run as soon as its selected surface is
 available. Independent completeness capabilities retain their own hard gates

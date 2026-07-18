@@ -112,6 +112,7 @@ underlying type.
 | Postfix                    | Subscript, direct and indirect calls, `.` and `->`, postfix `++`/`--`                                                | Implemented for supported operand and call types. Compound literals are parsed but rejected with `CCC2271`.                                                                                                                                                                                                   |
 | Unary                      | Prefix `++`/`--`, address, dereference, unary `+`/`-`, bitwise `~`, logical `!`                                      | Implemented with lvalue/modifiability checks, target signedness, and explicit loads/stores.                                                                                                                                                                                                                   |
 | Layout operators           | `sizeof expression`, `sizeof(type-name)`, `_Alignof(type-name)`, `__builtin_offsetof` with nested member/index paths | Implemented for types with a compile-time layout. `offsetof` rejects bit-fields and nonconstant indices. Runtime VLA layout is not implemented.                                                                                                                                                               |
+| Scalar constant builtins   | `__builtin_huge_val()`, `__builtin_inff()`, and `__builtin_nanf("")`                                                 | Fold to positive binary64 infinity, positive binary32 infinity, and the canonical binary32 quiet NaN respectively. The NaN form also accepts an empty `u8` literal; nonliteral, wide, and nonempty payloads are rejected rather than approximating payload semantics.                                         |
 | Casts                      | Arithmetic conversions, pointer/integer casts, pointer/pointer casts, casts to `_Bool` and `void`                    | Implemented for scalar types other than native `long double`.                                                                                                                                                                                                                                                 |
 | Arithmetic and bitwise     | `*`, `/`, `%`, `+`, `-`, shifts, `&`, `^`, and bitwise-or                                                            | Integer promotions and usual arithmetic conversions are explicit. Pointer addition/subtraction is scaled; pointer difference uses the target `ptrdiff_t` type.                                                                                                                                                |
 | Comparison and logic       | `<`, `<=`, `>`, `>=`, `==`, `!=`, `&&`, and logical-or                                                               | Arithmetic and compatible-pointer comparisons are implemented; both logical operators short-circuit in the CFG.                                                                                                                                                                                               |
@@ -259,11 +260,11 @@ them.
 
 ### Builtins, features, and pragmas
 
-| Kind    | Exact default entries                                                                                                                                                                                                                  |
-| ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Builtin | Implemented: `__builtin_offsetof`, `__builtin_expect`, `__builtin_huge_val`, `__builtin_va_start`, `__builtin_va_arg`, `__builtin_va_copy`, `__builtin_va_end`, and `__sync_synchronize`. Every other builtin key is unsupported.      |
-| Feature | No default entries. Feature predicates are false unless the effective configuration explicitly inserts an implemented or behavior-compatible entry.                                                                                    |
-| Pragma  | No generic registry entries. Ordered built-in handling implements `#pragma pack`, `#pragma once`, `#pragma GCC system_header`, and the supported `#pragma GCC diagnostic` forms; unknown semantic pragmas are rejected with `CCC2355`. |
+| Kind    | Exact default entries                                                                                                                                                                                                                                                 |
+| ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Builtin | Implemented: `__builtin_offsetof`, `__builtin_expect`, `__builtin_huge_val`, `__builtin_inff`, `__builtin_nanf`, `__builtin_va_start`, `__builtin_va_arg`, `__builtin_va_copy`, `__builtin_va_end`, and `__sync_synchronize`. Every other builtin key is unsupported. |
+| Feature | No default entries. Feature predicates are false unless the effective configuration explicitly inserts an implemented or behavior-compatible entry.                                                                                                                   |
+| Pragma  | No generic registry entries. Ordered built-in handling implements `#pragma pack`, `#pragma once`, `#pragma GCC system_header`, and the supported `#pragma GCC diagnostic` forms; unknown semantic pragmas are rejected with `CCC2355`.                                |
 
 `__has_attribute`, `__has_builtin`, `__has_feature`, and related predicates
 report true only for registry states whose promised behavior is available.
@@ -275,6 +276,14 @@ expectation must fold to a compile-time constant and has no runtime evaluation.
 Statically unselected `?:`, `&&`, and `||` operands do not prevent folding.
 Lowering emits only the value operand and does not require backend
 branch-probability metadata.
+
+`__builtin_huge_val()` and `__builtin_inff()` are zero-argument constant
+expressions for positive binary64 and binary32 infinity. The certified NaN
+surface is exactly `__builtin_nanf("")` and its empty UTF-8-literal equivalent;
+both produce binary32 quiet NaN bits `0x7fc00000`. Runtime pointers, wide
+literals, and nonempty payload strings receive `CCC2429`, because CCC does not
+claim GNU NaN payload encoding. These builtins lower as constants and never as
+host-libm calls.
 
 ## Explicit unsupported boundaries
 

@@ -258,6 +258,18 @@ impl CapabilityRegistry {
             CapabilityState::Implemented,
             "the operator produces the target binary64 positive-infinity constant",
         );
+        registry.insert_with_rationale(
+            CapabilityKind::Builtin,
+            "__builtin_inff",
+            CapabilityState::Implemented,
+            "the operator produces the target binary32 positive-infinity constant",
+        );
+        registry.insert_with_rationale(
+            CapabilityKind::Builtin,
+            "__builtin_nanf",
+            CapabilityState::Implemented,
+            "the certified empty narrow string-literal form produces a canonical target binary32 quiet NaN",
+        );
         for name in [
             "__builtin_va_start",
             "__builtin_va_arg",
@@ -437,6 +449,8 @@ mod tests {
             "__builtin_offsetof",
             "__builtin_expect",
             "__builtin_huge_val",
+            "__builtin_inff",
+            "__builtin_nanf",
             "__builtin_va_start",
             "__builtin_va_arg",
             "__builtin_va_copy",

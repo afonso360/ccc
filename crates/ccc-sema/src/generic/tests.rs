@@ -613,7 +613,7 @@ fn types_sync_synchronize_as_a_registry_gated_sequentially_consistent_fence() {
 }
 
 #[test]
-fn types_expect_and_huge_val_from_the_builtin_registry() {
+fn types_scalar_constants_and_expect_from_the_builtin_registry() {
     let unit = analyze_preprocessed_source(
         "scalar-builtins.c",
         "#if !__has_builtin(__builtin_expect)\n\
@@ -622,12 +622,21 @@ fn types_expect_and_huge_val_from_the_builtin_registry() {
          #if !__has_builtin(__builtin_huge_val)\n\
          #error missing huge-value builtin\n\
          #endif\n\
+         #if !__has_builtin(__builtin_inff)\n\
+         #error missing float-infinity builtin\n\
+         #endif\n\
+         #if !__has_builtin(__builtin_nanf)\n\
+         #error missing float-NaN builtin\n\
+         #endif\n\
          enum { expectation = 1, folded = __builtin_expect(7, expectation) };\n\
          _Static_assert(__builtin_expect(1, expectation), \"folded expectation\");\n\
          long choose(signed char value) {\n\
              return __builtin_expect(value, (0, 1));\n\
          }\n\
-         double infinity(void) { return __builtin_huge_val(); }",
+         double infinity(void) { return __builtin_huge_val(); }\n\
+         float infinityf(void) { return __builtin_inff(); }\n\
+         float not_a_number(void) { return __builtin_nanf(\"\"); }\n\
+         float utf8_not_a_number(void) { return __builtin_nanf(u8\"\"); }",
     )
     .unwrap();
 
@@ -673,6 +682,49 @@ fn types_expect_and_huge_val_from_the_builtin_registry() {
         Some(ConstantValue::Floating(value)) if value.is_infinite() && value.is_sign_positive()
     ));
 
+    let infinityf = unit
+        .functions
+        .iter()
+        .find(|function| function.name == "infinityf")
+        .unwrap();
+    let FullTypedStatementKind::Compound(items) = &infinityf.body.as_ref().unwrap().kind else {
+        panic!("infinityf has a compound body")
+    };
+    let FullTypedBlockItem::Statement(statement) = &items[0] else {
+        panic!("infinityf has a return statement")
+    };
+    let FullTypedStatementKind::Return(Some(expression)) = &statement.kind else {
+        panic!("infinityf returns an expression")
+    };
+    assert_eq!(expression.ty.ty, TypeId::FLOAT);
+    assert!(matches!(
+        expression.constant,
+        Some(ConstantValue::Floating(value))
+            if (value as f32).to_bits() == f32::INFINITY.to_bits()
+    ));
+
+    for function_name in ["not_a_number", "utf8_not_a_number"] {
+        let function = unit
+            .functions
+            .iter()
+            .find(|function| function.name == function_name)
+            .unwrap();
+        let FullTypedStatementKind::Compound(items) = &function.body.as_ref().unwrap().kind else {
+            panic!("{function_name} has a compound body")
+        };
+        let FullTypedBlockItem::Statement(statement) = &items[0] else {
+            panic!("{function_name} has a return statement")
+        };
+        let FullTypedStatementKind::Return(Some(expression)) = &statement.kind else {
+            panic!("{function_name} returns an expression")
+        };
+        assert_eq!(expression.ty.ty, TypeId::FLOAT);
+        assert!(matches!(
+            expression.constant,
+            Some(ConstantValue::Floating(value)) if (value as f32).to_bits() == 0x7fc0_0000
+        ));
+    }
+
     assert_eq!(
         diagnostic_codes("long f(void) { return __builtin_expect(1, missing); }"),
         vec!["CCC2274"]
@@ -700,6 +752,14 @@ fn types_expect_and_huge_val_from_the_builtin_registry() {
             "__builtin_huge_val",
             "double infinity(void) { return __builtin_huge_val(); }",
         ),
+        (
+            "__builtin_inff",
+            "float infinityf(void) { return __builtin_inff(); }",
+        ),
+        (
+            "__builtin_nanf",
+            "float not_a_number(void) { return __builtin_nanf(\"\"); }",
+        ),
     ] {
         let mut config = EffectiveCompilationConfig::default();
         config
@@ -714,6 +774,14 @@ fn types_expect_and_huge_val_from_the_builtin_registry() {
             ["CCC2407"],
             "{name}"
         );
+    }
+
+    for source in [
+        "float not_a_number(char *payload) { return __builtin_nanf(payload); }",
+        "float not_a_number(void) { return __builtin_nanf(L\"\"); }",
+        "float not_a_number(void) { return __builtin_nanf(\"payload\"); }",
+    ] {
+        assert_eq!(diagnostic_codes(source), vec!["CCC2429"], "{source}");
     }
 }
 

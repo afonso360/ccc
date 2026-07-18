@@ -720,7 +720,9 @@ fn lowers_scalar_builtins_to_value_preserving_ir_without_calls() {
         "long choose(int value) {\n\
              return __builtin_expect(value, 1 ? 1 : ++value);\n\
          }\n\
-         double infinity(void) { return __builtin_huge_val(); }",
+         double infinity(void) { return __builtin_huge_val(); }\n\
+         float infinityf(void) { return __builtin_inff(); }\n\
+         float not_a_number(void) { return __builtin_nanf(\"\"); }",
     );
     verify_frontend(&module).unwrap();
     assert_eq!(
@@ -734,6 +736,16 @@ fn lowers_scalar_builtins_to_value_preserving_ir_without_calls() {
             "function f1 @infinity() -> double [signature=double () linkage=External visibility=Default inline=false noreturn=false] {\n",
             "  b0():\n",
             "    i0: v0: double = const float:0x7ff0000000000000\n",
+            "    return v0\n",
+            "}\n",
+            "function f2 @infinityf() -> float [signature=float () linkage=External visibility=Default inline=false noreturn=false] {\n",
+            "  b0():\n",
+            "    i0: v0: float = const float:0x7ff0000000000000\n",
+            "    return v0\n",
+            "}\n",
+            "function f3 @not_a_number() -> float [signature=float () linkage=External visibility=Default inline=false noreturn=false] {\n",
+            "  b0():\n",
+            "    i0: v0: float = const float:0x7ff8000000000000\n",
             "    return v0\n",
             "}\n",
         )

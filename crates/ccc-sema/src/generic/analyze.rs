@@ -2518,6 +2518,8 @@ impl<'a> Analyzer<'a> {
                 self.analyze_builtin_expect(value, expected, expression.span)
             }
             E::BuiltinHugeVal => self.analyze_builtin_huge_val(expression.span),
+            E::BuiltinInfF => self.analyze_builtin_inff(expression.span),
+            E::BuiltinNanF { payload } => self.analyze_builtin_nanf(payload, expression.span),
             E::BuiltinSyncSynchronize => self.analyze_sync_synchronize(expression.span),
         }
     }
@@ -2564,6 +2566,46 @@ impl<'a> Analyzer<'a> {
         Ok(self.constant_expression(
             ConstantValue::Floating(f64::INFINITY),
             QualifiedType::unqualified(TypeId::DOUBLE),
+            span,
+        ))
+    }
+
+    fn analyze_builtin_inff(&mut self, span: Span) -> AnalysisResult<FullTypedExpression> {
+        self.require_builtin("__builtin_inff", span)?;
+        Ok(self.constant_expression(
+            ConstantValue::Floating(f64::from(f32::INFINITY)),
+            QualifiedType::unqualified(TypeId::FLOAT),
+            span,
+        ))
+    }
+
+    fn analyze_builtin_nanf(
+        &mut self,
+        payload: &syntax::Expression,
+        span: Span,
+    ) -> AnalysisResult<FullTypedExpression> {
+        self.require_builtin("__builtin_nanf", span)?;
+        let Some(payload_literal) = initializer_string_literal(payload) else {
+            return self.fail(
+                "CCC2429",
+                payload.span,
+                "`__builtin_nanf` requires an empty narrow string-literal payload",
+            );
+        };
+        if !matches!(
+            payload_literal.prefix,
+            StringLiteralPrefix::None | StringLiteralPrefix::Utf8
+        ) || !payload_literal.code_units.is_empty()
+        {
+            return self.fail(
+                "CCC2429",
+                payload.span,
+                "`__builtin_nanf` requires an empty narrow string-literal payload",
+            );
+        }
+        Ok(self.constant_expression(
+            ConstantValue::Floating(f64::from(f32::from_bits(0x7fc0_0000))),
+            QualifiedType::unqualified(TypeId::FLOAT),
             span,
         ))
     }

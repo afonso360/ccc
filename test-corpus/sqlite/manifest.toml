@@ -86,6 +86,8 @@ pin_rationales = [
 
 [expected_inventory]
 selected_builtins = ["__sync_synchronize"]
+available_hosted_builtins = ["__builtin_inff", "__builtin_nanf"]
+suite_consumers_of_hosted_float_builtins = ["all", "full"]
 unselected_builtin_families = [
     "__atomic_load_n-and-__atomic_store_n",
     "__builtin_bswap",
@@ -136,6 +138,7 @@ driver = "make-target"
 make_target = "alltest"
 primary_tcl_entrypoint = "test/all.test"
 components = ["alltest"]
+required_hosted_builtins = ["__builtin_inff", "__builtin_nanf"]
 command = "make -j1 alltest"
 
 [test_suites.full]
@@ -143,6 +146,7 @@ driver = "make-target"
 make_target = "fulltest"
 primary_tcl_entrypoint = "test/all.test"
 components = ["alltest", "fuzztest"]
+required_hosted_builtins = ["__builtin_inff", "__builtin_nanf"]
 command = "make -j1 fulltest"
 
 [adapter_artifacts]

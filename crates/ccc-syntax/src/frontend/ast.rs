@@ -365,6 +365,10 @@ pub enum ExpressionKind {
         expected: Box<Expression>,
     },
     BuiltinHugeVal,
+    BuiltinInfF,
+    BuiltinNanF {
+        payload: Box<Expression>,
+    },
     BuiltinSyncSynchronize,
 }
 

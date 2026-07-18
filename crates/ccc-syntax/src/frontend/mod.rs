@@ -402,22 +402,29 @@ mod tests {
     }
 
     #[test]
-    fn parses_expect_and_huge_val_with_their_exact_builtin_arity() {
+    fn parses_scalar_builtins_with_their_exact_arity() {
         let unit = parse_source(
             "long choose(int value, int expected) {\n\
                  return __builtin_expect(value, expected);\n\
              }\n\
-             double infinity(void) { return __builtin_huge_val(); }",
+             double infinity(void) { return __builtin_huge_val(); }\n\
+             float infinityf(void) { return __builtin_inff(); }\n\
+             float not_a_number(void) { return __builtin_nanf(\"\"); }",
         )
         .unwrap();
         let dump = dump_ast(&unit);
         assert!(dump.contains("builtin-expect"), "{dump}");
         assert!(dump.contains("builtin-huge-val"), "{dump}");
+        assert!(dump.contains("builtin-inff"), "{dump}");
+        assert!(dump.contains("builtin-nanf"), "{dump}");
 
         for source in [
             "long choose(void) { return __builtin_expect(1); }",
             "long choose(void) { return __builtin_expect(1, 0, 2); }",
             "double infinity(void) { return __builtin_huge_val(1); }",
+            "float infinityf(void) { return __builtin_inff(1); }",
+            "float not_a_number(void) { return __builtin_nanf(); }",
+            "float not_a_number(void) { return __builtin_nanf(\"\", \"x\"); }",
         ] {
             assert!(parse_source(source).is_err(), "{source}");
         }

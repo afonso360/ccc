@@ -272,6 +272,14 @@ grep -Fxq '#define __GNUC_PATCHLEVEL__ 1' effective-macros.txt ||
   die "CCC does not advertise the pinned __GNUC_PATCHLEVEL__ value"
 grep -Fxq 'selected_builtin=__sync_synchronize' predicate-probe.txt ||
   die "CCC does not select SQLite's required full-barrier builtin"
+if [[ "$suite" == all || "$suite" == full ]]; then
+  for required in \
+    available_hosted_builtin=__builtin_inff \
+    available_hosted_builtin=__builtin_nanf; do
+    grep -Fxq "$required" predicate-probe.txt ||
+      die "CCC does not expose SQLite's required hosted builtin: ${required#*=}"
+  done
+fi
 for unexpected in \
   selected_builtin=__atomic_load_n \
   selected_builtin=__atomic_store_n \
@@ -327,7 +335,7 @@ expected_source_count=$(wc -l <"$expected_source_inputs" | tr -d '[:space:]')
   die "SQLite testfixture declares $expected_source_count C inputs; expected $expected_testfixture_translation_units"
 
 {
-  grep '^selected_builtin=' predicate-probe.txt
+  grep -E '^(selected_builtin|available_hosted_builtin)=' predicate-probe.txt
   printf '%s\n' \
     'inline_assembly=none' \
     'wide_integer_use=none' \
