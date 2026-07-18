@@ -95,7 +95,6 @@ fn compile_reference(compiler: &str, optimization: &str, source: &Path, object: 
 fn link_and_run(compiler: &str, directory: &Path, objects: &[&Path]) -> Output {
     let executable = directory.join("program");
     let mut command = Command::new(compiler);
-    command.arg("-no-pie");
     command.args(objects.iter().map(|path| path.as_os_str()));
     command.arg("-o").arg(&executable);
     run(&mut command);
@@ -1838,10 +1837,11 @@ static _Unwind_Ptr parse_region(const char *text) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 3)
+    if (argc != 4)
         return 130;
-    entry_bridge_region = parse_region(argv[1]);
-    call_helper_region = parse_region(argv[2]);
+    _Unwind_Ptr load_bias = (_Unwind_Ptr)main - parse_region(argv[3]);
+    entry_bridge_region = load_bias + parse_region(argv[1]);
+    call_helper_region = load_bias + parse_region(argv[2]);
     if (entry_bridge_region == 0 || call_helper_region == 0)
         return 130;
     int entry_depth = ccc_variadic_unwind_depth(0, 1);
@@ -1866,7 +1866,6 @@ int main(int argc, char **argv) {
         compile_reference(compiler, optimization, &reference_source, &reference_object);
         let executable = directory.join("program");
         run(Command::new(compiler)
-            .arg("-no-pie")
             .arg(&ccc_object)
             .arg(&reference_object)
             .arg("-o")
@@ -1889,6 +1888,11 @@ int main(int argc, char **argv) {
                     .map(|_| symbol.address())
             })
             .collect::<Vec<_>>();
+        let main_address = object
+            .symbols()
+            .find(|symbol| symbol.name() == Ok("main"))
+            .map(|symbol| symbol.address())
+            .expect("main symbol is present");
         assert_eq!(
             helper_addresses.len(),
             1,
@@ -1897,7 +1901,8 @@ int main(int argc, char **argv) {
         let output = run(Command::new(&executable)
             .env("LC_ALL", "C")
             .arg(format!("{entry_address:x}"))
-            .arg(format!("{:x}", helper_addresses[0])));
+            .arg(format!("{:x}", helper_addresses[0]))
+            .arg(format!("{main_address:x}")));
         assert!(output.stdout.is_empty());
         assert!(output.stderr.is_empty());
         fs::remove_dir_all(directory).unwrap();

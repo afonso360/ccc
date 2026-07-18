@@ -1080,6 +1080,9 @@ pub fn link_executable_with_toolchain(
         RelocationModel::Static => {
             command.arg("-no-pie");
         }
+        RelocationModel::Pic | RelocationModel::Pie => {
+            command.arg("-pie");
+        }
     }
     let result = command.output().map_err(|error| LinkError {
         code: "CCC5003",

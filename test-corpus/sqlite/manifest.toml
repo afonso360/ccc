@@ -36,14 +36,13 @@ supported_test_suites = ["veryquick", "quick", "all", "full"]
 build_compiler = "gcc"
 target_compiler = "ccc"
 link_driver = "gcc"
-link_mode = "non-pie-executable"
+link_mode = "pie-executable"
 configure_arguments = [
     "--disable-shared",
     "--disable-readline",
     "--disable-load-extension",
 ]
 configure_cache = ["ac_cv_func_isnan=no"]
-configure_environment = ["LDFLAGS=-no-pie"]
 required_tools = [
     "awk",
     "bash",

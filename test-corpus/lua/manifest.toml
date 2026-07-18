@@ -25,11 +25,11 @@ language_mode = "gnu11"
 gnu_compatibility_tuple = "4.2.1"
 build_interface = "upstream-make-linux"
 build_target = "linux"
-build_command = "make linux CC='<ccc-adapter> -std=gnu11' MYLDFLAGS=-no-pie"
+build_command = "make linux CC='<ccc-adapter> -std=gnu11'"
 source_translation_units = 34
 target_compiler = "ccc"
 link_driver = "gcc"
-link_mode = "non-pie-executable"
+link_mode = "pie-executable"
 
 test_profile = "basic"
 test_entrypoint = "all.lua"
