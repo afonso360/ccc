@@ -869,7 +869,7 @@ int main(void) {
         1,
         "expected exactly one glibc sscanf redirect, found {scanf_redirects:?}"
     );
-    let (name, symbol) = scanf_redirects[0];
+    let (name, symbol) = &scanf_redirects[0];
     assert!(symbol.is_undefined(), "`{name}` must remain undefined");
     assert!(symbol.is_global(), "`{name}` must have external linkage");
     assert!(
