@@ -14,7 +14,9 @@ pub use corpus::{
     CLASSIFIER_CORPUS_SEED, CorpusAllocationPattern, CorpusBucket, CorpusCase, CorpusFixture,
     CorpusReturnMode, classifier_corpus, selected_cross_link_cases,
 };
-pub use digest::{abi_config_key, ir_shape_digest, translation_unit_digest};
+pub use digest::{
+    abi_config_key, ir_shape_digest, sysv_amd64_v1_config_fingerprint, translation_unit_digest,
+};
 pub use model::*;
 pub use module_plan::{dump_module_plan, plan_module};
 pub use sysv_amd64::{

@@ -419,7 +419,7 @@ fn complete_abi_plan_and_aggregate_clif_have_exact_snapshots() {
     assert!(dump.contains("packaging assembly-units=2"), "{dump}");
     assert_eq!(
         sha256(&dump),
-        "6e96880231371cdc038ca2453549b5d3a0c047b96766193efe448cd1df17c742"
+        "184145d0df795011821666eb33da6450a0d28c6548ce7e7bf8ead4952cd677c3"
     );
 
     let output = emit(&module, &config, Options { emit_clif: true }).unwrap();

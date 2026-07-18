@@ -16,9 +16,50 @@ pub use layout::{
     TargetScalarKind,
 };
 pub use target_lexicon::{
-    Architecture, BinaryFormat, CallingConvention, Environment, OperatingSystem, PointerWidth,
-    Triple, Vendor,
+    Aarch64Architecture, Architecture, BinaryFormat, CallingConvention, Environment,
+    OperatingSystem, PointerWidth, Riscv64Architecture, Triple, Vendor,
 };
+
+/// A CCC-owned C ABI identity.
+///
+/// `target-lexicon` calling conventions are backend-facing categories and are
+/// not precise enough to key C layout, aggregate classification, variadics,
+/// or generated boundary artifacts. This identity is therefore the stable
+/// planner and digest key.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum AbiIdentity {
+    SysvAmd64Lp64,
+    Aapcs64Lp64,
+    RiscvLp64d,
+    DarwinArm64,
+}
+
+impl AbiIdentity {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::SysvAmd64Lp64 => "sysv-amd64-lp64",
+            Self::Aapcs64Lp64 => "aapcs64-lp64",
+            Self::RiscvLp64d => "riscv-lp64d",
+            Self::DarwinArm64 => "darwin-arm64",
+        }
+    }
+
+    pub const fn calling_convention(self) -> CallingConvention {
+        match self {
+            Self::DarwinArm64 => CallingConvention::AppleAarch64,
+            Self::SysvAmd64Lp64 | Self::Aapcs64Lp64 | Self::RiscvLp64d => {
+                CallingConvention::SystemV
+            }
+        }
+    }
+
+    pub const fn is_linux(self) -> bool {
+        matches!(
+            self,
+            Self::SysvAmd64Lp64 | Self::Aapcs64Lp64 | Self::RiscvLp64d
+        )
+    }
+}
 
 /// The relocation contract used by generated objects.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -132,11 +173,50 @@ impl PredefinedMacroFacts {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TargetSpec {
     pub triple: Triple,
+    pub abi: AbiIdentity,
     pub int_align: u8,
     pub data_layout: TargetDataLayout,
 }
 
 impl TargetSpec {
+    /// Selects one of the complete target profiles enabled by CCC.
+    pub fn enabled(triple: Triple) -> Result<Self, String> {
+        let template = match (
+            triple.architecture,
+            triple.operating_system,
+            triple.environment,
+            triple.binary_format,
+        ) {
+            (Architecture::X86_64, OperatingSystem::Linux, Environment::Gnu, BinaryFormat::Elf) => {
+                X86_64_UNKNOWN_LINUX_GNU
+            }
+            (
+                Architecture::Aarch64(Aarch64Architecture::Aarch64),
+                OperatingSystem::Linux,
+                Environment::Gnu,
+                BinaryFormat::Elf,
+            ) => AARCH64_UNKNOWN_LINUX_GNU,
+            (
+                Architecture::Riscv64(_),
+                OperatingSystem::Linux,
+                Environment::Gnu,
+                BinaryFormat::Elf,
+            ) => RISCV64_UNKNOWN_LINUX_GNU,
+            (
+                Architecture::Aarch64(Aarch64Architecture::Aarch64),
+                operating_system,
+                Environment::Unknown,
+                BinaryFormat::Macho,
+            ) if operating_system.is_like_darwin() => AARCH64_APPLE_DARWIN,
+            _ => {
+                return Err(format!(
+                    "target `{triple}` is not an enabled CCC target profile"
+                ));
+            }
+        };
+        Ok(Self { triple, ..template })
+    }
+
     pub fn pointer_width(&self) -> Option<u8> {
         self.triple.pointer_width().ok().map(PointerWidth::bits)
     }
@@ -149,7 +229,7 @@ impl TargetSpec {
     }
 
     pub fn calling_convention(&self) -> Option<CallingConvention> {
-        self.triple.default_calling_convention().ok()
+        Some(self.abi.calling_convention())
     }
 
     pub const fn scalar_layout(&self, kind: TargetScalarKind) -> ScalarLayout {
@@ -213,6 +293,15 @@ impl TargetSpec {
             "__SIZEOF_WINT_T__",
             (self.data_layout.wint_width / 8).to_string(),
         );
+        if !self.data_layout.char_is_signed {
+            facts.insert("__CHAR_UNSIGNED__", "1");
+        }
+        if !self.data_layout.wchar_is_signed {
+            facts.insert("__WCHAR_UNSIGNED__", "1");
+        }
+        if !self.data_layout.wint_is_signed {
+            facts.insert("__WINT_UNSIGNED__", "1");
+        }
         insert_integer_compatibility_facts(self, &mut facts);
         facts.insert("__ORDER_LITTLE_ENDIAN__", "1234");
         facts.insert("__ORDER_BIG_ENDIAN__", "4321");
@@ -224,20 +313,40 @@ impl TargetSpec {
                 facts.insert(name, "1");
             }
         }
+        if matches!(
+            self.triple.architecture,
+            Architecture::Aarch64(Aarch64Architecture::Aarch64)
+        ) {
+            facts.insert("__aarch64__", "1");
+            facts.insert("__AARCH64EL__", "1");
+        }
+        if matches!(self.abi, AbiIdentity::RiscvLp64d) {
+            facts.insert("__riscv", "1");
+            facts.insert("__riscv_xlen", "64");
+            facts.insert("__riscv_float_abi_double", "1");
+            facts.insert("__riscv_flen", "64");
+        }
         if self.triple.operating_system == OperatingSystem::Linux {
             for name in ["__linux__", "__linux", "__unix__", "__unix"] {
                 facts.insert(name, "1");
             }
         }
+        if self.triple.operating_system.is_like_darwin() {
+            facts.insert("__APPLE__", "1");
+            facts.insert("__MACH__", "1");
+        }
         if self.triple.binary_format == BinaryFormat::Elf {
             facts.insert("__ELF__", "1");
         }
-        if self.triple.architecture == Architecture::X86_64
-            && self.triple.binary_format == BinaryFormat::Elf
-            && self.calling_convention() == Some(CallingConvention::SystemV)
-        {
-            facts.insert("__USER_LABEL_PREFIX__", "");
-        }
+        facts.insert(
+            "__USER_LABEL_PREFIX__",
+            if self.triple.binary_format == BinaryFormat::Macho {
+                "_"
+            } else {
+                ""
+            },
+        );
+        insert_long_double_compatibility_facts(self, &mut facts);
         if self.data_layout.pointer_width == 64 && self.data_layout.long_width == 64 {
             facts.insert("__LP64__", "1");
             facts.insert("_LP64", "1");
@@ -267,6 +376,56 @@ fn insert_binary64_compatibility_facts(facts: &mut PredefinedMacroFacts) {
         ("DENORM_MIN", "0x1p-1074"),
     ] {
         facts.insert(format!("__DBL_{suffix}__"), replacement);
+    }
+}
+
+fn insert_long_double_compatibility_facts(target: &TargetSpec, facts: &mut PredefinedMacroFacts) {
+    match target.data_layout.long_double_width {
+        64 => {
+            for (suffix, replacement) in [
+                ("MANT_DIG", "53"),
+                ("DIG", "15"),
+                ("MIN_EXP", "(-1021)"),
+                ("MIN_10_EXP", "(-307)"),
+                ("MAX_EXP", "1024"),
+                ("MAX_10_EXP", "308"),
+                ("DECIMAL_DIG", "17"),
+                ("HAS_DENORM", "1"),
+                ("HAS_INFINITY", "1"),
+                ("HAS_QUIET_NAN", "1"),
+                ("MAX", "0x1.fffffffffffffp+1023L"),
+                ("EPSILON", "0x1p-52L"),
+                ("MIN", "0x1p-1022L"),
+                ("DENORM_MIN", "0x1p-1074L"),
+            ] {
+                facts.insert(format!("__LDBL_{suffix}__"), replacement);
+            }
+        }
+        128 => {
+            // The Linux profiles store `long double` as IEEE binary128. These
+            // are representation facts only; arithmetic and native transport
+            // remain capability-checked by semantic and ABI analysis.
+            facts.insert("__LONG_DOUBLE_128__", "1");
+            for (suffix, replacement) in [
+                ("MANT_DIG", "113"),
+                ("DIG", "33"),
+                ("MIN_EXP", "(-16381)"),
+                ("MIN_10_EXP", "(-4931)"),
+                ("MAX_EXP", "16384"),
+                ("MAX_10_EXP", "4932"),
+                ("DECIMAL_DIG", "36"),
+                ("HAS_DENORM", "1"),
+                ("HAS_INFINITY", "1"),
+                ("HAS_QUIET_NAN", "1"),
+                ("MAX", "0x1.ffffffffffffffffffffffffffffp+16383L"),
+                ("EPSILON", "0x1p-112L"),
+                ("MIN", "0x1p-16382L"),
+                ("DENORM_MIN", "0x1p-16494L"),
+            ] {
+                facts.insert(format!("__LDBL_{suffix}__"), replacement);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -612,11 +771,40 @@ pub struct EffectiveCompilationConfig {
     pub resource_dir: Option<PathBuf>,
     pub toolchain: ToolchainSpec,
     pub relocation_model: RelocationModel,
+    pub target_cpu: Option<String>,
+    pub target_abi: Option<String>,
+    pub sdk_root: Option<PathBuf>,
+    pub deployment_target: Option<String>,
 }
 
 impl EffectiveCompilationConfig {
     pub fn x86_64_unknown_linux_gnu() -> Self {
-        let target = X86_64_UNKNOWN_LINUX_GNU;
+        Self::for_spec(X86_64_UNKNOWN_LINUX_GNU)
+    }
+
+    pub fn aarch64_unknown_linux_gnu() -> Self {
+        Self::for_spec(AARCH64_UNKNOWN_LINUX_GNU)
+    }
+
+    pub fn riscv64_unknown_linux_gnu() -> Self {
+        Self::for_spec(RISCV64_UNKNOWN_LINUX_GNU)
+    }
+
+    pub fn aarch64_apple_darwin() -> Self {
+        Self::for_spec(AARCH64_APPLE_DARWIN)
+    }
+
+    pub fn for_target(triple: Triple) -> Result<Self, String> {
+        TargetSpec::enabled(triple).map(Self::for_spec)
+    }
+
+    /// Selects the native host only when that host has a complete enabled
+    /// profile. There is deliberately no architecture fallback.
+    pub fn host() -> Result<Self, String> {
+        Self::for_target(target_lexicon::HOST)
+    }
+
+    fn for_spec(target: TargetSpec) -> Self {
         let target_macros = target.predefined_macro_facts();
         Self {
             target,
@@ -627,6 +815,10 @@ impl EffectiveCompilationConfig {
             resource_dir: None,
             toolchain: ToolchainSpec::default(),
             relocation_model: RelocationModel::Static,
+            target_cpu: None,
+            target_abi: None,
+            sdk_root: None,
+            deployment_target: None,
         }
     }
 
@@ -642,6 +834,26 @@ impl EffectiveCompilationConfig {
 
     pub fn with_resource_dir(mut self, resource_dir: impl Into<PathBuf>) -> Self {
         self.resource_dir = Some(resource_dir.into());
+        self
+    }
+
+    pub fn with_target_cpu(mut self, cpu: impl Into<String>) -> Self {
+        self.target_cpu = Some(cpu.into());
+        self
+    }
+
+    pub fn with_target_abi(mut self, abi: impl Into<String>) -> Self {
+        self.target_abi = Some(abi.into());
+        self
+    }
+
+    pub fn with_sdk_root(mut self, sdk_root: impl Into<PathBuf>) -> Self {
+        self.sdk_root = Some(sdk_root.into());
+        self
+    }
+
+    pub fn with_deployment_target(mut self, deployment_target: impl Into<String>) -> Self {
+        self.deployment_target = Some(deployment_target.into());
         self
     }
 
@@ -678,8 +890,28 @@ impl EffectiveCompilationConfig {
                 profile.version.patch.to_string(),
             );
         }
+        if let Some(version) = &self.deployment_target
+            && self.target.abi == AbiIdentity::DarwinArm64
+            && let Some(encoded) = encode_apple_deployment_version(version)
+        {
+            macros.insert(
+                "__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__".to_owned(),
+                encoded,
+            );
+        }
         macros
     }
+}
+
+fn encode_apple_deployment_version(version: &str) -> Option<String> {
+    let mut components = version.split('.');
+    let major = components.next()?.parse::<u32>().ok()?;
+    let minor = components.next().unwrap_or("0").parse::<u32>().ok()?;
+    let patch = components.next().unwrap_or("0").parse::<u32>().ok()?;
+    if components.next().is_some() || minor > 99 || patch > 99 {
+        return None;
+    }
+    Some((major * 10_000 + minor * 100 + patch).to_string())
 }
 
 impl Default for EffectiveCompilationConfig {
@@ -697,6 +929,7 @@ pub const X86_64_UNKNOWN_LINUX_GNU: TargetSpec = TargetSpec {
         environment: Environment::Gnu,
         binary_format: BinaryFormat::Elf,
     },
+    abi: AbiIdentity::SysvAmd64Lp64,
     int_align: 4,
     data_layout: TargetDataLayout {
         byte_order: ByteOrder::Little,
@@ -736,6 +969,98 @@ pub const X86_64_UNKNOWN_LINUX_GNU: TargetSpec = TargetSpec {
     },
 };
 
+/// The enabled AArch64 Linux GNU target using the base AAPCS64 data model.
+pub const AARCH64_UNKNOWN_LINUX_GNU: TargetSpec = TargetSpec {
+    triple: Triple {
+        architecture: Architecture::Aarch64(Aarch64Architecture::Aarch64),
+        vendor: Vendor::Unknown,
+        operating_system: OperatingSystem::Linux,
+        environment: Environment::Gnu,
+        binary_format: BinaryFormat::Elf,
+    },
+    abi: AbiIdentity::Aapcs64Lp64,
+    int_align: 4,
+    data_layout: TargetDataLayout {
+        char_is_signed: false,
+        wchar_is_signed: false,
+        ..LINUX_LP64_BINARY128_LAYOUT
+    },
+};
+
+/// The enabled RISC-V 64-bit Linux GNU LP64D target.
+pub const RISCV64_UNKNOWN_LINUX_GNU: TargetSpec = TargetSpec {
+    triple: Triple {
+        architecture: Architecture::Riscv64(Riscv64Architecture::Riscv64),
+        vendor: Vendor::Unknown,
+        operating_system: OperatingSystem::Linux,
+        environment: Environment::Gnu,
+        binary_format: BinaryFormat::Elf,
+    },
+    abi: AbiIdentity::RiscvLp64d,
+    int_align: 4,
+    data_layout: TargetDataLayout {
+        char_is_signed: false,
+        ..LINUX_LP64_BINARY128_LAYOUT
+    },
+};
+
+/// The enabled arm64 Darwin target.
+pub const AARCH64_APPLE_DARWIN: TargetSpec = TargetSpec {
+    triple: Triple {
+        architecture: Architecture::Aarch64(Aarch64Architecture::Aarch64),
+        vendor: Vendor::Apple,
+        operating_system: OperatingSystem::Darwin(None),
+        environment: Environment::Unknown,
+        binary_format: BinaryFormat::Macho,
+    },
+    abi: AbiIdentity::DarwinArm64,
+    int_align: 4,
+    data_layout: TargetDataLayout {
+        char_is_signed: true,
+        long_double_width: 64,
+        long_double_align: 8,
+        wint_is_signed: true,
+        ..LINUX_LP64_BINARY128_LAYOUT
+    },
+};
+
+const LINUX_LP64_BINARY128_LAYOUT: TargetDataLayout = TargetDataLayout {
+    byte_order: ByteOrder::Little,
+    char_is_signed: true,
+    bool_width: 8,
+    bool_align: 1,
+    char_width: 8,
+    char_align: 1,
+    short_width: 16,
+    short_align: 2,
+    int_width: 32,
+    int_align: 4,
+    long_width: 64,
+    long_align: 8,
+    long_long_width: 64,
+    long_long_align: 8,
+    pointer_width: 64,
+    pointer_align: 8,
+    float_width: 32,
+    float_align: 4,
+    double_width: 64,
+    double_align: 8,
+    long_double_width: 128,
+    long_double_align: 16,
+    wchar_width: 32,
+    wchar_is_signed: true,
+    wint_width: 32,
+    wint_is_signed: false,
+    bitfields: BitfieldLayoutPolicy {
+        order: BitfieldOrder::LeastSignificantFirst,
+        may_cross_storage_units: false,
+        coalesce_different_declared_types: true,
+        packed_fields_are_contiguous: true,
+        zero_width_uses_declared_alignment: true,
+    },
+    default_packing: PackingPolicy::NATIVE,
+};
+
 #[cfg(test)]
 mod tests {
     use target_lexicon::CDataModel;
@@ -751,6 +1076,7 @@ mod tests {
         assert_eq!(config.target.triple.data_model(), Ok(CDataModel::LP64));
         assert_eq!(config.target.int_width(), Some(32));
         assert_eq!(config.target.pointer_width(), Some(64));
+        assert_eq!(config.target.abi, AbiIdentity::SysvAmd64Lp64);
         let bitfields = config.target.data_layout.bitfields;
         assert_eq!(bitfields.order, BitfieldOrder::LeastSignificantFirst);
         assert!(!bitfields.may_cross_storage_units);
@@ -771,6 +1097,80 @@ mod tests {
             config.gnu_profile.as_ref().map(|profile| profile.scope),
             Some(CompatibilityScope::CodeGeneration)
         );
+    }
+
+    #[test]
+    fn enabled_profiles_have_distinct_abi_identities_and_formats() {
+        for (spelling, abi, format, long_double_width) in [
+            (
+                "x86_64-unknown-linux-gnu",
+                AbiIdentity::SysvAmd64Lp64,
+                BinaryFormat::Elf,
+                128,
+            ),
+            (
+                "aarch64-unknown-linux-gnu",
+                AbiIdentity::Aapcs64Lp64,
+                BinaryFormat::Elf,
+                128,
+            ),
+            (
+                "riscv64-unknown-linux-gnu",
+                AbiIdentity::RiscvLp64d,
+                BinaryFormat::Elf,
+                128,
+            ),
+            (
+                "aarch64-apple-darwin",
+                AbiIdentity::DarwinArm64,
+                BinaryFormat::Macho,
+                64,
+            ),
+        ] {
+            let triple = spelling.parse().unwrap();
+            let config = EffectiveCompilationConfig::for_target(triple).unwrap();
+            assert_eq!(config.target.abi, abi);
+            assert_eq!(config.target.triple.binary_format, format);
+            assert_eq!(
+                config.target.data_layout.long_double_width,
+                long_double_width
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_hosts_do_not_fall_back_to_x86_64() {
+        let error =
+            EffectiveCompilationConfig::for_target("wasm32-unknown-unknown".parse().unwrap())
+                .unwrap_err();
+        assert!(error.contains("not an enabled CCC target profile"));
+    }
+
+    #[test]
+    fn architecture_macros_follow_the_selected_profile() {
+        let aarch64 = EffectiveCompilationConfig::aarch64_unknown_linux_gnu();
+        assert_eq!(aarch64.target_macros.get("__aarch64__"), Some("1"));
+        assert_eq!(aarch64.target_macros.get("__LONG_DOUBLE_128__"), Some("1"));
+        assert_eq!(aarch64.target_macros.get("__CHAR_UNSIGNED__"), Some("1"));
+
+        let riscv = EffectiveCompilationConfig::riscv64_unknown_linux_gnu();
+        assert_eq!(riscv.target_macros.get("__riscv_xlen"), Some("64"));
+        assert_eq!(
+            riscv.target_macros.get("__riscv_float_abi_double"),
+            Some("1")
+        );
+
+        let darwin =
+            EffectiveCompilationConfig::aarch64_apple_darwin().with_deployment_target("14.2.1");
+        let macros = darwin.frontend_predefined_macros();
+        assert_eq!(macros.get("__APPLE__").map(String::as_str), Some("1"));
+        assert_eq!(
+            macros
+                .get("__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__")
+                .map(String::as_str),
+            Some("140201")
+        );
+        assert_eq!(darwin.target_macros.get("__USER_LABEL_PREFIX__"), Some("_"));
     }
 
     #[test]

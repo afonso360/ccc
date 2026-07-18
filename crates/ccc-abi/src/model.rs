@@ -4,7 +4,7 @@ use std::fmt;
 use ccc_ir::{InstructionId, ValueId};
 use ccc_sema::generic::FullFunctionId;
 use ccc_session::Span;
-use ccc_target::CallingConvention;
+use ccc_target::{AbiIdentity, CallingConvention};
 use ccc_types::TypeId;
 
 /// The source-level scalar representation carried across a native boundary.
@@ -292,6 +292,7 @@ pub struct BridgeArtifactPlan {
 pub struct AbiConfigKey {
     pub schema: &'static str,
     pub target_triple: String,
+    pub abi_identity: AbiIdentity,
     pub data_layout: String,
     pub calling_convention: CallingConvention,
     pub boundary_profile: &'static str,

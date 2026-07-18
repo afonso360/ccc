@@ -356,6 +356,12 @@ pub fn dump_module_plan(verified: VerifiedModuleAbiPlan<'_>) -> String {
     let mut output = String::new();
     writeln!(output, "abi-plan schema={}", plan.config_key.schema).unwrap();
     writeln!(output, "target={}", plan.config_key.target_triple).unwrap();
+    writeln!(
+        output,
+        "abi-identity={}",
+        plan.config_key.abi_identity.name()
+    )
+    .unwrap();
     writeln!(output, "data-layout={}", plan.config_key.data_layout).unwrap();
     writeln!(
         output,
@@ -886,7 +892,7 @@ mod tests {
         let verified = plan
             .verify_against(&module, &EffectiveCompilationConfig::default())
             .unwrap();
-        assert!(dump_module_plan(verified).contains("abi-plan schema=ccc-abi-config-v1"));
+        assert!(dump_module_plan(verified).contains("abi-plan schema=ccc-abi-config-v2"));
     }
 
     #[test]

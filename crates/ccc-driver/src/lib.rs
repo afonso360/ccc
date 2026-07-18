@@ -1185,7 +1185,7 @@ mod tests {
         ])
         .unwrap()
         .stdout;
-        assert!(abi.contains("abi-plan schema=ccc-abi-config-v1"));
+        assert!(abi.contains("abi-plan schema=ccc-abi-config-v2"));
         assert!(abi.contains("target=x86_64-unknown-linux-gnu"));
         assert!(abi.contains("definition function=0"));
         assert!(!abi.contains(std::env::temp_dir().to_string_lossy().as_ref()));
