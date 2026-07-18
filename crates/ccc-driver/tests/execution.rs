@@ -145,6 +145,35 @@ fn an_invalid_computed_goto_target_traps() {
     fs::remove_dir_all(directory).unwrap();
 }
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn invalid_runtime_sized_storage_extents_trap() {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    for name in [
+        "runtime_sized_storage_nonpositive.c",
+        "runtime_sized_storage_overflow.c",
+    ] {
+        let directory = test_directory(name);
+        let executable = directory.join("program");
+        let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+            .arg(fixture(name))
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .unwrap();
+        assert!(
+            compilation.status.success(),
+            "ccc failed for {name}: {}",
+            String::from_utf8_lossy(&compilation.stderr)
+        );
+        let execution = Command::new(&executable).output().unwrap();
+        assert_eq!(execution.status.code(), None, "{name}");
+        assert_eq!(execution.status.signal(), Some(4), "{name}");
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
 #[cfg_attr(
     not(all(target_arch = "x86_64", target_os = "linux")),
     allow(dead_code)
@@ -185,7 +214,7 @@ fn execution_cases() -> &'static [ExecutionExpectation] {
     &EXECUTION_CASES
 }
 
-static EXECUTION_CASES: [ExecutionExpectation; 50] = [
+static EXECUTION_CASES: [ExecutionExpectation; 51] = [
     exit_status("return_constant.c", 42),
     exit_status("arithmetic_precedence.c", 14),
     exit_status("unary_arithmetic.c", 3),
@@ -229,6 +258,7 @@ static EXECUTION_CASES: [ExecutionExpectation; 50] = [
     exit_status("integer_intrinsics.c", 61),
     exit_status("predefined_function_name.c", 62),
     exit_status("alignment_and_transparent_union.c", 65),
+    exit_status("runtime_sized_storage.c", 0),
     exit_status("combined_language_features.c", 53),
     exit_status("semantic_regressions.c", 54),
     exit_status("aggregate_calls.c", 63),

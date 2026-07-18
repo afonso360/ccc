@@ -206,6 +206,8 @@ pub enum StorageLocation {
     Automatic,
     Static,
     ThreadLocal,
+    /// Runtime-sized automatic storage backed by a per-invocation arena.
+    RuntimeSized,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -398,6 +400,31 @@ pub enum FullInstructionKind {
     },
     VaEnd {
         list: ValueId,
+    },
+    /// Allocates or reuses storage for one runtime-sized automatic object.
+    /// Each extent is checked for positivity and the complete byte-size
+    /// calculation is checked for overflow by the backend.
+    RuntimeSizedAllocate {
+        storage: StorageId,
+        extents: Vec<ValueId>,
+        element: QualifiedType,
+        constant_factor: u64,
+        requested_alignment: Option<u64>,
+    },
+    /// Pointer arithmetic whose element stride contains runtime VLA extents.
+    RuntimePointerOffset {
+        base: ValueId,
+        index: ValueId,
+        element: QualifiedType,
+        extents: Vec<ValueId>,
+        subtract: bool,
+    },
+    /// Pointer subtraction whose element stride contains runtime VLA extents.
+    RuntimePointerDifference {
+        left: ValueId,
+        right: ValueId,
+        element: QualifiedType,
+        extents: Vec<ValueId>,
     },
 }
 

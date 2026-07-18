@@ -1087,7 +1087,7 @@ fn packed_and_bitfield_memory_paths_remain_unaligned_and_explicit() {
 }
 
 #[test]
-fn automatic_alignment_requests_reach_cranelift_stack_slots() {
+fn automatic_alignment_requests_reach_effective_stack_addresses() {
     let output = emit_source(
         "int inspect(void) {\n\
              _Alignas(64) int value = 7;\n\
@@ -1096,5 +1096,33 @@ fn automatic_alignment_requests_reach_cranelift_stack_slots() {
          }",
     );
     let clif = function_clif(&output.clif, "inspect");
-    assert!(clif.contains("explicit_slot 4, align = 64"), "{clif}");
+    assert!(clif.contains("explicit_slot 67, align = 16"), "{clif}");
+    assert!(clif.contains("iconst.i64 -64"), "{clif}");
+    assert!(clif.contains("band"), "{clif}");
+}
+
+#[test]
+fn runtime_sized_storage_uses_checked_arena_growth_and_cleanup() {
+    let output = emit_source(
+        "int inspect(int rows, int columns) {
+             _Alignas(64) int matrix[rows][columns];
+             matrix[rows - 1][columns - 1] = 17;
+             return matrix[rows - 1][columns - 1];
+         }",
+    );
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    for name in ["realloc", "free"] {
+        let symbol = object
+            .symbols()
+            .find(|symbol| symbol.name() == Ok(name))
+            .unwrap_or_else(|| panic!("missing arena provider import `{name}`"));
+        assert!(symbol.is_undefined(), "{name}");
+    }
+
+    let clif = function_clif(&output.clif, "inspect");
+    assert!(clif.contains("umul_overflow"), "{clif}");
+    assert!(clif.contains("uadd_overflow"), "{clif}");
+    assert!(clif.contains("trapnz"), "{clif}");
+    assert!(clif.contains("iconst.i64 -64"), "{clif}");
+    assert!(clif.matches("call").count() >= 2, "{clif}");
 }

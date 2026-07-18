@@ -14,7 +14,8 @@ use ccc_sema::generic::{
 };
 use ccc_target::{EffectiveCompilationConfig, RelocationModel};
 use ccc_types::{
-    BuiltinType, LayoutShape, QualifiedType, TypeId, TypeKind, TypeQualifiers, TypeStore,
+    ArrayLength, BuiltinType, LayoutShape, QualifiedType, TypeId, TypeKind, TypeQualifiers,
+    TypeStore,
 };
 use cranelift_codegen::Context;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
@@ -367,6 +368,8 @@ struct Declarations {
     hidden_body_symbols: HashMap<u32, String>,
     call_helper: Option<FuncId>,
     call_helper_symbol: Option<String>,
+    runtime_realloc: Option<FuncId>,
+    runtime_free: Option<FuncId>,
     globals: HashMap<u32, DataDeclaration>,
     strings: HashMap<u32, ClifDataId>,
     commons: Vec<CommonDefinition>,
@@ -498,6 +501,33 @@ fn declare_module(
             (None, None)
         };
 
+    let (runtime_realloc, runtime_free) = if module_uses_runtime_sized_storage(module) {
+        let mut realloc_signature = object_module.make_signature();
+        realloc_signature
+            .params
+            .push(ir::AbiParam::new(ir::types::I64));
+        realloc_signature
+            .params
+            .push(ir::AbiParam::new(ir::types::I64));
+        realloc_signature
+            .returns
+            .push(ir::AbiParam::new(ir::types::I64));
+        let realloc = object_module
+            .declare_function("realloc", Linkage::Import, &realloc_signature)
+            .map_err(module_error)?;
+
+        let mut free_signature = object_module.make_signature();
+        free_signature
+            .params
+            .push(ir::AbiParam::new(ir::types::I64));
+        let free = object_module
+            .declare_function("free", Linkage::Import, &free_signature)
+            .map_err(module_error)?;
+        (Some(realloc), Some(free))
+    } else {
+        (None, None)
+    };
+
     let mut globals = HashMap::with_capacity(module.globals.len());
     let mut commons = Vec::new();
     for global in &module.globals {
@@ -559,9 +589,24 @@ fn declare_module(
         hidden_body_symbols,
         call_helper,
         call_helper_symbol,
+        runtime_realloc,
+        runtime_free,
         globals,
         strings,
         commons,
+    })
+}
+
+fn module_uses_runtime_sized_storage(module: &gir::FullModule) -> bool {
+    module.functions.iter().any(|function| {
+        function.blocks.iter().any(|block| {
+            block.instructions.iter().any(|instruction| {
+                matches!(
+                    instruction.kind,
+                    gir::FullInstructionKind::RuntimeSizedAllocate { .. }
+                )
+            })
+        })
     })
 }
 

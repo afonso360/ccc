@@ -1,5 +1,5 @@
-ccc: error[CCC2374]: `__thread` is parse-only until GNU thread-local storage semantics are enabled
- --> tests/diagnostics/cases/gnu-thread-local.c:1:1
+ccc: error[CCC2374]: a function cannot have thread-local storage duration
+ --> tests/diagnostics/cases/gnu-thread-local.c:1:14
    |
- 1 | __thread int value;
-   | ^^^^^^^^^^^^
+ 1 | __thread int function(void);
+   |              ^^^^^^^^^^^^^^

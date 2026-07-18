@@ -24,17 +24,51 @@ fn lower_source(source: &str) -> FullModule {
 }
 
 #[test]
-fn rejects_unlowered_variable_bound_effects() {
+fn lowers_variable_bound_effects() {
     for source in [
         "int f(int n, int (*value)[n]) { return 0; }",
         "int f(int n) { static int (*value)[n++]; return 0; }",
         "int f(int n) { int (*value)[(n++, 4)]; return n; }",
         "int f(int n) { int (*(*value)(void))[n++]; return n; }",
     ] {
-        let error = lower_frontend(&typed_source(source)).unwrap_err();
-        assert_eq!(error.code, "CCC3101");
-        assert!(error.message.contains("bounds are not yet lowered"));
+        let module = lower_source(source);
+        verify_frontend(&module).unwrap();
     }
+}
+
+#[test]
+fn lowers_runtime_sized_objects_and_dynamic_pointer_strides_explicitly() {
+    let module = lower_source(
+        "int inspect(int rows, int columns) {
+             _Alignas(64) int matrix[rows][columns];
+             matrix[rows - 1][columns - 1] = 17;
+             return matrix[rows - 1][columns - 1];
+         }",
+    );
+    verify_frontend(&module).unwrap();
+    let function = &module.functions[0];
+    assert_eq!(function.storage.len(), 1);
+    assert_eq!(function.storage[0].location, StorageLocation::RuntimeSized);
+    assert_eq!(function.storage[0].requested_alignment, Some(64));
+    assert!(function.blocks.iter().any(|block| {
+        block.instructions.iter().any(|instruction| {
+            matches!(
+                instruction.kind,
+                FullInstructionKind::RuntimeSizedAllocate { .. }
+            )
+        })
+    }));
+    assert!(function.blocks.iter().any(|block| {
+        block.instructions.iter().any(|instruction| {
+            matches!(
+                instruction.kind,
+                FullInstructionKind::RuntimePointerOffset { .. }
+            )
+        })
+    }));
+    let dump = dump_frontend_ir(&module);
+    assert!(dump.contains("runtime.allocate"), "{dump}");
+    assert!(dump.contains("pointer.offset.runtime"), "{dump}");
 }
 
 #[test]

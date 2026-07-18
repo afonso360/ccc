@@ -1707,10 +1707,7 @@ fn retains_parameter_and_local_variable_length_bounds_without_requiring_vla_stor
     assert_eq!(declarations[1].duration, StorageDuration::Static);
     assert_eq!(declarations[1].variable_length_bounds.len(), 1);
 
-    assert_eq!(
-        diagnostic_codes("int rejected(int n) { int values[2][n]; return 0; }"),
-        vec!["CCC2258"]
-    );
+    assert!(analyze_source("int accepted(int n) { int values[2][n]; return 0; }").is_ok());
     assert_eq!(
         diagnostic_codes("int rejected(int n) { extern int (*value)[n]; return 0; }"),
         vec!["CCC2415"]
@@ -2872,10 +2869,11 @@ fn no_argument_attributes_reject_argument_lists() {
 }
 
 #[test]
-fn rejects_unsupported_semantics_and_storage_but_allows_long_double_layout() {
-    assert!(
-        diagnostic_codes("int f(int n) { int values[n]; return 0; }")
-            .contains(&"CCC2258".to_owned())
+fn accepts_automatic_variable_length_and_thread_local_objects() {
+    assert!(analyze_source("int f(int n) { int values[n]; return values[n - 1]; }").is_ok());
+    assert_eq!(
+        diagnostic_codes("int f(int n) { static int values[n]; return 0; }"),
+        vec!["CCC2258"]
     );
     assert!(analyze_source("unsigned long size = sizeof(long double);").is_ok());
     assert!(analyze_source("unsigned long alignment = __alignof__(long double);").is_ok());
@@ -2910,7 +2908,11 @@ fn rejects_unsupported_semantics_and_storage_but_allows_long_double_layout() {
             .iter()
             .any(|diagnostic| diagnostic.code == "CCC2346")
     );
-    assert!(diagnostic_codes("__thread int value;").contains(&"CCC2374".to_owned()));
+    assert!(analyze_source("__thread int value;").is_ok());
+    assert_eq!(
+        diagnostic_codes("__thread int function(void);"),
+        vec!["CCC2374"]
+    );
 }
 
 #[test]

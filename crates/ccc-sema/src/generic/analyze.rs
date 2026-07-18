@@ -99,6 +99,7 @@ impl DeclaratorContext {
 struct DeclarationInfo {
     base: QualifiedType,
     storage: Option<syntax::StorageClass>,
+    thread_local: bool,
     properties: FunctionProperties,
     attributes: Vec<FullTypedAttribute>,
     has_alignment_specifier: bool,
@@ -297,6 +298,13 @@ impl<'a> Analyzer<'a> {
             attributes.extend(self.validate_attributes(&init.attributes)?);
             self.reject_packed_attribute(&attributes, init.span)?;
             if info.storage == Some(syntax::StorageClass::Typedef) {
+                if info.thread_local {
+                    return self.fail(
+                        "CCC2374",
+                        init.span,
+                        "a typedef cannot have thread-local storage duration",
+                    );
+                }
                 self.reject_alignment_specifier(&info, init.span, "a typedef")?;
                 if init.initializer.is_some() || init.asm_label.is_some() {
                     return self.fail(
@@ -314,6 +322,13 @@ impl<'a> Analyzer<'a> {
                 )?;
                 self.declare_typedef(name, ty, attributes, init.span)?;
             } else if self.types.function_signature(resolved.ty.ty).is_some() {
+                if info.thread_local {
+                    return self.fail(
+                        "CCC2374",
+                        init.span,
+                        "a function cannot have thread-local storage duration",
+                    );
+                }
                 self.reject_transparent_union_attribute(
                     &attributes,
                     init.span,
@@ -350,6 +365,7 @@ impl<'a> Analyzer<'a> {
                     name,
                     resolved.ty,
                     info.storage,
+                    info.thread_local,
                     attributes,
                     info.requested_alignment,
                     asm_label,
@@ -367,6 +383,13 @@ impl<'a> Analyzer<'a> {
         definition: &syntax::FunctionDefinition,
     ) -> AnalysisResult<()> {
         let info = self.resolve_declaration_specifiers(&definition.specifiers)?;
+        if info.thread_local {
+            return self.fail(
+                "CCC2374",
+                definition.span,
+                "a function cannot have thread-local storage duration",
+            );
+        }
         self.reject_packed_attribute(&info.attributes, definition.specifiers.span)?;
         self.reject_alignment_specifier(&info, definition.specifiers.span, "a function")?;
         if info.storage == Some(syntax::StorageClass::Typedef) {
@@ -551,6 +574,7 @@ impl<'a> Analyzer<'a> {
         specifiers: &syntax::DeclarationSpecifiers,
     ) -> AnalysisResult<DeclarationInfo> {
         let mut storage = None;
+        let mut thread_local = false;
         let mut properties = FunctionProperties::default();
         let mut qualifiers = TypeQualifiers::NONE;
         let mut type_specifiers = Vec::new();
@@ -560,14 +584,19 @@ impl<'a> Analyzer<'a> {
         for item in &specifiers.items {
             match item {
                 syntax::DeclarationSpecifier::StorageClass(candidate) => {
-                    if *candidate == syntax::StorageClass::GnuThreadLocal {
-                        return self.fail(
-                            "CCC2374",
-                            specifiers.span,
-                            "`__thread` is parse-only until GNU thread-local storage semantics are enabled",
-                        );
-                    }
-                    if storage.replace(*candidate).is_some() {
+                    if matches!(
+                        candidate,
+                        syntax::StorageClass::ThreadLocal | syntax::StorageClass::GnuThreadLocal
+                    ) {
+                        if thread_local {
+                            return self.fail(
+                                "CCC2210",
+                                specifiers.span,
+                                "a declaration repeats a thread-local storage specifier",
+                            );
+                        }
+                        thread_local = true;
+                    } else if storage.replace(*candidate).is_some() {
                         return self.fail(
                             "CCC2210",
                             specifiers.span,
@@ -611,6 +640,7 @@ impl<'a> Analyzer<'a> {
         Ok(DeclarationInfo {
             base,
             storage,
+            thread_local,
             properties,
             attributes,
             has_alignment_specifier: !alignment_specifiers.is_empty(),
@@ -858,7 +888,10 @@ impl<'a> Analyzer<'a> {
         self.reject_packed_attribute(&info.attributes, type_name.specifiers.span)?;
         self.reject_transparent_union_attribute(&info.attributes, type_name.span, "a type name")?;
         self.reject_alignment_specifier(&info, type_name.span, "a type name")?;
-        if info.storage.is_some() || info.properties != FunctionProperties::default() {
+        if info.storage.is_some()
+            || info.thread_local
+            || info.properties != FunctionProperties::default()
+        {
             return self.fail(
                 "CCC2219",
                 type_name.span,
@@ -1150,7 +1183,8 @@ impl<'a> Analyzer<'a> {
             "a parameter declaration",
         )?;
         self.reject_alignment_specifier(&info, parameter.span, "a parameter")?;
-        if !matches!(info.storage, None | Some(syntax::StorageClass::Register)) {
+        if info.thread_local || !matches!(info.storage, None | Some(syntax::StorageClass::Register))
+        {
             return self.fail(
                 "CCC2227",
                 parameter.span,
@@ -1318,7 +1352,10 @@ impl<'a> Analyzer<'a> {
                         declaration.span,
                         "a record member",
                     )?;
-                    if info.storage.is_some() || info.properties != FunctionProperties::default() {
+                    if info.storage.is_some()
+                        || info.thread_local
+                        || info.properties != FunctionProperties::default()
+                    {
                         return self.fail(
                             "CCC2232",
                             declaration.span,
@@ -1787,6 +1824,7 @@ impl<'a> Analyzer<'a> {
         name: String,
         mut ty: QualifiedType,
         storage: Option<syntax::StorageClass>,
+        thread_local: bool,
         attributes: Vec<FullTypedAttribute>,
         standard_alignment: Option<u64>,
         asm_label: Option<FullTypedAsmLabel>,
@@ -1838,15 +1876,17 @@ impl<'a> Analyzer<'a> {
         } else {
             Linkage::External
         };
-        let duration = if storage == Some(syntax::StorageClass::ThreadLocal) {
+        let duration = if thread_local {
             StorageDuration::Thread
         } else {
             StorageDuration::Static
         };
-        let semantic_storage = match storage {
-            Some(syntax::StorageClass::Static) => SemanticStorageClass::Static,
-            Some(syntax::StorageClass::ThreadLocal) => SemanticStorageClass::ThreadLocal,
-            _ => SemanticStorageClass::Extern,
+        let semantic_storage = if thread_local {
+            SemanticStorageClass::ThreadLocal
+        } else if storage == Some(syntax::StorageClass::Static) {
+            SemanticStorageClass::Static
+        } else {
+            SemanticStorageClass::Extern
         };
         let declared_binding = attributes
             .iter()
@@ -1862,6 +1902,15 @@ impl<'a> Analyzer<'a> {
 
         if let Some(existing) = self.lookup_file_ordinary(&name).cloned() {
             if let OrdinarySymbol::Global(id, existing_ty) = existing {
+                if self.globals[id.0 as usize].duration != duration {
+                    return self.fail(
+                        "CCC2374",
+                        span,
+                        format!(
+                            "object `{name}` is redeclared with different thread-local storage duration"
+                        ),
+                    );
+                }
                 self.register_global_standard_alignment(
                     id,
                     standard_alignment,
@@ -2082,6 +2131,13 @@ impl<'a> Analyzer<'a> {
             attributes.extend(self.validate_attributes(&init.attributes)?);
             self.reject_packed_attribute(&attributes, init.span)?;
             if info.storage == Some(syntax::StorageClass::Typedef) {
+                if info.thread_local {
+                    return self.fail(
+                        "CCC2374",
+                        init.span,
+                        "a typedef cannot have thread-local storage duration",
+                    );
+                }
                 self.reject_alignment_specifier(&info, init.span, "a typedef")?;
                 self.reject_transparent_union_attribute(
                     &attributes,
@@ -2123,6 +2179,13 @@ impl<'a> Analyzer<'a> {
                 continue;
             }
             if self.types.function_signature(resolved.ty.ty).is_some() {
+                if info.thread_local {
+                    return self.fail(
+                        "CCC2374",
+                        init.span,
+                        "a function cannot have thread-local storage duration",
+                    );
+                }
                 self.reject_transparent_union_attribute(
                     &attributes,
                     init.span,
@@ -2178,6 +2241,7 @@ impl<'a> Analyzer<'a> {
                     name.clone(),
                     resolved.ty,
                     info.storage,
+                    info.thread_local,
                     attributes,
                     info.requested_alignment,
                     asm_label,
@@ -2207,11 +2271,20 @@ impl<'a> Analyzer<'a> {
                 );
             }
             self.validate_object_type(resolved.ty, init.span, init.initializer.is_none())?;
-            if self.requires_runtime_sized_storage(resolved.ty.ty) {
+            if info.thread_local && info.storage != Some(syntax::StorageClass::Static) {
+                return self.fail(
+                    "CCC2374",
+                    init.span,
+                    "a block-scope thread-local object must also be declared `static` or `extern`",
+                );
+            }
+            if self.requires_runtime_sized_storage(resolved.ty.ty)
+                && info.storage == Some(syntax::StorageClass::Static)
+            {
                 return self.fail(
                     "CCC2258",
                     init.span,
-                    "variable-length array object storage is unavailable for this configuration",
+                    "a variable-length array object must have automatic storage duration",
                 );
             }
             let local = self.fresh_local();
@@ -2221,14 +2294,14 @@ impl<'a> Analyzer<'a> {
                 init.span,
             )?;
             let (storage, duration) = match info.storage {
+                Some(syntax::StorageClass::Static) if info.thread_local => {
+                    (SemanticStorageClass::ThreadLocal, StorageDuration::Thread)
+                }
                 Some(syntax::StorageClass::Static) => {
                     (SemanticStorageClass::Static, StorageDuration::Static)
                 }
                 Some(syntax::StorageClass::Register) => {
                     (SemanticStorageClass::Register, StorageDuration::Automatic)
-                }
-                Some(syntax::StorageClass::ThreadLocal) => {
-                    (SemanticStorageClass::ThreadLocal, StorageDuration::Thread)
                 }
                 None | Some(syntax::StorageClass::Auto) => {
                     (SemanticStorageClass::Automatic, StorageDuration::Automatic)
@@ -2236,8 +2309,8 @@ impl<'a> Analyzer<'a> {
                 Some(syntax::StorageClass::Extern | syntax::StorageClass::Typedef) => {
                     unreachable!("handled above")
                 }
-                Some(syntax::StorageClass::GnuThreadLocal) => {
-                    unreachable!("rejected with the declaration specifiers")
+                Some(syntax::StorageClass::ThreadLocal | syntax::StorageClass::GnuThreadLocal) => {
+                    unreachable!("thread-local specifiers are tracked separately")
                 }
             };
             if duration != StorageDuration::Automatic {
@@ -7312,23 +7385,15 @@ impl<'a> Analyzer<'a> {
             }
             requested = strongest_alignment(requested, Some(alignment));
         }
-        let natural = match self.types.try_kind(ty.ty).cloned() {
-            Some(TypeKind::Array(ArrayType {
-                element,
-                length: ArrayLength::Incomplete,
-            })) => {
-                self.types
-                    .layout_of(element.ty, self.config)
-                    .map_err(|error| self.emit("CCC2437", span, error.to_string()))?
-                    .align
-            }
-            _ => {
-                self.types
-                    .layout_of(ty.ty, self.config)
-                    .map_err(|error| self.emit("CCC2437", span, error.to_string()))?
-                    .align
-            }
-        };
+        let mut alignment_ty = ty.ty;
+        while let Some(TypeKind::Array(array)) = self.types.try_kind(alignment_ty) {
+            alignment_ty = array.element.ty;
+        }
+        let natural = self
+            .types
+            .layout_of(alignment_ty, self.config)
+            .map_err(|error| self.emit("CCC2437", span, error.to_string()))?
+            .align;
         if standard_alignment.is_some() && requested.is_some_and(|value| value < natural) {
             return self.fail(
                 "CCC2437",

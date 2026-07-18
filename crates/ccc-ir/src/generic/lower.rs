@@ -17,7 +17,7 @@ use ccc_syntax::frontend::{
 };
 use ccc_types::{
     ArrayLength, BuiltinType, FunctionParameters, QualifiedType, TypeId, TypeKind, TypeQualifiers,
-    TypeStore,
+    TypeStore, VariableLengthId,
 };
 
 use super::{
@@ -715,6 +715,65 @@ fn variably_modified(types: &TypeStore, ty: TypeId, active: &mut HashSet<TypeId>
     result
 }
 
+fn runtime_sized_object(types: &TypeStore, ty: TypeId) -> bool {
+    match types.try_kind(ty) {
+        Some(TypeKind::Array(array)) => {
+            matches!(array.length, ArrayLength::Variable(_))
+                || runtime_sized_object(types, array.element.ty)
+        }
+        _ => false,
+    }
+}
+
+fn runtime_storage_layout(
+    types: &TypeStore,
+    ty: QualifiedType,
+    bounds: &[(VariableLengthId, ValueId)],
+    span: Span,
+) -> Result<(Vec<ValueId>, QualifiedType, u64), IrError> {
+    let mut current = ty;
+    let mut extents = Vec::new();
+    let mut constant_factor = 1_u64;
+    loop {
+        let Some(TypeKind::Array(array)) = types.try_kind(current.ty) else {
+            return Ok((extents, current, constant_factor));
+        };
+        match array.length {
+            ArrayLength::Constant(length) => {
+                constant_factor = constant_factor.checked_mul(length).ok_or_else(|| {
+                    IrError::lower(
+                        LOWERING_ERROR,
+                        span,
+                        "constant dimensions of a variable-length array overflow size_t",
+                    )
+                })?;
+            }
+            ArrayLength::Variable(id) => {
+                extents.push(
+                    bounds
+                        .iter()
+                        .find_map(|(candidate, value)| (*candidate == id).then_some(*value))
+                        .ok_or_else(|| {
+                            IrError::lower(
+                                LOWERING_ERROR,
+                                span,
+                                format!("variable-length array is missing runtime bound {}", id.0),
+                            )
+                        })?,
+                );
+            }
+            ArrayLength::Incomplete | ArrayLength::UnspecifiedVariable(_) => {
+                return Err(IrError::lower(
+                    LOWERING_ERROR,
+                    span,
+                    "runtime-sized object has an incomplete or unspecified array bound",
+                ));
+            }
+        }
+        current = array.element;
+    }
+}
+
 fn scan_statement_for_address_taken(
     statement: &FullTypedStatement,
     types: &TypeStore,
@@ -1036,6 +1095,8 @@ struct FunctionBuilder<'a> {
     function: FullFunction,
     current: Option<BlockId>,
     storage_by_local: BTreeMap<FullLocalId, StorageId>,
+    runtime_storage_addresses: BTreeMap<FullLocalId, ValueId>,
+    runtime_bounds: Vec<(VariableLengthId, ValueId)>,
     label_blocks: BTreeMap<LabelId, BlockId>,
     break_targets: Vec<BlockId>,
     continue_targets: Vec<BlockId>,
@@ -1050,17 +1111,6 @@ impl<'a> FunctionBuilder<'a> {
         static_data: &'a BTreeMap<(FullFunctionId, FullLocalId), (DataId, StorageDuration)>,
         types: &'a mut TypeStore,
     ) -> Result<FullFunction, IrError> {
-        if let Some(parameter) = source
-            .parameters
-            .iter()
-            .find(|parameter| !parameter.variable_length_bounds.is_empty())
-        {
-            return Err(IrError::lower(
-                LOWERING_ERROR,
-                parameter.span,
-                "runtime variable-length parameter bounds are not yet lowered",
-            ));
-        }
         let signature = types.function_signature(source.signature).ok_or_else(|| {
             IrError::lower(
                 LOWERING_ERROR,
@@ -1085,6 +1135,9 @@ impl<'a> FunctionBuilder<'a> {
                 ty: fact.ty,
                 duration: fact.duration,
                 location: match fact.duration {
+                    StorageDuration::Automatic if runtime_sized_object(types, fact.ty.ty) => {
+                        StorageLocation::RuntimeSized
+                    }
                     StorageDuration::Automatic => StorageLocation::Automatic,
                     StorageDuration::Static => StorageLocation::Static,
                     StorageDuration::Thread => StorageLocation::ThreadLocal,
@@ -1136,6 +1189,8 @@ impl<'a> FunctionBuilder<'a> {
             },
             current: None,
             storage_by_local,
+            runtime_storage_addresses: BTreeMap::new(),
+            runtime_bounds: Vec::new(),
             label_blocks: BTreeMap::new(),
             break_targets: Vec::new(),
             continue_targets: Vec::new(),
@@ -1186,6 +1241,12 @@ impl<'a> FunctionBuilder<'a> {
                         span,
                     )?;
                 }
+            }
+        }
+        for parameter in &source.parameters {
+            for bound in &parameter.variable_length_bounds {
+                let value = builder.expect_value(&bound.expression)?;
+                builder.runtime_bounds.push((bound.id, value));
             }
         }
 
@@ -1337,6 +1398,88 @@ impl<'a> FunctionBuilder<'a> {
             QualifiedType::unqualified(pointer),
             span,
         )
+    }
+
+    fn runtime_extents(
+        &self,
+        mut element: QualifiedType,
+        span: Span,
+    ) -> Result<Vec<ValueId>, IrError> {
+        let mut extents = Vec::new();
+        while let Some(TypeKind::Array(array)) = self.types.try_kind(element.ty) {
+            if let ArrayLength::Variable(id) = array.length {
+                extents.push(
+                    self.runtime_bounds
+                        .iter()
+                        .rev()
+                        .find_map(|(candidate, value)| (*candidate == id).then_some(*value))
+                        .ok_or_else(|| {
+                            IrError::lower(
+                                LOWERING_ERROR,
+                                span,
+                                format!("pointer stride is missing runtime bound {}", id.0),
+                            )
+                        })?,
+                );
+            }
+            element = array.element;
+        }
+        Ok(extents)
+    }
+
+    fn pointer_offset(
+        &mut self,
+        base: ValueId,
+        index: ValueId,
+        element: QualifiedType,
+        subtract: bool,
+        result_ty: QualifiedType,
+        span: Span,
+    ) -> Result<ValueId, IrError> {
+        let extents = self.runtime_extents(element, span)?;
+        let kind = if extents.is_empty() {
+            FullInstructionKind::PointerOffset {
+                base,
+                index,
+                element,
+                subtract,
+            }
+        } else {
+            FullInstructionKind::RuntimePointerOffset {
+                base,
+                index,
+                element,
+                extents,
+                subtract,
+            }
+        };
+        self.emit_result(kind, result_ty, span)
+    }
+
+    fn pointer_difference(
+        &mut self,
+        left: ValueId,
+        right: ValueId,
+        element: QualifiedType,
+        result_ty: QualifiedType,
+        span: Span,
+    ) -> Result<ValueId, IrError> {
+        let extents = self.runtime_extents(element, span)?;
+        let kind = if extents.is_empty() {
+            FullInstructionKind::PointerDifference {
+                left,
+                right,
+                element,
+            }
+        } else {
+            FullInstructionKind::RuntimePointerDifference {
+                left,
+                right,
+                element,
+                extents,
+            }
+        };
+        self.emit_result(kind, result_ty, span)
     }
 }
 
@@ -1527,10 +1670,14 @@ fn promote_scalar_locals(function: &mut FullFunction, types: &TypeStore) -> Resu
     }
     for block in &mut function.blocks {
         for instruction in &mut block.instructions {
-            if let FullInstructionKind::AddressOfStorage { storage } = &mut instruction.kind {
-                *storage = *storage_remap.get(storage).ok_or_else(|| {
-                    IrError::verify("a promoted storage address escaped SSA construction")
-                })?;
+            match &mut instruction.kind {
+                FullInstructionKind::AddressOfStorage { storage }
+                | FullInstructionKind::RuntimeSizedAllocate { storage, .. } => {
+                    *storage = *storage_remap.get(storage).ok_or_else(|| {
+                        IrError::verify("a promoted storage address escaped SSA construction")
+                    })?;
+                }
+                _ => {}
             }
         }
     }
@@ -1676,15 +1823,44 @@ fn remap_instruction_values(
         | FullInstructionKind::AddressOfString { .. }
         | FullInstructionKind::AddressOfStorage { .. }
         | FullInstructionKind::MemoryFence { .. } => {}
+        FullInstructionKind::RuntimeSizedAllocate { extents, .. } => {
+            for extent in extents {
+                map(extent)?;
+            }
+        }
         FullInstructionKind::ProjectField { base, .. } => map(base)?,
         FullInstructionKind::PointerOffset { base, index, .. } => {
             map(base)?;
             map(index)?;
         }
+        FullInstructionKind::RuntimePointerOffset {
+            base,
+            index,
+            extents,
+            ..
+        } => {
+            map(base)?;
+            map(index)?;
+            for extent in extents {
+                map(extent)?;
+            }
+        }
         FullInstructionKind::PointerDifference { left, right, .. }
         | FullInstructionKind::Binary { left, right, .. } => {
             map(left)?;
             map(right)?;
+        }
+        FullInstructionKind::RuntimePointerDifference {
+            left,
+            right,
+            extents,
+            ..
+        } => {
+            map(left)?;
+            map(right)?;
+            for extent in extents {
+                map(extent)?;
+            }
         }
         FullInstructionKind::Load { address, .. }
         | FullInstructionKind::BitfieldLoad { address, .. }
@@ -1999,14 +2175,17 @@ impl FunctionBuilder<'_> {
         &mut self,
         declaration: &FullTypedLocalDeclaration,
     ) -> Result<(), IrError> {
-        if !declaration.variable_length_bounds.is_empty() {
-            return Err(IrError::lower(
-                LOWERING_ERROR,
-                declaration.span,
-                "runtime variable-length declaration bounds are not yet lowered",
-            ));
+        if self.current.is_none() {
+            return Ok(());
         }
-        if declaration.duration != StorageDuration::Automatic || self.current.is_none() {
+        let mut bounds = Vec::new();
+        for bound in &declaration.variable_length_bounds {
+            let value = self.expect_value(&bound.expression)?;
+            bounds.push((bound.id, value));
+            self.runtime_bounds.push((bound.id, value));
+        }
+
+        if declaration.duration != StorageDuration::Automatic {
             return Ok(());
         }
         let storage = *self
@@ -2019,6 +2198,33 @@ impl FunctionBuilder<'_> {
                     format!("local `{}` has no preallocated storage", declaration.name),
                 )
             })?;
+        if runtime_sized_object(self.types, declaration.ty.ty) {
+            if declaration.initializer.is_some() {
+                return Err(IrError::lower(
+                    LOWERING_ERROR,
+                    declaration.span,
+                    "a variable-length array cannot have an initializer",
+                ));
+            }
+            let (extents, element, constant_factor) =
+                runtime_storage_layout(self.types, declaration.ty, &bounds, declaration.span)?;
+            let pointer = self.types.pointer(declaration.ty);
+            let address = self.emit_result(
+                FullInstructionKind::RuntimeSizedAllocate {
+                    storage,
+                    extents,
+                    element,
+                    constant_factor,
+                    requested_alignment: declaration.requested_alignment,
+                },
+                QualifiedType::unqualified(pointer),
+                declaration.span,
+            )?;
+            self.runtime_storage_addresses
+                .insert(declaration.local, address);
+            return Ok(());
+        }
+
         if let Some(initializer) = &declaration.initializer {
             let address = self.address_of_storage(storage, declaration.span)?;
             let place = LoweredPlace {
@@ -2128,13 +2334,11 @@ impl FunctionBuilder<'_> {
                         pointer_ty,
                         span,
                     )?;
-                    let address = self.emit_result(
-                        FullInstructionKind::PointerOffset {
-                            base,
-                            index: index_value,
-                            element: array.element,
-                            subtract: false,
-                        },
+                    let address = self.pointer_offset(
+                        base,
+                        index_value,
+                        array.element,
+                        false,
                         pointer_ty,
                         span,
                     )?;
@@ -3095,6 +3299,8 @@ impl FunctionBuilder<'_> {
                     .map(|(data, _)| *data)
                 {
                     self.address_of_data(data, expression.ty, expression.span)?
+                } else if let Some(address) = self.runtime_storage_addresses.get(local).copied() {
+                    address
                 } else {
                     let storage = *self.storage_by_local.get(local).ok_or_else(|| {
                         IrError::lower(
@@ -3135,13 +3341,11 @@ impl FunctionBuilder<'_> {
                 let base = self.expect_value(base)?;
                 let index = self.expect_value(index)?;
                 let pointer = self.types.pointer(expression.ty);
-                self.emit_result(
-                    FullInstructionKind::PointerOffset {
-                        base,
-                        index,
-                        element: expression.ty,
-                        subtract: false,
-                    },
+                self.pointer_offset(
+                    base,
+                    index,
+                    expression.ty,
+                    false,
                     QualifiedType::unqualified(pointer),
                     expression.span,
                 )?
@@ -3510,16 +3714,7 @@ impl FunctionBuilder<'_> {
         };
         let one = self.emit_result(FullInstructionKind::Constant(one), one_ty, span)?;
         let updated = if let Some(element) = pointer {
-            self.emit_result(
-                FullInstructionKind::PointerOffset {
-                    base: old,
-                    index: one,
-                    element,
-                    subtract: decrement,
-                },
-                result_ty,
-                span,
-            )?
+            self.pointer_offset(old, one, element, decrement, result_ty, span)?
         } else {
             self.emit_result(
                 FullInstructionKind::Binary {
@@ -3555,13 +3750,11 @@ impl FunctionBuilder<'_> {
             if let Some(element) = left_pointee
                 && self.types.is_integer(right_ty)
             {
-                return self.emit_result(
-                    FullInstructionKind::PointerOffset {
-                        base: left,
-                        index: right,
-                        element,
-                        subtract: operator == AstBinary::Subtract,
-                    },
+                return self.pointer_offset(
+                    left,
+                    right,
+                    element,
+                    operator == AstBinary::Subtract,
                     result_ty,
                     span,
                 );
@@ -3570,29 +3763,18 @@ impl FunctionBuilder<'_> {
                 && let Some(element) = right_pointee
                 && self.types.is_integer(left_ty)
             {
-                return self.emit_result(
-                    FullInstructionKind::PointerOffset {
-                        base: right,
-                        index: left,
-                        element,
-                        subtract: false,
-                    },
-                    result_ty,
-                    span,
-                );
+                return self.pointer_offset(right, left, element, false, result_ty, span);
             }
             if operator == AstBinary::Subtract
                 && let (Some(element), Some(_)) = (left_pointee, right_pointee)
             {
-                return self.emit_result(
-                    FullInstructionKind::PointerDifference {
-                        left,
-                        right,
-                        // Pointer subtraction permits qualified and unqualified
-                        // versions of compatible object types. Qualifiers do not
-                        // affect the element stride carried by the IR.
-                        element: QualifiedType::unqualified(element.ty),
-                    },
+                return self.pointer_difference(
+                    left,
+                    right,
+                    // Pointer subtraction permits qualified and unqualified
+                    // versions of compatible object types. Qualifiers do not
+                    // affect the element stride carried by the IR.
+                    QualifiedType::unqualified(element.ty),
                     result_ty,
                     span,
                 );
