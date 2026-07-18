@@ -854,13 +854,24 @@ int main(void) {
 
     let bytes = fs::read(&object).unwrap();
     let file = object::File::parse(bytes.as_slice()).unwrap();
-    for name in ["open64", "__isoc99_sscanf"] {
-        let symbol = file
-            .symbol_by_name(name)
-            .unwrap_or_else(|| panic!("missing glibc redirect symbol `{name}`"));
-        assert!(symbol.is_undefined(), "`{name}` must remain undefined");
-        assert!(symbol.is_global(), "`{name}` must have external linkage");
-    }
+    let name = "open64";
+    let symbol = file
+        .symbol_by_name(name)
+        .unwrap_or_else(|| panic!("missing glibc redirect symbol `{name}`"));
+    assert!(symbol.is_undefined(), "`{name}` must remain undefined");
+    assert!(symbol.is_global(), "`{name}` must have external linkage");
+    let scanf_redirects = ["__isoc99_sscanf", "__isoc23_sscanf"]
+        .into_iter()
+        .filter_map(|name| file.symbol_by_name(name).map(|symbol| (name, symbol)))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        scanf_redirects.len(),
+        1,
+        "expected exactly one glibc sscanf redirect, found {scanf_redirects:?}"
+    );
+    let (name, symbol) = scanf_redirects[0];
+    assert!(symbol.is_undefined(), "`{name}` must remain undefined");
+    assert!(symbol.is_global(), "`{name}` must have external linkage");
     assert!(
         file.symbols()
             .filter_map(|symbol| symbol.name().ok())
