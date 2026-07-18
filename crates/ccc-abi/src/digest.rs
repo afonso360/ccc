@@ -100,6 +100,8 @@ pub fn abi_config_key(config: &EffectiveCompilationConfig) -> Result<AbiConfigKe
         specification_revision,
         specification_source_sha256: specification_digest,
         backend_profile: "cranelift-0.132.0-no-llvm-extensions-no-implicit-sret",
+        normalized_target_arch: config.normalized_target_arch(),
+        normalized_target_abi: config.normalized_target_abi(),
     })
 }
 
@@ -235,6 +237,10 @@ fn encode_config_key(encoder: &mut Encoder, key: &AbiConfigKey) {
     encoder.string(key.specification_revision);
     encoder.string(key.specification_source_sha256);
     encoder.string(key.backend_profile);
+    // Configuration-v2 fields are append-only. Stable tag assignments and the
+    // v1 encoder below must not be renumbered when another profile is added.
+    encoder.string(key.normalized_target_arch);
+    encoder.string(key.normalized_target_abi);
 }
 
 fn encode_config_key_v1(encoder: &mut Encoder, key: &AbiConfigKey) {
@@ -812,6 +818,77 @@ fn encode_instruction(encoder: &mut Encoder, instruction: &gir::FullInstructionK
             encoder.bool(*write);
             encoder.tag(*locality);
         }
+        I::RuntimeSizedAllocate {
+            storage,
+            extents,
+            element,
+            constant_factor,
+            requested_alignment,
+        } => {
+            encoder.tag(32);
+            encoder.u32(storage.0);
+            encoder.len(extents.len());
+            for extent in extents {
+                encoder.u32(extent.0);
+            }
+            encoder.qualified(*element);
+            encoder.u64(*constant_factor);
+            encoder.option_u64(*requested_alignment);
+        }
+        I::RuntimePointerOffset {
+            base,
+            index,
+            element,
+            extents,
+            subtract,
+        } => {
+            encoder.tag(33);
+            encoder.u32(base.0);
+            encoder.u32(index.0);
+            encoder.qualified(*element);
+            encoder.len(extents.len());
+            for extent in extents {
+                encoder.u32(extent.0);
+            }
+            encoder.bool(*subtract);
+        }
+        I::RuntimePointerDifference {
+            left,
+            right,
+            element,
+            extents,
+        } => {
+            encoder.tag(34);
+            encoder.u32(left.0);
+            encoder.u32(right.0);
+            encoder.qualified(*element);
+            encoder.len(extents.len());
+            for extent in extents {
+                encoder.u32(extent.0);
+            }
+        }
+        I::MemoryCopy {
+            destination,
+            source,
+            length,
+            overlap,
+        } => {
+            encoder.tag(35);
+            encoder.u32(destination.0);
+            encoder.u32(source.0);
+            encoder.u32(length.0);
+            encoder.bool(*overlap);
+        }
+        I::MemorySet {
+            destination,
+            value,
+            length,
+        } => {
+            encoder.tag(36);
+            encoder.u32(destination.0);
+            encoder.u32(value.0);
+            encoder.u32(length.0);
+        }
     }
 }
 
@@ -1030,32 +1107,42 @@ mod tests {
 
     #[test]
     fn configuration_key_uses_the_ccc_owned_abi_identity() {
-        for (config, identity, profile) in [
+        for (config, identity, profile, architecture, abi) in [
             (
                 EffectiveCompilationConfig::x86_64_unknown_linux_gnu(),
                 AbiIdentity::SysvAmd64Lp64,
                 "sysv-amd64-lp64-v1",
+                "x86-64",
+                "lp64",
             ),
             (
                 EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
                 AbiIdentity::Aapcs64Lp64,
                 "aapcs64-lp64-v1",
+                "armv8-a",
+                "lp64",
             ),
             (
                 EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
                 AbiIdentity::RiscvLp64d,
                 "riscv-lp64d-v1",
+                "rv64gc",
+                "lp64d",
             ),
             (
                 EffectiveCompilationConfig::aarch64_apple_darwin(),
                 AbiIdentity::DarwinArm64,
                 "darwin-arm64-v1",
+                "armv8-a",
+                "darwin",
             ),
         ] {
             let key = abi_config_key(&config).unwrap();
             assert_eq!(key.schema, "ccc-abi-config-v2");
             assert_eq!(key.abi_identity, identity);
             assert_eq!(key.boundary_profile, profile);
+            assert_eq!(key.normalized_target_arch, architecture);
+            assert_eq!(key.normalized_target_abi, abi);
             assert_ne!(key.specification_source_sha256, "embedded-policy");
             assert_eq!(key.specification_source_sha256.len(), 64);
         }

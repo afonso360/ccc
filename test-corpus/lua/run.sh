@@ -236,11 +236,11 @@ unset CFLAGS CPPFLAGS LDFLAGS LIBS
 unset MYCFLAGS MYLDFLAGS MYLIBS MYOBJS SYSCFLAGS SYSLDFLAGS SYSLIBS
 
 : >"$CCC_LUA_COMMAND_LOG"
-"$script_directory/ccc-cc" -std=gnu11 -dM -E \
+"$script_directory/ccc-cc" -dM -E \
   "$script_directory/predicate-probe.c" >"$work_directory/effective-macros.txt"
-"$script_directory/ccc-cc" -std=gnu11 -P -E \
+"$script_directory/ccc-cc" -P -E \
   "$script_directory/predicate-probe.c" >"$work_directory/predicate-probe.txt"
-"$script_directory/ccc-cc" -std=gnu11 -P -E \
+"$script_directory/ccc-cc" -P -E \
   "$script_directory/hosted-probe.c" | grep '^selected_' \
   >"$work_directory/hosted-probe.txt"
 
@@ -293,8 +293,7 @@ expected_source_count=$(wc -l <"$expected_source_inputs" | tr -d '[:space:]')
 [[ "$expected_source_count" == "$expected_translation_units" ]] ||
   die "Lua source archive contains $expected_source_count C inputs; expected $expected_translation_units"
 make -C "$source_directory" -j"$jobs" linux \
-  CC="$script_directory/ccc-cc -std=gnu11" \
-  MYLDFLAGS=-no-pie \
+  CC="$script_directory/ccc-cc" \
   2>&1 | tee "$work_directory/build.log"
 
 [[ -x "$source_directory/src/lua" ]] || die "Lua interpreter was not produced"
@@ -314,17 +313,17 @@ fi
 link_commands=$(grep -c '^link ' "$CCC_LUA_COMMAND_LOG" || true)
 [[ "$link_commands" == 2 ]] ||
   die "Lua build invoked $link_commands native links; expected 2"
-non_pie_links=$(grep '^link ' "$CCC_LUA_COMMAND_LOG" | grep -c -- ' -no-pie' || true)
-[[ "$non_pie_links" == 2 ]] ||
-  die "Lua native links did not both receive the pinned -no-pie option"
+if grep '^link ' "$CCC_LUA_COMMAND_LOG" | grep -q -- ' -no-pie'; then
+  die "Lua native links unexpectedly disabled PIE"
+fi
 linux_translations=$(grep '^ccc ' "$CCC_LUA_COMMAND_LOG" | \
   grep -c -- ' -DLUA_USE_LINUX' || true)
 [[ "$linux_translations" == "$expected_translation_units" ]] ||
   die "Lua C translations did not all select the pinned Linux profile"
-gnu11_translations=$(grep '^ccc ' "$CCC_LUA_COMMAND_LOG" | \
-  grep -c -- ' -std=gnu11' || true)
-[[ "$gnu11_translations" == "$expected_translation_units" ]] ||
-  die "Lua C translations did not all use the pinned GNU language mode"
+explicit_standard_translations=$(grep '^ccc ' "$CCC_LUA_COMMAND_LOG" | \
+  grep -Ec -- ' -std=' || true)
+[[ "$explicit_standard_translations" == 0 ]] ||
+  die "Lua C translations unexpectedly overrode CCC's default GNU language mode"
 if grep '^ccc ' "$CCC_LUA_COMMAND_LOG" | \
   grep -Eq -- '-DLUA_NOBUILTIN|-DLUA_USE_JUMPTABLE=0'; then
   die "Lua C translations disabled a compiler-selected source path"
@@ -343,8 +342,8 @@ for executable in lua luac; do
     readelf --dynamic "$binary"
   } >>"$work_directory/elf-dynamic-tags.txt"
   elf_type=$(readelf --file-header "$binary" | awk '/^[[:space:]]*Type:/{print $2; exit}')
-  [[ "$elf_type" == EXEC ]] ||
-    die "Lua $executable is $elf_type rather than the pinned non-PIE executable type"
+  [[ "$elf_type" == DYN ]] ||
+    die "Lua $executable is $elf_type rather than the required PIE executable type"
   if readelf --dynamic "$binary" | grep -Eq '\(TEXTREL\)|FLAGS.*TEXTREL'; then
     die "Lua $executable contains dynamic text relocations"
   fi

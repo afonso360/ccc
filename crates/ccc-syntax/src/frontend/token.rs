@@ -56,9 +56,11 @@ impl fmt::Display for TokenConversionError {
 
 impl std::error::Error for TokenConversionError {}
 
-/// Converts the canonical preprocessing item stream without discarding pragma
-/// or location events. Adjacent string tokens are decoded and concatenated as
-/// translation phase 6 requires; intervening non-token events keep their order.
+/// Converts the canonical preprocessing item stream without discarding semantic
+/// pragma or location events. Behavior-compatible optimization hints are omitted
+/// because `_Pragma` may legally place them between any two declaration tokens.
+/// Adjacent string tokens are decoded and concatenated as translation phase 6
+/// requires; intervening non-token events keep their order.
 pub fn convert_pp_items(
     items: impl IntoIterator<Item = PpItem>,
 ) -> Result<Vec<FrontendItem>, TokenConversionError> {
@@ -97,6 +99,7 @@ pub fn convert_pp_items(
     let mut pending = None::<PendingStrings>;
     for item in items {
         match item {
+            PpItem::Pragma(PragmaEvent::GccOptimize { .. }) => {}
             PpItem::Token(token) if token.kind == PpTokenKind::StringLiteral => {
                 let value = decode_string_literal(&token.spelling).map_err(|error| {
                     TokenConversionError {

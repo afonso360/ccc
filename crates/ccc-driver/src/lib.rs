@@ -49,13 +49,15 @@ const HELP: &str = "Usage: ccc [options] <input.c>\n\
   -E [-P]                    Preprocess only; -P suppresses linemarkers\n\
   -O|-O0|-O1|-O2|-O3|-Os|-Oz\n\
   -g|-gN                     Accepted compatibility options; currently no code-generation effect\n\
+  -fPIC|-fPIE|-pie           Select position-independent code and PIE linking (default)\n\
+  -fno-pic|-fno-pie|-no-pie Select static-model code and non-PIE linking\n\
   -Dname[=value] -Uname      Define or undefine a macro\n\
   -I dir -iquote dir         Add user include search paths\n\
   -isystem dir -idirafter dir Add system include search paths\n\
   -include file -imacros file Process a forced input\n\
   -M|-MM|-MD|-MMD            Generate Make dependencies\n\
   --target triple            Select an enabled target (defaults to the native host)\n\
-  -mcpu=name -mabi=name      Select a target CPU and ABI spelling\n\
+  -march=name -mabi=name     Select an enabled architecture and ABI spelling\n\
   --sysroot dir              Select a target sysroot\n\
   --sdk-root dir             Select a Darwin SDK root\n\
   -mmacosx-version-min=ver   Select the minimum Darwin deployment version\n\
@@ -227,8 +229,8 @@ fn effective_config(
     }
     .with_language_mode(options.language_mode);
     config.language.trigraphs = options.trigraphs;
-    if let Some(cpu) = &options.target_cpu {
-        config = config.with_target_cpu(cpu);
+    if let Some(architecture) = &options.target_arch {
+        config = config.with_target_arch(architecture);
     }
     if let Some(abi) = &options.target_abi {
         config = config.with_target_abi(abi);
@@ -253,6 +255,10 @@ fn effective_config(
             "`-mmacosx-version-min` is valid only for the Darwin arm64 target",
         ));
     }
+    config.relocation_model = options.relocation_model;
+    config
+        .validate_target_profile_options()
+        .map_err(|message| owner_error("CCC6005", message))?;
 
     let should_load_resources = options.resource_dir.is_some()
         || (!options.no_standard_includes && !options.no_builtin_includes);
@@ -281,6 +287,17 @@ fn effective_config(
         !options.no_standard_includes && should_probe_native_toolchain(&config);
     if resolve_system_headers || link || effective_sysroot.is_some() {
         let mut resolver = ToolchainResolver::new(&config);
+        if let Some(architecture) = &options.target_arch {
+            resolver = resolver.target_argument(format!("-march={architecture}"));
+        }
+        if let Some(abi) = &options.target_abi
+            && matches!(
+                config.target.abi,
+                ccc_target::AbiIdentity::Aapcs64Lp64 | ccc_target::AbiIdentity::RiscvLp64d
+            )
+        {
+            resolver = resolver.target_argument(format!("-mabi={abi}"));
+        }
         if let Some(sysroot) = effective_sysroot {
             resolver = resolver.sysroot(sysroot);
         }

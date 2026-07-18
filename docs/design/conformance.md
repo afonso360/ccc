@@ -85,12 +85,14 @@ objects such as pointers to VLA where C permits them, and diagnoses illegal
 storage classes. Variably modified typedef and type-name bounds remain explicit
 frontend boundaries until their effects can be represented without loss.
 
-An effective target profile removes `__STDC_NO_VLA__` only after its
-[runtime-sized automatic storage contract](cranelift-risks.md#runtime-sized-automatic-storage-contract)
-has complete semantic, CCC-IR, provider, failure, and execution evidence. A
-profile lacking any part defines the macro to `1` and diagnoses declarations
-that require runtime-sized object storage. This is documented C11 conformance,
-not an implicit promise to use the native stack.
+The hosted profile implements automatic VLA object allocation through the
+[runtime-sized automatic storage contract](cranelift-risks.md#runtime-sized-automatic-storage-contract),
+including checked extents, multidimensional strides, alignment, bounded reuse,
+and normal-return cleanup. It still defines `__STDC_NO_VLA__` to `1` until the
+remaining runtime-layout and variably modified type contexts have complete
+semantic, CCC-IR, provider, failure, and execution evidence. The macro describes
+the complete optional C11 capability; it does not prevent a documented subset
+from being accepted as an extension and does not promise native-stack storage.
 
 The selected hosted provider is the scoped arena in
 [ADR-0011](../adr/0011-arena-backed-runtime-sized-automatic-storage.md). It

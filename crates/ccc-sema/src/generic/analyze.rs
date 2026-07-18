@@ -8,8 +8,8 @@ use ccc_pp::{
 use ccc_session::Span;
 use ccc_syntax::frontend as syntax;
 use ccc_target::{
-    AbiIdentity, CapabilityKind, CapabilityState, EffectiveCompilationConfig, PackingPolicy,
-    TargetBuiltinType,
+    AbiIdentity, CapabilityKind, CapabilityState, EffectiveCompilationConfig, LanguageMode,
+    PackingPolicy, TargetBuiltinType,
 };
 use ccc_types::{
     ArrayLength, ArrayType, BuiltinType, Field, FunctionParameters, FunctionType, LayoutShape,
@@ -100,6 +100,7 @@ impl DeclaratorContext {
 struct DeclarationInfo {
     base: QualifiedType,
     storage: Option<syntax::StorageClass>,
+    thread_local: bool,
     properties: FunctionProperties,
     attributes: Vec<FullTypedAttribute>,
     has_alignment_specifier: bool,
@@ -110,6 +111,13 @@ struct DeclarationInfo {
 struct SwitchState {
     cases: HashMap<i128, Span>,
     default: Option<Span>,
+    entry_variably_modified_path: Vec<FullLocalId>,
+}
+
+struct VariablyModifiedGoto {
+    label: LabelId,
+    span: Span,
+    source_path: Vec<FullLocalId>,
 }
 
 struct FunctionState {
@@ -122,6 +130,12 @@ struct FunctionState {
     unaddressable_locals: HashSet<FullLocalId>,
     static_duration_locals: HashMap<FullLocalId, StorageDuration>,
     labels: LabelScope,
+    active_variably_modified_path: Vec<FullLocalId>,
+    variably_modified_scope_starts: Vec<usize>,
+    variably_modified_label_paths: HashMap<LabelId, (Span, Vec<FullLocalId>)>,
+    variably_modified_gotos: Vec<VariablyModifiedGoto>,
+    computed_gotos: Vec<Span>,
+    has_variably_modified_local: bool,
     loop_depth: usize,
     switches: Vec<SwitchState>,
     variadic: bool,
@@ -298,6 +312,13 @@ impl<'a> Analyzer<'a> {
             attributes.extend(self.validate_attributes(&init.attributes)?);
             self.reject_packed_attribute(&attributes, init.span)?;
             if info.storage == Some(syntax::StorageClass::Typedef) {
+                if info.thread_local {
+                    return self.fail(
+                        "CCC2374",
+                        init.span,
+                        "a typedef cannot have thread-local storage duration",
+                    );
+                }
                 self.reject_alignment_specifier(&info, init.span, "a typedef")?;
                 if init.initializer.is_some() || init.asm_label.is_some() {
                     return self.fail(
@@ -315,6 +336,13 @@ impl<'a> Analyzer<'a> {
                 )?;
                 self.declare_typedef(name, ty, attributes, init.span)?;
             } else if self.types.function_signature(resolved.ty.ty).is_some() {
+                if info.thread_local {
+                    return self.fail(
+                        "CCC2374",
+                        init.span,
+                        "a function cannot have thread-local storage duration",
+                    );
+                }
                 self.reject_transparent_union_attribute(
                     &attributes,
                     init.span,
@@ -351,6 +379,7 @@ impl<'a> Analyzer<'a> {
                     name,
                     resolved.ty,
                     info.storage,
+                    info.thread_local,
                     attributes,
                     info.requested_alignment,
                     asm_label,
@@ -368,6 +397,13 @@ impl<'a> Analyzer<'a> {
         definition: &syntax::FunctionDefinition,
     ) -> AnalysisResult<()> {
         let info = self.resolve_declaration_specifiers(&definition.specifiers)?;
+        if info.thread_local {
+            return self.fail(
+                "CCC2374",
+                definition.span,
+                "a function cannot have thread-local storage duration",
+            );
+        }
         self.reject_packed_attribute(&info.attributes, definition.specifiers.span)?;
         self.reject_alignment_specifier(&info, definition.specifiers.span, "a function")?;
         if info.storage == Some(syntax::StorageClass::Typedef) {
@@ -457,6 +493,12 @@ impl<'a> Analyzer<'a> {
             unaddressable_locals: HashSet::new(),
             static_duration_locals: HashMap::new(),
             labels: LabelScope::default(),
+            active_variably_modified_path: Vec::new(),
+            variably_modified_scope_starts: Vec::new(),
+            variably_modified_label_paths: HashMap::new(),
+            variably_modified_gotos: Vec::new(),
+            computed_gotos: Vec::new(),
+            has_variably_modified_local: false,
             loop_depth: 0,
             switches: Vec::new(),
             variadic: signature.variadic,
@@ -520,17 +562,24 @@ impl<'a> Analyzer<'a> {
                 .last_named_parameter_restriction = parameter.va_start_restriction;
         }
 
-        if self
-            .bind_current(
-                "__func__".to_owned(),
-                OrdinarySymbol::PredefinedFunctionName,
-                resolved.name_span,
-            )
-            .is_err()
-        {
-            self.pop_scope();
-            self.function = None;
-            return Err(());
+        let function_name_spellings: &[&str] = if self.config.language.mode == LanguageMode::Gnu11 {
+            &["__func__", "__FUNCTION__", "__PRETTY_FUNCTION__"]
+        } else {
+            &["__func__"]
+        };
+        for spelling in function_name_spellings {
+            if self
+                .bind_current(
+                    (*spelling).to_owned(),
+                    OrdinarySymbol::PredefinedFunctionName,
+                    resolved.name_span,
+                )
+                .is_err()
+            {
+                self.pop_scope();
+                self.function = None;
+                return Err(());
+            }
         }
 
         let body = self.analyze_function_body(&definition.body);
@@ -552,6 +601,7 @@ impl<'a> Analyzer<'a> {
         specifiers: &syntax::DeclarationSpecifiers,
     ) -> AnalysisResult<DeclarationInfo> {
         let mut storage = None;
+        let mut thread_local = false;
         let mut properties = FunctionProperties::default();
         let mut qualifiers = TypeQualifiers::NONE;
         let mut type_specifiers = Vec::new();
@@ -561,14 +611,19 @@ impl<'a> Analyzer<'a> {
         for item in &specifiers.items {
             match item {
                 syntax::DeclarationSpecifier::StorageClass(candidate) => {
-                    if *candidate == syntax::StorageClass::GnuThreadLocal {
-                        return self.fail(
-                            "CCC2374",
-                            specifiers.span,
-                            "`__thread` is parse-only until GNU thread-local storage semantics are enabled",
-                        );
-                    }
-                    if storage.replace(*candidate).is_some() {
+                    if matches!(
+                        candidate,
+                        syntax::StorageClass::ThreadLocal | syntax::StorageClass::GnuThreadLocal
+                    ) {
+                        if thread_local {
+                            return self.fail(
+                                "CCC2210",
+                                specifiers.span,
+                                "a declaration repeats a thread-local storage specifier",
+                            );
+                        }
+                        thread_local = true;
+                    } else if storage.replace(*candidate).is_some() {
                         return self.fail(
                             "CCC2210",
                             specifiers.span,
@@ -612,6 +667,7 @@ impl<'a> Analyzer<'a> {
         Ok(DeclarationInfo {
             base,
             storage,
+            thread_local,
             properties,
             attributes,
             has_alignment_specifier: !alignment_specifiers.is_empty(),
@@ -859,7 +915,10 @@ impl<'a> Analyzer<'a> {
         self.reject_packed_attribute(&info.attributes, type_name.specifiers.span)?;
         self.reject_transparent_union_attribute(&info.attributes, type_name.span, "a type name")?;
         self.reject_alignment_specifier(&info, type_name.span, "a type name")?;
-        if info.storage.is_some() || info.properties != FunctionProperties::default() {
+        if info.storage.is_some()
+            || info.thread_local
+            || info.properties != FunctionProperties::default()
+        {
             return self.fail(
                 "CCC2219",
                 type_name.span,
@@ -1109,7 +1168,9 @@ impl<'a> Analyzer<'a> {
         is_prototype_scope: bool,
     ) -> AnalysisResult<(Vec<ResolvedParameter>, DetachedSemanticScope)> {
         self.parameter_scope_depth += 1;
-        self.push_scope();
+        // Declarator parameter scopes do not participate in statement-level
+        // control-flow paths, even when resolved inside a function body.
+        self.scopes.push();
         let resolved = (|| {
             let mut resolved = Vec::with_capacity(parameters.len());
             for (index, parameter) in parameters.iter().enumerate() {
@@ -1151,7 +1212,8 @@ impl<'a> Analyzer<'a> {
             "a parameter declaration",
         )?;
         self.reject_alignment_specifier(&info, parameter.span, "a parameter")?;
-        if !matches!(info.storage, None | Some(syntax::StorageClass::Register)) {
+        if info.thread_local || !matches!(info.storage, None | Some(syntax::StorageClass::Register))
+        {
             return self.fail(
                 "CCC2227",
                 parameter.span,
@@ -1319,7 +1381,10 @@ impl<'a> Analyzer<'a> {
                         declaration.span,
                         "a record member",
                     )?;
-                    if info.storage.is_some() || info.properties != FunctionProperties::default() {
+                    if info.storage.is_some()
+                        || info.thread_local
+                        || info.properties != FunctionProperties::default()
+                    {
                         return self.fail(
                             "CCC2232",
                             declaration.span,
@@ -1613,6 +1678,7 @@ impl<'a> Analyzer<'a> {
         attributes: Vec<FullTypedAttribute>,
         span: Span,
     ) -> AnalysisResult<TypedefId> {
+        self.reject_tls_model_attribute(&attributes, span)?;
         self.reject_weak_attribute(&attributes, span, "a typedef")?;
         if matches!(self.types.try_kind(ty.ty), Some(TypeKind::Array(_)))
             && self.type_contains_flexible_array_member(ty.ty)
@@ -1659,6 +1725,7 @@ impl<'a> Analyzer<'a> {
         asm_label: Option<FullTypedAsmLabel>,
         span: Span,
     ) -> AnalysisResult<FullFunctionId> {
+        self.reject_tls_model_attribute(&attributes, span)?;
         if !matches!(
             storage,
             None | Some(syntax::StorageClass::Extern | syntax::StorageClass::Static)
@@ -1788,12 +1855,16 @@ impl<'a> Analyzer<'a> {
         name: String,
         mut ty: QualifiedType,
         storage: Option<syntax::StorageClass>,
+        thread_local: bool,
         attributes: Vec<FullTypedAttribute>,
         standard_alignment: Option<u64>,
         asm_label: Option<FullTypedAsmLabel>,
         initializer: Option<&syntax::Initializer>,
         span: Span,
     ) -> AnalysisResult<GlobalId> {
+        if !thread_local {
+            self.reject_tls_model_attribute(&attributes, span)?;
+        }
         let is_definition = initializer.is_some();
         if matches!(
             storage,
@@ -1809,7 +1880,7 @@ impl<'a> Analyzer<'a> {
                 "this storage class is not valid on a file-scope object",
             );
         }
-        self.reject_unavailable_thread_storage(storage, span)?;
+        self.reject_unavailable_thread_storage(thread_local, span)?;
         self.validate_object_type(ty, span, false)?;
         let typed_initializer = if let Some(initializer) = initializer {
             let (typed, completed_ty) = self.analyze_initializer(ty, initializer)?;
@@ -1819,6 +1890,13 @@ impl<'a> Analyzer<'a> {
                     "CCC2344",
                     span,
                     "a file-scope initializer must be a constant or relocatable address expression",
+                );
+            }
+            if self.initializer_references_thread_storage(&typed) {
+                return self.fail(
+                    "CCC2344",
+                    span,
+                    "a file-scope initializer cannot contain the address of a thread-local object",
                 );
             }
             Some(typed)
@@ -1840,15 +1918,17 @@ impl<'a> Analyzer<'a> {
         } else {
             Linkage::External
         };
-        let duration = if storage == Some(syntax::StorageClass::ThreadLocal) {
+        let duration = if thread_local {
             StorageDuration::Thread
         } else {
             StorageDuration::Static
         };
-        let semantic_storage = match storage {
-            Some(syntax::StorageClass::Static) => SemanticStorageClass::Static,
-            Some(syntax::StorageClass::ThreadLocal) => SemanticStorageClass::ThreadLocal,
-            _ => SemanticStorageClass::Extern,
+        let semantic_storage = if thread_local {
+            SemanticStorageClass::ThreadLocal
+        } else if storage == Some(syntax::StorageClass::Static) {
+            SemanticStorageClass::Static
+        } else {
+            SemanticStorageClass::Extern
         };
         let declared_binding = attributes
             .iter()
@@ -1864,6 +1944,15 @@ impl<'a> Analyzer<'a> {
 
         if let Some(existing) = self.lookup_file_ordinary(&name).cloned() {
             if let OrdinarySymbol::Global(id, existing_ty) = existing {
+                if self.globals[id.0 as usize].duration != duration {
+                    return self.fail(
+                        "CCC2374",
+                        span,
+                        format!(
+                            "object `{name}` is redeclared with different thread-local storage duration"
+                        ),
+                    );
+                }
                 self.register_global_standard_alignment(
                     id,
                     standard_alignment,
@@ -2084,6 +2173,13 @@ impl<'a> Analyzer<'a> {
             attributes.extend(self.validate_attributes(&init.attributes)?);
             self.reject_packed_attribute(&attributes, init.span)?;
             if info.storage == Some(syntax::StorageClass::Typedef) {
+                if info.thread_local {
+                    return self.fail(
+                        "CCC2374",
+                        init.span,
+                        "a typedef cannot have thread-local storage duration",
+                    );
+                }
                 self.reject_alignment_specifier(&info, init.span, "a typedef")?;
                 self.reject_transparent_union_attribute(
                     &attributes,
@@ -2125,6 +2221,13 @@ impl<'a> Analyzer<'a> {
                 continue;
             }
             if self.types.function_signature(resolved.ty.ty).is_some() {
+                if info.thread_local {
+                    return self.fail(
+                        "CCC2374",
+                        init.span,
+                        "a function cannot have thread-local storage duration",
+                    );
+                }
                 self.reject_transparent_union_attribute(
                     &attributes,
                     init.span,
@@ -2153,7 +2256,7 @@ impl<'a> Analyzer<'a> {
                 output.push(FullTypedBlockItem::FunctionDeclaration(id));
                 continue;
             }
-            self.reject_unavailable_thread_storage(info.storage, init.span)?;
+            self.reject_unavailable_thread_storage(info.thread_local, init.span)?;
             if info.storage == Some(syntax::StorageClass::Extern) {
                 self.reject_transparent_union_attribute(
                     &attributes,
@@ -2181,6 +2284,7 @@ impl<'a> Analyzer<'a> {
                     name.clone(),
                     resolved.ty,
                     info.storage,
+                    info.thread_local,
                     attributes,
                     info.requested_alignment,
                     asm_label,
@@ -2202,6 +2306,9 @@ impl<'a> Analyzer<'a> {
                 init.span,
                 "an object declaration",
             )?;
+            if !info.thread_local {
+                self.reject_tls_model_attribute(&attributes, init.span)?;
+            }
             if init.asm_label.is_some() {
                 return self.fail(
                     "CCC2257",
@@ -2210,11 +2317,20 @@ impl<'a> Analyzer<'a> {
                 );
             }
             self.validate_object_type(resolved.ty, init.span, init.initializer.is_none())?;
-            if self.requires_runtime_sized_storage(resolved.ty.ty) {
+            if info.thread_local && info.storage != Some(syntax::StorageClass::Static) {
+                return self.fail(
+                    "CCC2374",
+                    init.span,
+                    "a block-scope thread-local object must also be declared `static` or `extern`",
+                );
+            }
+            if self.requires_runtime_sized_storage(resolved.ty.ty)
+                && info.storage == Some(syntax::StorageClass::Static)
+            {
                 return self.fail(
                     "CCC2258",
                     init.span,
-                    "variable-length array object storage is unavailable for this configuration",
+                    "a variable-length array object must have automatic storage duration",
                 );
             }
             let local = self.fresh_local();
@@ -2224,14 +2340,14 @@ impl<'a> Analyzer<'a> {
                 init.span,
             )?;
             let (storage, duration) = match info.storage {
+                Some(syntax::StorageClass::Static) if info.thread_local => {
+                    (SemanticStorageClass::ThreadLocal, StorageDuration::Thread)
+                }
                 Some(syntax::StorageClass::Static) => {
                     (SemanticStorageClass::Static, StorageDuration::Static)
                 }
                 Some(syntax::StorageClass::Register) => {
                     (SemanticStorageClass::Register, StorageDuration::Automatic)
-                }
-                Some(syntax::StorageClass::ThreadLocal) => {
-                    (SemanticStorageClass::ThreadLocal, StorageDuration::Thread)
                 }
                 None | Some(syntax::StorageClass::Auto) => {
                     (SemanticStorageClass::Automatic, StorageDuration::Automatic)
@@ -2239,8 +2355,8 @@ impl<'a> Analyzer<'a> {
                 Some(syntax::StorageClass::Extern | syntax::StorageClass::Typedef) => {
                     unreachable!("handled above")
                 }
-                Some(syntax::StorageClass::GnuThreadLocal) => {
-                    unreachable!("rejected with the declaration specifiers")
+                Some(syntax::StorageClass::ThreadLocal | syntax::StorageClass::GnuThreadLocal) => {
+                    unreachable!("thread-local specifiers are tracked separately")
                 }
             };
             if duration != StorageDuration::Automatic {
@@ -2270,6 +2386,15 @@ impl<'a> Analyzer<'a> {
                             "CCC2367",
                             init.span,
                             "a static- or thread-duration block object requires a constant initializer",
+                        );
+                    }
+                    if duration != StorageDuration::Automatic
+                        && self.initializer_references_thread_storage(&typed)
+                    {
+                        return self.fail(
+                            "CCC2367",
+                            init.span,
+                            "a static- or thread-duration initializer cannot contain the address of a thread-local object",
                         );
                     }
                     (Some(typed), completed)
@@ -2311,6 +2436,17 @@ impl<'a> Analyzer<'a> {
                 self.apply_emission_attributes(&mut emission, &attributes, init.span)?;
                 Some(emission)
             };
+            if duration == StorageDuration::Automatic
+                && (!resolved.variable_length_bounds.is_empty()
+                    || self.is_variably_modified(completed_ty.ty))
+            {
+                let function = self
+                    .function
+                    .as_mut()
+                    .expect("variably modified locals occur inside a function");
+                function.active_variably_modified_path.push(local);
+                function.has_variably_modified_local = true;
+            }
             output.push(FullTypedBlockItem::Declaration(Box::new(
                 FullTypedLocalDeclaration {
                     local,
@@ -2350,6 +2486,12 @@ impl<'a> Analyzer<'a> {
                         statement.span,
                         "a statement label",
                     )?;
+                    let variably_modified_path = self
+                        .function
+                        .as_ref()
+                        .expect("labels only occur inside functions")
+                        .active_variably_modified_path
+                        .clone();
                     let id = {
                         let labels = &mut self
                             .function
@@ -2367,6 +2509,11 @@ impl<'a> Analyzer<'a> {
                             }
                         }
                     };
+                    self.function
+                        .as_mut()
+                        .expect("labels only occur inside functions")
+                        .variably_modified_label_paths
+                        .insert(id, (label.span, variably_modified_path));
                     FullTypedStatementKind::Label {
                         label: id,
                         name: label.name.clone(),
@@ -2378,6 +2525,7 @@ impl<'a> Analyzer<'a> {
                     statement: nested,
                 } => {
                     let value = self.evaluate_integer_constant(value)?;
+                    self.reject_switch_variably_modified_ingress(statement.span)?;
                     let Some(switch) = self
                         .function
                         .as_mut()
@@ -2403,6 +2551,7 @@ impl<'a> Analyzer<'a> {
                     }
                 }
                 S::Default(nested) => {
+                    self.reject_switch_variably_modified_ingress(statement.span)?;
                     let Some(switch) = self
                         .function
                         .as_mut()
@@ -2465,11 +2614,20 @@ impl<'a> Analyzer<'a> {
                             "a switch controlling expression must have integer type",
                         );
                     }
+                    let entry_variably_modified_path = self
+                        .function
+                        .as_ref()
+                        .expect("switches only occur inside functions")
+                        .active_variably_modified_path
+                        .clone();
                     self.function
                         .as_mut()
                         .expect("switches only occur inside functions")
                         .switches
-                        .push(SwitchState::default());
+                        .push(SwitchState {
+                            entry_variably_modified_path,
+                            ..SwitchState::default()
+                        });
                     let nested = self.analyze_statement(nested);
                     self.function
                         .as_mut()
@@ -2529,12 +2687,27 @@ impl<'a> Analyzer<'a> {
                     }
                 }
                 S::Goto(label) => {
+                    let source_path = self
+                        .function
+                        .as_ref()
+                        .expect("gotos only occur inside functions")
+                        .active_variably_modified_path
+                        .clone();
                     let labels = &mut self
                         .function
                         .as_mut()
                         .expect("gotos only occur inside functions")
                         .labels;
                     let id = labels.note_use(&label.name, label.span);
+                    self.function
+                        .as_mut()
+                        .expect("gotos only occur inside functions")
+                        .variably_modified_gotos
+                        .push(VariablyModifiedGoto {
+                            label: id,
+                            span: label.span,
+                            source_path,
+                        });
                     FullTypedStatementKind::Goto {
                         label: id,
                         name: label.name.clone(),
@@ -2562,6 +2735,11 @@ impl<'a> Analyzer<'a> {
                             "a computed goto cannot use a label from another function",
                         );
                     }
+                    self.function
+                        .as_mut()
+                        .expect("computed gotos only occur inside functions")
+                        .computed_gotos
+                        .push(statement.span);
                     FullTypedStatementKind::ComputedGoto(expression)
                 }
                 S::Continue => {
@@ -2758,6 +2936,9 @@ impl<'a> Analyzer<'a> {
                 typed.span = expression.span;
                 Ok(typed)
             }
+            E::StatementExpression(items) => {
+                self.analyze_statement_expression(items, expression.span)
+            }
             E::GenericSelection { .. } => self.fail(
                 "CCC2270",
                 expression.span,
@@ -2883,6 +3064,10 @@ impl<'a> Analyzer<'a> {
             E::BuiltinIntegerIntrinsic { operation, operand } => {
                 self.analyze_integer_intrinsic(*operation, operand, expression.span)
             }
+            E::BuiltinMemoryOperation {
+                operation,
+                arguments,
+            } => self.analyze_memory_builtin(*operation, arguments, expression.span),
             E::BuiltinPrefetch { arguments } => {
                 self.analyze_builtin_prefetch(arguments, expression.span)
             }
@@ -2892,6 +3077,116 @@ impl<'a> Analyzer<'a> {
             } => self.analyze_sync_operation(*operation, arguments, expression.span),
             E::BuiltinSyncSynchronize => self.analyze_sync_synchronize(expression.span),
         }
+    }
+
+    fn analyze_statement_expression(
+        &mut self,
+        items: &[syntax::BlockItem],
+        span: Span,
+    ) -> AnalysisResult<FullTypedExpression> {
+        if self.function.is_none() {
+            return self.fail(
+                "CCC2452",
+                span,
+                "a statement expression is only supported inside a function",
+            );
+        }
+
+        self.push_scope();
+        let meaningful = items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                !matches!(
+                    item,
+                    syntax::BlockItem::Statement(statement)
+                        if matches!(statement.kind, syntax::StatementKind::Expression(None))
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let transparent = match meaningful.as_slice() {
+            [(index, syntax::BlockItem::Statement(statement))] => match &statement.kind {
+                syntax::StatementKind::Expression(Some(expression)) => Some((*index, expression)),
+                _ => None,
+            },
+            _ => None,
+        };
+
+        let analyzed = (|| {
+            if let Some((result_index, result_expression)) = transparent {
+                let result = self.analyze_expression(result_expression)?;
+                let result = if matches!(
+                    self.types.try_kind(result.ty.ty),
+                    Some(TypeKind::Array(_) | TypeKind::Function(_))
+                ) || (result.category == ValueCategory::Lvalue
+                    && !result.ty.qualifiers.is_empty())
+                {
+                    self.value_conversion(result)?
+                } else {
+                    result
+                };
+                let mut output = Vec::new();
+                for (index, item) in items.iter().enumerate() {
+                    if index == result_index {
+                        continue;
+                    }
+                    if let syntax::BlockItem::Statement(statement) = item {
+                        output.push(FullTypedBlockItem::Statement(Box::new(
+                            self.analyze_statement(statement)?,
+                        )));
+                    }
+                }
+                Ok((output, Some(result)))
+            } else {
+                let mut output = self.analyze_compound_items(items)?;
+                let result_index = output.iter().rposition(|item| {
+                    !matches!(
+                        item,
+                        FullTypedBlockItem::Statement(statement)
+                            if matches!(statement.kind, FullTypedStatementKind::Expression(None))
+                    )
+                });
+                let result = result_index.and_then(|index| {
+                    let FullTypedBlockItem::Statement(statement) = &mut output[index] else {
+                        return None;
+                    };
+                    let FullTypedStatementKind::Expression(expression) = &mut statement.kind else {
+                        return None;
+                    };
+                    expression.take().map(|expression| (index, expression))
+                });
+                let result = result.map(|(index, expression)| {
+                    output.remove(index);
+                    expression
+                });
+                let result = result
+                    .map(|result| self.value_conversion(result))
+                    .transpose()?;
+                Ok((output, result))
+            }
+        })();
+        self.pop_scope();
+        let (items, result) = analyzed?;
+        let ty = result
+            .as_ref()
+            .map_or(QualifiedType::unqualified(TypeId::VOID), |result| result.ty);
+        let category = result
+            .as_ref()
+            .map_or(ValueCategory::Value, |result| result.category);
+        let place = result.as_ref().and_then(|result| result.place.clone());
+        Ok(FullTypedExpression {
+            kind: FullTypedExpressionKind::StatementExpression {
+                items,
+                result: result.map(Box::new),
+            },
+            ty,
+            category,
+            place,
+            constant: None,
+            constant_expression_kind: ConstantExpressionKind::Invalid,
+            span,
+        })
     }
 
     fn analyze_compound_literal(
@@ -3069,6 +3364,11 @@ impl<'a> Analyzer<'a> {
                 TypeId::UNSIGNED_LONG_LONG,
                 TypeId::INT,
             ),
+            syntax::IntegerBuiltinOperation::CountTrailingZerosInt => (
+                IntegerIntrinsicOperation::CountTrailingZerosInt,
+                TypeId::UNSIGNED_INT,
+                TypeId::INT,
+            ),
         };
         let operand = self.analyze_expression(operand)?;
         let operand_span = operand.span;
@@ -3115,7 +3415,8 @@ impl<'a> Analyzer<'a> {
         };
         let input = match operation {
             IntegerIntrinsicOperation::CountLeadingZerosInt
-            | IntegerIntrinsicOperation::PopulationCountInt => BuiltinType::UnsignedInt,
+            | IntegerIntrinsicOperation::PopulationCountInt
+            | IntegerIntrinsicOperation::CountTrailingZerosInt => BuiltinType::UnsignedInt,
             IntegerIntrinsicOperation::ByteSwap64
             | IntegerIntrinsicOperation::CountLeadingZerosLong => BuiltinType::UnsignedLong,
             IntegerIntrinsicOperation::CountLeadingZerosLongLong
@@ -3137,7 +3438,8 @@ impl<'a> Analyzer<'a> {
                 let leading = raw.leading_zeros() - (u128::BITS - u32::from(width));
                 Some(ConstantValue::Signed(i128::from(leading)))
             }
-            IntegerIntrinsicOperation::CountTrailingZerosLongLong => {
+            IntegerIntrinsicOperation::CountTrailingZerosLongLong
+            | IntegerIntrinsicOperation::CountTrailingZerosInt => {
                 if raw == 0 {
                     return None;
                 }
@@ -3178,6 +3480,69 @@ impl<'a> Analyzer<'a> {
                 locality,
             },
             ty: QualifiedType::unqualified(TypeId::VOID),
+            category: ValueCategory::Value,
+            place: None,
+            constant: None,
+            constant_expression_kind: ConstantExpressionKind::Invalid,
+            span,
+        })
+    }
+
+    fn analyze_memory_builtin(
+        &mut self,
+        operation: syntax::MemoryBuiltinOperation,
+        arguments: &[syntax::Expression],
+        span: Span,
+    ) -> AnalysisResult<FullTypedExpression> {
+        self.require_builtin(operation.spelling(), span)?;
+        debug_assert_eq!(arguments.len(), 3);
+
+        let void_pointer = QualifiedType::unqualified(
+            self.types.pointer(QualifiedType::unqualified(TypeId::VOID)),
+        );
+        let const_void_pointer = QualifiedType::unqualified(
+            self.types
+                .pointer(QualifiedType::new(TypeId::VOID, TypeQualifiers::CONST)),
+        );
+        let destination = self.analyze_expression(&arguments[0])?;
+        let destination =
+            self.assignment_conversion(destination, void_pointer, arguments[0].span)?;
+        let length = self.analyze_expression(&arguments[2])?;
+        let length = self.assignment_conversion(
+            length,
+            QualifiedType::unqualified(self.size_type()),
+            arguments[2].span,
+        )?;
+
+        let kind = match operation {
+            syntax::MemoryBuiltinOperation::Copy | syntax::MemoryBuiltinOperation::Move => {
+                let source = self.analyze_expression(&arguments[1])?;
+                let source =
+                    self.assignment_conversion(source, const_void_pointer, arguments[1].span)?;
+                FullTypedExpressionKind::MemoryCopy {
+                    destination: Box::new(destination),
+                    source: Box::new(source),
+                    length: Box::new(length),
+                    overlap: operation == syntax::MemoryBuiltinOperation::Move,
+                }
+            }
+            syntax::MemoryBuiltinOperation::Set => {
+                let value = self.analyze_expression(&arguments[1])?;
+                let value = self.assignment_conversion(
+                    value,
+                    QualifiedType::unqualified(TypeId::INT),
+                    arguments[1].span,
+                )?;
+                FullTypedExpressionKind::MemorySet {
+                    destination: Box::new(destination),
+                    value: Box::new(value),
+                    length: Box::new(length),
+                }
+            }
+        };
+        Ok(FullTypedExpression {
+            kind,
+            ty: void_pointer,
             category: ValueCategory::Value,
             place: None,
             constant: None,
@@ -4756,17 +5121,17 @@ impl<'a> Analyzer<'a> {
                 step.field.ty.qualifiers | step.record_ty.qualifiers,
             );
             let member_access = access_semantics(result_ty);
+            let layout = self
+                .types
+                .layout_of(step.record_ty.ty, self.config)
+                .map_err(|error| {
+                    self.emit("CCC2297", span, error.to_string());
+                })?;
+            let LayoutShape::Record(layout) = layout.shape else {
+                unreachable!("the queried type is a record")
+            };
+            let field_layout = &layout.fields[step.field_index];
             let bitfield = if step.field.bitfield.is_some() {
-                let layout = self
-                    .types
-                    .layout_of(step.record_ty.ty, self.config)
-                    .map_err(|error| {
-                        self.emit("CCC2297", span, error.to_string());
-                    })?;
-                let LayoutShape::Record(layout) = layout.shape else {
-                    unreachable!("the queried type is a record")
-                };
-                let field_layout = &layout.fields[step.field_index];
                 let shared = field_layout
                     .bitfield
                     .expect("a semantic bitfield has a bitfield layout");
@@ -4784,6 +5149,22 @@ impl<'a> Analyzer<'a> {
                     signed: self.is_signed_integer(step.field.ty.ty),
                     access: member_access,
                 })
+            } else {
+                None
+            };
+            let constant = if bitfield.is_none() {
+                match expression.constant {
+                    Some(ConstantValue::Address(mut address)) => {
+                        address.addend = address
+                            .addend
+                            .checked_add(i128::from(field_layout.offset))
+                            .ok_or_else(|| {
+                                self.emit("CCC2297", span, "member address offset overflows");
+                            })?;
+                        Some(ConstantValue::Address(address))
+                    }
+                    _ => None,
+                }
             } else {
                 None
             };
@@ -4810,7 +5191,7 @@ impl<'a> Analyzer<'a> {
                 ty: result_ty,
                 category,
                 place: place.clone(),
-                constant: None,
+                constant,
                 constant_expression_kind: ConstantExpressionKind::Invalid,
                 span,
             };
@@ -6769,12 +7150,10 @@ impl<'a> Analyzer<'a> {
 
     fn reject_unavailable_thread_storage(
         &mut self,
-        storage: Option<syntax::StorageClass>,
+        thread_local: bool,
         span: Span,
     ) -> AnalysisResult<()> {
-        if storage == Some(syntax::StorageClass::ThreadLocal)
-            && !self.config.target.abi.supports_tls_codegen()
-        {
+        if thread_local && !self.config.target.abi.supports_tls_codegen() {
             return self.fail(
                 "CCC2441",
                 span,
@@ -7309,6 +7688,24 @@ impl<'a> Analyzer<'a> {
         Ok(())
     }
 
+    fn reject_tls_model_attribute(
+        &mut self,
+        attributes: &[FullTypedAttribute],
+        span: Span,
+    ) -> AnalysisResult<()> {
+        if attributes
+            .iter()
+            .any(|attribute| attribute_has_name(attribute, "tls_model"))
+        {
+            return self.fail(
+                "CCC2441",
+                span,
+                "`tls_model` is only valid on an object with thread storage duration",
+            );
+        }
+        Ok(())
+    }
+
     fn object_requested_alignment(
         &mut self,
         ty: QualifiedType,
@@ -7342,23 +7739,15 @@ impl<'a> Analyzer<'a> {
             }
             requested = strongest_alignment(requested, Some(alignment));
         }
-        let natural = match self.types.try_kind(ty.ty).cloned() {
-            Some(TypeKind::Array(ArrayType {
-                element,
-                length: ArrayLength::Incomplete,
-            })) => {
-                self.types
-                    .layout_of(element.ty, self.config)
-                    .map_err(|error| self.emit("CCC2437", span, error.to_string()))?
-                    .align
-            }
-            _ => {
-                self.types
-                    .layout_of(ty.ty, self.config)
-                    .map_err(|error| self.emit("CCC2437", span, error.to_string()))?
-                    .align
-            }
-        };
+        let mut alignment_ty = ty.ty;
+        while let Some(TypeKind::Array(array)) = self.types.try_kind(alignment_ty) {
+            alignment_ty = array.element.ty;
+        }
+        let natural = self
+            .types
+            .layout_of(alignment_ty, self.config)
+            .map_err(|error| self.emit("CCC2437", span, error.to_string()))?
+            .align;
         if standard_alignment.is_some() && requested.is_some_and(|value| value < natural) {
             return self.fail(
                 "CCC2437",
@@ -7412,7 +7801,8 @@ impl<'a> Analyzer<'a> {
             }
             PragmaEvent::Once { .. }
             | PragmaEvent::SystemHeader { .. }
-            | PragmaEvent::Diagnostic { .. } => Ok(()),
+            | PragmaEvent::Diagnostic { .. }
+            | PragmaEvent::GccOptimize { .. } => Ok(()),
         }
     }
 
@@ -7545,12 +7935,93 @@ impl<'a> Analyzer<'a> {
     }
 
     fn validate_labels(&mut self) {
-        let Some(function) = &self.function else {
+        let Some(function) = self.function.as_ref() else {
             return;
         };
         let missing = function.labels.undefined_uses();
+        let variably_modified_gotos = function
+            .variably_modified_gotos
+            .iter()
+            .filter_map(|jump| {
+                let (definition_span, target_path) =
+                    function.variably_modified_label_paths.get(&jump.label)?;
+                variably_modified_path_enters(&jump.source_path, target_path)
+                    .then_some((jump.span, *definition_span))
+            })
+            .collect::<Vec<_>>();
+        let computed_gotos = if function.has_variably_modified_local {
+            function.computed_gotos.clone()
+        } else {
+            Vec::new()
+        };
         for (name, span) in missing {
             self.emit("CCC2363", span, format!("use of undefined label `{name}`"));
+        }
+        for (jump_span, definition_span) in variably_modified_gotos {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "CCC2442",
+                    "a goto cannot enter the scope of a variably modified object",
+                )
+                .with_primary(jump_span, "this jump bypasses the declaration")
+                .with_secondary(definition_span, "the target is inside that scope"),
+            );
+        }
+        for span in computed_gotos {
+            self.emit(
+                "CCC2442",
+                span,
+                "a computed goto is not supported in a function with variably modified automatic objects",
+            );
+        }
+    }
+
+    fn reject_switch_variably_modified_ingress(&mut self, span: Span) -> AnalysisResult<()> {
+        let Some(function) = self.function.as_ref() else {
+            return Ok(());
+        };
+        let Some(switch) = function.switches.last() else {
+            return Ok(());
+        };
+        if variably_modified_path_enters(
+            &switch.entry_variably_modified_path,
+            &function.active_variably_modified_path,
+        ) {
+            return self.fail(
+                "CCC2442",
+                span,
+                "a switch label cannot bypass the declaration of a variably modified object",
+            );
+        }
+        Ok(())
+    }
+
+    fn initializer_references_thread_storage(&self, initializer: &FullTypedInitializer) -> bool {
+        match &initializer.kind {
+            FullTypedInitializerKind::Scalar(expression) => {
+                let Some(ConstantValue::Address(address)) = expression.constant else {
+                    return false;
+                };
+                match address.base {
+                    RelocatableBase::Global(id) => self
+                        .globals
+                        .get(id.0 as usize)
+                        .is_some_and(|global| global.duration == StorageDuration::Thread),
+                    RelocatableBase::BlockStatic { function, local } => self
+                        .function
+                        .as_ref()
+                        .filter(|state| state.id == function)
+                        .and_then(|state| state.static_duration_locals.get(&local))
+                        .is_some_and(|duration| *duration == StorageDuration::Thread),
+                    RelocatableBase::Function(_)
+                    | RelocatableBase::String(_)
+                    | RelocatableBase::Label { .. } => false,
+                }
+            }
+            FullTypedInitializerKind::Aggregate(entries) => entries
+                .iter()
+                .any(|entry| self.initializer_references_thread_storage(&entry.initializer)),
+            FullTypedInitializerKind::String(_) | FullTypedInitializerKind::Zero => false,
         }
     }
 
@@ -7582,10 +8053,20 @@ impl<'a> Analyzer<'a> {
     }
 
     fn push_scope(&mut self) {
+        if let Some(function) = self.function.as_mut() {
+            function
+                .variably_modified_scope_starts
+                .push(function.active_variably_modified_path.len());
+        }
         self.scopes.push();
     }
 
     fn pop_scope(&mut self) {
+        if let Some(function) = self.function.as_mut()
+            && let Some(start) = function.variably_modified_scope_starts.pop()
+        {
+            function.active_variably_modified_path.truncate(start);
+        }
         self.scopes.pop();
     }
 
@@ -7893,6 +8374,7 @@ fn builtin_expect_folded_constant(expression: &FullTypedExpression) -> bool {
             }
         }
         E::Comma(expressions) => expressions.iter().all(builtin_expect_folded_constant),
+        E::StatementExpression { .. } => false,
         E::BuiltinExpect { value, expected: _ } => {
             expression.constant.is_some() && builtin_expect_folded_constant(value)
         }
@@ -7908,6 +8390,8 @@ fn builtin_expect_folded_constant(expression: &FullTypedExpression) -> bool {
         | E::VaCopy { .. }
         | E::VaEnd { .. }
         | E::IntegerIntrinsic { .. }
+        | E::MemoryCopy { .. }
+        | E::MemorySet { .. }
         | E::Prefetch { .. }
         | E::AtomicReadModifyWrite { .. }
         | E::AtomicCompareExchange { .. }
@@ -8225,6 +8709,10 @@ fn evaluate_binary_constant(
         },
         _ => None,
     }
+}
+
+fn variably_modified_path_enters(source: &[FullLocalId], target: &[FullLocalId]) -> bool {
+    target.iter().any(|local| !source.contains(local))
 }
 
 fn has_direct_label_address_provenance(expression: &FullTypedExpression) -> bool {

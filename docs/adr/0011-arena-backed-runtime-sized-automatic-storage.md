@@ -23,22 +23,20 @@ that function returns. ISO VLA support must not imply that extension.
 ## Decision
 
 CCC-IR represents runtime-sized automatic storage independently of its physical
-provider. It models declaration-time allocation and scope-exit restoration as
-explicit effects, verifies the active-region stack at every CFG edge, and does
-not expose `malloc`, an arena layout, or a native stack token in the IR.
+provider. It models declaration-time allocation as an explicit effect and does
+not expose an allocator, arena layout, or native stack token in the IR.
 
-The hosted provider selected by this decision is a scoped arena owned by each
-function invocation. The arena descriptor, saved marks, and current object
-addresses are fixed Cranelift stack slots; generated code never moves the
-native stack pointer. Stable heap chunks back arena allocations. Each
-runtime-sized declaration:
+The hosted provider selected by this decision is a per-invocation arena with
+one cached allocation per syntactic runtime-sized declaration. Each cache's
+base and capacity are held in a fixed Cranelift stack slot; generated code never
+moves the native stack pointer. Each runtime-sized declaration:
 
 1. evaluates and saves every runtime extent exactly once;
 2. rejects nonpositive extents;
 3. computes strides and total byte size with checked `size_t` arithmetic;
-4. saves an arena mark;
-5. allocates a stable pointer at the effective target alignment; and
-6. restores the mark on every normal edge that leaves the declaration's scope.
+4. reuses retained capacity or grows it with the hosted `realloc` provider;
+5. produces a stable pointer at the effective target alignment; and
+6. releases every cached base on ordinary function return.
 
 The effective alignment is the greater of the declared alignment and the
 target's VLA minimum. The System V AMD64 provider therefore guarantees at least
@@ -48,36 +46,21 @@ produces a null or undersized VLA object.
 
 Semantic analysis records the active variably modified declaration path at
 labels and switch targets. It rejects control-flow ingress that bypasses a
-declaration. Lowering restores the active suffix for normal fallthrough,
-`break`, `continue`, outward or backward `goto`, and return. A return operand is
-fully evaluated and copied before restoration. When computed goto is enabled
-alongside this provider, its dispatch must perform the same verified restoration
-and reject targets that enter a region.
+declaration. Named jumps may remain within a path or leave it, and switch labels
+may not enter a path deeper than the switch entry. Because an arbitrary computed
+target cannot yet prove its destination path, a function may not combine a
+computed goto with a variably modified automatic object. The arena retains
+physical capacity across scope exits but exposes no address after the C lifetime
+ends. A return operand, including an aggregate, is fully evaluated and copied
+before the cached bases are released.
 
-The provider's logical version-one support surface is:
-
-```c
-void __ccc_auto_arena_v1_init(struct __ccc_auto_arena_v1 *);
-void __ccc_auto_arena_v1_mark(
-    const struct __ccc_auto_arena_v1 *, struct __ccc_auto_mark_v1 *);
-void *__ccc_auto_arena_v1_alloc(
-    struct __ccc_auto_arena_v1 *, size_t, size_t);
-void __ccc_auto_arena_v1_restore(
-    struct __ccc_auto_arena_v1 *, const struct __ccc_auto_mark_v1 *);
-void __ccc_auto_arena_v1_destroy(struct __ccc_auto_arena_v1 *);
-```
-
-The structs are compiler-private target ABI records. Their size and alignment
-are fields of the automatic-storage provider descriptor in the effective
-target configuration; generated callers and local support definitions consume
-that same descriptor. Deterministically named local CLIF definitions implement
-the surface in the primary object and call the helper-manifest-selected hosted
-`malloc`, `free`, and non-returning `abort` providers. Consequently an object
-linked by an external GCC- or Clang-compatible driver needs only its ordinary
+The logical version-one provider surface is the target profile's exact hosted
+`realloc(void *, size_t)` and `free(void *)` ABI. A generated object linked by an
+external GCC- or Clang-compatible driver therefore needs only its ordinary
 hosted libc dependencies; it does not require a separately installed CCC
 runtime library or generated assembly. Freestanding profiles require another
-descriptor with a manifest-selected allocator or keep the capability
-unavailable.
+descriptor with a manifest-selected allocator or keep runtime-sized object
+storage unavailable.
 
 The arena is per invocation, not a thread-local secondary stack. That keeps
 recursion and concurrent calls independent and prevents a nonlocal exit from
@@ -104,10 +87,10 @@ reliably diagnosed from a signal-handler declaration. A profile requiring
 async-signal-safe runtime-sized storage must use a proven provider or leave VLA
 object storage unavailable.
 
-A VLA declared inside a GNU statement expression is restored at the closing
-brace after the final subexpression value is captured. The expression does not
-extend the VLA lifetime; a result that refers to that storage is invalid outside
-the statement expression.
+A VLA declared inside a GNU statement expression reaches the end of its C
+lifetime at the closing brace after the final subexpression value is captured.
+Retained physical arena capacity does not extend that lifetime; a result that
+refers to the object is invalid outside the statement expression.
 
 ## Alternatives
 
@@ -133,13 +116,15 @@ the statement expression.
 ## Consequences
 
 - Cranelift's fixed-stack-pointer invariant remains intact.
-- Runtime-sized objects can have correct ordinary lifetime, alignment, stable
-  addresses, recursion behavior, and bounded loop reuse.
+- Runtime-sized objects have correct logical lifetime, alignment, stable active
+  addresses, recursion behavior, and bounded loop reuse. Physical capacity can
+  be retained until the invocation returns.
 - Heap exhaustion replaces native stack exhaustion, and CCC makes no native
   stack observability or probing claim for the arena provider.
-- The provider is enabled only after semantic, IR, runtime, link, failure-path,
-  leak, alignment, recursion, thread, and performance tests pass. Until then,
-  `__STDC_NO_VLA__` remains defined and storage use is diagnosed.
+- The hosted provider is enabled for automatic VLA objects after semantic, IR,
+  runtime, link, failure-path, leak, alignment, recursion, and thread tests.
+  `__STDC_NO_VLA__` remains defined until the broader runtime-layout and
+  variably modified type surface is complete.
 - Provider-neutral CCC-IR permits a future verified native Cranelift operation
   without redesigning semantic analysis or control-flow cleanup.
 

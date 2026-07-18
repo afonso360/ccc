@@ -469,7 +469,10 @@ fn verify_function(module: &FullModule, function: &FullFunction) -> Result<(), I
                 function.name, storage.id.0
             )));
         }
-        if storage.location != StorageLocation::Automatic {
+        if !matches!(
+            storage.location,
+            StorageLocation::Automatic | StorageLocation::RuntimeSized
+        ) {
             return Err(IrError::verify(format!(
                 "function `{}` retains static-duration data in runtime storage",
                 function.name
@@ -800,6 +803,54 @@ impl FunctionVerifier<'_> {
                     .ok_or_else(|| {
                         IrError::verify(format!("address references unknown storage {}", storage.0))
                     })?;
+                if object.location == StorageLocation::RuntimeSized {
+                    return Err(IrError::verify(
+                        "runtime-sized storage must be addressed by its allocation result",
+                    ));
+                }
+                require_pointer_result(types, result, object.ty, instruction)?;
+            }
+            FullInstructionKind::RuntimeSizedAllocate {
+                storage,
+                extents,
+                element,
+                constant_factor,
+                requested_alignment,
+            } => {
+                let object = self
+                    .function
+                    .storage
+                    .get(storage.0 as usize)
+                    .filter(|object| object.id == *storage)
+                    .ok_or_else(|| {
+                        IrError::verify(format!(
+                            "runtime allocation references unknown storage {}",
+                            storage.0
+                        ))
+                    })?;
+                if object.location != StorageLocation::RuntimeSized {
+                    return Err(IrError::verify(
+                        "runtime allocation references fixed-size storage",
+                    ));
+                }
+                if extents.is_empty() || *constant_factor == 0 {
+                    return Err(IrError::verify(
+                        "runtime allocation has no dynamic extent or has a zero constant factor",
+                    ));
+                }
+                for extent in extents {
+                    if !types.is_integer(self.value_type(*extent)?.ty) {
+                        return Err(IrError::verify(
+                            "runtime allocation extent is not an integer",
+                        ));
+                    }
+                }
+                verify_type(types, *element, "runtime allocation element")?;
+                if requested_alignment.is_some_and(|alignment| !alignment.is_power_of_two()) {
+                    return Err(IrError::verify(
+                        "runtime allocation has an invalid requested alignment",
+                    ));
+                }
                 require_pointer_result(types, result, object.ty, instruction)?;
             }
             FullInstructionKind::ProjectField {
@@ -845,6 +896,28 @@ impl FunctionVerifier<'_> {
                 }
                 require_pointer_result(types, result, *element, instruction)?;
             }
+            FullInstructionKind::RuntimePointerOffset {
+                base,
+                index,
+                element,
+                extents,
+                ..
+            } => {
+                require_address(types, self.value_type(*base)?, *element, "pointer offset")?;
+                if !types.is_integer(self.value_type(*index)?.ty) || extents.is_empty() {
+                    return Err(IrError::verify(
+                        "runtime pointer offset has an invalid index or no extents",
+                    ));
+                }
+                for extent in extents {
+                    if !types.is_integer(self.value_type(*extent)?.ty) {
+                        return Err(IrError::verify(
+                            "runtime pointer offset extent is not an integer",
+                        ));
+                    }
+                }
+                require_pointer_result(types, result, *element, instruction)?;
+            }
             FullInstructionKind::PointerDifference {
                 left,
                 right,
@@ -862,6 +935,41 @@ impl FunctionVerifier<'_> {
                     *element,
                     "pointer difference",
                 )?;
+                let result = require_result(result, instruction, "pointer difference")?;
+                if !types.is_integer(result.ty) {
+                    return Err(IrError::verify(
+                        "pointer difference result is not an integer",
+                    ));
+                }
+            }
+            FullInstructionKind::RuntimePointerDifference {
+                left,
+                right,
+                element,
+                extents,
+            } => {
+                require_address_ignoring_pointee_qualifiers(
+                    types,
+                    self.value_type(*left)?,
+                    *element,
+                    "pointer difference",
+                )?;
+                require_address_ignoring_pointee_qualifiers(
+                    types,
+                    self.value_type(*right)?,
+                    *element,
+                    "pointer difference",
+                )?;
+                if extents.is_empty() {
+                    return Err(IrError::verify("runtime pointer difference has no extents"));
+                }
+                for extent in extents {
+                    if !types.is_integer(self.value_type(*extent)?.ty) {
+                        return Err(IrError::verify(
+                            "runtime pointer difference extent is not an integer",
+                        ));
+                    }
+                }
                 let result = require_result(result, instruction, "pointer difference")?;
                 if !types.is_integer(result.ty) {
                     return Err(IrError::verify(
@@ -1207,6 +1315,46 @@ impl FunctionVerifier<'_> {
                     return Err(IrError::verify(
                         "integer intrinsic result has the wrong exact type",
                     ));
+                }
+            }
+            FullInstructionKind::MemoryCopy {
+                destination,
+                source,
+                length,
+                ..
+            } => {
+                require_no_result(result, instruction, "memory copy")?;
+                let destination = pointer_pointee(types, self.value_type(*destination)?.ty)
+                    .ok_or_else(|| IrError::verify("memory copy destination is not a pointer"))?;
+                let source = pointer_pointee(types, self.value_type(*source)?.ty)
+                    .ok_or_else(|| IrError::verify("memory copy source is not a pointer"))?;
+                if destination.ty != TypeId::VOID || source.ty != TypeId::VOID {
+                    return Err(IrError::verify(
+                        "memory copy operands are not canonical void pointers",
+                    ));
+                }
+                if !types.is_integer(self.value_type(*length)?.ty) {
+                    return Err(IrError::verify("memory copy length is not an integer"));
+                }
+            }
+            FullInstructionKind::MemorySet {
+                destination,
+                value,
+                length,
+            } => {
+                require_no_result(result, instruction, "memory set")?;
+                let destination = pointer_pointee(types, self.value_type(*destination)?.ty)
+                    .ok_or_else(|| IrError::verify("memory set destination is not a pointer"))?;
+                if destination.ty != TypeId::VOID {
+                    return Err(IrError::verify(
+                        "memory set destination is not a canonical void pointer",
+                    ));
+                }
+                if self.value_type(*value)?.ty != TypeId::INT {
+                    return Err(IrError::verify("memory set value does not have type int"));
+                }
+                if !types.is_integer(self.value_type(*length)?.ty) {
+                    return Err(IrError::verify("memory set length is not an integer"));
                 }
             }
             FullInstructionKind::DirectCall {
@@ -1775,10 +1923,29 @@ fn instruction_operands(kind: &FullInstructionKind) -> Vec<ValueId> {
         | FullInstructionKind::AddressOfString { .. }
         | FullInstructionKind::AddressOfStorage { .. }
         | FullInstructionKind::MemoryFence { .. } => Vec::new(),
+        FullInstructionKind::RuntimeSizedAllocate { extents, .. } => extents.clone(),
         FullInstructionKind::ProjectField { base, .. } => vec![*base],
         FullInstructionKind::PointerOffset { base, index, .. } => vec![*base, *index],
+        FullInstructionKind::RuntimePointerOffset {
+            base,
+            index,
+            extents,
+            ..
+        } => std::iter::once(*base)
+            .chain(std::iter::once(*index))
+            .chain(extents.iter().copied())
+            .collect(),
         FullInstructionKind::PointerDifference { left, right, .. }
         | FullInstructionKind::Binary { left, right, .. } => vec![*left, *right],
+        FullInstructionKind::RuntimePointerDifference {
+            left,
+            right,
+            extents,
+            ..
+        } => std::iter::once(*left)
+            .chain(std::iter::once(*right))
+            .chain(extents.iter().copied())
+            .collect(),
         FullInstructionKind::Load { address, .. }
         | FullInstructionKind::BitfieldLoad { address, .. }
         | FullInstructionKind::ZeroInitialize {
@@ -1820,6 +1987,17 @@ fn instruction_operands(kind: &FullInstructionKind) -> Vec<ValueId> {
             source,
             ..
         } => vec![*destination, *source],
+        FullInstructionKind::MemoryCopy {
+            destination,
+            source,
+            length,
+            ..
+        } => vec![*destination, *source, *length],
+        FullInstructionKind::MemorySet {
+            destination,
+            value,
+            length,
+        } => vec![*destination, *value, *length],
         FullInstructionKind::Convert { operand, .. }
         | FullInstructionKind::Unary { operand, .. }
         | FullInstructionKind::IntegerIntrinsic { operand, .. } => vec![*operand],
@@ -1995,7 +2173,9 @@ fn integer_intrinsic_signature(operation: super::IntegerIntrinsicOperation) -> (
     use super::IntegerIntrinsicOperation as O;
     match operation {
         O::ByteSwap64 => (TypeId::UNSIGNED_LONG, TypeId::UNSIGNED_LONG),
-        O::CountLeadingZerosInt | O::PopulationCountInt => (TypeId::UNSIGNED_INT, TypeId::INT),
+        O::CountLeadingZerosInt | O::PopulationCountInt | O::CountTrailingZerosInt => {
+            (TypeId::UNSIGNED_INT, TypeId::INT)
+        }
         O::CountLeadingZerosLong => (TypeId::UNSIGNED_LONG, TypeId::INT),
         O::CountLeadingZerosLongLong
         | O::CountTrailingZerosLongLong

@@ -24,17 +24,51 @@ fn lower_source(source: &str) -> FullModule {
 }
 
 #[test]
-fn rejects_unlowered_variable_bound_effects() {
+fn lowers_variable_bound_effects() {
     for source in [
         "int f(int n, int (*value)[n]) { return 0; }",
         "int f(int n) { static int (*value)[n++]; return 0; }",
         "int f(int n) { int (*value)[(n++, 4)]; return n; }",
         "int f(int n) { int (*(*value)(void))[n++]; return n; }",
     ] {
-        let error = lower_frontend(&typed_source(source)).unwrap_err();
-        assert_eq!(error.code, "CCC3101");
-        assert!(error.message.contains("bounds are not yet lowered"));
+        let module = lower_source(source);
+        verify_frontend(&module).unwrap();
     }
+}
+
+#[test]
+fn lowers_runtime_sized_objects_and_dynamic_pointer_strides_explicitly() {
+    let module = lower_source(
+        "int inspect(int rows, int columns) {
+             _Alignas(64) int matrix[rows][columns];
+             matrix[rows - 1][columns - 1] = 17;
+             return matrix[rows - 1][columns - 1];
+         }",
+    );
+    verify_frontend(&module).unwrap();
+    let function = &module.functions[0];
+    assert_eq!(function.storage.len(), 1);
+    assert_eq!(function.storage[0].location, StorageLocation::RuntimeSized);
+    assert_eq!(function.storage[0].requested_alignment, Some(64));
+    assert!(function.blocks.iter().any(|block| {
+        block.instructions.iter().any(|instruction| {
+            matches!(
+                instruction.kind,
+                FullInstructionKind::RuntimeSizedAllocate { .. }
+            )
+        })
+    }));
+    assert!(function.blocks.iter().any(|block| {
+        block.instructions.iter().any(|instruction| {
+            matches!(
+                instruction.kind,
+                FullInstructionKind::RuntimePointerOffset { .. }
+            )
+        })
+    }));
+    let dump = dump_frontend_ir(&module);
+    assert!(dump.contains("runtime.allocate"), "{dump}");
+    assert!(dump.contains("pointer.offset.runtime"), "{dump}");
 }
 
 #[test]
@@ -935,7 +969,8 @@ fn lowers_integer_intrinsics_and_nonfaulting_prefetch_effects_explicitly() {
          unsigned long swap(unsigned long value) { return __builtin_bswap64(value); }\n\
          int bits(unsigned int word, unsigned long wide, unsigned long long widest) {\n\
              return __builtin_clz(word) + __builtin_clzl(wide) +\n\
-                 __builtin_clzll(widest) + __builtin_ctzll(widest) +\n\
+                 __builtin_clzll(widest) + __builtin_ctz(word) +\n\
+                 __builtin_ctzll(widest) +\n\
                  __builtin_popcount(word) + __builtin_popcountll(widest);\n\
          }\n\
          void hints(void) {\n\
@@ -965,6 +1000,7 @@ fn lowers_integer_intrinsics_and_nonfaulting_prefetch_effects_explicitly() {
             IntegerIntrinsicOperation::CountLeadingZerosInt,
             IntegerIntrinsicOperation::CountLeadingZerosLong,
             IntegerIntrinsicOperation::CountLeadingZerosLongLong,
+            IntegerIntrinsicOperation::CountTrailingZerosInt,
             IntegerIntrinsicOperation::CountTrailingZerosLongLong,
             IntegerIntrinsicOperation::PopulationCountInt,
             IntegerIntrinsicOperation::PopulationCountLongLong,
@@ -1009,6 +1045,7 @@ fn lowers_integer_intrinsics_and_nonfaulting_prefetch_effects_explicitly() {
         "CountLeadingZerosInt",
         "CountLeadingZerosLong",
         "CountLeadingZerosLongLong",
+        "CountTrailingZerosInt",
         "CountTrailingZerosLongLong",
         "PopulationCountInt",
         "PopulationCountLongLong",
@@ -1021,6 +1058,62 @@ fn lowers_integer_intrinsics_and_nonfaulting_prefetch_effects_explicitly() {
     assert!(dump.contains("prefetch v"), "{dump}");
     assert!(dump.contains("write=false locality=3"), "{dump}");
     assert!(dump.contains("write=true locality=0"), "{dump}");
+}
+
+#[test]
+fn lowers_statement_expressions_and_memory_operations_explicitly() {
+    let module = lower_source(
+        "void *memory(char *to, char *from, unsigned long count) {\n\
+             __builtin_memcpy(to, from, count);\n\
+             __builtin_memmove(to + 1, to, count - 1);\n\
+             return __builtin_memset(to, 65, count);\n\
+         }\n\
+         int statement(int *slot) {\n\
+             ({ *slot; }) = 4;\n\
+             return ({ int captured = *slot; captured + 1; });\n\
+         }",
+    );
+    verify_frontend(&module).unwrap();
+
+    let instructions = module
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        instructions
+            .iter()
+            .filter(|instruction| matches!(
+                instruction.kind,
+                FullInstructionKind::MemoryCopy { overlap: false, .. }
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        instructions
+            .iter()
+            .filter(|instruction| matches!(
+                instruction.kind,
+                FullInstructionKind::MemoryCopy { overlap: true, .. }
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        instructions
+            .iter()
+            .filter(|instruction| matches!(instruction.kind, FullInstructionKind::MemorySet { .. }))
+            .count(),
+        1
+    );
+
+    let dump = dump_frontend_ir(&module);
+    assert!(dump.contains("memory.copy"), "{dump}");
+    assert!(dump.contains("overlap=false"), "{dump}");
+    assert!(dump.contains("overlap=true"), "{dump}");
+    assert!(dump.contains("memory.set"), "{dump}");
 }
 
 #[test]
@@ -1437,6 +1530,27 @@ fn lowers_static_array_addresses_decay_and_mixed_shift_constants() {
     assert_eq!(
         high_bit.nodes[high_bit.root.0 as usize].kind,
         InitializerNodeKind::Scalar(ScalarConstant::Unsigned(1_u128 << 40))
+    );
+}
+
+#[test]
+fn lowers_static_subobject_addresses_with_complete_addends() {
+    let module = lower_source(
+        "struct Pair { int first; int second; };\n\
+         struct Pair values[2];\n\
+         int *pointer = &values[1].second;",
+    );
+    verify_frontend(&module).unwrap();
+
+    let pointer = module.globals[1].initializer.as_ref().unwrap();
+    assert_eq!(
+        pointer.nodes[pointer.root.0 as usize].kind,
+        InitializerNodeKind::Relocation {
+            target: RelocationTarget::Object(DataId(0)),
+            addend: 12,
+            one_past: false,
+            kind: RelocationKind::ObjectAddress,
+        }
     );
 }
 

@@ -1,0 +1,89 @@
+name: Csmith differential tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      cases:
+        description: Number of eligible differential cases
+        required: true
+        default: "100"
+        type: string
+      start_seed:
+        description: First Csmith seed
+        required: true
+        default: "1"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  differential:
+    runs-on: [self-hosted, Linux, X64, homelab]
+    timeout-minutes: 360
+    steps:
+      - name: Initialize artifacts
+        env:
+          CSMITH_CASES_INPUT: ${{ inputs.cases }}
+          CSMITH_START_SEED_INPUT: ${{ inputs.start_seed }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/ccc-csmith-artifacts/results"
+          {
+            printf 'cases=%s\n' "$CSMITH_CASES_INPUT"
+            printf 'start_seed=%s\n' "$CSMITH_START_SEED_INPUT"
+          } >"$RUNNER_TEMP/ccc-csmith-artifacts/dispatch-inputs.txt"
+      - uses: actions/checkout@v7
+      - name: Verify runner prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=()
+          for tool in awk bash basename cat chmod cmake cmp cp curl dirname \
+            env find g++ gcc clang grep m4 make mkdir mktemp mv objcopy openssl rm \
+            sed sort tar tee timeout tr uname wc; do
+            if ! command -v "$tool" >/dev/null; then
+              missing+=("$tool")
+            fi
+          done
+          if (( ${#missing[@]} )); then
+            printf -v missing_list '%s, ' "${missing[@]}"
+            missing_list=${missing_list%, }
+            printf '::error::Missing Csmith runner prerequisites: %s\n' \
+              "$missing_list" | tee \
+              "$RUNNER_TEMP/ccc-csmith-artifacts/runner-prerequisites.txt"
+            exit 1
+          fi
+          printf 'All Csmith runner prerequisites are available.\n' \
+            >"$RUNNER_TEMP/ccc-csmith-artifacts/runner-prerequisites.txt"
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - name: Test the Csmith harness
+        run: |
+          set -o pipefail
+          TMPDIR="$RUNNER_TEMP/ccc-csmith-artifacts" \
+            test-corpus/csmith/test-run.sh 2>&1 | tee \
+            "$RUNNER_TEMP/ccc-csmith-artifacts/harness-test.log"
+      - name: Build CCC
+        run: |
+          set -o pipefail
+          cargo build --locked -p ccc-driver 2>&1 | tee \
+            "$RUNNER_TEMP/ccc-csmith-artifacts/ccc-build.log"
+      - name: Run the differential suite
+        timeout-minutes: 330
+        env:
+          CSMITH_CASES_INPUT: ${{ inputs.cases }}
+          CSMITH_START_SEED_INPUT: ${{ inputs.start_seed }}
+        run: |
+          set -o pipefail
+          test-corpus/csmith/run.sh \
+            --cases "$CSMITH_CASES_INPUT" \
+            --start-seed "$CSMITH_START_SEED_INPUT" \
+            --work-dir "$RUNNER_TEMP/ccc-csmith-artifacts/results" \
+            2>&1 | tee "$RUNNER_TEMP/ccc-csmith-artifacts/csmith-run.log"
+      - name: Retain Csmith results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: csmith-results-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ccc-csmith-artifacts
+          if-no-files-found: error
+          retention-days: 14

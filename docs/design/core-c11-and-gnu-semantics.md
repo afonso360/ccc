@@ -91,6 +91,11 @@ expand. No `bswap32`, `ctz`, `ctzl`, `popcountl`, unreachable, overflow, or
 CPU-support builtin is selected. These results do not admit neighboring
 family spellings.
 
+The same inventory found that xxHash selects its empty GNU inline-assembly
+compiler guard from the compatibility tuple; an exact-hash adjustment selects
+a standard-C no-op under `__CCC__`, and the adapter requires exactly one marked
+no-op expansion and zero expanded inline-assembly forms.
+
 The builtin registry admits `__sync_synchronize` and the exact implemented
 legacy operation set (`__sync_add_and_fetch`, `__sync_fetch_and_add`,
 `__sync_sub_and_fetch`, both compare-and-swap result forms, and
@@ -169,12 +174,17 @@ the containing object actually has sufficient trailing storage.
 
 ### Variably modified types
 
-Expression bounds, prototype `[*]`, parameter adjustment, runtime `sizeof`,
-and multidimensional strides follow the provider-independent type contract in
-[the conformance policy](conformance.md#variable-length-arrays). Physical
-runtime-sized object storage remains separately gated by
-[ADR-0011](../adr/0011-arena-backed-runtime-sized-automatic-storage.md). Type
-support neither implies native-stack mutation nor enables GNU `alloca`.
+Expression bounds, prototype `[*]`, parameter adjustment, automatic object
+allocation, and multidimensional strides follow the provider-independent type
+contract in [the conformance policy](conformance.md#variable-length-arrays).
+Automatic VLA objects use the hosted arena in
+[ADR-0011](../adr/0011-arena-backed-runtime-sized-automatic-storage.md).
+Runtime `sizeof` and several variably modified typedef/type-name contexts remain
+explicit boundaries, so the complete VLA capability is not yet advertised.
+Arena storage neither implies native-stack mutation nor enables GNU `alloca`.
+Named and switch jumps cannot enter a variably modified declaration path;
+computed goto is conservatively rejected when such an automatic object exists
+in the same function.
 
 ## GNU C semantics
 
@@ -298,14 +308,14 @@ does not silently discard a payload whose GNU encoding it has not implemented.
 
 The selected integer builtins have exact GNU signatures. Byte-swap takes and
 returns target `uint64_t`, represented as `unsigned long` by the x86-64 GNU
-profile. The `clz` and `popcount` forms take `unsigned
-int`, `clzl` takes `unsigned long`, and the `clzll`, `ctzll`, and `popcountll`
-forms take `unsigned long long`; every count form returns `int`. CCC applies
+profile. The `clz`, `ctz`, and `popcount` forms take `unsigned int`, `clzl`
+takes `unsigned long`, and the `clzll`, `ctzll`, and `popcountll` forms take
+`unsigned long long`; every count form returns `int`. CCC applies
 the ordinary argument conversion and lowers the operation to Cranelift's
 native `bswap`, `clz`, `ctz`, or `popcnt` instruction. A zero input to `clz` or
 `ctz` remains undefined, as in GNU C, rather than acquiring a CCC-specific
 value.
-All seven forms fold valid integer constant-expression operands. A zero
+All eight forms fold valid integer constant-expression operands. A zero
 operand to `clz` or `ctz` remains outside that fold.
 
 The prefetch form accepts one to three arguments. Its address is converted to

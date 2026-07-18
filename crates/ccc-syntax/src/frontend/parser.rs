@@ -1545,12 +1545,22 @@ impl Parser<'_> {
             "__builtin_clzl" => Some(IntegerBuiltinOperation::CountLeadingZerosLong),
             "__builtin_clzll" => Some(IntegerBuiltinOperation::CountLeadingZerosLongLong),
             "__builtin_ctzll" => Some(IntegerBuiltinOperation::CountTrailingZerosLongLong),
+            "__builtin_ctz" => Some(IntegerBuiltinOperation::CountTrailingZerosInt),
             "__builtin_popcount" => Some(IntegerBuiltinOperation::PopulationCountInt),
             "__builtin_popcountll" => Some(IntegerBuiltinOperation::PopulationCountLongLong),
             _ => None,
         };
         if let Some(operation) = integer_intrinsic {
             return self.builtin_integer_intrinsic(operation);
+        }
+        let memory_operation = match token.spelling.as_str() {
+            "__builtin_memcpy" => Some(MemoryBuiltinOperation::Copy),
+            "__builtin_memmove" => Some(MemoryBuiltinOperation::Move),
+            "__builtin_memset" => Some(MemoryBuiltinOperation::Set),
+            _ => None,
+        };
+        if let Some(operation) = memory_operation {
+            return self.builtin_memory_operation(operation);
         }
         if token.spelling == "__builtin_prefetch" {
             return self.builtin_prefetch();
@@ -1612,6 +1622,22 @@ impl Parser<'_> {
             TokenKind::Keyword(Keyword::Generic) => self.generic_selection(),
             TokenKind::Punctuator(Punctuator::LeftParen) => {
                 self.position += 1;
+                if self.language_mode == LanguageMode::Gnu11
+                    && self.check_punctuator(Punctuator::LeftBrace)
+                {
+                    let compound = self.compound_statement(true)?;
+                    let right = self.expect_punctuator(
+                        Punctuator::RightParen,
+                        "expected `)` after statement expression",
+                    )?;
+                    let StatementKind::Compound(items) = compound.kind else {
+                        unreachable!("compound-statement parser returned another statement kind")
+                    };
+                    return Ok(Expression {
+                        kind: ExpressionKind::StatementExpression(items),
+                        span: span_through(token.span, right.span),
+                    });
+                }
                 let expression = self.expression()?;
                 let right = self
                     .expect_punctuator(Punctuator::RightParen, "expected `)` after expression")?;
@@ -1976,6 +2002,45 @@ impl Parser<'_> {
         )?;
         Ok(Expression {
             kind: ExpressionKind::BuiltinPrefetch { arguments },
+            span: span_through(builtin.span, right.span),
+        })
+    }
+
+    fn builtin_memory_operation(
+        &mut self,
+        operation: MemoryBuiltinOperation,
+    ) -> Result<Expression, ParseError> {
+        let builtin = self
+            .current_token()
+            .expect("caller checked builtin")
+            .clone();
+        self.position += 1;
+        self.expect_punctuator(
+            Punctuator::LeftParen,
+            &format!("expected `(` after `{}`", operation.spelling()),
+        )?;
+        let mut arguments = Vec::new();
+        while !self.check_punctuator(Punctuator::RightParen) {
+            arguments.push(self.assignment_expression()?);
+            if self.consume_punctuator(Punctuator::Comma).is_none() {
+                break;
+            }
+        }
+        if arguments.len() != 3 {
+            return Err(self.error_current(&format!(
+                "`{}` requires exactly three arguments",
+                operation.spelling()
+            )));
+        }
+        let right = self.expect_punctuator(
+            Punctuator::RightParen,
+            &format!("expected `)` after `{}` arguments", operation.spelling()),
+        )?;
+        Ok(Expression {
+            kind: ExpressionKind::BuiltinMemoryOperation {
+                operation,
+                arguments,
+            },
             span: span_through(builtin.span, right.span),
         })
     }
@@ -2452,6 +2517,7 @@ fn pragma_span(pragma: &PragmaEvent) -> Span {
         PragmaEvent::Once { span }
         | PragmaEvent::SystemHeader { span }
         | PragmaEvent::Diagnostic { span, .. }
+        | PragmaEvent::GccOptimize { span, .. }
         | PragmaEvent::Pack { span, .. }
         | PragmaEvent::Unknown { span, .. } => *span,
     }

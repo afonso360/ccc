@@ -58,6 +58,195 @@ fn debug_and_optimization_compatibility_options_preserve_baseline_object() {
     fs::remove_dir_all(directory).unwrap();
 }
 
+#[test]
+fn default_objects_use_position_independent_text_relocations() {
+    let directory = test_directory("position-independent-relocations");
+    let source = directory.join("position-independent-relocations.c");
+    let output = directory.join("position-independent-relocations.o");
+    fs::write(
+        &source,
+        r#"
+extern int imported_data;
+extern int imported_function(void);
+int local_data = 7;
+
+int *local_address(void) {
+    return &local_data;
+}
+
+int read_imported(void) {
+    return imported_data;
+}
+
+int call_imported(void) {
+    return imported_function();
+}
+"#,
+    )
+    .unwrap();
+    compile_ccc(&source, &output);
+
+    let bytes = fs::read(&output).unwrap();
+    let file = object::File::parse(bytes.as_slice()).unwrap();
+    let text = file.section_by_name(".text").unwrap();
+    let relocations = text
+        .relocations()
+        .filter_map(|(_, relocation)| {
+            let RelocationTarget::Symbol(index) = relocation.target() else {
+                return None;
+            };
+            let name = file.symbol_by_index(index).ok()?.name().ok()?;
+            Some((name.to_owned(), relocation.flags()))
+        })
+        .collect::<Vec<_>>();
+
+    for name in ["local_data", "imported_data"] {
+        assert!(
+            relocations.iter().any(|(target, flags)| {
+                target == name
+                    && *flags
+                        == RelocationFlags::Elf {
+                            r_type: object::elf::R_X86_64_GOTPCREL,
+                        }
+            }),
+            "missing position-independent data relocation to `{name}`: {relocations:?}"
+        );
+    }
+    assert!(
+        relocations.iter().any(|(target, flags)| {
+            target == "imported_function"
+                && *flags
+                    == RelocationFlags::Elf {
+                        r_type: object::elf::R_X86_64_PLT32,
+                    }
+        }),
+        "missing PLT-relative call relocation: {relocations:?}"
+    );
+    assert!(
+        relocations.iter().all(|(_, flags)| !matches!(
+            flags,
+            RelocationFlags::Elf {
+                r_type: object::elf::R_X86_64_32 | object::elf::R_X86_64_32S
+            }
+        )),
+        "position-independent text contains an absolute relocation: {relocations:?}"
+    );
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn thread_local_objects_use_the_selected_elf_relocation_models() {
+    let directory = test_directory("thread-local-relocations");
+    let source = directory.join("thread-local-relocations.c");
+    let output = directory.join("thread-local-relocations.o");
+    fs::write(
+        &source,
+        r#"
+_Thread_local int global_dynamic
+    __attribute__((tls_model("global-dynamic"))) = 1;
+_Thread_local int local_dynamic
+    __attribute__((tls_model("local-dynamic"))) = 2;
+_Thread_local int initial_exec
+    __attribute__((tls_model("initial-exec"))) = 3;
+_Thread_local int local_exec
+    __attribute__((tls_model("local-exec"))) = 4;
+_Thread_local int zero_tls;
+
+int *block_tls_address(void) {
+    static _Thread_local int block_tls = 8;
+    return &block_tls;
+}
+
+int read_tls_models(void) {
+    return global_dynamic + local_dynamic + initial_exec + local_exec + zero_tls;
+}
+"#,
+    )
+    .unwrap();
+    compile_ccc(&source, &output);
+
+    let bytes = fs::read(&output).unwrap();
+    let file = object::File::parse(bytes.as_slice()).unwrap();
+    for name in [
+        "global_dynamic",
+        "local_dynamic",
+        "initial_exec",
+        "local_exec",
+    ] {
+        let symbol = file
+            .symbol_by_name(name)
+            .unwrap_or_else(|| panic!("missing TLS symbol `{name}`"));
+        assert_eq!(symbol.kind(), SymbolKind::Tls, "{name}");
+        let section = file
+            .section_by_index(symbol.section_index().expect("defined TLS symbol"))
+            .unwrap();
+        assert_eq!(section.name().unwrap(), ".tdata", "{name}");
+    }
+    let zero = file
+        .symbol_by_name("zero_tls")
+        .expect("missing zero TLS symbol");
+    assert_eq!(zero.kind(), SymbolKind::Tls);
+    assert_eq!(
+        file.section_by_index(zero.section_index().expect("defined zero TLS symbol"))
+            .unwrap()
+            .name()
+            .unwrap(),
+        ".tbss"
+    );
+    let block_name = "__ccc_block_static.block_tls_address.0.0.block_tls";
+    let block = file
+        .symbol_by_name(block_name)
+        .expect("missing block-local TLS symbol");
+    assert_eq!(block.kind(), SymbolKind::Tls);
+    assert!(block.is_local(), "block-local TLS must be localized");
+    assert_eq!(
+        file.section_by_index(block.section_index().expect("defined block TLS symbol"))
+            .unwrap()
+            .name()
+            .unwrap(),
+        ".tdata"
+    );
+
+    let relocation_types = file
+        .sections()
+        .flat_map(|section| section.relocations())
+        .filter_map(|(_, relocation)| match relocation.flags() {
+            RelocationFlags::Elf { r_type } => Some(r_type),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for expected in [
+        object::elf::R_X86_64_TLSGD,
+        object::elf::R_X86_64_TLSLD,
+        object::elf::R_X86_64_DTPOFF32,
+        object::elf::R_X86_64_GOTTPOFF,
+        object::elf::R_X86_64_TPOFF32,
+    ] {
+        assert!(
+            relocation_types.contains(&expected),
+            "missing TLS relocation {expected}: {relocation_types:?}"
+        );
+    }
+    let accessors = file
+        .symbols()
+        .filter(|symbol| {
+            symbol
+                .name()
+                .is_ok_and(|name| name.starts_with("__ccc_tls_accessor_"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(accessors.len(), 6);
+    assert!(
+        accessors
+            .iter()
+            .all(|symbol| symbol.is_local() && symbol.is_definition()),
+        "packaged TLS accessors must be localized definitions"
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
 fn render_output(output: &Output) -> String {
     format!(
         "status: {}\nstdout:\n{}\nstderr:\n{}",
@@ -345,7 +534,6 @@ impl ReferenceCompiler {
     {
         let result = self
             .command()
-            .arg("-no-pie")
             .args(objects)
             .arg("-o")
             .arg(output)
@@ -444,6 +632,64 @@ fn objects_cross_link_in_both_directions_and_keep_static_names_local() {
         &local_program,
     );
     run_successfully(&local_program);
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn thread_local_objects_cross_link_with_the_platform_compiler() {
+    let directory = test_directory("thread-local-cross-link");
+    let reference = ReferenceCompiler::required();
+    eprintln!("TLS reference compiler: {}", reference.identity());
+
+    let ccc_definition = write_source(
+        &directory,
+        "ccc-tls-definition.c",
+        "_Thread_local int ccc_tls_value = 17;\n\
+         int ccc_tls_read(void) { return ccc_tls_value; }\n",
+    );
+    let reference_consumer = write_source(
+        &directory,
+        "reference-tls-consumer.c",
+        "extern _Thread_local int ccc_tls_value;\n\
+         extern int ccc_tls_read(void);\n\
+         int main(void) { ccc_tls_value = 42; return ccc_tls_read() == 42 ? 0 : 1; }\n",
+    );
+    let ccc_definition_object = directory.join("ccc-tls-definition.o");
+    let reference_consumer_object = directory.join("reference-tls-consumer.o");
+    compile_ccc(&ccc_definition, &ccc_definition_object);
+    reference.compile(&reference_consumer, &reference_consumer_object);
+    let ccc_definition_program = directory.join("ccc-tls-definition");
+    reference.link(
+        [&reference_consumer_object, &ccc_definition_object],
+        &ccc_definition_program,
+    );
+    run_successfully(&ccc_definition_program);
+
+    let ccc_reader = write_source(
+        &directory,
+        "ccc-tls-reader.c",
+        "_Thread_local int reference_tls_value __attribute__((weak));\n\
+         int reference_tls_read(void) { return reference_tls_value; }\n",
+    );
+    let reference_definition = write_source(
+        &directory,
+        "reference-tls-definition.c",
+        "_Thread_local int reference_tls_value = 39;\n\
+         extern int reference_tls_read(void);\n\
+         int main(void) { return reference_tls_read() == 39 ? 0 : 1; }\n",
+    );
+    let ccc_reader_object = directory.join("ccc-tls-reader.o");
+    let reference_definition_object = directory.join("reference-tls-definition.o");
+    compile_ccc(&ccc_reader, &ccc_reader_object);
+    reference.compile(&reference_definition, &reference_definition_object);
+    let reference_definition_program = directory.join("reference-tls-definition");
+    reference.link(
+        [&reference_definition_object, &ccc_reader_object],
+        &reference_definition_program,
+    );
+    run_successfully(&reference_definition_program);
 
     fs::remove_dir_all(directory).unwrap();
 }

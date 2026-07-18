@@ -14,7 +14,8 @@ use ccc_sema::generic::{
 };
 use ccc_target::{AbiIdentity, BinaryFormat, EffectiveCompilationConfig, RelocationModel};
 use ccc_types::{
-    BuiltinType, LayoutShape, QualifiedType, TypeId, TypeKind, TypeQualifiers, TypeStore,
+    ArrayLength, BuiltinType, LayoutShape, QualifiedType, TypeId, TypeKind, TypeQualifiers,
+    TypeStore,
 };
 use cranelift_codegen::Context;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
@@ -99,6 +100,9 @@ fn emit_inner(
     let mut flag_builder = settings::builder();
     match config.relocation_model {
         RelocationModel::Static => flag_builder.set("is_pic", "false").map_err(module_error)?,
+        RelocationModel::Pic | RelocationModel::Pie => {
+            flag_builder.set("is_pic", "true").map_err(module_error)?
+        }
     }
     flag_builder
         .set("enable_llvm_abi_extensions", "false")
@@ -145,6 +149,7 @@ fn emit_inner(
             &mut object_module,
             &mut context.func,
         );
+        let frontend_config = object_module.isa().frontend_config();
         let definition_plan = abi_plan
             .plan()
             .definitions
@@ -161,6 +166,7 @@ fn emit_inner(
             abi_plan,
             definition_plan,
             &references,
+            frontend_config,
             &mut context.func,
         )
         .map_err(|error| error.with_span_if_none(function.span))?;
@@ -303,7 +309,7 @@ fn parse_darwin_version(version: &str) -> Result<(u16, u8, u8), CodegenError> {
 }
 
 fn generated_bridge_artifacts(
-    _module: &gir::FullModule,
+    module: &gir::FullModule,
     config: &EffectiveCompilationConfig,
     abi_plan: ccc_abi::VerifiedModuleAbiPlan<'_>,
     hidden_body_symbols: &HashMap<u32, String>,
@@ -317,8 +323,9 @@ fn generated_bridge_artifacts(
 > {
     use ccc_link::artifact::{BridgeManifestV1, GeneratedSymbol, GeneratedSymbolOwner};
     use ccc_link::bridge::{
-        AssemblyFunctionLinkage, GeneratedSymbolKind, VariadicEntryPlan, render_target_call_helper,
-        render_target_variadic_entry,
+        AssemblyFunctionLinkage, ElfTlsAccessModel, ElfTlsSymbolVisibility, GeneratedSymbolKind,
+        TlsAccessorPlan, VariadicEntryPlan, render_target_call_helper,
+        render_target_variadic_entry, render_tls_accessor,
     };
 
     let mut assemblies = Vec::new();
@@ -423,6 +430,63 @@ fn generated_bridge_artifacts(
         ));
         assemblies.push(assembly);
     }
+    for (object, artifact) in &abi_plan.plan().artifacts.tls_accessors {
+        let global = module
+            .globals
+            .get(object.0 as usize)
+            .filter(|global| global.id == *object)
+            .ok_or_else(|| error(format!("TLS accessor references unknown data {}", object.0)))?;
+        if global.emission.symbol_name != artifact.object_symbol {
+            return Err(error(
+                "TLS accessor source symbol differs from the module ABI plan",
+            ));
+        }
+        let model = match artifact.model {
+            ccc_sema::generic::TlsModel::GeneralDynamic => ElfTlsAccessModel::GeneralDynamic,
+            ccc_sema::generic::TlsModel::LocalDynamic => ElfTlsAccessModel::LocalDynamic,
+            ccc_sema::generic::TlsModel::InitialExec => ElfTlsAccessModel::InitialExec,
+            ccc_sema::generic::TlsModel::LocalExec => ElfTlsAccessModel::LocalExec,
+        };
+        let object_visibility = if matches!(
+            artifact.source_linkage,
+            ccc_abi::SourceLinkage::None | ccc_abi::SourceLinkage::Internal
+        ) {
+            ElfTlsSymbolVisibility::Hidden
+        } else {
+            match artifact.source_visibility {
+                ccc_abi::SourceVisibility::Default => ElfTlsSymbolVisibility::Default,
+                ccc_abi::SourceVisibility::Hidden => ElfTlsSymbolVisibility::Hidden,
+                ccc_abi::SourceVisibility::Protected => ElfTlsSymbolVisibility::Protected,
+                ccc_abi::SourceVisibility::Internal => ElfTlsSymbolVisibility::Internal,
+            }
+        };
+        let assembly = render_tls_accessor(&TlsAccessorPlan {
+            helper_symbol: artifact.helper_symbol.clone(),
+            object_symbol: artifact.object_symbol.clone(),
+            model,
+            object_visibility,
+            logical_line: 1,
+        })
+        .map_err(module_error)?;
+        symbols.push(GeneratedSymbol::internal(
+            &artifact.helper_symbol,
+            GeneratedSymbolKind::TlsAccessor,
+            GeneratedSymbolOwner::AssemblyUnit(assembly.stem().to_owned()),
+        ));
+        if artifact.source_defined
+            && matches!(
+                artifact.source_linkage,
+                ccc_abi::SourceLinkage::None | ccc_abi::SourceLinkage::Internal
+            )
+        {
+            symbols.push(GeneratedSymbol::source_internal(
+                &artifact.object_symbol,
+                GeneratedSymbolKind::TlsObject,
+                GeneratedSymbolOwner::PrimaryObject,
+            ));
+        }
+        assemblies.push(assembly);
+    }
     let manifest = BridgeManifestV1::new(abi_plan.plan().translation_unit_digest.0, symbols);
     let actual_localization = manifest.localization_symbols();
     let expected_localization = &abi_plan
@@ -455,6 +519,8 @@ struct Declarations {
     hidden_body_symbols: HashMap<u32, String>,
     call_helper: Option<FuncId>,
     call_helper_symbol: Option<String>,
+    runtime_realloc: Option<FuncId>,
+    runtime_free: Option<FuncId>,
     globals: HashMap<u32, DataDeclaration>,
     strings: HashMap<u32, ClifDataId>,
     commons: Vec<CommonDefinition>,
@@ -464,6 +530,7 @@ struct Declarations {
 struct DataDeclaration {
     id: ClifDataId,
     tls: bool,
+    tls_accessor: Option<FuncId>,
 }
 
 struct CommonDefinition {
@@ -586,18 +653,72 @@ fn declare_module(
             (None, None)
         };
 
+    let (runtime_realloc, runtime_free) = if module_uses_runtime_sized_storage(module) {
+        let mut realloc_signature = object_module.make_signature();
+        realloc_signature
+            .params
+            .push(ir::AbiParam::new(ir::types::I64));
+        realloc_signature
+            .params
+            .push(ir::AbiParam::new(ir::types::I64));
+        realloc_signature
+            .returns
+            .push(ir::AbiParam::new(ir::types::I64));
+        let realloc = object_module
+            .declare_function("realloc", Linkage::Import, &realloc_signature)
+            .map_err(module_error)?;
+
+        let mut free_signature = object_module.make_signature();
+        free_signature
+            .params
+            .push(ir::AbiParam::new(ir::types::I64));
+        let free = object_module
+            .declare_function("free", Linkage::Import, &free_signature)
+            .map_err(module_error)?;
+        (Some(realloc), Some(free))
+    } else {
+        (None, None)
+    };
+
+    let tls_accessor_signature = tls_accessor_signature(config)?;
+    let mut tls_accessors = HashMap::with_capacity(abi_plan.plan().artifacts.tls_accessors.len());
+    for (object, accessor) in &abi_plan.plan().artifacts.tls_accessors {
+        let id = object_module
+            .declare_function(
+                &accessor.helper_symbol,
+                Linkage::Import,
+                &tls_accessor_signature,
+            )
+            .map_err(module_error)?;
+        if tls_accessors.insert(object.0, id).is_some() {
+            return Err(error(format!(
+                "duplicate TLS accessor for data {} in module ABI plan",
+                object.0
+            )));
+        }
+    }
+
     let mut globals = HashMap::with_capacity(module.globals.len());
     let mut commons = Vec::new();
     for global in &module.globals {
         let tls = global.duration == StorageDuration::Thread || global.emission.tls.is_some();
-        let is_external_common = global.emission.definition
-            == ObjectDefinitionPolicy::TentativeCommon
+        let is_external_common = !tls
+            && global.emission.definition == ObjectDefinitionPolicy::TentativeCommon
             && global.linkage == CLinkage::External;
         let linkage = if is_external_common {
             // Cranelift has no common-symbol linkage. Keep the symbol
             // undefined through module finalization, then rewrite its ELF
             // symbol entry to SHN_COMMON with the requested size/alignment.
             Linkage::Import
+        } else if tls
+            && global.linkage != CLinkage::External
+            && global.emission.definition != ObjectDefinitionPolicy::Declaration
+        {
+            // The generated accessor lives in a separate temporary object.
+            // Give an internal TLS definition hidden link visibility until
+            // the verified partial link resolves it, then the manifest
+            // restores local binding before publication.
+            Linkage::Hidden
         } else {
             global_linkage(global)
         };
@@ -606,8 +727,23 @@ fn declare_module(
             .declare_data(&global.emission.symbol_name, linkage, writable, tls)
             .map_err(module_error)
             .map_err(|error| error.with_span_if_none(global.span))?;
+        let tls_accessor = tls_accessors.get(&global.id.0).copied();
+        if tls != tls_accessor.is_some() {
+            return Err(error(format!(
+                "data {} and its TLS accessor plan disagree",
+                global.id.0
+            ))
+            .with_span_if_none(global.span));
+        }
         if globals
-            .insert(global.id.0, DataDeclaration { id, tls })
+            .insert(
+                global.id.0,
+                DataDeclaration {
+                    id,
+                    tls,
+                    tls_accessor,
+                },
+            )
             .is_some()
         {
             return Err(
@@ -647,9 +783,24 @@ fn declare_module(
         hidden_body_symbols,
         call_helper,
         call_helper_symbol,
+        runtime_realloc,
+        runtime_free,
         globals,
         strings,
         commons,
+    })
+}
+
+fn module_uses_runtime_sized_storage(module: &gir::FullModule) -> bool {
+    module.functions.iter().any(|function| {
+        function.blocks.iter().any(|block| {
+            block.instructions.iter().any(|instruction| {
+                matches!(
+                    instruction.kind,
+                    gir::FullInstructionKind::RuntimeSizedAllocate { .. }
+                )
+            })
+        })
     })
 }
 
@@ -732,6 +883,14 @@ fn variadic_body_signature(
         purpose: ccc_abi::NativePurpose::Normal,
     });
     super::signature(&plan).map_err(error)
+}
+
+fn tls_accessor_signature(
+    config: &EffectiveCompilationConfig,
+) -> Result<ir::Signature, CodegenError> {
+    let mut signature = opaque_signature(config)?;
+    signature.returns.push(ir::AbiParam::new(ir::types::I64));
+    Ok(signature)
 }
 
 fn function_linkage(function: &gir::FullFunction) -> Linkage {

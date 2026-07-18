@@ -44,6 +44,10 @@ pub enum PragmaEvent {
         option: Option<String>,
         span: Span,
     },
+    GccOptimize {
+        payload: Vec<PpToken>,
+        span: Span,
+    },
     Pack {
         payload: Vec<PpToken>,
         span: Span,
@@ -1664,6 +1668,11 @@ impl Engine<'_> {
                 option,
                 span,
             }
+        } else if spellings_start_with(operands, &["GCC", "optimize"]) {
+            PragmaEvent::GccOptimize {
+                payload: operands[2..].to_vec(),
+                span,
+            }
         } else if operands
             .first()
             .is_some_and(|token| token.spelling == "pack")
@@ -2912,6 +2921,23 @@ mod tests {
             .unwrap();
         assert!(pragma_lines[pragma + 1].starts_with("# 2 \"/project/main.c\""));
         assert_eq!(pragma_lines[pragma + 2], "int pragma_value;");
+    }
+
+    #[test]
+    fn recognizes_gcc_optimize_pragma_operators_without_an_unknown_warning() {
+        let (output, diagnostics) = run(
+            "int _Pragma(\"GCC optimize(\\\"no-tree-vectorize\\\")\") value;\n",
+            &MemoryFiles::default(),
+            &PreprocessOptions::default(),
+        );
+        assert!(!output.had_errors, "{:#?}", diagnostics.diagnostics);
+        assert!(diagnostics.diagnostics.is_empty());
+        assert!(output.items.iter().any(|item| matches!(
+            item,
+            PpItem::Pragma(PragmaEvent::GccOptimize { payload, .. })
+                if payload.iter().map(|token| token.spelling.as_str()).collect::<Vec<_>>()
+                    == ["(", "\"no-tree-vectorize\"", ")"]
+        )));
     }
 
     #[test]

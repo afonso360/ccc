@@ -67,10 +67,15 @@ impl AbiIdentity {
     }
 }
 
-/// The relocation contract used by generated objects.
+/// The relocation and executable-output contract used by code generation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RelocationModel {
+    /// Generate code that may only be linked at a fixed address.
     Static,
+    /// Generate position-independent code suitable for PIE and shared objects.
+    Pic,
+    /// Generate position-independent code and advertise a PIE compilation.
+    Pie,
 }
 
 /// Compiler-provided C types whose representation is selected by the target
@@ -277,6 +282,12 @@ impl TargetSpec {
             "__SIZEOF_LONG_DOUBLE__",
             (self.data_layout.long_double_width / 8).to_string(),
         );
+        // A 32-bit float in the enabled target data-layout contract uses the
+        // IEEE 754 binary32 representation.  Hosted GCC headers spell their
+        // <float.h> limits in terms of this predefined-macro family.
+        if self.data_layout.float_width == 32 {
+            insert_binary32_compatibility_facts(&mut facts);
+        }
         // A 64-bit double in the enabled target data-layout contract uses the
         // IEEE 754 binary64 representation. Keep the hosted `float.h` family
         // together so its precision, ranges, and exact boundary values agree.
@@ -387,6 +398,28 @@ impl TargetSpec {
             facts.insert("_LP64", "1");
         }
         facts
+    }
+}
+
+fn insert_binary32_compatibility_facts(facts: &mut PredefinedMacroFacts) {
+    for (suffix, replacement) in [
+        ("MANT_DIG", "24"),
+        ("DIG", "6"),
+        ("MIN_EXP", "(-125)"),
+        ("MIN_10_EXP", "(-37)"),
+        ("MAX_EXP", "128"),
+        ("MAX_10_EXP", "38"),
+        ("DECIMAL_DIG", "9"),
+        ("HAS_DENORM", "1"),
+        ("HAS_INFINITY", "1"),
+        ("HAS_QUIET_NAN", "1"),
+        ("MAX", "0x1.fffffep+127F"),
+        ("NORM_MAX", "0x1.fffffep+127F"),
+        ("EPSILON", "0x1p-23F"),
+        ("MIN", "0x1p-126F"),
+        ("DENORM_MIN", "0x1p-149F"),
+    ] {
+        facts.insert(format!("__FLT_{suffix}__"), replacement);
     }
 }
 
@@ -825,7 +858,7 @@ pub struct EffectiveCompilationConfig {
     pub resource_dir: Option<PathBuf>,
     pub toolchain: ToolchainSpec,
     pub relocation_model: RelocationModel,
-    pub target_cpu: Option<String>,
+    pub target_arch: Option<String>,
     pub target_abi: Option<String>,
     pub sdk_root: Option<PathBuf>,
     pub deployment_target: Option<String>,
@@ -868,8 +901,8 @@ impl EffectiveCompilationConfig {
             target_macros,
             resource_dir: None,
             toolchain: ToolchainSpec::default(),
-            relocation_model: RelocationModel::Static,
-            target_cpu: None,
+            relocation_model: RelocationModel::Pie,
+            target_arch: None,
             target_abi: None,
             sdk_root: None,
             deployment_target: None,
@@ -891,14 +924,52 @@ impl EffectiveCompilationConfig {
         self
     }
 
-    pub fn with_target_cpu(mut self, cpu: impl Into<String>) -> Self {
-        self.target_cpu = Some(cpu.into());
+    pub fn with_target_arch(mut self, architecture: impl Into<String>) -> Self {
+        self.target_arch = Some(architecture.into());
         self
     }
 
     pub fn with_target_abi(mut self, abi: impl Into<String>) -> Self {
         self.target_abi = Some(abi.into());
         self
+    }
+
+    pub const fn normalized_target_arch(&self) -> &'static str {
+        match self.target.abi {
+            AbiIdentity::SysvAmd64Lp64 => "x86-64",
+            AbiIdentity::Aapcs64Lp64 | AbiIdentity::DarwinArm64 => "armv8-a",
+            AbiIdentity::RiscvLp64d => "rv64gc",
+        }
+    }
+
+    pub const fn normalized_target_abi(&self) -> &'static str {
+        match self.target.abi {
+            AbiIdentity::SysvAmd64Lp64 | AbiIdentity::Aapcs64Lp64 => "lp64",
+            AbiIdentity::RiscvLp64d => "lp64d",
+            AbiIdentity::DarwinArm64 => "darwin",
+        }
+    }
+
+    pub fn validate_target_profile_options(&self) -> Result<(), String> {
+        if let Some(architecture) = self.target_arch.as_deref()
+            && architecture != self.normalized_target_arch()
+        {
+            return Err(format!(
+                "target architecture option `{architecture}` contradicts the enabled `{}` profile `{}`",
+                self.target.abi.name(),
+                self.normalized_target_arch()
+            ));
+        }
+        if let Some(abi) = self.target_abi.as_deref()
+            && abi != self.normalized_target_abi()
+        {
+            return Err(format!(
+                "target ABI option `{abi}` contradicts the enabled `{}` profile `{}`",
+                self.target.abi.name(),
+                self.normalized_target_abi()
+            ));
+        }
+        Ok(())
     }
 
     pub fn with_sdk_root(mut self, sdk_root: impl Into<PathBuf>) -> Self {
@@ -1143,6 +1214,7 @@ mod tests {
         );
         assert_eq!(config.language.mode, LanguageMode::Gnu11);
         assert!(!config.language.trigraphs_enabled());
+        assert_eq!(config.relocation_model, RelocationModel::Pie);
         assert_eq!(
             config.gnu_profile.as_ref().map(|profile| profile.version),
             Some(CompatibilityVersion::new(4, 2, 1))
@@ -1198,6 +1270,54 @@ mod tests {
             EffectiveCompilationConfig::for_target("wasm32-unknown-unknown".parse().unwrap())
                 .unwrap_err();
         assert!(error.contains("not an enabled CCC target profile"));
+    }
+
+    #[test]
+    fn target_profile_options_are_exact_and_cannot_be_silently_discarded() {
+        for (config, architecture, abi) in [
+            (
+                EffectiveCompilationConfig::x86_64_unknown_linux_gnu(),
+                "x86-64",
+                "lp64",
+            ),
+            (
+                EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+                "armv8-a",
+                "lp64",
+            ),
+            (
+                EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
+                "rv64gc",
+                "lp64d",
+            ),
+            (
+                EffectiveCompilationConfig::aarch64_apple_darwin(),
+                "armv8-a",
+                "darwin",
+            ),
+        ] {
+            assert_eq!(config.normalized_target_arch(), architecture);
+            assert_eq!(config.normalized_target_abi(), abi);
+            config
+                .clone()
+                .with_target_arch(architecture)
+                .with_target_abi(abi)
+                .validate_target_profile_options()
+                .unwrap();
+            assert!(
+                config
+                    .clone()
+                    .with_target_arch("contradictory-architecture")
+                    .validate_target_profile_options()
+                    .is_err()
+            );
+            assert!(
+                config
+                    .with_target_abi("contradictory-abi")
+                    .validate_target_profile_options()
+                    .is_err()
+            );
+        }
     }
 
     #[test]
@@ -1260,6 +1380,21 @@ mod tests {
         for (name, expected) in [
             ("__FLT_RADIX__", "2"),
             ("__FLT_EVAL_METHOD__", "0"),
+            ("__FLT_MANT_DIG__", "24"),
+            ("__FLT_DIG__", "6"),
+            ("__FLT_MIN_EXP__", "(-125)"),
+            ("__FLT_MIN_10_EXP__", "(-37)"),
+            ("__FLT_MAX_EXP__", "128"),
+            ("__FLT_MAX_10_EXP__", "38"),
+            ("__FLT_DECIMAL_DIG__", "9"),
+            ("__FLT_HAS_DENORM__", "1"),
+            ("__FLT_HAS_INFINITY__", "1"),
+            ("__FLT_HAS_QUIET_NAN__", "1"),
+            ("__FLT_MAX__", "0x1.fffffep+127F"),
+            ("__FLT_NORM_MAX__", "0x1.fffffep+127F"),
+            ("__FLT_EPSILON__", "0x1p-23F"),
+            ("__FLT_MIN__", "0x1p-126F"),
+            ("__FLT_DENORM_MIN__", "0x1p-149F"),
             ("__DBL_MANT_DIG__", "53"),
             ("__DBL_DIG__", "15"),
             ("__DBL_MIN_EXP__", "(-1021)"),

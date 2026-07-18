@@ -715,6 +715,27 @@ mod tests {
     }
 
     #[test]
+    fn ships_the_hosted_math_classification_wrapper() {
+        let resources = ResourceDirectory::discover(None).unwrap();
+        let manifest_source = fs::read_to_string(resources.root().join("manifest.toml")).unwrap();
+        let manifest = ResourceManifest::parse(&manifest_source).unwrap();
+        assert_eq!(manifest.headers.hosted_wrappers, vec!["math.h".to_owned()]);
+
+        let math = fs::read_to_string(resources.include().join("math.h")).unwrap();
+        for contract in [
+            "#include_next <math.h>",
+            "#define isfinite(value) __ccc_math_isfinite(value)",
+            "#define isinf(value) __ccc_math_isinf(value)",
+            "#define isnan(value) __ccc_math_isnan(value)",
+        ] {
+            assert!(
+                math.contains(contract),
+                "math.h is missing contract {contract:?}"
+            );
+        }
+    }
+
+    #[test]
     fn parses_and_validates_the_complete_manifest() {
         let directory = TestDirectory::new();
         directory.write_manifest(VALID_MANIFEST);

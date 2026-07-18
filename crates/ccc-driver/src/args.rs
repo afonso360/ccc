@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use ccc_target::{LanguageMode, TrigraphPolicy};
+use ccc_target::{LanguageMode, RelocationModel, TrigraphPolicy};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DumpKind {
@@ -90,6 +90,7 @@ pub(crate) struct DriverOptions {
     pub input: PathBuf,
     pub output: Option<PathBuf>,
     pub language_mode: LanguageMode,
+    pub relocation_model: RelocationModel,
     pub trigraphs: TrigraphPolicy,
     pub suppress_linemarkers: bool,
     pub dump_macros: bool,
@@ -101,7 +102,7 @@ pub(crate) struct DriverOptions {
     pub sysroot: Option<PathBuf>,
     pub resource_dir: Option<PathBuf>,
     pub target: Option<String>,
-    pub target_cpu: Option<String>,
+    pub target_arch: Option<String>,
     pub target_abi: Option<String>,
     pub sdk_root: Option<PathBuf>,
     pub deployment_target: Option<String>,
@@ -125,6 +126,7 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
     let mut output = None;
     let mut inputs = Vec::new();
     let mut language_mode = LanguageMode::Gnu11;
+    let mut relocation_model = RelocationModel::Pie;
     let mut trigraphs = TrigraphPolicy::LanguageDefault;
     let mut suppress_linemarkers = false;
     let mut dump_macros = false;
@@ -136,7 +138,7 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
     let mut sysroot = None;
     let mut resource_dir = None;
     let mut target = None;
-    let mut target_cpu = None;
+    let mut target_arch = None;
     let mut target_abi = None;
     let mut sdk_root = None;
     let mut deployment_target = None;
@@ -165,6 +167,13 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
             "-w" => suppress_warnings = true,
             "-Werror" => warnings_as_errors = true,
             "-Wno-error" => warnings_as_errors = false,
+            "-fPIC" | "-fpic" => {
+                relocation_model = RelocationModel::Pic;
+            }
+            "-fPIE" | "-fpie" | "-pie" => relocation_model = RelocationModel::Pie,
+            "-fno-PIC" | "-fno-pic" | "-fno-PIE" | "-fno-pie" | "-no-pie" => {
+                relocation_model = RelocationModel::Static;
+            }
             // CCC currently has one baseline code-generation profile and does
             // not emit debug information. These explicitly allowlisted quality
             // options therefore cannot change language semantics, ABI,
@@ -262,9 +271,9 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
                 require_joined_value(value, "--target")?;
                 target = Some(value.to_owned());
             }
-            _ if let Some(value) = argument.strip_prefix("-mcpu=") => {
-                require_joined_value(value, "-mcpu")?;
-                target_cpu = Some(value.to_owned());
+            _ if let Some(value) = argument.strip_prefix("-march=") => {
+                require_joined_value(value, "-march")?;
+                target_arch = Some(value.to_owned());
             }
             _ if let Some(value) = argument.strip_prefix("-mabi=") => {
                 require_joined_value(value, "-mabi")?;
@@ -372,6 +381,7 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
         input: inputs.pop().expect("input count was checked"),
         output,
         language_mode,
+        relocation_model,
         trigraphs,
         suppress_linemarkers,
         dump_macros,
@@ -383,7 +393,7 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
         sysroot,
         resource_dir,
         target,
-        target_cpu,
+        target_arch,
         target_abi,
         sdk_root,
         deployment_target,
@@ -539,6 +549,7 @@ mod tests {
     #[test]
     fn rejects_unsupported_or_conflicting_modes() {
         assert!(parse(["-std=c17".to_owned(), "input.c".to_owned()]).is_err());
+        assert!(parse(["-mcpu=native".to_owned(), "input.c".to_owned()]).is_err());
         assert!(parse(["-M".to_owned(), "-MD".to_owned(), "input.c".to_owned()]).is_err());
         assert!(parse(["-MG".to_owned(), "input.c".to_owned()]).is_err());
         assert!(parse(["-dM".to_owned(), "-M".to_owned(), "input.c".to_owned()]).is_err());
@@ -575,14 +586,14 @@ mod tests {
     fn parses_target_toolchain_and_darwin_configuration() {
         let options = options(&[
             "--target=aarch64-apple-darwin",
-            "-mcpu=generic",
+            "-march=armv8-a",
             "-mabi=darwin",
             "--sdk-root=/SDK",
             "-mmacosx-version-min=14.2",
             "input.c",
         ]);
         assert_eq!(options.target.as_deref(), Some("aarch64-apple-darwin"));
-        assert_eq!(options.target_cpu.as_deref(), Some("generic"));
+        assert_eq!(options.target_arch.as_deref(), Some("armv8-a"));
         assert_eq!(options.target_abi.as_deref(), Some("darwin"));
         assert_eq!(options.sdk_root, Some(PathBuf::from("/SDK")));
         assert_eq!(options.deployment_target.as_deref(), Some("14.2"));
@@ -604,6 +615,32 @@ mod tests {
         ] {
             let options = options(&[argument, "input.c"]);
             assert_eq!(options.input, PathBuf::from("input.c"), "{argument}");
+        }
+    }
+
+    #[test]
+    fn relocation_options_select_a_coupled_codegen_and_link_model() {
+        assert_eq!(options(&["input.c"]).relocation_model, RelocationModel::Pie);
+        for argument in ["-fPIC", "-fpic"] {
+            assert_eq!(
+                options(&["-no-pie", argument, "input.c"]).relocation_model,
+                RelocationModel::Pic,
+                "{argument}"
+            );
+        }
+        for argument in ["-fPIE", "-fpie", "-pie"] {
+            assert_eq!(
+                options(&["-no-pie", argument, "input.c"]).relocation_model,
+                RelocationModel::Pie,
+                "{argument}"
+            );
+        }
+        for argument in ["-fno-PIC", "-fno-pic", "-fno-PIE", "-fno-pie", "-no-pie"] {
+            assert_eq!(
+                options(&["-pie", argument, "input.c"]).relocation_model,
+                RelocationModel::Static,
+                "{argument}"
+            );
         }
     }
 

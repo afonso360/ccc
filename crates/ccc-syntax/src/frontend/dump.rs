@@ -390,6 +390,15 @@ impl AstDumper {
                 self.line(indent, operation.spelling());
                 self.expression(operand, indent + 1);
             }
+            ExpressionKind::BuiltinMemoryOperation {
+                operation,
+                arguments,
+            } => {
+                self.line(indent, operation.spelling());
+                for argument in arguments {
+                    self.expression(argument, indent + 1);
+                }
+            }
             ExpressionKind::BuiltinPrefetch { arguments } => {
                 self.line(indent, "builtin-prefetch");
                 for argument in arguments {
@@ -422,6 +431,22 @@ impl AstDumper {
                 self.line(indent, "expression");
                 self.expression(inner, indent + 1);
             }
+            ExpressionKind::StatementExpression(items) => {
+                self.line(indent, "statement-expression");
+                for item in items {
+                    match item {
+                        BlockItem::Declaration(declaration) => {
+                            self.declaration(declaration, indent + 1)
+                        }
+                        BlockItem::StaticAssert(assertion) => {
+                            self.line(indent + 1, "static-assert");
+                            self.expression(&assertion.condition, indent + 2);
+                        }
+                        BlockItem::Statement(statement) => self.statement(statement, indent + 1),
+                        BlockItem::Pragma(pragma) => self.pragma(pragma, indent + 1),
+                    }
+                }
+            }
             ExpressionKind::Subscript { base, index } => {
                 self.line(indent, "subscript");
                 self.expression(base, indent + 1);
@@ -450,6 +475,14 @@ impl AstDumper {
             PragmaEvent::Once { .. } => "once".to_owned(),
             PragmaEvent::SystemHeader { .. } => "GCC system_header".to_owned(),
             PragmaEvent::Diagnostic { .. } => "GCC diagnostic".to_owned(),
+            PragmaEvent::GccOptimize { payload, .. } => format!(
+                "GCC optimize {}",
+                payload
+                    .iter()
+                    .map(|token| token.spelling.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
             PragmaEvent::Pack { payload, .. } => format!(
                 "pack {}",
                 payload

@@ -159,6 +159,8 @@ const _: () = {
 pub enum GeneratedSymbolKind {
     CallHelper,
     CallStub,
+    TlsAccessor,
+    TlsObject,
     VariadicEntry,
     VariadicBody,
     Support,
@@ -169,6 +171,8 @@ impl GeneratedSymbolKind {
         match self {
             Self::CallHelper => "call-helper",
             Self::CallStub => "call-stub",
+            Self::TlsAccessor => "tls-accessor",
+            Self::TlsObject => "tls-object",
             Self::VariadicEntry => "variadic-entry",
             Self::VariadicBody => "variadic-body",
             Self::Support => "support",
@@ -179,6 +183,8 @@ impl GeneratedSymbolKind {
         match self {
             Self::CallHelper => "call_helper",
             Self::CallStub => "call_stub",
+            Self::TlsAccessor => "tls_accessor",
+            Self::TlsObject => "tls_object",
             Self::VariadicEntry => "variadic_entry",
             Self::VariadicBody => "variadic_body",
             Self::Support => "support",
@@ -315,12 +321,123 @@ pub(crate) fn is_bridge_generated_symbol(symbol: &str) -> bool {
     [
         "__ccc_call_helper_",
         "__ccc_call_stub_",
+        "__ccc_tls_accessor_",
+        "__ccc_tls_object_",
         "__ccc_variadic_entry_",
         "__ccc_variadic_body_",
         "__ccc_support_",
     ]
     .iter()
     .any(|prefix| symbol.starts_with(prefix))
+}
+
+/// ELF x86-64 TLS address sequence selected by the source-level TLS model.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ElfTlsAccessModel {
+    GeneralDynamic,
+    LocalDynamic,
+    InitialExec,
+    LocalExec,
+}
+
+/// Visibility that the generated accessor must attach to its TLS reference.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ElfTlsSymbolVisibility {
+    Default,
+    Hidden,
+    Protected,
+    Internal,
+}
+
+/// Canonical inputs for one compiler-generated TLS address accessor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TlsAccessorPlan {
+    pub helper_symbol: String,
+    pub object_symbol: String,
+    pub model: ElfTlsAccessModel,
+    pub object_visibility: ElfTlsSymbolVisibility,
+    pub logical_line: u32,
+}
+
+impl TlsAccessorPlan {
+    fn validate(&self) -> Result<(), LinkError> {
+        validate_symbol(&self.helper_symbol)?;
+        validate_symbol(&self.object_symbol)?;
+        if !self.helper_symbol.starts_with("__ccc_tls_accessor_") {
+            return Err(artifact_error(
+                "a TLS accessor helper must use the reserved compiler namespace",
+            ));
+        }
+        if self.helper_symbol == self.object_symbol {
+            return Err(artifact_error(
+                "a TLS accessor and its source object must use distinct symbols",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Renders a hidden SysV AMD64 function that returns the calling thread's
+/// address for one ELF TLS object. Dynamic-model calls use a canonical,
+/// linker-relaxable sequence and preserve the ABI stack-alignment contract.
+pub fn render_tls_accessor(plan: &TlsAccessorPlan) -> Result<GeneratedAssembly, LinkError> {
+    plan.validate()?;
+    let mut source = String::new();
+    assembly_prelude(&mut source);
+    match plan.object_visibility {
+        ElfTlsSymbolVisibility::Default => {}
+        ElfTlsSymbolVisibility::Hidden => {
+            writeln!(source, ".hidden {}", plan.object_symbol).unwrap();
+        }
+        ElfTlsSymbolVisibility::Protected => {
+            writeln!(source, ".protected {}", plan.object_symbol).unwrap();
+        }
+        ElfTlsSymbolVisibility::Internal => {
+            writeln!(source, ".internal {}", plan.object_symbol).unwrap();
+        }
+    }
+    function_header(
+        &plan.helper_symbol,
+        AssemblyFunctionLinkage::ExternalHidden,
+        &mut source,
+    );
+    match plan.model {
+        ElfTlsAccessModel::GeneralDynamic => {
+            source.push_str("subq $8, %rsp\n.cfi_def_cfa_offset 16\n");
+            writeln!(
+                source,
+                "data16 leaq {}@TLSGD(%rip), %rdi",
+                plan.object_symbol
+            )
+            .unwrap();
+            source.push_str(".value 0x6666\nrex64\ncall __tls_get_addr@PLT\n");
+            source.push_str("addq $8, %rsp\n.cfi_def_cfa_offset 8\nret\n");
+        }
+        ElfTlsAccessModel::LocalDynamic => {
+            source.push_str("subq $8, %rsp\n.cfi_def_cfa_offset 16\n");
+            writeln!(source, "leaq {}@TLSLD(%rip), %rdi", plan.object_symbol).unwrap();
+            source.push_str("call __tls_get_addr@PLT\n");
+            writeln!(source, "leaq {}@DTPOFF(%rax), %rax", plan.object_symbol).unwrap();
+            source.push_str("addq $8, %rsp\n.cfi_def_cfa_offset 8\nret\n");
+        }
+        ElfTlsAccessModel::InitialExec => {
+            source.push_str("movq %fs:0, %rax\n");
+            writeln!(source, "addq {}@GOTTPOFF(%rip), %rax", plan.object_symbol).unwrap();
+            source.push_str("ret\n");
+        }
+        ElfTlsAccessModel::LocalExec => {
+            source.push_str("movq %fs:0, %rax\n");
+            writeln!(source, "leaq {}@TPOFF(%rax), %rax", plan.object_symbol).unwrap();
+            source.push_str("ret\n");
+        }
+    }
+    function_footer(&plan.helper_symbol, &mut source);
+    GeneratedAssembly::new(
+        format!("tls-accessor-{}", plan.helper_symbol),
+        source,
+        vec![plan.helper_symbol.clone()],
+        vec![LogicalDebugLocation::generated(plan.logical_line.max(1))],
+    )
 }
 
 fn assembly_prelude(output: &mut String) {
@@ -1129,6 +1246,79 @@ mod tests {
                 b"canonical-plan",
             )
         );
+    }
+
+    #[test]
+    fn tls_accessors_render_canonical_elf_models_and_unwind_state() {
+        let helper = "__ccc_tls_accessor_0123456789abcdef";
+        for (model, required) in [
+            (
+                ElfTlsAccessModel::GeneralDynamic,
+                &[
+                    "data16 leaq tls_value@TLSGD(%rip), %rdi",
+                    ".value 0x6666\nrex64\ncall __tls_get_addr@PLT",
+                ][..],
+            ),
+            (
+                ElfTlsAccessModel::LocalDynamic,
+                &[
+                    "leaq tls_value@TLSLD(%rip), %rdi",
+                    "call __tls_get_addr@PLT",
+                    "leaq tls_value@DTPOFF(%rax), %rax",
+                ][..],
+            ),
+            (
+                ElfTlsAccessModel::InitialExec,
+                &["movq %fs:0, %rax", "addq tls_value@GOTTPOFF(%rip), %rax"][..],
+            ),
+            (
+                ElfTlsAccessModel::LocalExec,
+                &["movq %fs:0, %rax", "leaq tls_value@TPOFF(%rax), %rax"][..],
+            ),
+        ] {
+            let assembly = render_tls_accessor(&TlsAccessorPlan {
+                helper_symbol: helper.to_owned(),
+                object_symbol: "tls_value".to_owned(),
+                model,
+                object_visibility: ElfTlsSymbolVisibility::Default,
+                logical_line: 19,
+            })
+            .unwrap();
+            for instruction in required {
+                assert!(
+                    assembly.source().contains(instruction),
+                    "missing `{instruction}` in:\n{}",
+                    assembly.source()
+                );
+            }
+            assert!(assembly.source().contains(".hidden __ccc_tls_accessor_"));
+            assert!(assembly.source().contains(".cfi_startproc"));
+            assert!(assembly.source().contains(".cfi_endproc"));
+            assert!(assembly.source().contains(".note.GNU-stack"));
+            assert_eq!(assembly.debug_locations()[0].line, 19);
+        }
+    }
+
+    #[test]
+    fn dynamic_tls_accessors_align_calls_and_general_dynamic_is_relaxable() {
+        let assembly = render_tls_accessor(&TlsAccessorPlan {
+            helper_symbol: "__ccc_tls_accessor_dynamic".to_owned(),
+            object_symbol: "value".to_owned(),
+            model: ElfTlsAccessModel::GeneralDynamic,
+            object_visibility: ElfTlsSymbolVisibility::Hidden,
+            logical_line: 1,
+        })
+        .unwrap();
+        let source = assembly.source();
+        let subtract = source.find("subq $8, %rsp").unwrap();
+        let call = source.find("call __tls_get_addr@PLT").unwrap();
+        let add = source.find("addq $8, %rsp").unwrap();
+        assert!(subtract < call && call < add, "{source}");
+        assert!(source.contains(".cfi_def_cfa_offset 16"));
+        assert!(source.contains(".cfi_def_cfa_offset 8"));
+        assert!(source.contains(".hidden value"));
+        assert!(source.contains("data16 leaq"));
+        assert!(source.contains(".value 0x6666\nrex64\ncall"));
     }
 
     #[test]

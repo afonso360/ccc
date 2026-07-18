@@ -12,8 +12,9 @@ committed to the repository.
 ## Build interface
 
 The adapter uses Lua's upstream `make linux` interface on x86-64 Linux. It
-overrides the default `gcc -std=gnu99` command with `ccc-cc -std=gnu11`, the GNU
-language mode CCC supports. All 34 C translation units that produce `liblua.a`,
+overrides the default `gcc -std=gnu99` command with `ccc-cc`; CCC's documented
+driver default selects GNU C11 without an adapter flag. All 34 C translation
+units that produce `liblua.a`,
 `lua`, and `luac` are compiled by CCC. The native GCC driver receives only
 already-produced objects and archives for the two final links; the adapter
 never retries a failed translation with another compiler. A source-input log is
@@ -21,11 +22,11 @@ checked against every `.c` file in the pinned `src/` directory, so a duplicate,
 omitted, substituted, or native-compiled translation unit fails the run rather
 than being hidden by a command count.
 
-CCC currently emits static-model objects, while contemporary Linux GCC drivers
-default to position-independent executables. The build therefore pins Lua's
-`MYLDFLAGS=-no-pie` customization hook. After linking, the adapter requires both
-programs to be ELF `EXEC` files and rejects `TEXTREL` dynamic tags. The retained
-ELF headers, dynamic tags, and exact link commands make this boundary auditable.
+CCC emits position-independent objects, and Lua's native GCC link steps use
+their normal executable defaults without an adapter-supplied relocation flag.
+After linking, the adapter requires both programs to be ELF `DYN` files and
+rejects `TEXTREL` dynamic tags. The retained ELF headers, dynamic tags, and
+exact link commands make this boundary auditable.
 The adapter rejects a native driver that does not identify as GCC, targets a
 non-GNU x86-64 Linux ABI, or exposes Clang identity macros. Its resolved path,
 target, version, complete `--version` output, and predefined macros are retained
@@ -50,8 +51,9 @@ or `GNUMAKEFLAGS` is cleared with the other build flags. Exact compiler and
 linker commands are retained in `compile-commands.txt`; logging is one complete append per command so
 parallel builds cannot splice records together. The run rejects any native link
 command containing a C source input, requires exactly the two upstream program
-links, and verifies that every C command retained both `-std=gnu11` and
-`LUA_USE_LINUX` without disabling compiler-selected builtins or jump tables.
+links, and verifies that no C command injects a `-std=` override while every
+translation retains `LUA_USE_LINUX` without disabling compiler-selected
+builtins or jump tables.
 
 ## Official test profiles
 

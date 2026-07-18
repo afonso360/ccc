@@ -448,6 +448,81 @@ fn weak_binding_reaches_defined_and_undefined_elf_symbols() {
 }
 
 #[test]
+fn thread_local_accesses_use_manifested_generated_accessors() {
+    const SOURCE: &str = "_Thread_local int external_value = 7;\n\
+         int read_values(void) {\n\
+             static _Thread_local int block_value = 5;\n\
+             ++external_value;\n\
+             return external_value + block_value;\n\
+         }";
+    let module = lower_source(SOURCE);
+    let config = EffectiveCompilationConfig::default();
+    let plan = ccc_abi::plan_module(&module, &config).unwrap();
+    assert_eq!(plan.artifacts.tls_accessors.len(), 2);
+    assert_eq!(
+        plan.artifacts.packaging.generated_assembly_units, 2,
+        "one deterministic assembly unit is planned per TLS object"
+    );
+    let first_dump = ccc_abi::dump_module_plan(plan.verify_against(&module, &config).unwrap());
+    let second = ccc_abi::plan_module(&module, &config).unwrap();
+    assert_eq!(
+        first_dump,
+        ccc_abi::dump_module_plan(second.verify_against(&module, &config).unwrap())
+    );
+
+    let output = emit(&module, &config, Options { emit_clif: true }).unwrap();
+    assert!(!output.clif.contains("tls_value"), "{}", output.clif);
+    assert_eq!(output.assemblies.len(), 2);
+    assert_eq!(
+        output
+            .manifest
+            .symbols()
+            .iter()
+            .filter(|symbol| symbol.kind == ccc_link::bridge::GeneratedSymbolKind::TlsAccessor)
+            .count(),
+        2
+    );
+    let block = module
+        .globals
+        .iter()
+        .find(|global| global.name == "block_value")
+        .unwrap();
+    let block_manifest = output
+        .manifest
+        .symbols()
+        .iter()
+        .find(|symbol| symbol.name == block.emission.symbol_name)
+        .unwrap();
+    assert_eq!(
+        block_manifest.kind,
+        ccc_link::bridge::GeneratedSymbolKind::TlsObject
+    );
+    assert_eq!(
+        block_manifest.visibility,
+        ccc_link::artifact::GeneratedSymbolVisibility::SourceInternal
+    );
+    let block_accessor = output
+        .assemblies
+        .iter()
+        .find(|assembly| assembly.source().contains(&block.emission.symbol_name))
+        .unwrap();
+    assert!(
+        block_accessor
+            .source()
+            .contains(&format!(".hidden {}", block.emission.symbol_name))
+    );
+
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    for global in &module.globals {
+        let symbol = object
+            .symbol_by_name(&global.emission.symbol_name)
+            .unwrap_or_else(|| panic!("missing TLS symbol `{}`", global.emission.symbol_name));
+        assert_eq!(symbol.kind(), object::SymbolKind::Tls);
+    }
+    output.into_artifact_bundle().verify().unwrap();
+}
+
+#[test]
 fn incomplete_extern_arrays_remain_layout_free_undefined_data() {
     const SOURCE: &str = "extern const char bytes[];\n\
          extern int values[];\n\
@@ -587,7 +662,7 @@ fn complete_abi_plan_and_aggregate_clif_have_exact_snapshots() {
     assert!(dump.contains("packaging assembly-units=2"), "{dump}");
     assert_eq!(
         sha256(&dump),
-        "b0f28d95504a8b93fd8b8dcd2546e4f05271c95e80063c2fef9951b5de0fe557"
+        "cb2555b2f23457372fcf9d0a90db412724a2be11fc893903dc4f130fd69d59bb"
     );
 
     let output = emit(&module, &config, Options { emit_clif: true }).unwrap();
@@ -1046,11 +1121,12 @@ fn integer_intrinsics_are_native_clif_operations_without_external_symbols() {
          int clz_int(unsigned int value) { return __builtin_clz(value); }\n\
          int clz_long(unsigned long value) { return __builtin_clzl(value); }\n\
          int clz_long_long(unsigned long long value) { return __builtin_clzll(value); }\n\
+         int ctz_int(unsigned int value) { return __builtin_ctz(value); }\n\
          int ctz_long_long(unsigned long long value) { return __builtin_ctzll(value); }\n\
          int popcount_int(unsigned int value) { return __builtin_popcount(value); }\n\
          int popcount_long_long(unsigned long long value) { return __builtin_popcountll(value); }",
     );
-    for (operation, expected) in [("bswap", 1), ("clz", 3), ("ctz", 1), ("popcnt", 2)] {
+    for (operation, expected) in [("bswap", 1), ("clz", 3), ("ctz", 2), ("popcnt", 2)] {
         assert_eq!(
             output
                 .clif
@@ -1069,6 +1145,7 @@ fn integer_intrinsics_are_native_clif_operations_without_external_symbols() {
         "__builtin_clz",
         "__builtin_clzl",
         "__builtin_clzll",
+        "__builtin_ctz",
         "__builtin_ctzll",
         "__builtin_popcount",
         "__builtin_popcountll",
@@ -1079,6 +1156,30 @@ fn integer_intrinsics_are_native_clif_operations_without_external_symbols() {
                 .filter(|candidate| candidate.is_undefined())
                 .all(|candidate| candidate.name() != Ok(symbol)),
             "unexpected external reference to {symbol}"
+        );
+    }
+}
+
+#[test]
+fn memory_builtins_lower_to_target_libcalls() {
+    let output = emit_source(
+        "void *operations(char *to, char *from, unsigned long count) {\n\
+             __builtin_memcpy(to, from, count);\n\
+             __builtin_memmove(to + 1, to, count - 1);\n\
+             return __builtin_memset(to, 65, count);\n\
+         }",
+    );
+    let clif = function_clif(&output.clif, "operations");
+    assert!(clif.contains("call fn"), "{clif}");
+
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    for symbol in ["memcpy", "memmove", "memset"] {
+        assert!(
+            object
+                .symbols()
+                .filter(|candidate| candidate.is_undefined())
+                .any(|candidate| candidate.name() == Ok(symbol)),
+            "missing target libcall reference to {symbol}"
         );
     }
 }
@@ -1255,7 +1356,7 @@ fn packed_and_bitfield_memory_paths_remain_unaligned_and_explicit() {
 }
 
 #[test]
-fn automatic_alignment_requests_reach_cranelift_stack_slots() {
+fn automatic_alignment_requests_reach_effective_stack_addresses() {
     let output = emit_source(
         "int inspect(void) {\n\
              _Alignas(64) int value = 7;\n\
@@ -1264,5 +1365,33 @@ fn automatic_alignment_requests_reach_cranelift_stack_slots() {
          }",
     );
     let clif = function_clif(&output.clif, "inspect");
-    assert!(clif.contains("explicit_slot 4, align = 64"), "{clif}");
+    assert!(clif.contains("explicit_slot 67, align = 16"), "{clif}");
+    assert!(clif.contains("iconst.i64 -64"), "{clif}");
+    assert!(clif.contains("band"), "{clif}");
+}
+
+#[test]
+fn runtime_sized_storage_uses_checked_arena_growth_and_cleanup() {
+    let output = emit_source(
+        "int inspect(int rows, int columns) {
+             _Alignas(64) int matrix[rows][columns];
+             matrix[rows - 1][columns - 1] = 17;
+             return matrix[rows - 1][columns - 1];
+         }",
+    );
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    for name in ["realloc", "free"] {
+        let symbol = object
+            .symbols()
+            .find(|symbol| symbol.name() == Ok(name))
+            .unwrap_or_else(|| panic!("missing arena provider import `{name}`"));
+        assert!(symbol.is_undefined(), "{name}");
+    }
+
+    let clif = function_clif(&output.clif, "inspect");
+    assert!(clif.contains("umul_overflow"), "{clif}");
+    assert!(clif.contains("uadd_overflow"), "{clif}");
+    assert!(clif.contains("trapnz"), "{clif}");
+    assert!(clif.contains("iconst.i64 -64"), "{clif}");
+    assert!(clif.matches("call").count() >= 2, "{clif}");
 }

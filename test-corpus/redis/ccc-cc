@@ -1,0 +1,290 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+: "${CCC:?set CCC to the ccc executable}"
+: "${CCC_RESOURCE_DIR:?set CCC_RESOURCE_DIR to the shipped resource directory}"
+: "${CCC_LINK_CC:=gcc}"
+
+export CCC_CC="$CCC_LINK_CC"
+
+command -v "$CCC" >/dev/null 2>&1 || {
+  echo "ccc-cc: CCC is not executable: $CCC" >&2
+  exit 2
+}
+[[ -d "$CCC_RESOURCE_DIR" ]] || {
+  echo "ccc-cc: resource directory does not exist: $CCC_RESOURCE_DIR" >&2
+  exit 2
+}
+command -v "$CCC_LINK_CC" >/dev/null 2>&1 || {
+  echo "ccc-cc: link driver is not executable: $CCC_LINK_CC" >&2
+  exit 2
+}
+
+log_command() {
+  if [[ -z "${CCC_REDIS_COMMAND_LOG:-}" ]]; then
+    return
+  fi
+  local line=$1
+  local argument rendered
+  shift
+  for argument in "$@"; do
+    printf -v rendered '%q' "$argument"
+    line+=" $rendered"
+  done
+  printf '%s\n' "$line" >>"$CCC_REDIS_COMMAND_LOG"
+}
+
+record_source() {
+  local source=$1
+  local parent absolute root
+  [[ -f "$source" ]] || {
+    echo "ccc-cc: C source does not exist: $source" >&2
+    exit 2
+  }
+  parent=$(cd "$(dirname "$source")" && pwd -P)
+  absolute="$parent/$(basename "$source")"
+  if [[ -n "${CCC_REDIS_SOURCE_ROOT:-}" ]]; then
+    root=$(cd "$CCC_REDIS_SOURCE_ROOT" && pwd -P)
+    [[ "$absolute" == "$root/"* ]] || {
+      echo "ccc-cc: C source is outside the pinned Redis source tree: $absolute" >&2
+      exit 2
+    }
+  fi
+  if [[ -n "${CCC_REDIS_SOURCE_LOG:-}" ]]; then
+    printf '%s\n' "$absolute" >>"$CCC_REDIS_SOURCE_LOG"
+  fi
+}
+
+capture_preprocessed_source() {
+  local source=$1
+  shift
+  [[ -n "${CCC_REDIS_PREPROCESS_DIR:-}" ]] || return 0
+  [[ -n "${CCC_REDIS_SOURCE_ROOT:-}" ]] || {
+    echo "ccc-cc: preprocessing capture requires CCC_REDIS_SOURCE_ROOT" >&2
+    exit 2
+  }
+
+  local parent absolute root relative destination argument
+  local index
+  local filtered=()
+  local preprocess_arguments=("$@")
+  parent=$(cd "$(dirname "$source")" && pwd -P)
+  absolute="$parent/$(basename "$source")"
+  root=$(cd "$CCC_REDIS_SOURCE_ROOT" && pwd -P)
+  [[ "$absolute" == "$root/"* ]] || {
+    echo "ccc-cc: preprocessing source is outside the pinned Redis tree: $absolute" >&2
+    exit 2
+  }
+  relative=${absolute#"$root/"}
+  destination="$CCC_REDIS_PREPROCESS_DIR/$relative.i"
+  mkdir -p "$(dirname "$destination")"
+
+  # Dependency-generation options are orthogonal to the token inventory and
+  # can overwrite the real compile's Make dependency output. Preserve every
+  # language, macro, include, warning, and optimization input while omitting
+  # only that side-effecting family.
+  for ((index = 0; index < ${#preprocess_arguments[@]}; index++)); do
+    argument=${preprocess_arguments[index]}
+    case "$argument" in
+      -MD | -MMD | -MP)
+        ;;
+      -MF | -MT | -MQ)
+        ((index += 1))
+        ;;
+      -MF?* | -MT?* | -MQ?* | -Wp,-MD,* | -Wp,-MMD,*)
+        ;;
+      *)
+        filtered+=("$argument")
+        ;;
+    esac
+  done
+
+  if ((${#filtered[@]})); then
+    log_command preprocess "$CCC" -resource-dir "$CCC_RESOURCE_DIR" \
+      "${filtered[@]}" -E -P "$source"
+    "$CCC" -resource-dir "$CCC_RESOURCE_DIR" \
+      "${filtered[@]}" -E -P "$source" >"$destination"
+  else
+    log_command preprocess "$CCC" -resource-dir "$CCC_RESOURCE_DIR" \
+      -E -P "$source"
+    "$CCC" -resource-dir "$CCC_RESOURCE_DIR" \
+      -E -P "$source" >"$destination"
+  fi
+}
+
+run_ccc() {
+  log_command ccc "$CCC" -resource-dir "$CCC_RESOURCE_DIR" "$@"
+  "$CCC" -resource-dir "$CCC_RESOURCE_DIR" "$@"
+}
+
+run_linker() {
+  log_command link "$CCC_LINK_CC" "$@"
+  "$CCC_LINK_CC" "$@"
+}
+
+arguments=("$@")
+sources=()
+# Redis and its bundled dependencies request C99, GNU99, and GNU C11. Filter
+# those upstream selections and use CCC's GNU C11 driver default.
+compile_arguments=()
+output=
+compile_only=false
+frontend_only=false
+
+for ((index = 0; index < ${#arguments[@]}; index++)); do
+  argument=${arguments[index]}
+  case "$argument" in
+    *.c)
+      sources+=("$argument")
+      ;;
+    -o)
+      if ((index + 1 >= ${#arguments[@]})); then
+        echo "ccc-cc: -o requires an argument" >&2
+        exit 2
+      fi
+      output=${arguments[index + 1]}
+      ((index += 1))
+      ;;
+    -c)
+      compile_only=true
+      ;;
+    -std=c99 | -std=gnu99 | -std=gnu11)
+      ;;
+    -pedantic | -ggdb)
+      ;;
+    -MF | -MT | -MQ)
+      if ((index + 1 >= ${#arguments[@]})); then
+        echo "ccc-cc: $argument requires an argument" >&2
+        exit 2
+      fi
+      compile_arguments+=("$argument" "${arguments[index + 1]}")
+      ((index += 1))
+      ;;
+    -E | -M | -MM | --dump-* | --emit=*)
+      frontend_only=true
+      compile_arguments+=("$argument")
+      ;;
+    -l?* | -L?* | -Wl,* | -pie | -no-pie | -rdynamic | -pthread)
+      ;;
+    -l | -L | -Xlinker)
+      if ((index + 1 >= ${#arguments[@]})); then
+        echo "ccc-cc: $argument requires an argument" >&2
+        exit 2
+      fi
+      ((index += 1))
+      ;;
+    *.o | *.a | *.so | *.lo)
+      ;;
+    *.s | *.S | *.asm)
+      echo "ccc-cc: assembly input is outside the selected Redis C surface: $argument" >&2
+      exit 2
+      ;;
+    *.i | *.ii)
+      echo "ccc-cc: preprocessed source input is unsupported and will not be delegated: $argument" >&2
+      exit 2
+      ;;
+    *.cc | *.cp | *.cpp | *.cxx | *.C | *.m | *.mm)
+      echo "ccc-cc: non-C source input is outside the selected Redis C surface: $argument" >&2
+      exit 2
+      ;;
+    -S)
+      echo "ccc-cc: assembly output is outside the selected Redis C surface" >&2
+      exit 2
+      ;;
+    -x)
+      echo "ccc-cc: explicit language selection is unsupported and will not be delegated" >&2
+      exit 2
+      ;;
+    @*)
+      echo "ccc-cc: response files are unsupported because their C inputs cannot be audited" >&2
+      exit 2
+      ;;
+    *)
+      compile_arguments+=("$argument")
+      ;;
+  esac
+done
+
+if ((${#sources[@]} == 0)); then
+  if ((${#arguments[@]} == 1)) && [[ "${arguments[0]}" == "--version" ]]; then
+    printf 'ccc Redis corpus adapter (C translation by %s; linking by %s)\n' \
+      "$CCC" "$CCC_LINK_CC"
+    exit 0
+  fi
+  run_linker "${arguments[@]}"
+  exit $?
+fi
+
+if $frontend_only; then
+  if ((${#sources[@]} != 1)); then
+    echo "ccc-cc: frontend-only actions require exactly one C source" >&2
+    exit 2
+  fi
+  run_ccc "${arguments[@]}"
+  exit $?
+fi
+
+if $compile_only && [[ -n "$output" ]]; then
+  if ((${#sources[@]} != 1)); then
+    echo "ccc-cc: -o with -c requires exactly one C source" >&2
+    exit 2
+  fi
+fi
+
+object_directory=
+if ! $compile_only; then
+  object_directory=$(mktemp -d "${TMPDIR:-/tmp}/ccc-redis-objects.XXXXXX")
+  cleanup_object_directory() {
+    if [[ -n "$object_directory" ]] && [[ -d "$object_directory" ]]; then
+      rm -rf -- "$object_directory"
+    fi
+  }
+  trap cleanup_object_directory EXIT
+fi
+objects=()
+
+for ((index = 0; index < ${#sources[@]}; index++)); do
+  source=${sources[index]}
+  record_source "$source"
+  if ((${#compile_arguments[@]})); then
+    capture_preprocessed_source "$source" "${compile_arguments[@]}"
+  else
+    capture_preprocessed_source "$source"
+  fi
+  if $compile_only; then
+    if [[ -n "$output" ]]; then
+      object=$output
+    else
+      object=$(basename "${source%.c}.o")
+    fi
+  else
+    object="$object_directory/$index.o"
+  fi
+  if ((${#compile_arguments[@]})); then
+    run_ccc "${compile_arguments[@]}" -c "$source" -o "$object"
+  else
+    run_ccc -c "$source" -o "$object"
+  fi
+  objects+=("$object")
+done
+
+if $compile_only; then
+  exit 0
+fi
+
+link_arguments=()
+source_index=0
+for ((index = 0; index < ${#arguments[@]}; index++)); do
+  argument=${arguments[index]}
+  case "$argument" in
+    *.c)
+      link_arguments+=("${objects[source_index]}")
+      ((source_index += 1))
+      ;;
+    *)
+      link_arguments+=("$argument")
+      ;;
+  esac
+done
+run_linker "${link_arguments[@]}"

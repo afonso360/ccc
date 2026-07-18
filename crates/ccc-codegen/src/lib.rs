@@ -5,7 +5,7 @@ pub mod generic;
 use std::fmt;
 
 use ccc_session::Span;
-use ccc_target::{AbiIdentity, CallingConvention, EffectiveCompilationConfig};
+use ccc_target::{CallingConvention, EffectiveCompilationConfig};
 use cranelift_codegen::ir::{self, AbiParam, ArgumentPurpose, Signature};
 use cranelift_codegen::isa::CallConv;
 
@@ -80,27 +80,7 @@ pub(crate) fn validate_target(config: &EffectiveCompilationConfig) -> Result<(),
             config.target.triple
         ));
     }
-    if let Some(abi) = config.target_abi.as_deref() {
-        let accepted = match config.target.abi {
-            AbiIdentity::SysvAmd64Lp64 | AbiIdentity::Aapcs64Lp64 => abi == "lp64",
-            AbiIdentity::RiscvLp64d => abi == "lp64d",
-            AbiIdentity::DarwinArm64 => abi == "darwin",
-        };
-        if !accepted {
-            return Err(format!(
-                "target ABI option `{abi}` is incompatible with {}",
-                config.target.abi.name()
-            ));
-        }
-    }
-    if let Some(cpu) = config.target_cpu.as_deref()
-        && !matches!(cpu, "generic" | "native")
-    {
-        return Err(format!(
-            "target CPU `{cpu}` is not an enabled CPU profile for `{}`",
-            config.target.triple
-        ));
-    }
+    config.validate_target_profile_options()?;
     Ok(())
 }
 

@@ -89,7 +89,7 @@ export CCC_SQLITE_FUZZCHECK_HWTIME_FALLBACK=1
 [[ "$(wc -l <"$CCC_SQLITE_SOURCE_LOG" | tr -d '[:space:]')" == 1 ]]
 grep -Fxq "$source_directory/src/a.c" "$CCC_SQLITE_SOURCE_LOG"
 grep -Eq '^gnu11 ordinary strict-ansi=absent ' "$CCC_SQLITE_LANGUAGE_MODE_LOG"
-grep '^ccc ' "$CCC_SQLITE_COMMAND_LOG" | grep -q -- ' -std=gnu11'
+! grep '^ccc ' "$CCC_SQLITE_COMMAND_LOG" | grep -q -- ' -std='
 
 : >"$TRACE"
 : >"$CCC_SQLITE_COMMAND_LOG"
@@ -165,13 +165,13 @@ fi
 : >"$CCC_SQLITE_SOURCE_LOG"
 "$script_directory/ccc-cc" "$source_directory/src/a.c" \
   "$source_directory/src/b.c" "$generated_source" \
-  -o "$temporary_directory/program" -no-pie -Wl,-E -ldl -lm
+  -o "$temporary_directory/program" -Wl,-E -ldl -lm
 [[ -f "$temporary_directory/program" ]]
 [[ "$(grep -c '^ccc ' "$TRACE")" == 3 ]]
 [[ "$(grep -c '^link ' "$TRACE")" == 1 ]]
 ! grep '^link ' "$TRACE" | grep -Eq '\.(c|i)( |$)'
 ! grep '^ccc ' "$CCC_SQLITE_COMMAND_LOG" | grep -Eq -- '-no-pie|-Wl,-E|-ldl|-lm'
-grep '^link ' "$CCC_SQLITE_COMMAND_LOG" | grep -q -- ' -no-pie'
+! grep '^link ' "$CCC_SQLITE_COMMAND_LOG" | grep -q -- ' -no-pie'
 grep '^link ' "$CCC_SQLITE_COMMAND_LOG" | grep -Fq -- ' -Wl\,-E'
 grep '^link ' "$CCC_SQLITE_COMMAND_LOG" | grep -q -- ' -ldl'
 [[ "$(grep -c '^ccc ' "$CCC_SQLITE_COMMAND_LOG")" == 3 ]]

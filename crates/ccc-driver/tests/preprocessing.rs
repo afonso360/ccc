@@ -515,6 +515,9 @@ fn emits_predefined_dynamic_and_reproducible_macros() {
             "const char *translation_file = __FILE__;\n",
             "int translation_line = __LINE__;\n",
             "int double_mantissa_bits = __DBL_MANT_DIG__;\n",
+            "int float_mantissa_bits = __FLT_MANT_DIG__;\n",
+            "float float_maximum = __FLT_MAX__;\n",
+            "float float_epsilon = __FLT_EPSILON__;\n",
             "int double_decimal_digits = __DBL_DIG__;\n",
             "int double_max_decimal_exponent = __DBL_MAX_10_EXP__;\n",
             "double double_maximum = __DBL_MAX__;\n",
@@ -546,6 +549,12 @@ fn emits_predefined_dynamic_and_reproducible_macros() {
     assert!(output.contains("intcompatibility=4*100+2;"), "{output}");
     assert!(output.contains("intpointer_size=8;"), "{output}");
     assert!(output.contains("intdouble_mantissa_bits=53;"), "{output}");
+    assert!(output.contains("intfloat_mantissa_bits=24;"), "{output}");
+    assert!(
+        output.contains("floatfloat_maximum=0x1.fffffep+127F;"),
+        "{output}"
+    );
+    assert!(output.contains("floatfloat_epsilon=0x1p-23F;"), "{output}");
     assert!(output.contains("intdouble_decimal_digits=15;"), "{output}");
     assert!(
         output.contains("intdouble_max_decimal_exponent=308;"),
@@ -592,6 +601,21 @@ fn emits_predefined_dynamic_and_reproducible_macros() {
         "#define __DBL_MIN__ 0x1p-1022",
         "#define __DBL_NORM_MAX__ 0x1.fffffffffffffp+1023",
         "#define __FLT_EVAL_METHOD__ 0",
+        "#define __FLT_DECIMAL_DIG__ 9",
+        "#define __FLT_DENORM_MIN__ 0x1p-149F",
+        "#define __FLT_DIG__ 6",
+        "#define __FLT_EPSILON__ 0x1p-23F",
+        "#define __FLT_HAS_DENORM__ 1",
+        "#define __FLT_HAS_INFINITY__ 1",
+        "#define __FLT_HAS_QUIET_NAN__ 1",
+        "#define __FLT_MANT_DIG__ 24",
+        "#define __FLT_MAX_10_EXP__ 38",
+        "#define __FLT_MAX_EXP__ 128",
+        "#define __FLT_MAX__ 0x1.fffffep+127F",
+        "#define __FLT_MIN_10_EXP__ (-37)",
+        "#define __FLT_MIN_EXP__ (-125)",
+        "#define __FLT_MIN__ 0x1p-126F",
+        "#define __FLT_NORM_MAX__ 0x1.fffffep+127F",
         "#define __FLT_RADIX__ 2",
         "#define __GNUC__ 4",
         "#define __INTMAX_TYPE__ long int",

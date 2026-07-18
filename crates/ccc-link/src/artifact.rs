@@ -267,7 +267,9 @@ impl BridgeManifestV1 {
                 GeneratedSymbolOwner::AssemblyUnit(_)
                     if matches!(
                         symbol.kind,
-                        GeneratedSymbolKind::CallHelper | GeneratedSymbolKind::CallStub
+                        GeneratedSymbolKind::CallHelper
+                            | GeneratedSymbolKind::CallStub
+                            | GeneratedSymbolKind::TlsAccessor
                     ) && !undefined.contains(&symbol.name) =>
                 {
                     return Err(artifact_error(format!(

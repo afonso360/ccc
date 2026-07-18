@@ -934,6 +934,7 @@ fn types_the_exact_integer_intrinsic_and_prefetch_contracts() {
              !__has_builtin(__builtin_clz) || \
              !__has_builtin(__builtin_clzl) || \
              !__has_builtin(__builtin_clzll) || \
+             !__has_builtin(__builtin_ctz) || \
              !__has_builtin(__builtin_ctzll) || \
              !__has_builtin(__builtin_popcount) || \
              !__has_builtin(__builtin_popcountll) || \
@@ -941,7 +942,6 @@ fn types_the_exact_integer_intrinsic_and_prefetch_contracts() {
          #error missing selected builtin\n\
          #endif\n\
          #if __has_builtin(__builtin_bswap32) || \
-             __has_builtin(__builtin_ctz) || \
              __has_builtin(__builtin_ctzl) || \
              __has_builtin(__builtin_popcountl)\n\
          #error unselected builtin was advertised\n\
@@ -950,6 +950,7 @@ fn types_the_exact_integer_intrinsic_and_prefetch_contracts() {
          int clz_int(int value) { return __builtin_clz(value); }\n\
          int clz_long(long value) { return __builtin_clzl(value); }\n\
          int clz_long_long(long long value) { return __builtin_clzll(value); }\n\
+         int ctz_int(int value) { return __builtin_ctz(value); }\n\
          int ctz_long_long(long long value) { return __builtin_ctzll(value); }\n\
          int popcount_int(int value) { return __builtin_popcount(value); }\n\
          int popcount_long_long(long long value) { return __builtin_popcountll(value); }\n\
@@ -970,6 +971,7 @@ fn types_the_exact_integer_intrinsic_and_prefetch_contracts() {
         ("CountLeadingZerosInt", "int"),
         ("CountLeadingZerosLong", "int"),
         ("CountLeadingZerosLongLong", "int"),
+        ("CountTrailingZerosInt", "int"),
         ("CountTrailingZerosLongLong", "int"),
         ("PopulationCountInt", "int"),
         ("PopulationCountLongLong", "int"),
@@ -1050,6 +1052,84 @@ fn types_the_exact_integer_intrinsic_and_prefetch_contracts() {
 }
 
 #[test]
+fn types_gnu_statement_expression_value_categories_and_scope() {
+    let unit = analyze_source(
+        "int global; int array[2];\n\
+         int transparent(void) { ({ global; ; }) = 7; return global; }\n\
+         int *transparent_address(void) { return &({ global; }); }\n\
+         int *array_decay(void) { return ({ array; }); }\n\
+         int scoped(void) { return ({ int local = 3; local; }); }\n\
+         int sequenced(void) { return ({ global = 4; global; }); }\n\
+         void empty(void) { ({ ; ; }); }",
+    )
+    .unwrap();
+    let dump = dump_frontend_typed_ast(&unit);
+    assert!(dump.contains("statement-expression : int Lvalue"), "{dump}");
+    assert!(
+        dump.contains("statement-expression : pointer to int Value"),
+        "{dump}"
+    );
+    assert!(
+        dump.matches("statement-expression : int Value").count() >= 2,
+        "{dump}"
+    );
+    assert!(dump.contains("statement-expression : void Value"), "{dump}");
+
+    for source in [
+        "const int value = 0; int f(void) { ({ value; }) = 1; return 0; }",
+        "int value; int f(void) { ({ 0; value; }) = 1; return 0; }",
+        "int f(void) { return ({ int local = 1; local; }) = 2; }",
+        "int outside = ({ 1; });",
+    ] {
+        assert!(analyze_source(source).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn types_memory_builtins_as_libc_compatible_operations() {
+    let unit = analyze_preprocessed_source(
+        "memory-builtins.c",
+        "#if !__has_builtin(__builtin_memcpy) || \\
+             !__has_builtin(__builtin_memmove) || \\
+             !__has_builtin(__builtin_memset)\n\
+         #error missing memory builtin\n\
+         #endif\n\
+         void *copy(void *to, const void *from, unsigned long count) {\n\
+             return __builtin_memcpy(to, from, count);\n\
+         }\n\
+         void *move(void *to, const void *from, unsigned long count) {\n\
+             return __builtin_memmove(to, from, count);\n\
+         }\n\
+         void *fill(void *to, int value, unsigned long count) {\n\
+             return __builtin_memset(to, value, count);\n\
+         }",
+    )
+    .unwrap();
+    let dump = dump_frontend_typed_ast(&unit);
+    assert!(dump.contains("memory-copy overlap=false"), "{dump}");
+    assert!(dump.contains("memory-copy overlap=true"), "{dump}");
+    assert!(dump.contains("memory-set"), "{dump}");
+    assert_eq!(
+        dump.matches(" : pointer to void Value").count(),
+        12,
+        "{dump}"
+    );
+
+    for name in ["__builtin_memcpy", "__builtin_memmove", "__builtin_memset"] {
+        let mut config = EffectiveCompilationConfig::default();
+        config
+            .capabilities
+            .insert(CapabilityKind::Builtin, name, CapabilityState::ParseOnly);
+        let source = format!(
+            "void *f(void *p) {{ return {name}(p, {}, 1); }}",
+            if name == "__builtin_memset" { "0" } else { "p" }
+        );
+        let diagnostics = analyze_source_with_config(&source, &config).unwrap_err();
+        assert_eq!(diagnostics[0].code, "CCC2407", "{name}");
+    }
+}
+
+#[test]
 fn folds_integer_intrinsics_in_integer_constant_expression_contexts() {
     analyze_source(
         "enum folded {\n\
@@ -1057,6 +1137,7 @@ fn folds_integer_intrinsics_in_integer_constant_expression_contexts() {
              leading_int = __builtin_clz(1U),\n\
              leading_long = __builtin_clzl(1UL),\n\
              leading_long_long = __builtin_clzll(1ULL),\n\
+             trailing_int = __builtin_ctz(0x20U),\n\
              trailing_long_long = __builtin_ctzll(0x100ULL),\n\
              population_int = __builtin_popcount(0xf0U),\n\
              population_long_long = __builtin_popcountll(0xf00000000000000fULL)\n\
@@ -1065,18 +1146,24 @@ fn folds_integer_intrinsics_in_integer_constant_expression_contexts() {
          _Static_assert(leading_int == 31, \"clz\");\n\
          _Static_assert(leading_long == 63, \"clzl\");\n\
          _Static_assert(leading_long_long == 63, \"clzll\");\n\
+         _Static_assert(trailing_int == 5, \"ctz\");\n\
          _Static_assert(trailing_long_long == 8, \"ctzll\");\n\
          _Static_assert(population_int == 4, \"popcount\");\n\
          _Static_assert(population_long_long == 8, \"popcountll\");\n\
          int folded_array[(swapped == 0x0100000000000000UL &&\n\
              leading_int + leading_long + leading_long_long +\n\
-             trailing_long_long + population_int + population_long_long == 177) ? 7 : -1];",
+             trailing_int + trailing_long_long + population_int +\n\
+             population_long_long == 182) ? 7 : -1];",
     )
     .unwrap();
 
     assert!(
         analyze_source("enum invalid { value = __builtin_clz(0U) };").is_err(),
         "zero-input clz must remain outside constant folding"
+    );
+    assert!(
+        analyze_source("enum invalid { value = __builtin_ctz(0U) };").is_err(),
+        "zero-input ctz must remain outside constant folding"
     );
     analyze_source("int runtime(unsigned value) { return __builtin_clz(value); }").unwrap();
 }
@@ -1707,10 +1794,7 @@ fn retains_parameter_and_local_variable_length_bounds_without_requiring_vla_stor
     assert_eq!(declarations[1].duration, StorageDuration::Static);
     assert_eq!(declarations[1].variable_length_bounds.len(), 1);
 
-    assert_eq!(
-        diagnostic_codes("int rejected(int n) { int values[2][n]; return 0; }"),
-        vec!["CCC2258"]
-    );
+    assert!(analyze_source("int accepted(int n) { int values[2][n]; return 0; }").is_ok());
     assert_eq!(
         diagnostic_codes("int rejected(int n) { extern int (*value)[n]; return 0; }"),
         vec!["CCC2415"]
@@ -2136,6 +2220,38 @@ fn predefined_function_names_preserve_identifier_encoding_and_scope_rules() {
 }
 
 #[test]
+fn gnu_function_name_aliases_share_the_predefined_object() {
+    let unit = analyze_source(
+        "int aliases(void) {\n\
+             return __func__ == __FUNCTION__ &&\n\
+                 __FUNCTION__ == __PRETTY_FUNCTION__ &&\n\
+                 sizeof __PRETTY_FUNCTION__ == sizeof \"aliases\";\n\
+         }",
+    )
+    .unwrap();
+    assert_eq!(unit.strings.len(), 2);
+    let dump = dump_frontend_typed_ast(&unit);
+    assert_eq!(
+        dump.matches("PredefinedFunctionName(StringId(0))").count(),
+        4,
+        "{dump}"
+    );
+
+    let mut config = EffectiveCompilationConfig::default();
+    config.language.mode = LanguageMode::C11;
+    let diagnostics = analyze_source_with_config(
+        "int f(void) { return __FUNCTION__[0] + __PRETTY_FUNCTION__[0]; }",
+        &config,
+    )
+    .unwrap_err();
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code == "CCC2274")
+    );
+}
+
+#[test]
 fn ordinary_strings_initialize_all_character_array_types() {
     let unit =
         analyze_source("unsigned char bytes[] = \"xy\"; signed char signed_bytes[] = \"z\";")
@@ -2475,6 +2591,38 @@ fn global_addresses_are_relocation_bearing_constants() {
         Some(ConstantValue::Address(RelocatableAddress {
             base: RelocatableBase::Global(target.id),
             addend: 0,
+            one_past: false,
+        }))
+    );
+}
+
+#[test]
+fn global_subobject_addresses_include_array_and_member_offsets() {
+    let unit = analyze_source(
+        "struct Pair { int first; int second; };\n\
+         struct Pair values[2];\n\
+         int *pointer = &values[1].second;",
+    )
+    .unwrap();
+    let values = unit
+        .globals
+        .iter()
+        .find(|global| global.name == "values")
+        .unwrap();
+    let pointer = unit
+        .globals
+        .iter()
+        .find(|global| global.name == "pointer")
+        .unwrap();
+    let FullTypedInitializerKind::Scalar(expression) = &pointer.initializer.as_ref().unwrap().kind
+    else {
+        panic!("pointer initializer is scalar")
+    };
+    assert_eq!(
+        expression.constant,
+        Some(ConstantValue::Address(RelocatableAddress {
+            base: RelocatableBase::Global(values.id),
+            addend: 12,
             one_past: false,
         }))
     );
@@ -2872,10 +3020,43 @@ fn no_argument_attributes_reject_argument_lists() {
 }
 
 #[test]
-fn rejects_unsupported_semantics_and_storage_but_allows_long_double_layout() {
+fn accepts_automatic_variable_length_and_thread_local_objects() {
+    assert!(analyze_source("int f(int n) { int values[n]; return values[n - 1]; }").is_ok());
     assert!(
-        diagnostic_codes("int f(int n) { int values[n]; return 0; }")
-            .contains(&"CCC2258".to_owned())
+        analyze_source("int f(int n) { int values[n]; goto inside; inside: return values[0]; }")
+            .is_ok()
+    );
+    assert!(
+        analyze_source("int f(int n) { { int values[n]; goto outside; } outside: return 0; }")
+            .is_ok()
+    );
+    assert_eq!(
+        diagnostic_codes("int f(int n) { goto inside; int values[n]; inside: return 0; }"),
+        vec!["CCC2442"]
+    );
+    assert_eq!(
+        diagnostic_codes(
+            "int f(int n, int choice) {
+                 switch (choice) { int values[n]; case 0: return values[0]; }
+                 return 0;
+             }"
+        ),
+        vec!["CCC2442"]
+    );
+    assert_eq!(
+        diagnostic_codes(
+            "int f(int n) {
+                 void *target = &&done;
+                 int values[n];
+                 goto *target;
+                 done: return values[0];
+             }"
+        ),
+        vec!["CCC2442"]
+    );
+    assert_eq!(
+        diagnostic_codes("int f(int n) { static int values[n]; return 0; }"),
+        vec!["CCC2258"]
     );
     assert!(analyze_source("unsigned long size = sizeof(long double);").is_ok());
     assert!(analyze_source("unsigned long alignment = __alignof__(long double);").is_ok());
@@ -2910,14 +3091,51 @@ fn rejects_unsupported_semantics_and_storage_but_allows_long_double_layout() {
             .iter()
             .any(|diagnostic| diagnostic.code == "CCC2346")
     );
-    assert!(diagnostic_codes("__thread int value;").contains(&"CCC2374".to_owned()));
+    assert!(analyze_source("__thread int value;").is_ok());
+    assert!(
+        analyze_source("__thread int value __attribute__((tls_model(\"initial-exec\")));").is_ok()
+    );
+    for source in [
+        "int value __attribute__((tls_model(\"initial-exec\")));",
+        "static int value __attribute__((tls_model(\"local-exec\")));",
+        "int function(void) __attribute__((tls_model(\"global-dynamic\")));",
+        "typedef int Alias __attribute__((tls_model(\"local-dynamic\")));",
+        "int function(void) { int value __attribute__((tls_model(\"initial-exec\"))); return value; }",
+        "int function(void) { static int value __attribute__((tls_model(\"local-exec\"))); return value; }",
+    ] {
+        assert_eq!(diagnostic_codes(source), vec!["CCC2441"], "{source}");
+    }
+    assert!(analyze_source("int value; _Thread_local int *pointer = &value;").is_ok());
+    assert_eq!(
+        diagnostic_codes("_Thread_local int value; int *pointer = &value;"),
+        vec!["CCC2344"]
+    );
+    assert_eq!(
+        diagnostic_codes(
+            "int function(void) {
+                 static _Thread_local int value;
+                 static int *pointer = &value;
+                 return pointer != 0;
+             }"
+        ),
+        vec!["CCC2367"]
+    );
+    assert_eq!(
+        diagnostic_codes("__thread int function(void);"),
+        vec!["CCC2374"]
+    );
 }
 
 #[test]
 fn target_specific_tls_and_variadic_alignment_gates_are_exact() {
     let tls_sources = [
         "_Thread_local int file_value;",
-        "int read(void) { _Thread_local int block_value; return block_value; }",
+        "static _Thread_local int file_static;",
+        "extern _Thread_local int file_extern;",
+        "__thread int gnu_file_value;",
+        "static __thread int gnu_file_static;",
+        "int read(void) { static _Thread_local int block_value; return block_value; }",
+        "int read(void) { extern _Thread_local int block_value; return block_value; }",
     ];
     for config in [
         EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),

@@ -287,6 +287,58 @@ fn display_instruction(module: &FullModule, kind: &FullInstructionKind) -> Strin
         FullInstructionKind::AddressOfStorage { storage } => {
             format!("address.storage m{}", storage.0)
         }
+        FullInstructionKind::RuntimeSizedAllocate {
+            storage,
+            extents,
+            element,
+            constant_factor,
+            requested_alignment,
+        } => format!(
+            "runtime.allocate m{} extents=[{}] element={} constant-factor={} requested-align={}",
+            storage.0,
+            extents
+                .iter()
+                .map(|value| format!("v{}", value.0))
+                .collect::<Vec<_>>()
+                .join(", "),
+            module.types.display_qualified(*element),
+            constant_factor,
+            requested_alignment.map_or_else(|| "natural".to_owned(), |value| value.to_string())
+        ),
+        FullInstructionKind::RuntimePointerOffset {
+            base,
+            index,
+            element,
+            extents,
+            subtract,
+        } => format!(
+            "pointer.offset.runtime v{}, {}v{} element={} extents=[{}]",
+            base.0,
+            if *subtract { "-" } else { "" },
+            index.0,
+            module.types.display_qualified(*element),
+            extents
+                .iter()
+                .map(|value| format!("v{}", value.0))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        FullInstructionKind::RuntimePointerDifference {
+            left,
+            right,
+            element,
+            extents,
+        } => format!(
+            "pointer.difference.runtime v{}, v{} element={} extents=[{}]",
+            left.0,
+            right.0,
+            module.types.display_qualified(*element),
+            extents
+                .iter()
+                .map(|value| format!("v{}", value.0))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         FullInstructionKind::ProjectField {
             base,
             record,
@@ -478,6 +530,23 @@ fn display_instruction(module: &FullModule, kind: &FullInstructionKind) -> Strin
         FullInstructionKind::IntegerIntrinsic { operation, operand } => {
             format!("integer.intrinsic operation={operation:?} v{}", operand.0)
         }
+        FullInstructionKind::MemoryCopy {
+            destination,
+            source,
+            length,
+            overlap,
+        } => format!(
+            "memory.copy v{} -> v{} length=v{} overlap={overlap}",
+            source.0, destination.0, length.0
+        ),
+        FullInstructionKind::MemorySet {
+            destination,
+            value,
+            length,
+        } => format!(
+            "memory.set v{} value=v{} length=v{}",
+            destination.0, value.0, length.0
+        ),
         FullInstructionKind::DirectCall {
             function,
             signature,

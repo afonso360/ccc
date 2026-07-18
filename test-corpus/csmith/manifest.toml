@@ -1,0 +1,75 @@
+format_version = 2
+name = "csmith"
+version = "2.4.0"
+revision = "0cdc710315cfee9035e22ef4363ca479270d1934f"
+distribution = "official-commit-source"
+origin = "https://codeload.github.com/csmith-project/csmith/tar.gz/0cdc710315cfee9035e22ef4363ca479270d1934f"
+archive = "csmith-0cdc710315cfee9035e22ef4363ca479270d1934f.tar.gz"
+archive_bytes = 330825
+archive_sha256 = "f85081c3cc817770c1664b5d4457d1b91120e26daff86e24aa3e7fb91941c611"
+archive_sha3_256 = "35f8dcc176f8a99af6672af270891bf65b070a19036713412974d8038ec9141e"
+license = "BSD-3-Clause"
+upstream_license_file = "COPYING"
+fetched_not_vendored = true
+
+target = "x86_64-unknown-linux-gnu"
+language_mode = "c11"
+profile = "profile.sh"
+generator_options = [
+    "--no-argc",
+    "--no-float",
+    "--no-packed-struct",
+    "--no-unions",
+    "--no-bitfields",
+    "--no-builtins",
+    "--no-dangling-global-pointers",
+    "--no-return-dead-pointer",
+    "--strict-volatile-rule",
+    "--match-exact-qualifiers",
+    "--safe-math",
+    "--max-funcs",
+    "5",
+    "--max-block-depth",
+    "4",
+    "--max-block-size",
+    "4",
+    "--max-expr-complexity",
+    "8",
+    "--max-array-dim",
+    "2",
+    "--max-array-len-per-dim",
+    "5",
+]
+reference_compilers = ["gcc", "clang"]
+reference_optimizations = ["-O0", "-O2"]
+target_compiler = "ccc"
+output_oracle = "reference-consensus"
+eligibility = "gcc-and-clang-strict-c11"
+inconclusive_policy = "replace-joint-reference-timeout"
+link_driver = "gcc"
+link_libraries = ["m"]
+
+[defaults]
+cases = 100
+start_seed = 1
+build_jobs = 2
+maximum_attempt_multiplier = 10
+generator_timeout_seconds = 30
+compile_timeout_seconds = 60
+execution_timeout_seconds = 10
+
+[retained_artifacts]
+run = [
+    "run-config.txt",
+    "run-summary.txt",
+    "summary.tsv",
+    "tool-identities",
+]
+case = [
+    "program.c",
+    "commands.txt",
+    "result.txt",
+    "*.status",
+    "*.stdout",
+    "*.stderr",
+]

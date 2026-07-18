@@ -22,7 +22,7 @@ jobs:
           artifact_dir="$RUNNER_TEMP/ccc-sysv-amd64-artifacts"
           mkdir -p "$artifact_dir"
           missing=()
-          for tool in curl gcc clang make tclsh pkg-config objdump readelf gdb objcopy timeout; do
+          for tool in curl cc gcc clang make tclsh pkg-config objdump readelf gdb objcopy timeout openssl patch; do
             if ! command -v "$tool" >/dev/null; then
               missing+=("$tool")
             fi
@@ -81,6 +81,8 @@ jobs:
             printf 'puts [info patchlevel]\n' | tclsh
           } 2>&1 | tee "$RUNNER_TEMP/ccc-sysv-amd64-artifacts/tool-identities.txt"
       - run: cargo fmt --check
+      - name: Test corpus adapters
+        run: ./test-corpus/test-adapters.sh
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test -p ccc-driver --test preprocessing -- --show-output
       - run: cargo test -p ccc-driver --features ci-sysv-amd64 --test sysv_amd64_environment -- --show-output

@@ -1,1 +1,1 @@
-__thread int value;
+__thread int function(void);
