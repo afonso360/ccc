@@ -1465,7 +1465,10 @@ int calls_reference(void) {
         .arg(&first_source));
     let dump = String::from_utf8(dump.stdout).unwrap();
     assert!(dump.lines().any(|line| {
-        line.contains("transport=bridge kind=variadic-call") && line.contains(" al=8 ")
+        line.contains("transport=bridge")
+            && line.contains("abi=sysv-amd64-lp64")
+            && line.contains("kind=variadic-call")
+            && line.contains(" al=8 ")
     }));
 
     compile_ccc("gcc", &first_source, &first_object);

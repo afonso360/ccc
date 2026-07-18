@@ -981,7 +981,7 @@ fn homogeneous_members(
                 return Ok(None);
             };
             if definition.kind == RecordKind::Union {
-                let mut canonical = None;
+                let mut canonical: Option<Vec<HomogeneousMember>> = None;
                 for field_layout in &record_layout.fields {
                     if field_layout.bitfield.is_some() {
                         return Ok(None);
@@ -992,13 +992,17 @@ fn homogeneous_members(
                     else {
                         return Ok(None);
                     };
-                    if canonical
-                        .as_ref()
-                        .is_some_and(|members: &Vec<HomogeneousMember>| *members != field_members)
-                    {
-                        return Ok(None);
+                    if let Some(members) = &canonical {
+                        let shared = members.len().min(field_members.len());
+                        if members[..shared] != field_members[..shared] {
+                            return Ok(None);
+                        }
+                        if field_members.len() > members.len() {
+                            canonical = Some(field_members);
+                        }
+                    } else {
+                        canonical = Some(field_members);
                     }
-                    canonical = Some(field_members);
                 }
                 return Ok(canonical);
             }
@@ -1492,13 +1496,17 @@ mod tests {
     #[test]
     fn union_hfas_deduplicate_uniquely_addressable_members() {
         let mut types = TypeStore::default();
+        let doubles = types.array(ccc_types::ArrayType {
+            element: QualifiedType::unqualified(TypeId::DOUBLE),
+            length: ArrayLength::Constant(2),
+        });
         let (id, union) = types.declare_record(RecordKind::Union, None);
         types
             .complete_record(
                 id,
                 vec![
                     Field::named("first", TypeId::DOUBLE),
-                    Field::named("second", TypeId::DOUBLE),
+                    Field::named("second", doubles),
                 ],
             )
             .unwrap();
@@ -1512,9 +1520,16 @@ mod tests {
             &EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
         )
         .unwrap();
-        assert_eq!(plan.parameters[0].classified.classes, [AbiClass::Sse]);
-        assert_eq!(plan.parameters[0].classified.pieces.len(), 1);
-        assert_eq!(plan.clif_parameters[0].carrier, AbiCarrier::F64);
+        assert_eq!(
+            plan.parameters[0].classified.classes,
+            [AbiClass::Sse, AbiClass::Sse]
+        );
+        assert_eq!(plan.parameters[0].classified.pieces.len(), 2);
+        assert!(
+            plan.clif_parameters
+                .iter()
+                .all(|carrier| carrier.carrier == AbiCarrier::F64)
+        );
     }
 
     #[test]

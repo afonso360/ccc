@@ -691,8 +691,13 @@ fn render_arm64_call_helper(
          str q2, [x19, #288]\n\
          str q3, [x19, #304]\n\
          mov sp, x29\n\
+         .cfi_def_cfa sp, 32\n\
          ldp x19, x20, [sp, #16]\n\
+         .cfi_restore x19\n\
+         .cfi_restore x20\n\
          ldp x29, x30, [sp], #32\n\
+         .cfi_restore x29\n\
+         .cfi_restore x30\n\
          .cfi_def_cfa sp, 0\n\
          ret\n",
     );
@@ -1083,7 +1088,10 @@ fn render_arm64_variadic_entry(
     }
     source.push_str(
         "mov sp, x29\n\
+         .cfi_def_cfa sp, 16\n\
          ldp x29, x30, [sp], #16\n\
+         .cfi_restore x29\n\
+         .cfi_restore x30\n\
          .cfi_def_cfa sp, 0\n\
          ret\n",
     );

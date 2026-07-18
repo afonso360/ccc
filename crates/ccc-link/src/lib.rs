@@ -121,15 +121,15 @@ impl ToolchainRequirements {
         }
     }
 
-    /// Mach-O bridge assembly uses private-external symbols and therefore
-    /// needs no GNU-style post-link symbol localization tool.
+    /// Mach-O partial linking preserves source-hidden private externs, then
+    /// LLVM objcopy localizes only compiler-internal manifest symbols.
     pub const fn package_generated_macho_assembly() -> Self {
         Self {
             system_headers: false,
             disable_system_headers: false,
             assembler: false,
             linker: false,
-            object_copier: false,
+            object_copier: true,
             archiver: false,
         }
     }
@@ -1098,6 +1098,12 @@ pub fn link_executable_with_toolchain(
     config: &EffectiveCompilationConfig,
     toolchain: &ToolchainSpec,
 ) -> Result<(), LinkError> {
+    config
+        .validate_target_profile_options()
+        .map_err(|message| LinkError {
+            code: "CCC5005",
+            message,
+        })?;
     let driver = toolchain
         .linker_driver
         .as_ref()
@@ -1111,14 +1117,7 @@ pub fn link_executable_with_toolchain(
         })?;
     let mut command = tool_command(driver);
     command.arg(object).arg("-o").arg(output);
-    match config.relocation_model {
-        RelocationModel::Static => {
-            command.arg("-no-pie");
-        }
-        RelocationModel::Pic | RelocationModel::Pie => {
-            command.arg("-pie");
-        }
-    }
+    command.arg(relocation_link_argument(config));
     let result = command.output().map_err(|error| LinkError {
         code: "CCC5003",
         message: format!(
@@ -1138,6 +1137,20 @@ pub fn link_executable_with_toolchain(
         });
     }
     Ok(())
+}
+
+fn relocation_link_argument(config: &EffectiveCompilationConfig) -> &'static str {
+    match (
+        config.target.triple.binary_format,
+        config.relocation_model,
+    ) {
+        (ccc_target::BinaryFormat::Macho, RelocationModel::Static) => "-Wl,-no_pie",
+        (ccc_target::BinaryFormat::Macho, RelocationModel::Pic | RelocationModel::Pie) => {
+            "-Wl,-pie"
+        }
+        (_, RelocationModel::Static) => "-no-pie",
+        (_, RelocationModel::Pic | RelocationModel::Pie) => "-pie",
+    }
 }
 
 /// Compatibility entry point. Configurations carrying a resolved toolchain do
@@ -1554,6 +1567,20 @@ mod tests {
             &"aarch64-apple-ios".parse().unwrap(),
             &macos
         ));
+    }
+
+    #[test]
+    fn executable_relocation_flags_follow_the_target_driver() {
+        let mut linux = EffectiveCompilationConfig::x86_64_unknown_linux_gnu();
+        assert_eq!(relocation_link_argument(&linux), "-pie");
+        linux.relocation_model = RelocationModel::Static;
+        assert_eq!(relocation_link_argument(&linux), "-no-pie");
+
+        let darwin = EffectiveCompilationConfig::aarch64_apple_darwin();
+        assert_eq!(relocation_link_argument(&darwin), "-Wl,-pie");
+        let mut unsupported = darwin;
+        unsupported.relocation_model = RelocationModel::Static;
+        assert!(unsupported.validate_target_profile_options().is_err());
     }
 
     #[test]

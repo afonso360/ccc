@@ -87,14 +87,10 @@ pub fn package_artifact_bundle_with_runner<R: ProbeRunner>(
             object_copier: None,
         });
     }
-    let candidates = if config.target.triple.binary_format == BinaryFormat::Macho {
-        Vec::new()
-    } else {
-        vec![toolchain.object_copier.clone().ok_or_else(|| LinkError {
-            code: "CCC5011",
-            message: "resolved toolchain has no object copier for generated assembly".to_owned(),
-        })?]
-    };
+    let candidates = vec![toolchain.object_copier.clone().ok_or_else(|| LinkError {
+        code: "CCC5011",
+        message: "resolved toolchain has no object copier for generated assembly".to_owned(),
+    })?];
     package_with_runner(&verified, output, config, toolchain, runner, candidates)
 }
 
@@ -126,16 +122,13 @@ fn package_with_runner<R: ProbeRunner>(
         })?;
     let workspace = ArtifactWorkspace::create(output)?;
     let macho = config.target.triple.binary_format == BinaryFormat::Macho;
-    let copier = if macho {
-        None
-    } else {
-        Some(probe_packaging_capabilities(
-            workspace.path(),
-            driver,
-            &candidates,
-            runner,
-        )?)
-    };
+    let copier = Some(probe_packaging_capabilities(
+        workspace.path(),
+        driver,
+        &candidates,
+        runner,
+        macho,
+    )?);
 
     let primary = workspace.path().join("primary.o");
     write_file(&primary, bundle.primary_object())?;
@@ -158,20 +151,23 @@ fn package_with_runner<R: ProbeRunner>(
     }
 
     let combined = workspace.path().join("combined.unlocalized.o");
-    partial_link(runner, driver, &objects, &combined)?;
+    partial_link(runner, driver, &objects, &combined, macho)?;
     inspect_combined_object(&combined, bundle, false)?;
 
-    if macho {
-        inspect_combined_object(&combined, bundle, true)?;
-        workspace.publish(&combined, output)?;
-        return Ok(PackagingReport {
-            used_generated_assembly: true,
-            object_copier: None,
-        });
-    }
-
     let localization_file = workspace.path().join("localize-symbols.txt");
-    let mut localization = bundle.manifest().localization_symbols().join("\n");
+    let mut localization = bundle
+        .manifest()
+        .localization_symbols()
+        .into_iter()
+        .map(|symbol| {
+            if macho {
+                format!("_{symbol}")
+            } else {
+                symbol.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     if !localization.is_empty() {
         localization.push('\n');
     }
@@ -182,7 +178,7 @@ fn package_with_runner<R: ProbeRunner>(
         runner,
         &copier
             .as_ref()
-            .expect("non-Mach-O packaging probes an object copier")
+            .expect("generated-assembly packaging probes an object copier")
             .command,
         &localization_file,
         &combined,
@@ -201,6 +197,7 @@ fn probe_packaging_capabilities<R: ProbeRunner>(
     driver: &ToolCommandSpec,
     candidates: &[ToolCommandSpec],
     runner: &R,
+    macho: bool,
 ) -> Result<PackagingToolIdentity, LinkError> {
     let probe_primary_source = workspace.join("capability-primary.s");
     let probe_generated_source = workspace.join("capability-generated.s");
@@ -208,15 +205,27 @@ fn probe_packaging_capabilities<R: ProbeRunner>(
     let probe_generated = workspace.join("capability-generated.o");
     let probe_combined = workspace.join("capability-combined.o");
     let localization_file = workspace.join("capability-localize.txt");
-    write_file(
-        &probe_primary_source,
-        b".text\n.globl __ccc_capability_primary\n.type __ccc_capability_primary,@function\n__ccc_capability_primary:\nret\n.section .note.GNU-stack,\"\",@progbits\n",
-    )?;
-    write_file(
-        &probe_generated_source,
-        b".text\n.globl __ccc_capability_internal\n.type __ccc_capability_internal,@function\n__ccc_capability_internal:\nret\n.section .note.GNU-stack,\"\",@progbits\n",
-    )?;
-    write_file(&localization_file, b"__ccc_capability_internal\n")?;
+    if macho {
+        write_file(
+            &probe_primary_source,
+            b".text\n.globl ___ccc_capability_primary\n___ccc_capability_primary:\nret\n.subsections_via_symbols\n",
+        )?;
+        write_file(
+            &probe_generated_source,
+            b".text\n.globl ___ccc_capability_internal\n.private_extern ___ccc_capability_internal\n___ccc_capability_internal:\nret\n.subsections_via_symbols\n",
+        )?;
+        write_file(&localization_file, b"___ccc_capability_internal\n")?;
+    } else {
+        write_file(
+            &probe_primary_source,
+            b".text\n.globl __ccc_capability_primary\n.type __ccc_capability_primary,@function\n__ccc_capability_primary:\nret\n.section .note.GNU-stack,\"\",@progbits\n",
+        )?;
+        write_file(
+            &probe_generated_source,
+            b".text\n.globl __ccc_capability_internal\n.type __ccc_capability_internal,@function\n__ccc_capability_internal:\nret\n.section .note.GNU-stack,\"\",@progbits\n",
+        )?;
+        write_file(&localization_file, b"__ccc_capability_internal\n")?;
+    }
     assemble(
         runner,
         driver,
@@ -236,6 +245,7 @@ fn probe_packaging_capabilities<R: ProbeRunner>(
         driver,
         &[probe_primary, probe_generated],
         &probe_combined,
+        macho,
     )?;
     inspect_path(&probe_combined, "packaging capability partial link")?;
 
@@ -264,7 +274,8 @@ fn probe_packaging_capabilities<R: ProbeRunner>(
     Err(LinkError {
         code: "CCC5012",
         message: format!(
-            "no object copier supports exact x86-64 ELF symbol localization: {}",
+            "no object copier supports exact generated-symbol localization for {}: {}",
+            if macho { "Mach-O" } else { "ELF" },
             failures.join("; ")
         ),
     })
@@ -297,8 +308,12 @@ fn partial_link<R: ProbeRunner>(
     driver: &ToolCommandSpec,
     objects: &[PathBuf],
     output: &Path,
+    macho: bool,
 ) -> Result<(), LinkError> {
     let mut arguments = vec![OsString::from("-nostdlib"), OsString::from("-r")];
+    if macho {
+        arguments.push(OsString::from("-Wl,-keep_private_externs"));
+    }
     arguments.extend(objects.iter().map(|path| path.as_os_str().to_owned()));
     arguments.extend([OsString::from("-o"), output.as_os_str().to_owned()]);
     run_tool(runner, driver, arguments, "generated-object partial link")
@@ -450,7 +465,11 @@ fn inspect_localized_probe(path: &Path) -> Result<(), LinkError> {
     let object = parse_relocatable(&bytes, "localized capability object")?;
     let symbol = object
         .symbols()
-        .find(|symbol| symbol.name() == Ok("__ccc_capability_internal"))
+        .find(|symbol| {
+            symbol.name().is_ok_and(|name| {
+                canonical_symbol_name(object.format(), name) == "__ccc_capability_internal"
+            })
+        })
         .ok_or_else(|| artifact_error("localized capability object lost its sentinel symbol"))?;
     if symbol.scope() != SymbolScope::Compilation {
         return Err(artifact_error(
@@ -1410,7 +1429,7 @@ mod tests {
             ),
             (
                 "CCC5012",
-                "no object copier supports exact x86-64 ELF symbol localization: fake-objcopy: `fake-objcopy` failed during exact generated-symbol localization with exit status: 1: injected failure",
+                "no object copier supports exact generated-symbol localization for ELF: fake-objcopy: `fake-objcopy` failed during exact generated-symbol localization with exit status: 1: injected failure",
             ),
             (
                 "CCC5014",
@@ -1559,7 +1578,7 @@ mod tests {
         assert_eq!(error.code, "CCC5012");
         assert_eq!(
             error.message,
-            "no object copier supports exact x86-64 ELF symbol localization: missing-objcopy: cannot invoke `missing-objcopy` for exact generated-symbol localization: injected missing executable"
+            "no object copier supports exact generated-symbol localization for ELF: missing-objcopy: cannot invoke `missing-objcopy` for exact generated-symbol localization: injected missing executable"
         );
 
         assert!(!output.exists());

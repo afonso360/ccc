@@ -988,6 +988,13 @@ impl EffectiveCompilationConfig {
     }
 
     pub fn validate_target_profile_options(&self) -> Result<(), String> {
+        if self.target.abi == AbiIdentity::DarwinArm64
+            && self.relocation_model == RelocationModel::Static
+        {
+            return Err(
+                "Darwin arm64 does not provide a non-PIE executable/object profile".to_owned(),
+            );
+        }
         if let Some(architecture) = self.target_arch.as_deref()
             && architecture != self.normalized_target_arch()
         {
@@ -1422,10 +1429,28 @@ mod tests {
         let aarch64 = EffectiveCompilationConfig::aarch64_unknown_linux_gnu();
         assert_eq!(aarch64.target_macros.get("__aarch64__"), Some("1"));
         assert_eq!(aarch64.target_macros.get("__ARM_ARCH"), Some("8"));
+        assert_eq!(aarch64.target_macros.get("__ARM_ARCH_8A"), Some("1"));
+        assert_eq!(aarch64.target_macros.get("__ARM64_ARCH_8__"), None);
+        assert_eq!(aarch64.target_macros.get("__ARM_ARCH_PROFILE"), Some("65"));
+        assert_eq!(aarch64.target_macros.get("__ARM_FP"), Some("14"));
+        assert_eq!(
+            aarch64.target_macros.get("__ARM_ALIGN_MAX_STACK_PWR"),
+            Some("16")
+        );
+        assert_eq!(aarch64.target_macros.get("__BIGGEST_ALIGNMENT__"), Some("16"));
         assert_eq!(aarch64.target_macros.get("__ARM_PCS_AAPCS64"), Some("1"));
         assert_eq!(aarch64.target_macros.get("__LONG_DOUBLE_128__"), Some("1"));
         assert_eq!(aarch64.target_macros.get("__LDBL_MANT_DIG__"), Some("113"));
         assert_eq!(aarch64.target_macros.get("__CHAR_UNSIGNED__"), Some("1"));
+        for unsupported_surface in [
+            "__ARM_NEON",
+            "__ARM_NEON__",
+            "__ARM_FP16_ARGS",
+            "__ARM_FP16_FORMAT_IEEE",
+            "__ARM_FEATURE_CLZ",
+        ] {
+            assert_eq!(aarch64.target_macros.get(unsupported_surface), None);
+        }
 
         let riscv = EffectiveCompilationConfig::riscv64_unknown_linux_gnu();
         assert_eq!(riscv.target_macros.get("__riscv_xlen"), Some("64"));
@@ -1434,9 +1459,27 @@ mod tests {
             Some("1")
         );
         assert_eq!(riscv.target_macros.get("__riscv_m"), Some("2000000"));
+        assert_eq!(riscv.target_macros.get("__riscv_zicsr"), Some("2000000"));
+        assert_eq!(
+            riscv.target_macros.get("__riscv_zifencei"),
+            Some("2000000")
+        );
         assert_eq!(riscv.target_macros.get("__riscv_atomic"), Some("1"));
         assert_eq!(riscv.target_macros.get("__LONG_DOUBLE_128__"), Some("1"));
         assert_eq!(riscv.target_macros.get("__LDBL_MANT_DIG__"), Some("113"));
+        let pie = riscv.frontend_predefined_macros();
+        assert_eq!(pie.get("__riscv_cmodel_medany").map(String::as_str), Some("1"));
+        assert_eq!(pie.get("__riscv_cmodel_pic").map(String::as_str), Some("1"));
+        assert_eq!(pie.get("__riscv_cmodel_medlow"), None);
+        let mut static_riscv = riscv.clone();
+        static_riscv.relocation_model = RelocationModel::Static;
+        let static_macros = static_riscv.frontend_predefined_macros();
+        assert_eq!(
+            static_macros.get("__riscv_cmodel_medlow").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(static_macros.get("__riscv_cmodel_medany"), None);
+        assert_eq!(static_macros.get("__riscv_cmodel_pic"), None);
 
         let darwin =
             EffectiveCompilationConfig::aarch64_apple_darwin().with_deployment_target("14.2.1");
@@ -1450,6 +1493,15 @@ mod tests {
             Some("140201")
         );
         assert_eq!(darwin.target_macros.get("__USER_LABEL_PREFIX__"), Some("_"));
+        assert_eq!(darwin.target_macros.get("__ARM_ARCH_8A"), None);
+        assert_eq!(darwin.target_macros.get("__ARM64_ARCH_8__"), Some("1"));
+        assert_eq!(darwin.target_macros.get("__ARM_ARCH_PROFILE"), Some("'A'"));
+        assert_eq!(darwin.target_macros.get("__ARM_FP"), Some("0xE"));
+        assert_eq!(
+            darwin.target_macros.get("__ARM_ALIGN_MAX_STACK_PWR"),
+            Some("4")
+        );
+        assert_eq!(darwin.target_macros.get("__BIGGEST_ALIGNMENT__"), Some("8"));
         assert_eq!(darwin.target_macros.get("__LDBL_MANT_DIG__"), Some("53"));
         assert_eq!(darwin.target_macros.get("__LONG_DOUBLE_128__"), None);
     }

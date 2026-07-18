@@ -227,6 +227,8 @@ fn emit_inner(
         symbol.weak = function.binding == SymbolBinding::Weak;
         if config.target.triple.binary_format == BinaryFormat::Elf {
             set_elf_symbol_visibility(symbol, function.visibility);
+        } else if config.target.triple.binary_format == BinaryFormat::Macho {
+            set_macho_symbol_visibility(symbol, function.visibility);
         }
     }
     for global in module
@@ -242,6 +244,8 @@ fn emit_inner(
         symbol.weak = global.emission.binding == SymbolBinding::Weak;
         if config.target.triple.binary_format == BinaryFormat::Elf {
             set_elf_symbol_visibility(symbol, global.emission.visibility);
+        } else if config.target.triple.binary_format == BinaryFormat::Macho {
+            set_macho_symbol_visibility(symbol, global.emission.visibility);
         }
     }
     unwind.emit(&mut product).map_err(error)?;
@@ -705,6 +709,8 @@ fn declare_module(
         let is_external_common = !tls
             && global.emission.definition == ObjectDefinitionPolicy::TentativeCommon
             && global.linkage == CLinkage::External;
+        let is_external_common =
+            is_external_common && config.target.triple.binary_format == BinaryFormat::Elf;
         let linkage = if is_external_common {
             // Cranelift has no common-symbol linkage. Keep the symbol
             // undefined through module finalization, then rewrite its ELF
@@ -944,6 +950,18 @@ fn set_elf_symbol_visibility(symbol: &mut object::write::Symbol, visibility: Sym
     symbol.flags = SymbolFlags::Elf {
         st_info: (binding << 4) | symbol_type,
         st_other,
+    };
+}
+
+fn set_macho_symbol_visibility(
+    symbol: &mut object::write::Symbol,
+    visibility: SymbolVisibility,
+) {
+    symbol.scope = match visibility {
+        SymbolVisibility::Default | SymbolVisibility::Protected => SymbolScope::Dynamic,
+        SymbolVisibility::Hidden | SymbolVisibility::Internal => {
+            SymbolScope::Linkage
+        }
     };
 }
 

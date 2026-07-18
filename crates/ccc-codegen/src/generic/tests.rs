@@ -85,7 +85,13 @@ fn enabled_non_x86_targets_emit_native_objects_with_fixed_aggregate_calls() {
         assert!(
             object
                 .symbols()
-                .any(|symbol| symbol.name() == Ok(swap.as_str()))
+                .any(|symbol| symbol.name() == Ok(swap.as_str())),
+            "{} expected {swap}; symbols={:?}",
+            config.target.triple,
+            object
+                .symbols()
+                .filter_map(|symbol| symbol.name().ok().map(str::to_owned))
+                .collect::<Vec<_>>()
         );
         assert!(
             object
@@ -93,6 +99,39 @@ fn enabled_non_x86_targets_emit_native_objects_with_fixed_aggregate_calls() {
                 .any(|symbol| symbol.name() == Ok(sum.as_str()))
         );
     }
+}
+
+#[test]
+fn darwin_symbols_tentative_data_and_libcalls_match_apple_spelling() {
+    let output = emit_source_with_config(
+        "int tentative;\n\
+         int default_function(void) { return tentative; }\n\
+         int hidden_function(void) __attribute__((visibility(\"hidden\")));\n\
+         int hidden_function(void) { return 2; }\n\
+         int protected_function(void) __attribute__((visibility(\"protected\")));\n\
+         int protected_function(void) { return 3; }\n\
+         int internal_function(void) __attribute__((visibility(\"internal\")));\n\
+         int internal_function(void) { return 4; }\n\
+         void copy_bytes(void *to, const void *from, unsigned long count) {\n\
+             __builtin_memcpy(to, from, count);\n\
+         }",
+        &EffectiveCompilationConfig::aarch64_apple_darwin(),
+    );
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    let tentative = object.symbol_by_name("_tentative").unwrap();
+    assert!(!tentative.is_undefined());
+    assert_ne!(tentative.section(), object::SymbolSection::Common);
+    for (name, scope) in [
+        ("_default_function", object::SymbolScope::Dynamic),
+        ("_hidden_function", object::SymbolScope::Linkage),
+        ("_protected_function", object::SymbolScope::Dynamic),
+        ("_internal_function", object::SymbolScope::Linkage),
+    ] {
+        assert_eq!(object.symbol_by_name(name).unwrap().scope(), scope, "{name}");
+    }
+    let memcpy = object.symbol_by_name("_memcpy").unwrap();
+    assert!(memcpy.is_undefined());
+    assert!(object.symbol_by_name("__memcpy").is_none());
 }
 
 #[test]
