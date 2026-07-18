@@ -2410,7 +2410,7 @@ fn bridge_frame_layout(abi: ccc_target::AbiIdentity) -> BridgeFrameLayout {
             // stack argument area, making the public pointer va_list cursor
             // contiguous across saved a-registers and caller stack slots.
             entry_integer_arguments: 448,
-            entry_float_arguments: 288,
+            entry_float_arguments: 112,
             integer_results: 240,
             float_results: 256,
             indirect_result: 48,

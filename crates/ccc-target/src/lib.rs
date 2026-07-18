@@ -59,6 +59,12 @@ impl AbiIdentity {
             Self::SysvAmd64Lp64 | Self::Aapcs64Lp64 | Self::RiscvLp64d
         )
     }
+
+    /// Whether CCC has complete object, link, and execution evidence for
+    /// thread-local storage under this ABI profile.
+    pub const fn supports_tls_codegen(self) -> bool {
+        matches!(self, Self::SysvAmd64Lp64)
+    }
 }
 
 /// The relocation contract used by generated objects.
@@ -319,12 +325,39 @@ impl TargetSpec {
         ) {
             facts.insert("__aarch64__", "1");
             facts.insert("__AARCH64EL__", "1");
+            facts.insert("__ARM_ARCH", "8");
+            facts.insert("__ARM_ARCH_8A__", "1");
+            facts.insert("__ARM_ARCH_ISA_A64", "1");
+            facts.insert("__ARM_64BIT_STATE", "1");
+            facts.insert("__ARM_PCS_AAPCS64", "1");
+            facts.insert("__ARM_SIZEOF_WCHAR_T", "4");
         }
         if matches!(self.abi, AbiIdentity::RiscvLp64d) {
             facts.insert("__riscv", "1");
             facts.insert("__riscv_xlen", "64");
             facts.insert("__riscv_float_abi_double", "1");
             facts.insert("__riscv_flen", "64");
+            for (name, version) in [
+                ("__riscv_i", "2001000"),
+                ("__riscv_m", "2000000"),
+                ("__riscv_a", "2001000"),
+                ("__riscv_c", "2000000"),
+                ("__riscv_f", "2002000"),
+                ("__riscv_d", "2002000"),
+            ] {
+                facts.insert(name, version);
+            }
+            for name in [
+                "__riscv_atomic",
+                "__riscv_compressed",
+                "__riscv_div",
+                "__riscv_mul",
+                "__riscv_muldiv",
+                "__riscv_fdiv",
+                "__riscv_fsqrt",
+            ] {
+                facts.insert(name, "1");
+            }
         }
         if self.triple.operating_system == OperatingSystem::Linux {
             for name in ["__linux__", "__linux", "__unix__", "__unix"] {
@@ -334,6 +367,8 @@ impl TargetSpec {
         if self.triple.operating_system.is_like_darwin() {
             facts.insert("__APPLE__", "1");
             facts.insert("__MACH__", "1");
+            facts.insert("__arm64", "1");
+            facts.insert("__arm64__", "1");
         }
         if self.triple.binary_format == BinaryFormat::Elf {
             facts.insert("__ELF__", "1");
@@ -380,8 +415,8 @@ fn insert_binary64_compatibility_facts(facts: &mut PredefinedMacroFacts) {
 }
 
 fn insert_long_double_compatibility_facts(target: &TargetSpec, facts: &mut PredefinedMacroFacts) {
-    match target.data_layout.long_double_width {
-        64 => {
+    match target.abi {
+        AbiIdentity::DarwinArm64 => {
             for (suffix, replacement) in [
                 ("MANT_DIG", "53"),
                 ("DIG", "15"),
@@ -401,7 +436,27 @@ fn insert_long_double_compatibility_facts(target: &TargetSpec, facts: &mut Prede
                 facts.insert(format!("__LDBL_{suffix}__"), replacement);
             }
         }
-        128 => {
+        AbiIdentity::SysvAmd64Lp64 => {
+            for (suffix, replacement) in [
+                ("MANT_DIG", "64"),
+                ("DIG", "18"),
+                ("MIN_EXP", "(-16381)"),
+                ("MIN_10_EXP", "(-4931)"),
+                ("MAX_EXP", "16384"),
+                ("MAX_10_EXP", "4932"),
+                ("DECIMAL_DIG", "21"),
+                ("HAS_DENORM", "1"),
+                ("HAS_INFINITY", "1"),
+                ("HAS_QUIET_NAN", "1"),
+                ("MAX", "0xf.fffffffffffffffp+16380L"),
+                ("EPSILON", "0x8p-66L"),
+                ("MIN", "0x8p-16385L"),
+                ("DENORM_MIN", "0x0.000000000000001p-16385L"),
+            ] {
+                facts.insert(format!("__LDBL_{suffix}__"), replacement);
+            }
+        }
+        AbiIdentity::Aapcs64Lp64 | AbiIdentity::RiscvLp64d => {
             // The Linux profiles store `long double` as IEEE binary128. These
             // are representation facts only; arithmetic and native transport
             // remain capability-checked by semantic and ABI analysis.
@@ -425,7 +480,6 @@ fn insert_long_double_compatibility_facts(target: &TargetSpec, facts: &mut Prede
                 facts.insert(format!("__LDBL_{suffix}__"), replacement);
             }
         }
-        _ => {}
     }
 }
 
@@ -1148,9 +1202,17 @@ mod tests {
 
     #[test]
     fn architecture_macros_follow_the_selected_profile() {
+        let x86 = EffectiveCompilationConfig::x86_64_unknown_linux_gnu();
+        assert_eq!(x86.target_macros.get("__LDBL_MANT_DIG__"), Some("64"));
+        assert_eq!(x86.target_macros.get("__LDBL_DECIMAL_DIG__"), Some("21"));
+        assert_eq!(x86.target_macros.get("__LONG_DOUBLE_128__"), None);
+
         let aarch64 = EffectiveCompilationConfig::aarch64_unknown_linux_gnu();
         assert_eq!(aarch64.target_macros.get("__aarch64__"), Some("1"));
+        assert_eq!(aarch64.target_macros.get("__ARM_ARCH"), Some("8"));
+        assert_eq!(aarch64.target_macros.get("__ARM_PCS_AAPCS64"), Some("1"));
         assert_eq!(aarch64.target_macros.get("__LONG_DOUBLE_128__"), Some("1"));
+        assert_eq!(aarch64.target_macros.get("__LDBL_MANT_DIG__"), Some("113"));
         assert_eq!(aarch64.target_macros.get("__CHAR_UNSIGNED__"), Some("1"));
 
         let riscv = EffectiveCompilationConfig::riscv64_unknown_linux_gnu();
@@ -1159,11 +1221,16 @@ mod tests {
             riscv.target_macros.get("__riscv_float_abi_double"),
             Some("1")
         );
+        assert_eq!(riscv.target_macros.get("__riscv_m"), Some("2000000"));
+        assert_eq!(riscv.target_macros.get("__riscv_atomic"), Some("1"));
+        assert_eq!(riscv.target_macros.get("__LONG_DOUBLE_128__"), Some("1"));
+        assert_eq!(riscv.target_macros.get("__LDBL_MANT_DIG__"), Some("113"));
 
         let darwin =
             EffectiveCompilationConfig::aarch64_apple_darwin().with_deployment_target("14.2.1");
         let macros = darwin.frontend_predefined_macros();
         assert_eq!(macros.get("__APPLE__").map(String::as_str), Some("1"));
+        assert_eq!(macros.get("__arm64__").map(String::as_str), Some("1"));
         assert_eq!(
             macros
                 .get("__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__")
@@ -1171,6 +1238,8 @@ mod tests {
             Some("140201")
         );
         assert_eq!(darwin.target_macros.get("__USER_LABEL_PREFIX__"), Some("_"));
+        assert_eq!(darwin.target_macros.get("__LDBL_MANT_DIG__"), Some("53"));
+        assert_eq!(darwin.target_macros.get("__LONG_DOUBLE_128__"), None);
     }
 
     #[test]

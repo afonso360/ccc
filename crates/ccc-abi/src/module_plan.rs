@@ -18,6 +18,20 @@ pub fn plan_module(
     config: &EffectiveCompilationConfig,
 ) -> Result<ModuleAbiPlan, AbiError> {
     crate::validate_target(config)?;
+    if !config.target.abi.supports_tls_codegen()
+        && module.globals.iter().any(|global| {
+            global.duration == ccc_sema::generic::StorageDuration::Thread
+                || global.emission.tls.is_some()
+        })
+    {
+        return Err(AbiError::new(
+            "CCC3522",
+            format!(
+                "thread-local storage has no enabled object and link contract for target ABI `{}`",
+                config.target.abi.name()
+            ),
+        ));
+    }
     let config_key = abi_config_key(config)?;
     let ir_shape_digest = ir_shape_digest(module, &config_key)?;
     let translation_unit_digest = translation_unit_digest(module, &config_key, ir_shape_digest);
@@ -401,11 +415,16 @@ pub fn dump_module_plan(verified: VerifiedModuleAbiPlan<'_>) -> String {
         plan.config_key.classifier_revision
     )
     .unwrap();
-    writeln!(output, "psabi-commit={}", plan.config_key.psabi_commit).unwrap();
     writeln!(
         output,
-        "psabi-source-sha256={}",
-        plan.config_key.psabi_source_sha256
+        "specification-revision={}",
+        plan.config_key.specification_revision
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "specification-source-sha256={}",
+        plan.config_key.specification_source_sha256
     )
     .unwrap();
     writeln!(

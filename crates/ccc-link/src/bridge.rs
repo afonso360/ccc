@@ -993,14 +993,14 @@ fn render_riscv64_variadic_entry(plan: &VariadicEntryPlan) -> Result<GeneratedAs
          sd a5, 488(sp)\n\
          sd a6, 496(sp)\n\
          sd a7, 504(sp)\n\
-         fsd fa0, 288(sp)\n\
-         fsd fa1, 304(sp)\n\
-         fsd fa2, 320(sp)\n\
-         fsd fa3, 336(sp)\n\
-         fsd fa4, 352(sp)\n\
-         fsd fa5, 368(sp)\n\
-         fsd fa6, 384(sp)\n\
-         fsd fa7, 400(sp)\n",
+         fsd fa0, 112(sp)\n\
+         fsd fa1, 128(sp)\n\
+         fsd fa2, 144(sp)\n\
+         fsd fa3, 160(sp)\n\
+         fsd fa4, 176(sp)\n\
+         fsd fa5, 192(sp)\n\
+         fsd fa6, 208(sp)\n\
+         fsd fa7, 224(sp)\n",
     );
     writeln!(source, "li t0, {VA_STATE_MAGIC}\nsw t0, 0(sp)").unwrap();
     source.push_str("li t0, 2\nsh t0, 4(sp)\n");

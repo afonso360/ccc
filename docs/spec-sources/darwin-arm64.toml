@@ -1,0 +1,27 @@
+schema_version = 1
+source_id = "Apple-arm64-ABI"
+upstream = "https://developer.apple.com/documentation/xcode/writing-arm64-code-for-apple-platforms"
+versioning = "unversioned"
+retrieved_at = "2026-07-18T13:01:16Z"
+classifier_revision = 1
+
+[[files]]
+path = "writing-arm64-code-for-apple-platforms.md"
+url = "https://docs.developer.apple.com/tutorials/data/documentation/xcode/writing-arm64-code-for-apple-platforms.md"
+sha256 = "afe0badf53abe5510e610358ba81050080692af7df7715a44be55271904d3b3e"
+
+[oracle_environment]
+developer_tools = "Command Line Tools 26.6.0.0.1781586589"
+sdk = "macOS 26.5"
+deployment_target = "11.0"
+compiler = "Apple clang 21.0.0 (clang-2100.1.1.101)"
+compiler_target = "arm64-apple-darwin25.5.0"
+
+[implemented_profile]
+identity = "darwin-arm64"
+boundary_profile = "darwin-arm64-v1"
+variadic_profile = "darwin-stack-unnamed-v1"
+long_double = "IEEE binary64, transported as double"
+tls = "rejected with CCC2441/CCC3522"
+symbol_prefix = "_"
+generated_symbol_localization = ".private_extern followed by relocatable link"

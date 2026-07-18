@@ -43,13 +43,21 @@ jobs:
           fi
           printf 'All runner prerequisites are available.\n' \
             > "$artifact_dir/runner-prerequisites.txt"
-      - name: Verify pinned x86-64 psABI source
+      - name: Verify pinned ABI sources
         run: |
           mkdir -p "$RUNNER_TEMP/ccc-sysv-amd64-artifacts"
           curl --fail --silent --show-error --location --retry 3 \
             https://gitlab.com/x86-psABIs/x86-64-ABI/-/raw/e1ce098331da5dbd66e1ffc74162380bcc213236/x86-64-ABI/low-level-sys-info.tex \
             --output "$RUNNER_TEMP/ccc-sysv-amd64-artifacts/x86-64-low-level-sys-info.tex"
           echo "2d42f2ab76b99a3b8456e6bc07e18314e85991119f72db90ca1175328e27b705  $RUNNER_TEMP/ccc-sysv-amd64-artifacts/x86-64-low-level-sys-info.tex" | sha256sum --check --strict
+          curl --fail --silent --show-error --location --retry 3 \
+            https://raw.githubusercontent.com/ARM-software/abi-aa/daa7a94ca55973736c0e434a67a6e4bbcd35d7fa/aapcs64/aapcs64.rst \
+            --output "$RUNNER_TEMP/ccc-sysv-amd64-artifacts/aapcs64.rst"
+          echo "92460d0e8a1e081e0b1ed8f23dd6f9a0716ca566158a3e099a48de62cb2125a6  $RUNNER_TEMP/ccc-sysv-amd64-artifacts/aapcs64.rst" | sha256sum --check --strict
+          curl --fail --silent --show-error --location --retry 3 \
+            https://raw.githubusercontent.com/riscv-non-isa/riscv-elf-psabi-doc/e03d44ae2f0e1144f9498c2896b5ae25b0449398/riscv-cc.adoc \
+            --output "$RUNNER_TEMP/ccc-sysv-amd64-artifacts/riscv-cc.adoc"
+          echo "c87c97d518681c44398add931cc41a43235abe656eaf831b849934a3919d86e5  $RUNNER_TEMP/ccc-sysv-amd64-artifacts/riscv-cc.adoc" | sha256sum --check --strict
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: clippy,rustfmt

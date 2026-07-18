@@ -2914,6 +2914,95 @@ fn rejects_unsupported_semantics_and_storage_but_allows_long_double_layout() {
 }
 
 #[test]
+fn target_specific_tls_and_variadic_alignment_gates_are_exact() {
+    let tls_sources = [
+        "_Thread_local int file_value;",
+        "int read(void) { _Thread_local int block_value; return block_value; }",
+    ];
+    for config in [
+        EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+        EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
+        EffectiveCompilationConfig::aarch64_apple_darwin(),
+    ] {
+        for source in tls_sources {
+            let diagnostics = analyze_source_with_config(source, &config).unwrap_err();
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.code.as_str())
+                    .collect::<Vec<_>>(),
+                ["CCC2441"],
+                "{} should reject `{source}` before IR lowering",
+                config.target.triple
+            );
+        }
+    }
+    for source in tls_sources {
+        analyze_source_with_config(source, &EffectiveCompilationConfig::default()).unwrap();
+    }
+
+    let aligned_va_arg = "typedef __builtin_va_list va_list;\n\
+         struct Pair { _Alignas(16) long first; long second; };\n\
+         struct Pair read(int count, ...) { va_list list;\n\
+           __builtin_va_start(list, count);\n\
+           return __builtin_va_arg(list, struct Pair); }";
+    for config in [
+        EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+        EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
+        EffectiveCompilationConfig::aarch64_apple_darwin(),
+    ] {
+        analyze_source_with_config(aligned_va_arg, &config).unwrap_or_else(|diagnostics| {
+            panic!(
+                "{} rejected a supported 16-byte aligned va_arg: {diagnostics:#?}",
+                config.target.triple
+            )
+        });
+    }
+    let diagnostics = analyze_source(aligned_va_arg).unwrap_err();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CCC2406")
+    );
+}
+
+#[test]
+fn linux_binary128_operations_and_variadic_fetches_fail_explicitly() {
+    for config in [
+        EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+        EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
+    ] {
+        for source in [
+            "long double value = 1.0;",
+            "long double convert(double value) { return (long double)value; }",
+            "long double add(long double value) { return value + value; }",
+        ] {
+            let diagnostics = analyze_source_with_config(source, &config).unwrap_err();
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "CCC2343"),
+                "{} did not reject `{source}` explicitly: {diagnostics:#?}",
+                config.target.triple
+            );
+        }
+        let diagnostics = analyze_source_with_config(
+            "typedef __builtin_va_list va_list;\n\
+             long double read(int count, ...) { va_list list;\n\
+               __builtin_va_start(list, count);\n\
+               return __builtin_va_arg(list, long double); }",
+            &config,
+        )
+        .unwrap_err();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "CCC2404")
+        );
+    }
+}
+
+#[test]
 fn full_typed_dump_is_independent_of_source_offsets() {
     let first = analyze_source(
         "struct { int member; } object = { .member = 1 };\n\

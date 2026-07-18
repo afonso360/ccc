@@ -1244,4 +1244,44 @@ mod tests {
         );
         assert!(matches!(plan.result, NativeResultPlan::Indirect { .. }));
     }
+
+    #[test]
+    fn linux_binary128_scalar_and_aggregate_boundaries_are_exact_errors() {
+        let config = EffectiveCompilationConfig::aarch64_unknown_linux_gnu();
+        let mut types = TypeStore::default();
+        let wrapper = record(
+            &mut types,
+            vec![
+                Field::named("tag", TypeId::LONG),
+                Field::named("value", TypeId::LONG_DOUBLE),
+            ],
+        );
+        for ty in [TypeId::LONG_DOUBLE, wrapper] {
+            let signature = types.function_type(FunctionType::prototype(
+                QualifiedType::unqualified(ty),
+                vec![QualifiedType::unqualified(ty)],
+            ));
+            let error = plan_function_type(&types, signature, &config).unwrap_err();
+            assert_eq!(error.code, "CCC3509");
+            assert!(error.message.contains("binary128"));
+        }
+        let error = plan_va_arg(&types, wrapper, &config).unwrap_err();
+        assert_eq!(error.code, "CCC3509");
+        assert!(error.message.contains("binary128"));
+    }
+
+    #[test]
+    fn darwin_long_double_boundaries_use_binary64_carriers() {
+        let config = EffectiveCompilationConfig::aarch64_apple_darwin();
+        let mut types = TypeStore::default();
+        let signature = types.function_type(FunctionType::prototype(
+            QualifiedType::unqualified(TypeId::LONG_DOUBLE),
+            vec![QualifiedType::unqualified(TypeId::LONG_DOUBLE)],
+        ));
+        let plan = plan_function_type(&types, signature, &config).unwrap();
+        assert_eq!(plan.clif_parameters[0].carrier, AbiCarrier::F64);
+        assert_eq!(plan.clif_results[0].carrier, AbiCarrier::F64);
+        let va_arg = plan_va_arg(&types, TypeId::LONG_DOUBLE, &config).unwrap();
+        assert_eq!(va_arg.classified.pieces[0].class, AbiClass::Sse);
+    }
 }

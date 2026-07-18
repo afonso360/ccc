@@ -8,6 +8,15 @@ use crate::{AbiConfigKey, AbiError, IrShapeDigest, TranslationUnitDigest};
 const PSABI_COMMIT: &str = "e1ce098331da5dbd66e1ffc74162380bcc213236";
 const PSABI_SOURCE_SHA256: &str =
     "2d42f2ab76b99a3b8456e6bc07e18314e85991119f72db90ca1175328e27b705";
+const AAPCS64_COMMIT: &str = "daa7a94ca55973736c0e434a67a6e4bbcd35d7fa";
+const AAPCS64_SOURCE_SHA256: &str =
+    "92460d0e8a1e081e0b1ed8f23dd6f9a0716ca566158a3e099a48de62cb2125a6";
+const RISCV_PSABI_COMMIT: &str = "e03d44ae2f0e1144f9498c2896b5ae25b0449398";
+const RISCV_PSABI_SOURCE_SHA256: &str =
+    "c87c97d518681c44398add931cc41a43235abe656eaf831b849934a3919d86e5";
+const APPLE_ARM64_EVIDENCE_REVISION: &str = "retrieved-2026-07-18-clt-26.6";
+const APPLE_ARM64_SOURCE_SHA256: &str =
+    "afe0badf53abe5510e610358ba81050080692af7df7715a44be55271904d3b3e";
 
 pub fn abi_config_key(config: &EffectiveCompilationConfig) -> Result<AbiConfigKey, AbiError> {
     let calling_convention = config.target.calling_convention().ok_or_else(|| {
@@ -64,23 +73,20 @@ pub fn abi_config_key(config: &EffectiveCompilationConfig) -> Result<AbiConfigKe
             AbiIdentity::SysvAmd64Lp64 => {
                 ("sysv-amd64-lp64-v1", 1, PSABI_COMMIT, PSABI_SOURCE_SHA256)
             }
-            AbiIdentity::Aapcs64Lp64 => (
-                "aapcs64-lp64-v1",
-                1,
-                "ccc-aapcs64-policy-v1",
-                "embedded-policy",
-            ),
+            AbiIdentity::Aapcs64Lp64 => {
+                ("aapcs64-lp64-v1", 1, AAPCS64_COMMIT, AAPCS64_SOURCE_SHA256)
+            }
             AbiIdentity::RiscvLp64d => (
                 "riscv-lp64d-v1",
                 1,
-                "ccc-riscv-lp64d-policy-v1",
-                "embedded-policy",
+                RISCV_PSABI_COMMIT,
+                RISCV_PSABI_SOURCE_SHA256,
             ),
             AbiIdentity::DarwinArm64 => (
                 "darwin-arm64-v1",
                 1,
-                "ccc-darwin-arm64-policy-v1",
-                "embedded-policy",
+                APPLE_ARM64_EVIDENCE_REVISION,
+                APPLE_ARM64_SOURCE_SHA256,
             ),
         };
     Ok(AbiConfigKey {
@@ -91,8 +97,8 @@ pub fn abi_config_key(config: &EffectiveCompilationConfig) -> Result<AbiConfigKe
         calling_convention,
         boundary_profile,
         classifier_revision,
-        psabi_commit: specification_revision,
-        psabi_source_sha256: specification_digest,
+        specification_revision,
+        specification_source_sha256: specification_digest,
         backend_profile: "cranelift-0.132.0-no-llvm-extensions-no-implicit-sret",
     })
 }
@@ -226,8 +232,8 @@ fn encode_config_key(encoder: &mut Encoder, key: &AbiConfigKey) {
     encode_calling_convention(encoder, key.calling_convention);
     encoder.string(key.boundary_profile);
     encoder.u32(key.classifier_revision);
-    encoder.string(key.psabi_commit);
-    encoder.string(key.psabi_source_sha256);
+    encoder.string(key.specification_revision);
+    encoder.string(key.specification_source_sha256);
     encoder.string(key.backend_profile);
 }
 
@@ -238,8 +244,8 @@ fn encode_config_key_v1(encoder: &mut Encoder, key: &AbiConfigKey) {
     encode_calling_convention(encoder, key.calling_convention);
     encoder.string(key.boundary_profile);
     encoder.u32(key.classifier_revision);
-    encoder.string(key.psabi_commit);
-    encoder.string(key.psabi_source_sha256);
+    encoder.string(key.specification_revision);
+    encoder.string(key.specification_source_sha256);
     encoder.string(key.backend_profile);
 }
 
@@ -1050,6 +1056,8 @@ mod tests {
             assert_eq!(key.schema, "ccc-abi-config-v2");
             assert_eq!(key.abi_identity, identity);
             assert_eq!(key.boundary_profile, profile);
+            assert_ne!(key.specification_source_sha256, "embedded-policy");
+            assert_eq!(key.specification_source_sha256.len(), 64);
         }
     }
 

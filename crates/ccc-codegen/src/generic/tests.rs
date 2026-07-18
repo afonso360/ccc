@@ -145,6 +145,66 @@ fn enabled_non_x86_targets_plan_target_variadics_and_emit_matching_adapters() {
 }
 
 #[test]
+fn riscv_variadic_entry_keeps_fixed_float_arguments_separate_from_results() {
+    let config = EffectiveCompilationConfig::riscv64_unknown_linux_gnu();
+    let output = emit_source_with_config(
+        "typedef __builtin_va_list va_list;\n\
+         long collect(double first, double second, int count, ...) {\n\
+           va_list list; long tail; __builtin_va_start(list, count);\n\
+           tail = __builtin_va_arg(list, long);\n\
+           return (long)first + (long)second + tail; }",
+        &config,
+    );
+    let entry = output
+        .assemblies
+        .iter()
+        .find(|assembly| assembly.stem().starts_with("variadic-entry-"))
+        .expect("RISC-V variadic definition adapter");
+    assert!(entry.source().contains("fsd fa0, 112(sp)"));
+    assert!(entry.source().contains("fsd fa1, 128(sp)"));
+    assert!(!entry.source().contains("fsd fa0, 288(sp)"));
+    assert!(entry.source().contains("sd zero, 288(sp)"));
+}
+
+#[test]
+fn non_x86_tls_is_rejected_before_backend_lowering() {
+    let module = lower_source(
+        "_Thread_local int value;\n\
+         int read(void) { return value; }",
+    );
+    for config in [
+        EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+        EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
+        EffectiveCompilationConfig::aarch64_apple_darwin(),
+    ] {
+        let error = emit(&module, &config, Options::default()).unwrap_err();
+        assert_eq!(error.code, "CCC3522");
+        assert!(error.message.contains(config.target.abi.name()));
+    }
+}
+
+#[test]
+fn darwin_binary64_long_double_uses_the_double_transport() {
+    let config = EffectiveCompilationConfig::aarch64_apple_darwin();
+    let output = emit_source_with_config(
+        "typedef __builtin_va_list va_list;\n\
+         long double identity(long double value) { return value; }\n\
+         long double read(int count, ...) { va_list list;\n\
+           __builtin_va_start(list, count);\n\
+           return __builtin_va_arg(list, long double); }",
+        &config,
+    );
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    assert_eq!(object.format(), object::BinaryFormat::MachO);
+    assert!(
+        output
+            .assemblies
+            .iter()
+            .any(|assembly| { assembly.source().contains(".subsections_via_symbols") })
+    );
+}
+
+#[test]
 fn emitted_functions_have_relocatable_system_v_call_frames() {
     use gimli::UnwindSection as _;
 
@@ -527,7 +587,7 @@ fn complete_abi_plan_and_aggregate_clif_have_exact_snapshots() {
     assert!(dump.contains("packaging assembly-units=2"), "{dump}");
     assert_eq!(
         sha256(&dump),
-        "1767a26a4561b575946dc1649df6e1cdcfcc198112f3fe7aa1cb972eb3af7a61"
+        "b0f28d95504a8b93fd8b8dcd2546e4f05271c95e80063c2fef9951b5de0fe557"
     );
 
     let output = emit(&module, &config, Options { emit_clif: true }).unwrap();

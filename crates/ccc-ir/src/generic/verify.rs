@@ -1375,11 +1375,6 @@ impl FunctionVerifier<'_> {
                         "va_arg requested a type changed by the default argument promotions",
                     ));
                 }
-                if contains_long_double(types, requested.ty, &mut HashSet::new()) {
-                    return Err(IrError::verify(
-                        "va_arg requested an unsupported long double boundary type",
-                    ));
-                }
                 if matches!(
                     types.try_kind(requested.ty),
                     Some(TypeKind::Record(record))
@@ -2067,27 +2062,6 @@ fn is_variably_modified(types: &TypeStore, ty: TypeId) -> bool {
             ) || is_variably_modified(types, array.element.ty)
         }
         Some(TypeKind::Pointer(pointer)) => is_variably_modified(types, pointer.pointee.ty),
-        _ => false,
-    }
-}
-
-fn contains_long_double(types: &TypeStore, ty: TypeId, seen: &mut HashSet<TypeId>) -> bool {
-    if ty == TypeId::LONG_DOUBLE {
-        return true;
-    }
-    if !seen.insert(ty) {
-        return false;
-    }
-    match types.try_kind(ty) {
-        Some(TypeKind::Array(array)) => contains_long_double(types, array.element.ty, seen),
-        Some(TypeKind::Record(record)) => types
-            .record(*record)
-            .and_then(|record| record.fields.as_ref())
-            .is_some_and(|fields| {
-                fields
-                    .iter()
-                    .any(|field| contains_long_double(types, field.ty.ty, seen))
-            }),
         _ => false,
     }
 }

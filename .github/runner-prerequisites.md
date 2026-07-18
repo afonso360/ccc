@@ -22,3 +22,30 @@ before running any native ABI or corpus test.
 
 Provisioning is runner administration. The workflow checks and reports the
 environment but does not mutate the self-hosted machine with `apt`.
+
+## Cross-Linux target runners
+
+Required AArch64 and RISC-V Linux jobs must provide matching GNU cross
+compilers, sysroots, binutils, user-mode QEMU, and `gdb-multiarch`. The command
+set is:
+
+```text
+aarch64-linux-gnu-gcc aarch64-linux-gnu-objdump aarch64-linux-gnu-readelf qemu-aarch64
+riscv64-linux-gnu-gcc riscv64-linux-gnu-objdump riscv64-linux-gnu-readelf qemu-riscv64
+gdb-multiarch
+```
+
+The AArch64 compiler target must be `aarch64-linux-gnu`. The RISC-V compiler
+must target RV64GC with the LP64D ABI. The workflow records the resolved
+sysroots and passes them explicitly to QEMU; it must not use an unrelated host
+root. Required jobs fail when a command, sysroot, dynamic loader, gdbstub, or
+applicable test is missing.
+
+## Darwin arm64 target runner
+
+The native Darwin job requires an Apple-silicon host with `xcrun`, Apple Clang,
+the macOS SDK, LLDB, `otool`, `nm`, and `dwarfdump`. It records the Command Line
+Tools or Xcode build, SDK version, Apple Clang version and target, linker
+version, and deployment target. The recorded identities are compared with the
+Darwin evidence manifest before tests run. A non-arm64 host or a missing native
+tool is a hard failure for the required job.

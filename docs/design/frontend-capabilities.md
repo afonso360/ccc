@@ -218,10 +218,11 @@ bytes happen to match.
 | ELF proof              | Object tests inspect `.text`, `.data`, `.bss`, `.rodata`, local/global/undefined bindings, data and string relocations, and `R_X86_64_PLT32` direct external calls. Linux tests cross-link CCC callers and callees with a reference compiler in both directions and prove same-spelled `static` names stay local.                                     |
 
 Standard `_Thread_local` objects are represented through TLS storage and
-relocation nodes, but the current acceptance suite does not certify a
-cross-linked TLS access model. It is therefore not part of the advertised
-cross-link contract. The GNU `__thread` spelling remains parse-only in the
-registry even though it is recognized by token conversion.
+relocation nodes for SysV AMD64. AAPCS64, RISC-V LP64D, and Darwin arm64 reject
+them during semantic analysis with `CCC2441`; ABI planning and code generation
+repeat the fail-closed check as `CCC3522`, so no target can reach the x86 TLS
+lowering accidentally. The GNU `__thread` spelling remains parse-only and is
+rejected with `CCC2374`.
 
 ### Statements and CFG behavior
 

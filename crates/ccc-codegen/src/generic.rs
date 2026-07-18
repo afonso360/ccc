@@ -69,6 +69,20 @@ fn emit_inner(
     options: Options,
 ) -> Result<Output, CodegenError> {
     super::validate_target(config).map_err(error)?;
+    if !config.target.abi.supports_tls_codegen()
+        && module.globals.iter().any(|global| {
+            global.duration == StorageDuration::Thread || global.emission.tls.is_some()
+        })
+    {
+        return Err(CodegenError {
+            code: "CCC3522",
+            message: format!(
+                "thread-local storage has no enabled object and link contract for target ABI `{}`",
+                config.target.abi.name()
+            ),
+            span: None,
+        });
+    }
     let mut isa_builder = isa::lookup(config.target.triple.clone()).map_err(module_error)?;
     if config.target.abi == AbiIdentity::RiscvLp64d {
         for extension in [

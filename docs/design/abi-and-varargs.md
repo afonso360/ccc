@@ -14,8 +14,9 @@ list, fixed variadic boundary, direct or indirect target identity, source
 location, result storage, and required bridge operations.
 
 The plan records an `AbiConfigKey` containing the normalized target triple,
-data layout, calling convention, boundary-profile revision, classifier
-revision, psABI source identity, and pinned backend profile. Absolute tool
+compiler-owned ABI identity, data layout, backend calling convention,
+boundary-profile revision, classifier revision, specification evidence
+identity, and pinned backend profile. Absolute tool
 paths, executable versions, sysroots, and packaging fingerprints are
 operational provenance and are not part of ABI-plan identity or deterministic
 `--dump-abi` output.
@@ -51,19 +52,20 @@ compatibility test proves scalar interleaving, register rollback,
 `StructReturn` pointer echo behavior for the exact pinned Cranelift version and
 settings.
 
-## Supported boundary profile
+## Supported boundary profiles
 
-The enabled `x86_64-unknown-linux-gnu` SysV boundary profile supports the
-compiler's existing integer types, enumerations, pointers, `float`, `double`,
-and aggregates recursively composed from those types with required alignment
-no greater than eight.
+The enabled SysV AMD64, AAPCS64, RISC-V LP64D, and Darwin arm64 profiles
+support integer types, enumerations, pointers, `float`, `double`, and their
+documented aggregate forms. AAPCS64 implements homogeneous floating-point
+aggregates and indirect large aggregates. LP64D implements floating-point
+aggregate flattening, aligned integer pairs, and indirect large aggregates.
+Darwin follows its distinct narrow-argument, stack-layout, and variadic rules.
 
-Native `long double`, vector types, `_BitInt`, `__int128`, over-aligned types,
-and aggregates containing them remain representable for declarations and
-layout queries but are rejected when a definition, call, return, or `va_arg`
-requires an unsupported boundary. The profile is versioned so an additional
-profile can add address-only or generated-bridge transport without changing
-the meaning of already produced plans.
+The Linux binary128 profiles preserve representation, layout, macros, and
+aggregate object layout but reject conversions, initialization, arithmetic,
+calls, returns, aggregate boundaries, and `va_arg` with `CCC2343`, `CCC2404`,
+or `CCC3509`. Darwin `long double` is binary64 and uses the same carriers as
+`double`. Vectors and `_BitInt` remain outside every enabled boundary profile.
 
 ## Aggregate values and fixed calls
 
@@ -85,6 +87,11 @@ AMD64 the hidden pointer consumes the first GP argument position and the callee
 returns that exact pointer in `%rax`.
 
 ## Generated call bridge
+
+The x86 bridge retains its byte-stable version-one frame. The arm64 and
+RISC-V adapters use version-two target layouts with indexed integer and
+floating register banks. Each renderer owns exact physical locations; the
+target-neutral plan contains no x86 register enum.
 
 Every bridged call uses a versioned `BridgeFrameV1` passed to a nonvariadic
 assembly helper. The 16-byte-aligned fixed area is 256 bytes:
@@ -145,6 +152,13 @@ and XMM registers, computes the initial overflow address, and constructs a
 The public `va_list` view starts at byte eight and is the psABI array-of-one
 24-byte structure. Its register-save area has six eight-byte GP slots followed
 by eight sixteen-byte XMM slots.
+
+AAPCS64 Linux exposes the five-field array-of-one register-save form. RISC-V
+LP64D exposes a pointer cursor and routes unnamed variadic arguments through
+the integer convention, including aligned pairs and the stack transition.
+Darwin exposes `char *`; its unnamed arguments occupy compact stack slots.
+Target-specific `va_start`, `va_copy`, and `va_arg` state is derived from the
+same ABI identity used by the boundary planner.
 
 `va_arg` is one effectful ABI-neutral CCC-IR operation with an immutable
 `VaArgPlan`. Code generation expands it into register, overflow, and merge

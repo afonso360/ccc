@@ -314,8 +314,8 @@ pub struct AbiConfigKey {
     pub calling_convention: CallingConvention,
     pub boundary_profile: &'static str,
     pub classifier_revision: u32,
-    pub psabi_commit: &'static str,
-    pub psabi_source_sha256: &'static str,
+    pub specification_revision: &'static str,
+    pub specification_source_sha256: &'static str,
     pub backend_profile: &'static str,
 }
 

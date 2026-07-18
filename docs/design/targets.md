@@ -5,12 +5,23 @@ Targets are named by exact triples. A target is enabled only when its object for
 | Internal triple               | User-facing form                                      | Object | ABI / calling convention | libc       | Target defaults                                                                                |
 | ----------------------------- | ----------------------------------------------------- | ------ | ------------------------ | ---------- | ---------------------------------------------------------------------------------------------- |
 | `x86_64-unknown-linux-gnu`    | same                                                  | ELF    | System V AMD64, LP64     | glibc      | signed `char`; f80 `long double`                                                               |
-| `x86_64-unknown-linux-musl`   | same                                                  | ELF    | System V AMD64, LP64     | musl       | signed `char`; f80 `long double`; static linking available when the musl toolchain is resolved |
+| `x86_64-unknown-linux-musl`   | same                                                  | ELF    | System V AMD64, LP64     | musl       | catalog entry only; not an enabled profile                                                     |
 | `aarch64-unknown-linux-gnu`   | same                                                  | ELF    | AAPCS64, LP64            | glibc      | unsigned `char`; HFA/HVA; binary128 `long double`                                              |
 | `riscv64gc-unknown-linux-gnu` | `riscv64-unknown-linux-gnu -march=rv64gc -mabi=lp64d` | ELF    | RISC-V LP64D             | glibc      | unsigned `char`; FP aggregates; binary128 `long double`                                        |
 | `aarch64-apple-darwin`        | same, plus deployment target                          | Mach-O | Darwin arm64             | Apple libc | signed `char`; Apple variadics; `long double == double`                                        |
 
 Internal triples use target-lexicon canonical forms. The driver normalizes a user triple plus `-march`, `-mcpu`, `-mabi`, deployment-target, and feature flags into an effective configuration. It rejects contradictory combinations instead of silently discarding an option.
+
+The compiler-owned ABI identities are `sysv-amd64-lp64`, `aapcs64-lp64`,
+`riscv-lp64d`, and `darwin-arm64`. Backend calling-convention enums are derived
+from these identities and are never used as classifier or digest keys. The
+pinned evidence manifests are [AAPCS64](../spec-sources/aapcs64.toml),
+[RISC-V ELF psABI](../spec-sources/riscv-elf-psabi.toml), and
+[Apple arm64](../spec-sources/darwin-arm64.toml).
+
+With no explicit target, the driver selects the build host only when that exact
+host has an enabled profile. An unsupported host is an error; there is no
+x86-64 fallback.
 
 ## Effective compilation configuration
 

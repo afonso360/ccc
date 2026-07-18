@@ -1224,4 +1224,29 @@ mod tests {
         );
         assert!(matches!(plan.result, NativeResultPlan::Indirect { .. }));
     }
+
+    #[test]
+    fn linux_binary128_scalar_and_aggregate_boundaries_are_exact_errors() {
+        let config = EffectiveCompilationConfig::riscv64_unknown_linux_gnu();
+        let mut types = TypeStore::default();
+        let wrapper = record(
+            &mut types,
+            vec![
+                Field::named("tag", TypeId::LONG),
+                Field::named("value", TypeId::LONG_DOUBLE),
+            ],
+        );
+        for ty in [TypeId::LONG_DOUBLE, wrapper] {
+            let signature = types.function_type(FunctionType::prototype(
+                QualifiedType::unqualified(ty),
+                vec![QualifiedType::unqualified(ty)],
+            ));
+            let error = plan_function_type(&types, signature, &config).unwrap_err();
+            assert_eq!(error.code, "CCC3509");
+            assert!(error.message.contains("binary128"));
+        }
+        let error = plan_va_arg(&types, wrapper, &config).unwrap_err();
+        assert_eq!(error.code, "CCC3509");
+        assert!(error.message.contains("binary128"));
+    }
 }

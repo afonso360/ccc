@@ -1287,18 +1287,6 @@ fn verifier_rejects_invalid_va_arg_types_independently_of_sema() {
             .contains("variably modified")
     );
 
-    let mut unsupported = module();
-    replace_requested(
-        &mut unsupported,
-        QualifiedType::unqualified(TypeId::LONG_DOUBLE),
-    );
-    assert!(
-        verify_frontend(&unsupported)
-            .unwrap_err()
-            .message
-            .contains("long double")
-    );
-
     let mut incomplete = module();
     let (_, record) = incomplete
         .types

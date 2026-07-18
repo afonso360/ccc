@@ -1,0 +1,21 @@
+schema_version = 1
+source_id = "Arm-AAPCS64"
+upstream = "https://github.com/ARM-software/abi-aa"
+release = "2025Q4"
+commit = "daa7a94ca55973736c0e434a67a6e4bbcd35d7fa"
+retrieved = "2026-07-18"
+license = "CC-BY-SA-4.0"
+vendored = false
+classifier_revision = 1
+
+[[files]]
+path = "aapcs64/aapcs64.rst"
+url = "https://raw.githubusercontent.com/ARM-software/abi-aa/daa7a94ca55973736c0e434a67a6e4bbcd35d7fa/aapcs64/aapcs64.rst"
+sha256 = "92460d0e8a1e081e0b1ed8f23dd6f9a0716ca566158a3e099a48de62cb2125a6"
+
+[implemented_profile]
+identity = "aapcs64-lp64"
+boundary_profile = "aapcs64-lp64-v1"
+variadic_profile = "aapcs64-linux-register-save-v1"
+binary128 = "layout-only; transport is rejected with CCC3509"
+tls = "rejected with CCC2441/CCC3522"

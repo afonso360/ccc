@@ -8,7 +8,8 @@ use ccc_pp::{
 use ccc_session::Span;
 use ccc_syntax::frontend as syntax;
 use ccc_target::{
-    CapabilityKind, CapabilityState, EffectiveCompilationConfig, PackingPolicy, TargetBuiltinType,
+    AbiIdentity, CapabilityKind, CapabilityState, EffectiveCompilationConfig, PackingPolicy,
+    TargetBuiltinType,
 };
 use ccc_types::{
     ArrayLength, ArrayType, BuiltinType, Field, FunctionParameters, FunctionType, LayoutShape,
@@ -1808,6 +1809,7 @@ impl<'a> Analyzer<'a> {
                 "this storage class is not valid on a file-scope object",
             );
         }
+        self.reject_unavailable_thread_storage(storage, span)?;
         self.validate_object_type(ty, span, false)?;
         let typed_initializer = if let Some(initializer) = initializer {
             let (typed, completed_ty) = self.analyze_initializer(ty, initializer)?;
@@ -2151,6 +2153,7 @@ impl<'a> Analyzer<'a> {
                 output.push(FullTypedBlockItem::FunctionDeclaration(id));
                 continue;
             }
+            self.reject_unavailable_thread_storage(info.storage, init.span)?;
             if info.storage == Some(syntax::StorageClass::Extern) {
                 self.reject_transparent_union_attribute(
                     &attributes,
@@ -3504,7 +3507,9 @@ impl<'a> Analyzer<'a> {
                 ),
             );
         }
-        if self.type_contains_long_double(requested.ty, &mut HashSet::new()) {
+        if self.config.target.data_layout.long_double_width > 64
+            && self.type_contains_long_double(requested.ty, &mut HashSet::new())
+        {
             return self.fail(
                 "CCC2404",
                 type_name.span,
@@ -3515,7 +3520,11 @@ impl<'a> Analyzer<'a> {
             .types
             .layout_of(requested.ty, self.config)
             .expect("a validated, non-variably-modified object type has a layout");
-        if layout.align > 8 {
+        let maximum_alignment = match self.config.target.abi {
+            AbiIdentity::SysvAmd64Lp64 => 8,
+            AbiIdentity::Aapcs64Lp64 | AbiIdentity::RiscvLp64d | AbiIdentity::DarwinArm64 => 16,
+        };
+        if layout.align > maximum_alignment {
             return self.fail(
                 "CCC2406",
                 type_name.span,
@@ -6756,6 +6765,26 @@ impl<'a> Analyzer<'a> {
         } else {
             Ok(())
         }
+    }
+
+    fn reject_unavailable_thread_storage(
+        &mut self,
+        storage: Option<syntax::StorageClass>,
+        span: Span,
+    ) -> AnalysisResult<()> {
+        if storage == Some(syntax::StorageClass::ThreadLocal)
+            && !self.config.target.abi.supports_tls_codegen()
+        {
+            return self.fail(
+                "CCC2441",
+                span,
+                format!(
+                    "thread-local storage is not enabled for target ABI `{}`",
+                    self.config.target.abi.name()
+                ),
+            );
+        }
+        Ok(())
     }
 
     fn apply_declarator_type_attributes(
