@@ -290,6 +290,7 @@ pub enum ExpressionKind {
     Character(CharacterConstant),
     String(StringLiteral),
     Parenthesized(Box<Expression>),
+    StatementExpression(Vec<BlockItem>),
     GenericSelection {
         controlling: Box<Expression>,
         associations: Vec<GenericAssociation>,
@@ -373,6 +374,10 @@ pub enum ExpressionKind {
         operation: IntegerBuiltinOperation,
         operand: Box<Expression>,
     },
+    BuiltinMemoryOperation {
+        operation: MemoryBuiltinOperation,
+        arguments: Vec<Expression>,
+    },
     BuiltinPrefetch {
         arguments: Vec<Expression>,
     },
@@ -392,6 +397,7 @@ pub enum IntegerBuiltinOperation {
     CountTrailingZerosLongLong,
     PopulationCountInt,
     PopulationCountLongLong,
+    CountTrailingZerosInt,
 }
 
 impl IntegerBuiltinOperation {
@@ -404,6 +410,24 @@ impl IntegerBuiltinOperation {
             Self::CountTrailingZerosLongLong => "__builtin_ctzll",
             Self::PopulationCountInt => "__builtin_popcount",
             Self::PopulationCountLongLong => "__builtin_popcountll",
+            Self::CountTrailingZerosInt => "__builtin_ctz",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MemoryBuiltinOperation {
+    Copy,
+    Move,
+    Set,
+}
+
+impl MemoryBuiltinOperation {
+    pub const fn spelling(self) -> &'static str {
+        match self {
+            Self::Copy => "__builtin_memcpy",
+            Self::Move => "__builtin_memmove",
+            Self::Set => "__builtin_memset",
         }
     }
 }

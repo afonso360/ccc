@@ -110,12 +110,13 @@ underlying type.
 
 | Expression family          | Implemented forms                                                                                                    | Explicit boundary                                                                                                                                                                                                                                                                                             |
 | -------------------------- | -------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Primary and literals       | Identifiers, including C11 `__func__`; integer, floating, character, and ordinary/`u8`/`u`/`U`/`L` string literals; parenthesized expressions | Integer literal candidates follow radix and suffix rules. Ordinary character constants apply target plain-`char` signedness. Adjacent strings are concatenated before parsing. Native `long double` operations remain unavailable.                                                                            |
+| Primary and literals       | Identifiers, including C11 `__func__` and the GNU-mode aliases `__FUNCTION__` and `__PRETTY_FUNCTION__`; integer, floating, character, and ordinary/`u8`/`u`/`U`/`L` string literals; parenthesized expressions | The three function-name spellings designate the same per-function static const array. Integer literal candidates follow radix and suffix rules. Ordinary character constants apply target plain-`char` signedness. Adjacent strings are concatenated before parsing. Native `long double` operations remain unavailable. |
 | Postfix                    | Subscript, direct and indirect calls, `.` and `->`, postfix `++`/`--`, and block-scope compound literals            | Compound literals are addressable lvalues with enclosing-block automatic storage; each evaluation runs the initializer against the occurrence's retained object. File-scope occurrences are rejected with `CCC2430`.                                                                                          |
 | Unary                      | Prefix `++`/`--`, address, dereference, unary `+`/`-`, bitwise `~`, logical `!`                                      | Implemented with lvalue/modifiability checks, target signedness, and explicit loads/stores.                                                                                                                                                                                                                   |
 | Layout operators           | `sizeof expression`, `sizeof(type-name)`, `_Alignof(type-name)`, `__builtin_offsetof` with nested member/index paths | Implemented for types with a compile-time layout. `offsetof` rejects bit-fields and nonconstant indices. Runtime VLA layout is not implemented.                                                                                                                                                               |
 | Scalar constant builtins   | `__builtin_huge_val()`, `__builtin_inff()`, and `__builtin_nanf("")`                                                 | Fold to positive binary64 infinity, positive binary32 infinity, and the canonical binary32 quiet NaN respectively. The NaN form also accepts an empty `u8` literal; nonliteral, wide, and nonempty payloads are rejected rather than approximating payload semantics.                                         |
-| Integer builtins           | `__builtin_bswap64`, `__builtin_clz`, `__builtin_clzl`, `__builtin_clzll`, `__builtin_ctzll`, `__builtin_popcount`, and `__builtin_popcountll` | Use their exact GNU argument and result types and lower to native Cranelift `bswap`, `clz`, `ctz`, and `popcnt` operations. Count-leading/trailing-zero with a zero operand retains GNU's undefined-behavior contract. Other family spellings, including `__builtin_bswap32`, are not inferred. |
+| Integer builtins           | `__builtin_bswap64`, `__builtin_clz`, `__builtin_clzl`, `__builtin_clzll`, `__builtin_ctz`, `__builtin_ctzll`, `__builtin_popcount`, and `__builtin_popcountll` | Use their exact GNU argument and result types and lower to native Cranelift `bswap`, `clz`, `ctz`, and `popcnt` operations. Count-leading/trailing-zero with a zero operand retains GNU's undefined-behavior contract. Other family spellings, including `__builtin_bswap32`, are not inferred. |
+| Memory builtins            | `__builtin_memcpy`, `__builtin_memmove`, and `__builtin_memset`                                                    | Enforce the libc-compatible destination, source/value, and `size_t` conversions, return the converted destination, and lower to the target's corresponding memory libcall. `memmove` retains overlap-safe semantics. |
 | Prefetch builtin           | `__builtin_prefetch(address[, rw[, locality]])`                                                                       | Behavior-compatible no-op: converts the address to `const void *` and evaluates it exactly once, accepts only integer constant hints in the GNU ranges, and emits no memory access. The default hints are read and locality 3.                                                                            |
 | Legacy atomic builtins     | `__sync_add_and_fetch`, `__sync_fetch_and_add`, `__sync_sub_and_fetch`, `__sync_bool_compare_and_swap`, `__sync_val_compare_and_swap`, `__sync_lock_test_and_set`, and `__sync_synchronize` | The operation builtins accept modifiable 1, 2, 4, or 8-byte integer and pointer objects and lower to native sequentially consistent atomic RMW/CAS instructions. This intentionally strengthens the acquire-only minimum ordering of GNU lock/test-and-set. The optional protected-variable list is analyzed but not evaluated. |
 | Casts                      | Arithmetic conversions, pointer/integer casts, pointer/pointer casts, casts to `_Bool` and `void`                    | Implemented for scalar types other than native `long double`.                                                                                                                                                                                                                                                 |
@@ -127,18 +128,21 @@ underlying type.
 | Comma and discarded values | Comma expressions and expression statements, including lvalues whose result is unused                                | Implemented. Discarding a value does not suppress required volatile scalar, member, array, bit-field, or aggregate reads.                                                                                                                                                                                     |
 | Generic selection          | `_Generic` syntax and associations                                                                                   | Parsed, then rejected with `CCC2270`.                                                                                                                                                                                                                                                                         |
 | GNU expression marker      | `__extension__ expression`                                                                                           | Behavior-compatible no-op; it only suppresses diagnostics CCC does not emit.                                                                                                                                                                                                                                  |
+| GNU statement expression   | `({ block-items })` in `gnu11`                                                                                       | Introduces a block scope, executes preceding items in order, and produces `void`, a captured value, or the narrowly transparent final lvalue described by the GNU semantics contract. |
 | GNU label values           | `&&label` in `gnu11`                                                                                                 | Produces an opaque pointer-typed token for a label in the current function. Direct pointer tables, copying, storage, equality, and computed jumps are implemented. Arithmetic receives `CCC2425` while direct label provenance remains detectable; post-storage arithmetic is outside the supported behavior. |
 
 Each function definition provides one `__func__` object with the lexical
 function name, as if declared `static const char __func__[]` at the start of
 the body. Repeated uses share its static-storage address, while unrelated
 string literals retain separate object identity. The object is materialized
-only when used. GNU function-name aliases are not inferred from this standard
-identifier.
+only when used. In `gnu11`, `__FUNCTION__` and `__PRETTY_FUNCTION__` resolve to
+that same object; strict `c11` exposes only the standard identifier.
 
-GNU statement expressions and inline assembly expressions/bodies are not part
-of the current grammar. Declaration assembly labels are the separate
-symbol-renaming construct listed above.
+GNU statement expressions are implemented with the result-category and scope
+rules specified in the
+[GNU C semantics contract](core-c11-and-gnu-semantics.md#statement-expressions).
+Inline assembly expressions and bodies remain outside the grammar. Declaration
+assembly labels are the separate symbol-renaming construct listed above.
 
 ### Explicit typed-AST conversions
 
@@ -247,7 +251,7 @@ spellings can be implemented while the aggregate key remains parse-only.
 
 | State                     | Exact keys                                                                                                                                                                                                                  |
 | ------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Implemented               | `__const`, `__const__`, `__inline`, `__inline__`, `__restrict`, `__restrict__`, `__signed`, `__signed__`, `__volatile`, `__volatile__`, `__alignof`, `__alignof__`, `gnu-declaration-asm-labels`, `gnu-restrict-qualifiers` |
+| Implemented               | `__const`, `__const__`, `__inline`, `__inline__`, `__restrict`, `__restrict__`, `__signed`, `__signed__`, `__volatile`, `__volatile__`, `__alignof`, `__alignof__`, `gnu-declaration-asm-labels`, `gnu-function-name-aliases`, `gnu-statement-expressions`, `gnu-restrict-qualifiers` |
 | Behavior-compatible no-op | `__extension__`, `gnu-extension-marker`                                                                                                                                                                                     |
 | Parse-only                | `__asm`, `__asm__`, `__attribute`, `__attribute__`, `__typeof`, `__typeof__`, `__thread`, `gnu-alternative-keywords`, `gnu-attribute-specifiers`, `gnu-typeof`                                                              |
 | Unsupported               | Every other extension key, including plain unreserved spellings in strict `c11` mode                                                                                                                                        |
@@ -274,7 +278,7 @@ them.
 
 | Kind    | Exact default entries                                                                                                                                                                                                                                                 |
 | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Builtin | Implemented: `__builtin_offsetof`, `__builtin_expect`, `__builtin_huge_val`, `__builtin_inff`, `__builtin_nanf`, `__builtin_bswap64`, `__builtin_clz`, `__builtin_clzl`, `__builtin_clzll`, `__builtin_ctzll`, `__builtin_popcount`, `__builtin_popcountll`, `__builtin_va_start`, `__builtin_va_arg`, `__builtin_va_copy`, `__builtin_va_end`, `__sync_add_and_fetch`, `__sync_fetch_and_add`, `__sync_sub_and_fetch`, `__sync_bool_compare_and_swap`, `__sync_val_compare_and_swap`, `__sync_lock_test_and_set`, and `__sync_synchronize`. Behavior-compatible no-op: `__builtin_prefetch`. Every other builtin key, including `__builtin_bswap32`, is unsupported. |
+| Builtin | Implemented: `__builtin_offsetof`, `__builtin_expect`, `__builtin_huge_val`, `__builtin_inff`, `__builtin_nanf`, `__builtin_bswap64`, `__builtin_clz`, `__builtin_clzl`, `__builtin_clzll`, `__builtin_ctz`, `__builtin_ctzll`, `__builtin_popcount`, `__builtin_popcountll`, `__builtin_memcpy`, `__builtin_memmove`, `__builtin_memset`, `__builtin_va_start`, `__builtin_va_arg`, `__builtin_va_copy`, `__builtin_va_end`, `__sync_add_and_fetch`, `__sync_fetch_and_add`, `__sync_sub_and_fetch`, `__sync_bool_compare_and_swap`, `__sync_val_compare_and_swap`, `__sync_lock_test_and_set`, and `__sync_synchronize`. Behavior-compatible no-op: `__builtin_prefetch`. Every other builtin key, including `__builtin_bswap32`, is unsupported. |
 | Feature | No default entries. Feature predicates are false unless the effective configuration explicitly inserts an implemented or behavior-compatible entry.                                                                                                                   |
 | Pragma  | No generic registry entries. Ordered built-in handling implements `#pragma pack`, `#pragma once`, `#pragma GCC system_header`, and the supported `#pragma GCC diagnostic` forms; unknown semantic pragmas are rejected with `CCC2355`.                                |
 
@@ -299,16 +303,24 @@ host-libm calls.
 
 The integer-intrinsic signatures are exact: `__builtin_bswap64` accepts and
 returns target `uint64_t`, which is `unsigned long` in the x86-64 GNU profile;
-`__builtin_clz` and `__builtin_popcount` accept
-`unsigned int`; `__builtin_clzl` accepts `unsigned long`; and the `clzll`,
-`ctzll`, and `popcountll` forms accept `unsigned long long`. Every count form
+`__builtin_clz`, `__builtin_ctz`, and `__builtin_popcount` accept `unsigned
+int`; `__builtin_clzl` accepts `unsigned long`; and the `clzll`, `ctzll`, and
+`popcountll` forms accept `unsigned long long`. Every count form
 returns `int`. The ordinary assignment conversions happen before the native
 Cranelift operation. CCC deliberately does not define the `clz` or `ctz`
 result for zero, matching the GNU contract, and does not infer neighboring
 spellings such as `__builtin_bswap32`.
-Valid integer constant-expression operands fold for all seven forms and remain
+Valid integer constant-expression operands fold for all eight forms and remain
 usable in enumerators, static assertions, and array bounds. Zero-input `clz`
 and `ctz` remain outside that fold at their undefined-behavior boundary.
+
+The memory builtins convert the destination to `void *`, the copy/move source
+to `const void *`, and the extent to target `size_t`; `memset` converts its
+fill value to `int`. The expression result is the converted destination.
+CCC-IR distinguishes overlap-safe copy from non-overlapping copy and a fill
+operation. Code generation uses Cranelift's target-aware memory-libcall
+lowering, preserving the platform's normal `memcpy`, `memmove`, and `memset`
+ABI rather than exposing compiler-specific helper symbols.
 
 `__builtin_prefetch` has the exact first-argument type `const void *`, including
 ordinary null-pointer-constant conversion. Its optional hints are converted to
@@ -351,7 +363,7 @@ The current frontend never silently approximates these constructs:
 | Residual unspecified-prototype definition ABI                   | Typed signature                           | `CCC3506`; unprototyped calls use their promoted actual types through the generated SysV bridge                                                                                                                                                                                               |
 | GNU `typeof`, unsupported or parse-only attributes              | Untyped AST with original spelling/tokens | `CCC2214` or `CCC2345` under the default registry                                                                                                                                                                                                                                             |
 | Assembly labels on declarations without a linkable symbol       | Untyped AST with decoded label            | `CCC2257`; automatic and block-static object declarations are never silently renamed                                                                                                                                                                                                          |
-| GNU statement expressions and inline assembly bodies            | Preprocessing tokens                      | Not in the current parser grammar                                                                                                                                                                                                                                                             |
+| Inline assembly expressions and bodies                           | Preprocessing tokens                      | Not in the current parser grammar                                                                                                                                                                                                                                                             |
 | Unsupported targets, output modes, or command-line options      | Driver option/configuration               | Rejected before source compilation; no host fallback                                                                                                                                                                                                                                          |
 
 An unused declaration with an unsupported call boundary may remain in an

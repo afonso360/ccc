@@ -934,6 +934,7 @@ fn types_the_exact_integer_intrinsic_and_prefetch_contracts() {
              !__has_builtin(__builtin_clz) || \
              !__has_builtin(__builtin_clzl) || \
              !__has_builtin(__builtin_clzll) || \
+             !__has_builtin(__builtin_ctz) || \
              !__has_builtin(__builtin_ctzll) || \
              !__has_builtin(__builtin_popcount) || \
              !__has_builtin(__builtin_popcountll) || \
@@ -941,7 +942,6 @@ fn types_the_exact_integer_intrinsic_and_prefetch_contracts() {
          #error missing selected builtin\n\
          #endif\n\
          #if __has_builtin(__builtin_bswap32) || \
-             __has_builtin(__builtin_ctz) || \
              __has_builtin(__builtin_ctzl) || \
              __has_builtin(__builtin_popcountl)\n\
          #error unselected builtin was advertised\n\
@@ -950,6 +950,7 @@ fn types_the_exact_integer_intrinsic_and_prefetch_contracts() {
          int clz_int(int value) { return __builtin_clz(value); }\n\
          int clz_long(long value) { return __builtin_clzl(value); }\n\
          int clz_long_long(long long value) { return __builtin_clzll(value); }\n\
+         int ctz_int(int value) { return __builtin_ctz(value); }\n\
          int ctz_long_long(long long value) { return __builtin_ctzll(value); }\n\
          int popcount_int(int value) { return __builtin_popcount(value); }\n\
          int popcount_long_long(long long value) { return __builtin_popcountll(value); }\n\
@@ -970,6 +971,7 @@ fn types_the_exact_integer_intrinsic_and_prefetch_contracts() {
         ("CountLeadingZerosInt", "int"),
         ("CountLeadingZerosLong", "int"),
         ("CountLeadingZerosLongLong", "int"),
+        ("CountTrailingZerosInt", "int"),
         ("CountTrailingZerosLongLong", "int"),
         ("PopulationCountInt", "int"),
         ("PopulationCountLongLong", "int"),
@@ -1050,6 +1052,84 @@ fn types_the_exact_integer_intrinsic_and_prefetch_contracts() {
 }
 
 #[test]
+fn types_gnu_statement_expression_value_categories_and_scope() {
+    let unit = analyze_source(
+        "int global; int array[2];\n\
+         int transparent(void) { ({ global; ; }) = 7; return global; }\n\
+         int *transparent_address(void) { return &({ global; }); }\n\
+         int *array_decay(void) { return ({ array; }); }\n\
+         int scoped(void) { return ({ int local = 3; local; }); }\n\
+         int sequenced(void) { return ({ global = 4; global; }); }\n\
+         void empty(void) { ({ ; ; }); }",
+    )
+    .unwrap();
+    let dump = dump_frontend_typed_ast(&unit);
+    assert!(dump.contains("statement-expression : int Lvalue"), "{dump}");
+    assert!(
+        dump.contains("statement-expression : pointer to int Value"),
+        "{dump}"
+    );
+    assert!(
+        dump.matches("statement-expression : int Value").count() >= 2,
+        "{dump}"
+    );
+    assert!(dump.contains("statement-expression : void Value"), "{dump}");
+
+    for source in [
+        "const int value = 0; int f(void) { ({ value; }) = 1; return 0; }",
+        "int value; int f(void) { ({ 0; value; }) = 1; return 0; }",
+        "int f(void) { return ({ int local = 1; local; }) = 2; }",
+        "int outside = ({ 1; });",
+    ] {
+        assert!(analyze_source(source).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn types_memory_builtins_as_libc_compatible_operations() {
+    let unit = analyze_preprocessed_source(
+        "memory-builtins.c",
+        "#if !__has_builtin(__builtin_memcpy) || \\
+             !__has_builtin(__builtin_memmove) || \\
+             !__has_builtin(__builtin_memset)\n\
+         #error missing memory builtin\n\
+         #endif\n\
+         void *copy(void *to, const void *from, unsigned long count) {\n\
+             return __builtin_memcpy(to, from, count);\n\
+         }\n\
+         void *move(void *to, const void *from, unsigned long count) {\n\
+             return __builtin_memmove(to, from, count);\n\
+         }\n\
+         void *fill(void *to, int value, unsigned long count) {\n\
+             return __builtin_memset(to, value, count);\n\
+         }",
+    )
+    .unwrap();
+    let dump = dump_frontend_typed_ast(&unit);
+    assert!(dump.contains("memory-copy overlap=false"), "{dump}");
+    assert!(dump.contains("memory-copy overlap=true"), "{dump}");
+    assert!(dump.contains("memory-set"), "{dump}");
+    assert_eq!(
+        dump.matches(" : pointer to void Value").count(),
+        12,
+        "{dump}"
+    );
+
+    for name in ["__builtin_memcpy", "__builtin_memmove", "__builtin_memset"] {
+        let mut config = EffectiveCompilationConfig::default();
+        config
+            .capabilities
+            .insert(CapabilityKind::Builtin, name, CapabilityState::ParseOnly);
+        let source = format!(
+            "void *f(void *p) {{ return {name}(p, {}, 1); }}",
+            if name == "__builtin_memset" { "0" } else { "p" }
+        );
+        let diagnostics = analyze_source_with_config(&source, &config).unwrap_err();
+        assert_eq!(diagnostics[0].code, "CCC2407", "{name}");
+    }
+}
+
+#[test]
 fn folds_integer_intrinsics_in_integer_constant_expression_contexts() {
     analyze_source(
         "enum folded {\n\
@@ -1057,6 +1137,7 @@ fn folds_integer_intrinsics_in_integer_constant_expression_contexts() {
              leading_int = __builtin_clz(1U),\n\
              leading_long = __builtin_clzl(1UL),\n\
              leading_long_long = __builtin_clzll(1ULL),\n\
+             trailing_int = __builtin_ctz(0x20U),\n\
              trailing_long_long = __builtin_ctzll(0x100ULL),\n\
              population_int = __builtin_popcount(0xf0U),\n\
              population_long_long = __builtin_popcountll(0xf00000000000000fULL)\n\
@@ -1065,18 +1146,24 @@ fn folds_integer_intrinsics_in_integer_constant_expression_contexts() {
          _Static_assert(leading_int == 31, \"clz\");\n\
          _Static_assert(leading_long == 63, \"clzl\");\n\
          _Static_assert(leading_long_long == 63, \"clzll\");\n\
+         _Static_assert(trailing_int == 5, \"ctz\");\n\
          _Static_assert(trailing_long_long == 8, \"ctzll\");\n\
          _Static_assert(population_int == 4, \"popcount\");\n\
          _Static_assert(population_long_long == 8, \"popcountll\");\n\
          int folded_array[(swapped == 0x0100000000000000UL &&\n\
              leading_int + leading_long + leading_long_long +\n\
-             trailing_long_long + population_int + population_long_long == 177) ? 7 : -1];",
+             trailing_int + trailing_long_long + population_int +\n\
+             population_long_long == 182) ? 7 : -1];",
     )
     .unwrap();
 
     assert!(
         analyze_source("enum invalid { value = __builtin_clz(0U) };").is_err(),
         "zero-input clz must remain outside constant folding"
+    );
+    assert!(
+        analyze_source("enum invalid { value = __builtin_ctz(0U) };").is_err(),
+        "zero-input ctz must remain outside constant folding"
     );
     analyze_source("int runtime(unsigned value) { return __builtin_clz(value); }").unwrap();
 }
@@ -2133,6 +2220,38 @@ fn predefined_function_names_preserve_identifier_encoding_and_scope_rules() {
     assert!(analyze_source("int f(void) { char copy[] = __func__; return 0; }").is_err());
     assert!(analyze_source("int f(void) { int __func__; return 0; }").is_err());
     assert!(analyze_source("int f(void) { { int __func__ = 3; return __func__; } }").is_ok());
+}
+
+#[test]
+fn gnu_function_name_aliases_share_the_predefined_object() {
+    let unit = analyze_source(
+        "int aliases(void) {\n\
+             return __func__ == __FUNCTION__ &&\n\
+                 __FUNCTION__ == __PRETTY_FUNCTION__ &&\n\
+                 sizeof __PRETTY_FUNCTION__ == sizeof \"aliases\";\n\
+         }",
+    )
+    .unwrap();
+    assert_eq!(unit.strings.len(), 2);
+    let dump = dump_frontend_typed_ast(&unit);
+    assert_eq!(
+        dump.matches("PredefinedFunctionName(StringId(0))").count(),
+        4,
+        "{dump}"
+    );
+
+    let mut config = EffectiveCompilationConfig::default();
+    config.language.mode = LanguageMode::C11;
+    let diagnostics = analyze_source_with_config(
+        "int f(void) { return __FUNCTION__[0] + __PRETTY_FUNCTION__[0]; }",
+        &config,
+    )
+    .unwrap_err();
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code == "CCC2274")
+    );
 }
 
 #[test]

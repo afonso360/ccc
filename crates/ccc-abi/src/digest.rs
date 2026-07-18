@@ -739,6 +739,28 @@ fn encode_instruction(encoder: &mut Encoder, instruction: &gir::FullInstructionK
             encoder.bool(*write);
             encoder.tag(*locality);
         }
+        I::MemoryCopy {
+            destination,
+            source,
+            length,
+            overlap,
+        } => {
+            encoder.tag(32);
+            encoder.u32(destination.0);
+            encoder.u32(source.0);
+            encoder.u32(length.0);
+            encoder.bool(*overlap);
+        }
+        I::MemorySet {
+            destination,
+            value,
+            length,
+        } => {
+            encoder.tag(33);
+            encoder.u32(destination.0);
+            encoder.u32(value.0);
+            encoder.u32(length.0);
+        }
     }
 }
 

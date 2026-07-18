@@ -138,11 +138,21 @@ impl CapabilityRegistry {
             "__alignof",
             "__alignof__",
             "gnu-declaration-asm-labels",
+            "gnu-function-name-aliases",
+            "gnu-statement-expressions",
         ] {
             registry.insert(
                 CapabilityKind::Extension,
                 name,
                 CapabilityState::Implemented,
+            );
+        }
+        for name in ["__builtin_memcpy", "__builtin_memmove", "__builtin_memset"] {
+            registry.insert_with_rationale(
+                CapabilityKind::Builtin,
+                name,
+                CapabilityState::Implemented,
+                "the frontend enforces the libc memory-operation signature and the backend emits the matching target libcall",
             );
         }
 
@@ -285,6 +295,7 @@ impl CapabilityRegistry {
             "__builtin_clz",
             "__builtin_clzl",
             "__builtin_clzll",
+            "__builtin_ctz",
             "__builtin_ctzll",
             "__builtin_popcount",
             "__builtin_popcountll",
@@ -419,6 +430,8 @@ mod tests {
             "__signed__",
             "__alignof__",
             "gnu-declaration-asm-labels",
+            "gnu-function-name-aliases",
+            "gnu-statement-expressions",
         ] {
             assert_eq!(
                 registry.state(CapabilityKind::Extension, name),
@@ -512,9 +525,13 @@ mod tests {
             "__builtin_clz",
             "__builtin_clzl",
             "__builtin_clzll",
+            "__builtin_ctz",
             "__builtin_ctzll",
             "__builtin_popcount",
             "__builtin_popcountll",
+            "__builtin_memcpy",
+            "__builtin_memmove",
+            "__builtin_memset",
             "__builtin_va_start",
             "__builtin_va_arg",
             "__builtin_va_copy",

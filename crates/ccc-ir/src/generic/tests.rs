@@ -935,7 +935,8 @@ fn lowers_integer_intrinsics_and_nonfaulting_prefetch_effects_explicitly() {
          unsigned long swap(unsigned long value) { return __builtin_bswap64(value); }\n\
          int bits(unsigned int word, unsigned long wide, unsigned long long widest) {\n\
              return __builtin_clz(word) + __builtin_clzl(wide) +\n\
-                 __builtin_clzll(widest) + __builtin_ctzll(widest) +\n\
+                 __builtin_clzll(widest) + __builtin_ctz(word) +\n\
+                 __builtin_ctzll(widest) +\n\
                  __builtin_popcount(word) + __builtin_popcountll(widest);\n\
          }\n\
          void hints(void) {\n\
@@ -965,6 +966,7 @@ fn lowers_integer_intrinsics_and_nonfaulting_prefetch_effects_explicitly() {
             IntegerIntrinsicOperation::CountLeadingZerosInt,
             IntegerIntrinsicOperation::CountLeadingZerosLong,
             IntegerIntrinsicOperation::CountLeadingZerosLongLong,
+            IntegerIntrinsicOperation::CountTrailingZerosInt,
             IntegerIntrinsicOperation::CountTrailingZerosLongLong,
             IntegerIntrinsicOperation::PopulationCountInt,
             IntegerIntrinsicOperation::PopulationCountLongLong,
@@ -1009,6 +1011,7 @@ fn lowers_integer_intrinsics_and_nonfaulting_prefetch_effects_explicitly() {
         "CountLeadingZerosInt",
         "CountLeadingZerosLong",
         "CountLeadingZerosLongLong",
+        "CountTrailingZerosInt",
         "CountTrailingZerosLongLong",
         "PopulationCountInt",
         "PopulationCountLongLong",
@@ -1021,6 +1024,62 @@ fn lowers_integer_intrinsics_and_nonfaulting_prefetch_effects_explicitly() {
     assert!(dump.contains("prefetch v"), "{dump}");
     assert!(dump.contains("write=false locality=3"), "{dump}");
     assert!(dump.contains("write=true locality=0"), "{dump}");
+}
+
+#[test]
+fn lowers_statement_expressions_and_memory_operations_explicitly() {
+    let module = lower_source(
+        "void *memory(char *to, char *from, unsigned long count) {\n\
+             __builtin_memcpy(to, from, count);\n\
+             __builtin_memmove(to + 1, to, count - 1);\n\
+             return __builtin_memset(to, 65, count);\n\
+         }\n\
+         int statement(int *slot) {\n\
+             ({ *slot; }) = 4;\n\
+             return ({ int captured = *slot; captured + 1; });\n\
+         }",
+    );
+    verify_frontend(&module).unwrap();
+
+    let instructions = module
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        instructions
+            .iter()
+            .filter(|instruction| matches!(
+                instruction.kind,
+                FullInstructionKind::MemoryCopy { overlap: false, .. }
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        instructions
+            .iter()
+            .filter(|instruction| matches!(
+                instruction.kind,
+                FullInstructionKind::MemoryCopy { overlap: true, .. }
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        instructions
+            .iter()
+            .filter(|instruction| matches!(instruction.kind, FullInstructionKind::MemorySet { .. }))
+            .count(),
+        1
+    );
+
+    let dump = dump_frontend_ir(&module);
+    assert!(dump.contains("memory.copy"), "{dump}");
+    assert!(dump.contains("overlap=false"), "{dump}");
+    assert!(dump.contains("overlap=true"), "{dump}");
+    assert!(dump.contains("memory.set"), "{dump}");
 }
 
 #[test]

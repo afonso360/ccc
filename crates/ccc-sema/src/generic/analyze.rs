@@ -8,7 +8,8 @@ use ccc_pp::{
 use ccc_session::Span;
 use ccc_syntax::frontend as syntax;
 use ccc_target::{
-    CapabilityKind, CapabilityState, EffectiveCompilationConfig, PackingPolicy, TargetBuiltinType,
+    CapabilityKind, CapabilityState, EffectiveCompilationConfig, LanguageMode, PackingPolicy,
+    TargetBuiltinType,
 };
 use ccc_types::{
     ArrayLength, ArrayType, BuiltinType, Field, FunctionParameters, FunctionType, LayoutShape,
@@ -519,17 +520,24 @@ impl<'a> Analyzer<'a> {
                 .last_named_parameter_restriction = parameter.va_start_restriction;
         }
 
-        if self
-            .bind_current(
-                "__func__".to_owned(),
-                OrdinarySymbol::PredefinedFunctionName,
-                resolved.name_span,
-            )
-            .is_err()
-        {
-            self.pop_scope();
-            self.function = None;
-            return Err(());
+        let function_name_spellings: &[&str] = if self.config.language.mode == LanguageMode::Gnu11 {
+            &["__func__", "__FUNCTION__", "__PRETTY_FUNCTION__"]
+        } else {
+            &["__func__"]
+        };
+        for spelling in function_name_spellings {
+            if self
+                .bind_current(
+                    (*spelling).to_owned(),
+                    OrdinarySymbol::PredefinedFunctionName,
+                    resolved.name_span,
+                )
+                .is_err()
+            {
+                self.pop_scope();
+                self.function = None;
+                return Err(());
+            }
         }
 
         let body = self.analyze_function_body(&definition.body);
@@ -2755,6 +2763,9 @@ impl<'a> Analyzer<'a> {
                 typed.span = expression.span;
                 Ok(typed)
             }
+            E::StatementExpression(items) => {
+                self.analyze_statement_expression(items, expression.span)
+            }
             E::GenericSelection { .. } => self.fail(
                 "CCC2270",
                 expression.span,
@@ -2880,6 +2891,10 @@ impl<'a> Analyzer<'a> {
             E::BuiltinIntegerIntrinsic { operation, operand } => {
                 self.analyze_integer_intrinsic(*operation, operand, expression.span)
             }
+            E::BuiltinMemoryOperation {
+                operation,
+                arguments,
+            } => self.analyze_memory_builtin(*operation, arguments, expression.span),
             E::BuiltinPrefetch { arguments } => {
                 self.analyze_builtin_prefetch(arguments, expression.span)
             }
@@ -2889,6 +2904,116 @@ impl<'a> Analyzer<'a> {
             } => self.analyze_sync_operation(*operation, arguments, expression.span),
             E::BuiltinSyncSynchronize => self.analyze_sync_synchronize(expression.span),
         }
+    }
+
+    fn analyze_statement_expression(
+        &mut self,
+        items: &[syntax::BlockItem],
+        span: Span,
+    ) -> AnalysisResult<FullTypedExpression> {
+        if self.function.is_none() {
+            return self.fail(
+                "CCC2452",
+                span,
+                "a statement expression is only supported inside a function",
+            );
+        }
+
+        self.push_scope();
+        let meaningful = items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                !matches!(
+                    item,
+                    syntax::BlockItem::Statement(statement)
+                        if matches!(statement.kind, syntax::StatementKind::Expression(None))
+                )
+            })
+            .collect::<Vec<_>>();
+
+        let transparent = match meaningful.as_slice() {
+            [(index, syntax::BlockItem::Statement(statement))] => match &statement.kind {
+                syntax::StatementKind::Expression(Some(expression)) => Some((*index, expression)),
+                _ => None,
+            },
+            _ => None,
+        };
+
+        let analyzed = (|| {
+            if let Some((result_index, result_expression)) = transparent {
+                let result = self.analyze_expression(result_expression)?;
+                let result = if matches!(
+                    self.types.try_kind(result.ty.ty),
+                    Some(TypeKind::Array(_) | TypeKind::Function(_))
+                ) || (result.category == ValueCategory::Lvalue
+                    && !result.ty.qualifiers.is_empty())
+                {
+                    self.value_conversion(result)?
+                } else {
+                    result
+                };
+                let mut output = Vec::new();
+                for (index, item) in items.iter().enumerate() {
+                    if index == result_index {
+                        continue;
+                    }
+                    if let syntax::BlockItem::Statement(statement) = item {
+                        output.push(FullTypedBlockItem::Statement(Box::new(
+                            self.analyze_statement(statement)?,
+                        )));
+                    }
+                }
+                Ok((output, Some(result)))
+            } else {
+                let mut output = self.analyze_compound_items(items)?;
+                let result_index = output.iter().rposition(|item| {
+                    !matches!(
+                        item,
+                        FullTypedBlockItem::Statement(statement)
+                            if matches!(statement.kind, FullTypedStatementKind::Expression(None))
+                    )
+                });
+                let result = result_index.and_then(|index| {
+                    let FullTypedBlockItem::Statement(statement) = &mut output[index] else {
+                        return None;
+                    };
+                    let FullTypedStatementKind::Expression(expression) = &mut statement.kind else {
+                        return None;
+                    };
+                    expression.take().map(|expression| (index, expression))
+                });
+                let result = result.map(|(index, expression)| {
+                    output.remove(index);
+                    expression
+                });
+                let result = result
+                    .map(|result| self.value_conversion(result))
+                    .transpose()?;
+                Ok((output, result))
+            }
+        })();
+        self.pop_scope();
+        let (items, result) = analyzed?;
+        let ty = result
+            .as_ref()
+            .map_or(QualifiedType::unqualified(TypeId::VOID), |result| result.ty);
+        let category = result
+            .as_ref()
+            .map_or(ValueCategory::Value, |result| result.category);
+        let place = result.as_ref().and_then(|result| result.place.clone());
+        Ok(FullTypedExpression {
+            kind: FullTypedExpressionKind::StatementExpression {
+                items,
+                result: result.map(Box::new),
+            },
+            ty,
+            category,
+            place,
+            constant: None,
+            constant_expression_kind: ConstantExpressionKind::Invalid,
+            span,
+        })
     }
 
     fn analyze_compound_literal(
@@ -3066,6 +3191,11 @@ impl<'a> Analyzer<'a> {
                 TypeId::UNSIGNED_LONG_LONG,
                 TypeId::INT,
             ),
+            syntax::IntegerBuiltinOperation::CountTrailingZerosInt => (
+                IntegerIntrinsicOperation::CountTrailingZerosInt,
+                TypeId::UNSIGNED_INT,
+                TypeId::INT,
+            ),
         };
         let operand = self.analyze_expression(operand)?;
         let operand_span = operand.span;
@@ -3112,7 +3242,8 @@ impl<'a> Analyzer<'a> {
         };
         let input = match operation {
             IntegerIntrinsicOperation::CountLeadingZerosInt
-            | IntegerIntrinsicOperation::PopulationCountInt => BuiltinType::UnsignedInt,
+            | IntegerIntrinsicOperation::PopulationCountInt
+            | IntegerIntrinsicOperation::CountTrailingZerosInt => BuiltinType::UnsignedInt,
             IntegerIntrinsicOperation::ByteSwap64
             | IntegerIntrinsicOperation::CountLeadingZerosLong => BuiltinType::UnsignedLong,
             IntegerIntrinsicOperation::CountLeadingZerosLongLong
@@ -3134,7 +3265,8 @@ impl<'a> Analyzer<'a> {
                 let leading = raw.leading_zeros() - (u128::BITS - u32::from(width));
                 Some(ConstantValue::Signed(i128::from(leading)))
             }
-            IntegerIntrinsicOperation::CountTrailingZerosLongLong => {
+            IntegerIntrinsicOperation::CountTrailingZerosLongLong
+            | IntegerIntrinsicOperation::CountTrailingZerosInt => {
                 if raw == 0 {
                     return None;
                 }
@@ -3175,6 +3307,69 @@ impl<'a> Analyzer<'a> {
                 locality,
             },
             ty: QualifiedType::unqualified(TypeId::VOID),
+            category: ValueCategory::Value,
+            place: None,
+            constant: None,
+            constant_expression_kind: ConstantExpressionKind::Invalid,
+            span,
+        })
+    }
+
+    fn analyze_memory_builtin(
+        &mut self,
+        operation: syntax::MemoryBuiltinOperation,
+        arguments: &[syntax::Expression],
+        span: Span,
+    ) -> AnalysisResult<FullTypedExpression> {
+        self.require_builtin(operation.spelling(), span)?;
+        debug_assert_eq!(arguments.len(), 3);
+
+        let void_pointer = QualifiedType::unqualified(
+            self.types.pointer(QualifiedType::unqualified(TypeId::VOID)),
+        );
+        let const_void_pointer = QualifiedType::unqualified(
+            self.types
+                .pointer(QualifiedType::new(TypeId::VOID, TypeQualifiers::CONST)),
+        );
+        let destination = self.analyze_expression(&arguments[0])?;
+        let destination =
+            self.assignment_conversion(destination, void_pointer, arguments[0].span)?;
+        let length = self.analyze_expression(&arguments[2])?;
+        let length = self.assignment_conversion(
+            length,
+            QualifiedType::unqualified(self.size_type()),
+            arguments[2].span,
+        )?;
+
+        let kind = match operation {
+            syntax::MemoryBuiltinOperation::Copy | syntax::MemoryBuiltinOperation::Move => {
+                let source = self.analyze_expression(&arguments[1])?;
+                let source =
+                    self.assignment_conversion(source, const_void_pointer, arguments[1].span)?;
+                FullTypedExpressionKind::MemoryCopy {
+                    destination: Box::new(destination),
+                    source: Box::new(source),
+                    length: Box::new(length),
+                    overlap: operation == syntax::MemoryBuiltinOperation::Move,
+                }
+            }
+            syntax::MemoryBuiltinOperation::Set => {
+                let value = self.analyze_expression(&arguments[1])?;
+                let value = self.assignment_conversion(
+                    value,
+                    QualifiedType::unqualified(TypeId::INT),
+                    arguments[1].span,
+                )?;
+                FullTypedExpressionKind::MemorySet {
+                    destination: Box::new(destination),
+                    value: Box::new(value),
+                    length: Box::new(length),
+                }
+            }
+        };
+        Ok(FullTypedExpression {
+            kind,
+            ty: void_pointer,
             category: ValueCategory::Value,
             place: None,
             constant: None,
@@ -7863,6 +8058,7 @@ fn builtin_expect_folded_constant(expression: &FullTypedExpression) -> bool {
             }
         }
         E::Comma(expressions) => expressions.iter().all(builtin_expect_folded_constant),
+        E::StatementExpression { .. } => false,
         E::BuiltinExpect { value, expected: _ } => {
             expression.constant.is_some() && builtin_expect_folded_constant(value)
         }
@@ -7878,6 +8074,8 @@ fn builtin_expect_folded_constant(expression: &FullTypedExpression) -> bool {
         | E::VaCopy { .. }
         | E::VaEnd { .. }
         | E::IntegerIntrinsic { .. }
+        | E::MemoryCopy { .. }
+        | E::MemorySet { .. }
         | E::Prefetch { .. }
         | E::AtomicReadModifyWrite { .. }
         | E::AtomicCompareExchange { .. }

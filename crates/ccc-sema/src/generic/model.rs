@@ -342,6 +342,7 @@ pub enum IntegerIntrinsicOperation {
     CountTrailingZerosLongLong,
     PopulationCountInt,
     PopulationCountLongLong,
+    CountTrailingZerosInt,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -500,6 +501,10 @@ pub enum FullTypedExpressionKind {
         else_expression: Box<FullTypedExpression>,
     },
     Comma(Vec<FullTypedExpression>),
+    StatementExpression {
+        items: Vec<FullTypedBlockItem>,
+        result: Option<Box<FullTypedExpression>>,
+    },
     BuiltinExpect {
         value: Box<FullTypedExpression>,
         expected: Box<FullTypedExpression>,
@@ -535,6 +540,17 @@ pub enum FullTypedExpressionKind {
     IntegerIntrinsic {
         operation: IntegerIntrinsicOperation,
         operand: Box<FullTypedExpression>,
+    },
+    MemoryCopy {
+        destination: Box<FullTypedExpression>,
+        source: Box<FullTypedExpression>,
+        length: Box<FullTypedExpression>,
+        overlap: bool,
+    },
+    MemorySet {
+        destination: Box<FullTypedExpression>,
+        value: Box<FullTypedExpression>,
+        length: Box<FullTypedExpression>,
     },
     Prefetch {
         address: Box<FullTypedExpression>,

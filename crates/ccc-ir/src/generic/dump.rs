@@ -478,6 +478,23 @@ fn display_instruction(module: &FullModule, kind: &FullInstructionKind) -> Strin
         FullInstructionKind::IntegerIntrinsic { operation, operand } => {
             format!("integer.intrinsic operation={operation:?} v{}", operand.0)
         }
+        FullInstructionKind::MemoryCopy {
+            destination,
+            source,
+            length,
+            overlap,
+        } => format!(
+            "memory.copy v{} -> v{} length=v{} overlap={overlap}",
+            source.0, destination.0, length.0
+        ),
+        FullInstructionKind::MemorySet {
+            destination,
+            value,
+            length,
+        } => format!(
+            "memory.set v{} value=v{} length=v{}",
+            destination.0, value.0, length.0
+        ),
         FullInstructionKind::DirectCall {
             function,
             signature,

@@ -568,7 +568,8 @@ mod tests {
              }\n\
              int bits(unsigned int word, unsigned long wide, unsigned long long widest) {\n\
                  return __builtin_clz(word) + __builtin_clzl(wide) +\n\
-                     __builtin_clzll(widest) + __builtin_ctzll(widest) +\n\
+                     __builtin_clzll(widest) + __builtin_ctz(word) +\n\
+                     __builtin_ctzll(widest) +\n\
                      __builtin_popcount(word) + __builtin_popcountll(widest);\n\
              }\n\
              void hints(void *address) {\n\
@@ -584,6 +585,7 @@ mod tests {
             "__builtin_clz",
             "__builtin_clzl",
             "__builtin_clzll",
+            "__builtin_ctz",
             "__builtin_ctzll",
             "__builtin_popcount",
             "__builtin_popcountll",
@@ -606,6 +608,35 @@ mod tests {
         ] {
             let error = parse_source(source).unwrap_err();
             assert!(error.message.contains("__builtin_prefetch"), "{error}");
+        }
+    }
+
+    #[test]
+    fn parses_gnu_statement_expressions_and_memory_builtins() {
+        let source = "void *copy(void *to, const void *from, unsigned long count) {\n\
+                 return ({ __builtin_memcpy(to, from, count); });\n\
+             }\n\
+             void *move(void *to, const void *from, unsigned long count) {\n\
+                 return __builtin_memmove(to, from, count);\n\
+             }\n\
+             void *fill(void *to, int value, unsigned long count) {\n\
+                 return __builtin_memset(to, value, count);\n\
+             }";
+        let unit = parse_source_with_mode(source, LanguageMode::Gnu11).unwrap();
+        let dump = dump_ast(&unit);
+        assert!(dump.contains("statement-expression"), "{dump}");
+        for spelling in ["__builtin_memcpy", "__builtin_memmove", "__builtin_memset"] {
+            assert!(dump.contains(spelling), "{dump}");
+        }
+        assert!(parse_source_with_mode(source, LanguageMode::C11).is_err());
+
+        for source in [
+            "void *f(void *p) { return __builtin_memcpy(p, p); }",
+            "void *f(void *p) { return __builtin_memmove(p, p, 1, 2); }",
+            "void *f(void *p) { return __builtin_memset(p, 0); }",
+        ] {
+            let error = parse_source(source).unwrap_err();
+            assert!(error.message.contains("exactly three arguments"), "{error}");
         }
     }
 

@@ -86,6 +86,7 @@ pub(super) fn lower_function(
     abi_plan: ccc_abi::VerifiedModuleAbiPlan<'_>,
     definition_plan: DefinitionAbi<'_>,
     references: &FunctionReferences,
+    frontend_config: isa::TargetFrontendConfig,
     clif_function: &mut ir::Function,
 ) -> Result<(), CodegenError> {
     let entry = function.entry.ok_or_else(|| {
@@ -155,6 +156,7 @@ pub(super) fn lower_function(
         abi_plan,
         definition_plan,
         references,
+        frontend_config,
         blocks,
         storage,
         values: vec![None; function.value_types.len()],
@@ -229,6 +231,7 @@ struct FunctionState<'a> {
     abi_plan: ccc_abi::VerifiedModuleAbiPlan<'a>,
     definition_plan: DefinitionAbi<'a>,
     references: &'a FunctionReferences,
+    frontend_config: isa::TargetFrontendConfig,
     blocks: HashMap<u32, ir::Block>,
     storage: HashMap<u32, StackSlot>,
     values: Vec<Option<ir::Value>>,
@@ -830,7 +833,8 @@ impl FunctionState<'_> {
                         | gir::IntegerIntrinsicOperation::CountLeadingZerosLongLong => {
                             builder.ins().clz(operand)
                         }
-                        gir::IntegerIntrinsicOperation::CountTrailingZerosLongLong => {
+                        gir::IntegerIntrinsicOperation::CountTrailingZerosLongLong
+                        | gir::IntegerIntrinsicOperation::CountTrailingZerosInt => {
                             builder.ins().ctz(operand)
                         }
                         gir::IntegerIntrinsicOperation::PopulationCountInt
@@ -851,6 +855,38 @@ impl FunctionState<'_> {
                         destination,
                         false,
                     )))
+                }
+                I::MemoryCopy {
+                    destination,
+                    source,
+                    length,
+                    overlap,
+                } => {
+                    let destination = self.value(*destination)?;
+                    let source = self.value(*source)?;
+                    let length = self.value(*length)?;
+                    if *overlap {
+                        builder.call_memmove(self.frontend_config, destination, source, length);
+                    } else {
+                        builder.call_memcpy(self.frontend_config, destination, source, length);
+                    }
+                    Ok(None)
+                }
+                I::MemorySet {
+                    destination,
+                    value,
+                    length,
+                } => {
+                    let value = self.value(*value)?;
+                    let value_ty = builder.func.dfg.value_type(value);
+                    let value = coerce_integer(builder, value, value_ty, ir::types::I8, true);
+                    builder.call_memset(
+                        self.frontend_config,
+                        self.value(*destination)?,
+                        value,
+                        self.value(*length)?,
+                    );
+                    Ok(None)
                 }
                 I::AtomicReadModifyWrite {
                     operation,

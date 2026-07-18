@@ -878,11 +878,12 @@ fn integer_intrinsics_are_native_clif_operations_without_external_symbols() {
          int clz_int(unsigned int value) { return __builtin_clz(value); }\n\
          int clz_long(unsigned long value) { return __builtin_clzl(value); }\n\
          int clz_long_long(unsigned long long value) { return __builtin_clzll(value); }\n\
+         int ctz_int(unsigned int value) { return __builtin_ctz(value); }\n\
          int ctz_long_long(unsigned long long value) { return __builtin_ctzll(value); }\n\
          int popcount_int(unsigned int value) { return __builtin_popcount(value); }\n\
          int popcount_long_long(unsigned long long value) { return __builtin_popcountll(value); }",
     );
-    for (operation, expected) in [("bswap", 1), ("clz", 3), ("ctz", 1), ("popcnt", 2)] {
+    for (operation, expected) in [("bswap", 1), ("clz", 3), ("ctz", 2), ("popcnt", 2)] {
         assert_eq!(
             output
                 .clif
@@ -901,6 +902,7 @@ fn integer_intrinsics_are_native_clif_operations_without_external_symbols() {
         "__builtin_clz",
         "__builtin_clzl",
         "__builtin_clzll",
+        "__builtin_ctz",
         "__builtin_ctzll",
         "__builtin_popcount",
         "__builtin_popcountll",
@@ -911,6 +913,30 @@ fn integer_intrinsics_are_native_clif_operations_without_external_symbols() {
                 .filter(|candidate| candidate.is_undefined())
                 .all(|candidate| candidate.name() != Ok(symbol)),
             "unexpected external reference to {symbol}"
+        );
+    }
+}
+
+#[test]
+fn memory_builtins_lower_to_target_libcalls() {
+    let output = emit_source(
+        "void *operations(char *to, char *from, unsigned long count) {\n\
+             __builtin_memcpy(to, from, count);\n\
+             __builtin_memmove(to + 1, to, count - 1);\n\
+             return __builtin_memset(to, 65, count);\n\
+         }",
+    );
+    let clif = function_clif(&output.clif, "operations");
+    assert!(clif.contains("call fn"), "{clif}");
+
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    for symbol in ["memcpy", "memmove", "memset"] {
+        assert!(
+            object
+                .symbols()
+                .filter(|candidate| candidate.is_undefined())
+                .any(|candidate| candidate.name() == Ok(symbol)),
+            "missing target libcall reference to {symbol}"
         );
     }
 }

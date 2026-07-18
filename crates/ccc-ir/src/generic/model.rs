@@ -347,6 +347,17 @@ pub enum FullInstructionKind {
         operation: IntegerIntrinsicOperation,
         operand: ValueId,
     },
+    MemoryCopy {
+        destination: ValueId,
+        source: ValueId,
+        length: ValueId,
+        overlap: bool,
+    },
+    MemorySet {
+        destination: ValueId,
+        value: ValueId,
+        length: ValueId,
+    },
     DirectCall {
         function: FullFunctionId,
         signature: TypeId,
@@ -445,6 +456,7 @@ pub enum IntegerIntrinsicOperation {
     CountTrailingZerosLongLong,
     PopulationCountInt,
     PopulationCountLongLong,
+    CountTrailingZerosInt,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

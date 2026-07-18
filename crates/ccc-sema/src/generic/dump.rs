@@ -560,6 +560,15 @@ fn dump_expression(
                 dump_expression(output, unit, expression, indent + 1);
             }
         }
+        FullTypedExpressionKind::StatementExpression { items, result } => {
+            line(output, indent, format_args!("statement-expression{suffix}"));
+            for item in items {
+                dump_block_item(output, unit, item, indent + 1);
+            }
+            if let Some(result) = result {
+                dump_named_expression(output, unit, "result", result, indent + 1);
+            }
+        }
         FullTypedExpressionKind::BuiltinExpect { value, expected } => {
             line(output, indent, format_args!("builtin-expect{suffix}"));
             dump_expression(output, unit, value, indent + 1);
@@ -572,6 +581,31 @@ fn dump_expression(
                 format_args!("integer-intrinsic {operation:?}{suffix}"),
             );
             dump_expression(output, unit, operand, indent + 1);
+        }
+        FullTypedExpressionKind::MemoryCopy {
+            destination,
+            source,
+            length,
+            overlap,
+        } => {
+            line(
+                output,
+                indent,
+                format_args!("memory-copy overlap={overlap}{suffix}"),
+            );
+            dump_expression(output, unit, destination, indent + 1);
+            dump_expression(output, unit, source, indent + 1);
+            dump_expression(output, unit, length, indent + 1);
+        }
+        FullTypedExpressionKind::MemorySet {
+            destination,
+            value,
+            length,
+        } => {
+            line(output, indent, format_args!("memory-set{suffix}"));
+            dump_expression(output, unit, destination, indent + 1);
+            dump_expression(output, unit, value, indent + 1);
+            dump_expression(output, unit, length, indent + 1);
         }
         FullTypedExpressionKind::Prefetch {
             address,

@@ -631,6 +631,9 @@ fn collect_automatic_local_facts(
                                 types,
                             ),
                         );
+                        if let Some(initializer) = &declaration.initializer {
+                            collect_automatic_local_facts_in_initializer(initializer, types, facts);
+                        }
                     }
                     FullTypedBlockItem::Statement(statement) => {
                         collect_automatic_local_facts(statement, types, facts);
@@ -639,11 +642,17 @@ fn collect_automatic_local_facts(
                 }
             }
         }
+        S::Expression(expression) => {
+            if let Some(expression) = expression {
+                collect_automatic_local_facts_in_expression(expression, types, facts);
+            }
+        }
         S::If {
+            condition,
             then_statement,
             else_statement,
-            ..
         } => {
+            collect_automatic_local_facts_in_expression(condition, types, facts);
             collect_automatic_local_facts(then_statement, types, facts);
             if let Some(statement) = else_statement {
                 collect_automatic_local_facts(statement, types, facts);
@@ -651,40 +660,249 @@ fn collect_automatic_local_facts(
         }
         S::For {
             initializer,
+            condition,
+            step,
             statement,
-            ..
         } => {
-            if let FullTypedForInitializer::Declarations(items) = initializer {
-                for item in items {
-                    if let FullTypedBlockItem::Declaration(declaration) = item
-                        && declaration.duration == StorageDuration::Automatic
-                    {
-                        facts.insert(
-                            declaration.local,
-                            make_local_fact(
-                                declaration.local,
-                                declaration.name.clone(),
-                                declaration.ty,
-                                declaration.duration,
-                                declaration.requested_alignment,
-                                declaration.span,
-                                types,
-                            ),
-                        );
+            match initializer {
+                FullTypedForInitializer::Empty => {}
+                FullTypedForInitializer::Expression(expression) => {
+                    collect_automatic_local_facts_in_expression(expression, types, facts);
+                }
+                FullTypedForInitializer::Declarations(items) => {
+                    for item in items {
+                        if let FullTypedBlockItem::Declaration(declaration) = item {
+                            if declaration.duration == StorageDuration::Automatic {
+                                facts.insert(
+                                    declaration.local,
+                                    make_local_fact(
+                                        declaration.local,
+                                        declaration.name.clone(),
+                                        declaration.ty,
+                                        declaration.duration,
+                                        declaration.requested_alignment,
+                                        declaration.span,
+                                        types,
+                                    ),
+                                );
+                            }
+                            if let Some(initializer) = &declaration.initializer {
+                                collect_automatic_local_facts_in_initializer(
+                                    initializer,
+                                    types,
+                                    facts,
+                                );
+                            }
+                        }
                     }
                 }
             }
+            if let Some(condition) = condition {
+                collect_automatic_local_facts_in_expression(condition, types, facts);
+            }
+            if let Some(step) = step {
+                collect_automatic_local_facts_in_expression(step, types, facts);
+            }
             collect_automatic_local_facts(statement, types, facts);
         }
-        S::Switch { statement, .. } | S::While { statement, .. } | S::DoWhile { statement, .. } => {
+        S::Switch {
+            expression,
+            statement,
+        }
+        | S::While {
+            condition: expression,
+            statement,
+        } => {
+            collect_automatic_local_facts_in_expression(expression, types, facts);
             collect_automatic_local_facts(statement, types, facts);
         }
-        S::Expression(_)
-        | S::Goto { .. }
-        | S::ComputedGoto(_)
-        | S::Continue
-        | S::Break
-        | S::Return(_) => {}
+        S::DoWhile {
+            statement,
+            condition,
+        } => {
+            collect_automatic_local_facts(statement, types, facts);
+            collect_automatic_local_facts_in_expression(condition, types, facts);
+        }
+        S::ComputedGoto(expression) => {
+            collect_automatic_local_facts_in_expression(expression, types, facts);
+        }
+        S::Return(expression) => {
+            if let Some(expression) = expression {
+                collect_automatic_local_facts_in_expression(expression, types, facts);
+            }
+        }
+        S::Goto { .. } | S::Continue | S::Break => {}
+    }
+}
+
+fn collect_automatic_local_facts_in_initializer(
+    initializer: &FullTypedInitializer,
+    types: &TypeStore,
+    facts: &mut BTreeMap<FullLocalId, LocalFact>,
+) {
+    match &initializer.kind {
+        FullTypedInitializerKind::Scalar(expression) => {
+            collect_automatic_local_facts_in_expression(expression, types, facts);
+        }
+        FullTypedInitializerKind::Aggregate(entries) => {
+            for entry in entries {
+                collect_automatic_local_facts_in_initializer(&entry.initializer, types, facts);
+            }
+        }
+        FullTypedInitializerKind::String(_) | FullTypedInitializerKind::Zero => {}
+    }
+}
+
+fn collect_automatic_local_facts_in_expression(
+    expression: &FullTypedExpression,
+    types: &TypeStore,
+    facts: &mut BTreeMap<FullLocalId, LocalFact>,
+) {
+    use FullTypedExpressionKind as E;
+    match &expression.kind {
+        E::Conversion {
+            expression: operand,
+            ..
+        }
+        | E::Unary { operand, .. }
+        | E::AddressOf(operand)
+        | E::Dereference(operand) => {
+            collect_automatic_local_facts_in_expression(operand, types, facts);
+        }
+        E::Binary { left, right, .. }
+        | E::Subscript {
+            base: left,
+            index: right,
+        } => {
+            collect_automatic_local_facts_in_expression(left, types, facts);
+            collect_automatic_local_facts_in_expression(right, types, facts);
+        }
+        E::Member { base, .. } => {
+            collect_automatic_local_facts_in_expression(base, types, facts);
+        }
+        E::CompoundLiteral { initializer, .. } => {
+            collect_automatic_local_facts_in_initializer(initializer, types, facts);
+        }
+        E::Assignment { target, value, .. } => {
+            collect_automatic_local_facts_in_expression(target, types, facts);
+            collect_automatic_local_facts_in_expression(value, types, facts);
+        }
+        E::Increment { operand, .. } | E::IntegerIntrinsic { operand, .. } => {
+            collect_automatic_local_facts_in_expression(operand, types, facts);
+        }
+        E::Call {
+            callee, arguments, ..
+        } => {
+            collect_automatic_local_facts_in_expression(callee, types, facts);
+            for argument in arguments {
+                collect_automatic_local_facts_in_expression(argument, types, facts);
+            }
+        }
+        E::Conditional {
+            condition,
+            then_expression,
+            else_expression,
+        } => {
+            collect_automatic_local_facts_in_expression(condition, types, facts);
+            collect_automatic_local_facts_in_expression(then_expression, types, facts);
+            collect_automatic_local_facts_in_expression(else_expression, types, facts);
+        }
+        E::Comma(expressions) => {
+            for expression in expressions {
+                collect_automatic_local_facts_in_expression(expression, types, facts);
+            }
+        }
+        E::StatementExpression { items, result } => {
+            for item in items {
+                match item {
+                    FullTypedBlockItem::Declaration(declaration) => {
+                        if declaration.duration == StorageDuration::Automatic {
+                            facts.insert(
+                                declaration.local,
+                                make_local_fact(
+                                    declaration.local,
+                                    declaration.name.clone(),
+                                    declaration.ty,
+                                    declaration.duration,
+                                    declaration.requested_alignment,
+                                    declaration.span,
+                                    types,
+                                ),
+                            );
+                        }
+                        if let Some(initializer) = &declaration.initializer {
+                            collect_automatic_local_facts_in_initializer(initializer, types, facts);
+                        }
+                    }
+                    FullTypedBlockItem::Statement(statement) => {
+                        collect_automatic_local_facts(statement, types, facts);
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(result) = result {
+                collect_automatic_local_facts_in_expression(result, types, facts);
+            }
+        }
+        E::BuiltinExpect { value, expected } => {
+            collect_automatic_local_facts_in_expression(value, types, facts);
+            collect_automatic_local_facts_in_expression(expected, types, facts);
+        }
+        E::MemoryCopy {
+            destination,
+            source,
+            length,
+            ..
+        } => {
+            collect_automatic_local_facts_in_expression(destination, types, facts);
+            collect_automatic_local_facts_in_expression(source, types, facts);
+            collect_automatic_local_facts_in_expression(length, types, facts);
+        }
+        E::MemorySet {
+            destination,
+            value,
+            length,
+        } => {
+            collect_automatic_local_facts_in_expression(destination, types, facts);
+            collect_automatic_local_facts_in_expression(value, types, facts);
+            collect_automatic_local_facts_in_expression(length, types, facts);
+        }
+        E::Prefetch { address, .. } => {
+            collect_automatic_local_facts_in_expression(address, types, facts);
+        }
+        E::AtomicReadModifyWrite {
+            pointer, operand, ..
+        } => {
+            collect_automatic_local_facts_in_expression(pointer, types, facts);
+            collect_automatic_local_facts_in_expression(operand, types, facts);
+        }
+        E::AtomicCompareExchange {
+            pointer,
+            expected,
+            replacement,
+            ..
+        } => {
+            collect_automatic_local_facts_in_expression(pointer, types, facts);
+            collect_automatic_local_facts_in_expression(expected, types, facts);
+            collect_automatic_local_facts_in_expression(replacement, types, facts);
+        }
+        E::VaStart { list, .. } | E::VaArg { list, .. } | E::VaEnd { list } => {
+            collect_automatic_local_facts_in_expression(list, types, facts);
+        }
+        E::VaCopy {
+            destination,
+            source,
+        } => {
+            collect_automatic_local_facts_in_expression(destination, types, facts);
+            collect_automatic_local_facts_in_expression(source, types, facts);
+        }
+        E::Constant(_)
+        | E::StringLiteral(_)
+        | E::DeclRef(_)
+        | E::Sizeof { .. }
+        | E::Alignof { .. }
+        | E::Offsetof { .. }
+        | E::MemoryFence { .. } => {}
     }
 }
 
@@ -906,11 +1124,48 @@ fn scan_expression_for_address_taken(
                 scan_expression_for_address_taken(expression, types, facts);
             }
         }
+        E::StatementExpression { items, result } => {
+            for item in items {
+                match item {
+                    FullTypedBlockItem::Declaration(declaration) => {
+                        if let Some(initializer) = &declaration.initializer {
+                            scan_initializer_for_address_taken(initializer, types, facts);
+                        }
+                    }
+                    FullTypedBlockItem::Statement(statement) => {
+                        scan_statement_for_address_taken(statement, types, facts);
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(result) = result {
+                scan_expression_for_address_taken(result, types, facts);
+            }
+        }
         E::BuiltinExpect { value, expected: _ } => {
             scan_expression_for_address_taken(value, types, facts);
         }
         E::IntegerIntrinsic { operand, .. } => {
             scan_expression_for_address_taken(operand, types, facts);
+        }
+        E::MemoryCopy {
+            destination,
+            source,
+            length,
+            ..
+        } => {
+            scan_expression_for_address_taken(destination, types, facts);
+            scan_expression_for_address_taken(source, types, facts);
+            scan_expression_for_address_taken(length, types, facts);
+        }
+        E::MemorySet {
+            destination,
+            value,
+            length,
+        } => {
+            scan_expression_for_address_taken(destination, types, facts);
+            scan_expression_for_address_taken(value, types, facts);
+            scan_expression_for_address_taken(length, types, facts);
         }
         E::Prefetch { address, .. } => {
             scan_expression_for_address_taken(address, types, facts);
@@ -1732,6 +1987,25 @@ fn remap_instruction_values(
         } => {
             map(destination)?;
             map(source)?;
+        }
+        FullInstructionKind::MemoryCopy {
+            destination,
+            source,
+            length,
+            ..
+        } => {
+            map(destination)?;
+            map(source)?;
+            map(length)?;
+        }
+        FullInstructionKind::MemorySet {
+            destination,
+            value,
+            length,
+        } => {
+            map(destination)?;
+            map(value)?;
+            map(length)?;
         }
         FullInstructionKind::Convert { operand, .. }
         | FullInstructionKind::Unary { operand, .. }
@@ -2582,6 +2856,28 @@ impl FunctionBuilder<'_> {
                 }
                 Ok(result)
             }
+            E::StatementExpression { items, result } => {
+                for item in items {
+                    match item {
+                        FullTypedBlockItem::Declaration(declaration) => {
+                            self.local_declaration(declaration)?;
+                        }
+                        FullTypedBlockItem::Statement(statement) => self.statement(statement)?,
+                        FullTypedBlockItem::Typedef(_)
+                        | FullTypedBlockItem::ExternalObject(_)
+                        | FullTypedBlockItem::FunctionDeclaration(_)
+                        | FullTypedBlockItem::StaticAssert { .. }
+                        | FullTypedBlockItem::Pragma(_) => {}
+                    }
+                }
+                if self.current.is_none() {
+                    Ok(None)
+                } else if let Some(result) = result {
+                    self.expression(result)
+                } else {
+                    Ok(None)
+                }
+            }
             E::BuiltinExpect { value, expected: _ } => self.expression(value),
             E::IntegerIntrinsic { operation, operand } => {
                 let operand = self.expect_value(operand)?;
@@ -2607,6 +2903,9 @@ impl FunctionBuilder<'_> {
                     TypedIntegerIntrinsicOperation::PopulationCountLongLong => {
                         IntegerIntrinsicOperation::PopulationCountLongLong
                     }
+                    TypedIntegerIntrinsicOperation::CountTrailingZerosInt => {
+                        IntegerIntrinsicOperation::CountTrailingZerosInt
+                    }
                 };
                 self.emit_result(
                     FullInstructionKind::IntegerIntrinsic { operation, operand },
@@ -2614,6 +2913,44 @@ impl FunctionBuilder<'_> {
                     expression.span,
                 )
                 .map(Some)
+            }
+            E::MemoryCopy {
+                destination,
+                source,
+                length,
+                overlap,
+            } => {
+                let destination = self.expect_value(destination)?;
+                let source = self.expect_value(source)?;
+                let length = self.expect_value(length)?;
+                self.emit_effect(
+                    FullInstructionKind::MemoryCopy {
+                        destination,
+                        source,
+                        length,
+                        overlap: *overlap,
+                    },
+                    expression.span,
+                )?;
+                Ok(Some(destination))
+            }
+            E::MemorySet {
+                destination,
+                value,
+                length,
+            } => {
+                let destination = self.expect_value(destination)?;
+                let value = self.expect_value(value)?;
+                let length = self.expect_value(length)?;
+                self.emit_effect(
+                    FullInstructionKind::MemorySet {
+                        destination,
+                        value,
+                        length,
+                    },
+                    expression.span,
+                )?;
+                Ok(Some(destination))
             }
             E::Prefetch {
                 address,
@@ -3006,6 +3343,27 @@ impl FunctionBuilder<'_> {
     }
 
     fn place(&mut self, expression: &FullTypedExpression) -> Result<LoweredPlace, IrError> {
+        if let FullTypedExpressionKind::StatementExpression {
+            items,
+            result: Some(result),
+        } = &expression.kind
+        {
+            for item in items {
+                match item {
+                    FullTypedBlockItem::Declaration(declaration) => {
+                        self.local_declaration(declaration)?;
+                    }
+                    FullTypedBlockItem::Statement(statement) => self.statement(statement)?,
+                    FullTypedBlockItem::Typedef(_)
+                    | FullTypedBlockItem::ExternalObject(_)
+                    | FullTypedBlockItem::FunctionDeclaration(_)
+                    | FullTypedBlockItem::StaticAssert { .. }
+                    | FullTypedBlockItem::Pragma(_) => {}
+                }
+            }
+            return self.place(result);
+        }
+
         let mut pending = Vec::new();
         if let Some(root) = collect_aggregate_projection(expression, &mut pending) {
             if !is_aggregate(self.types, root.ty.ty) {
