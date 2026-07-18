@@ -138,32 +138,41 @@ pub struct NativeBoundaryPlan {
 pub type FunctionPlan = NativeBoundaryPlan;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum GpRegister {
-    Rax,
-    Rdi,
-    Rsi,
-    Rdx,
-    Rcx,
-    R8,
-    R9,
+pub enum RegisterBank {
+    Integer,
+    Float,
 }
 
+/// A register slot in an ABI-defined argument or result bank.
+///
+/// Machine register spellings deliberately stay in the assembly renderer;
+/// ABI plans use only a bank and ordinal so the same model covers AMD64,
+/// arm64, and RISC-V.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum SseRegister {
-    Xmm0,
-    Xmm1,
-    Xmm2,
-    Xmm3,
-    Xmm4,
-    Xmm5,
-    Xmm6,
-    Xmm7,
+pub struct RegisterSlot {
+    pub bank: RegisterBank,
+    pub index: u8,
+}
+
+impl RegisterSlot {
+    pub const fn integer(index: u8) -> Self {
+        Self {
+            bank: RegisterBank::Integer,
+            index,
+        }
+    }
+
+    pub const fn float(index: u8) -> Self {
+        Self {
+            bank: RegisterBank::Float,
+            index,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum BridgeLocation {
-    Gp(GpRegister),
-    Sse(SseRegister),
+    Register(RegisterSlot),
     Stack { offset: u32 },
 }
 
@@ -172,6 +181,9 @@ pub struct BridgePiecePlan {
     pub source_index: Option<u32>,
     pub piece: AbiPiece,
     pub extension: IntegerExtension,
+    /// The physical piece carries a pointer to a caller-owned aggregate copy
+    /// rather than bytes from the aggregate itself.
+    pub indirect: bool,
     pub location: BridgeLocation,
 }
 
@@ -184,6 +196,7 @@ pub enum BridgeKind {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct BridgeBoundaryPlan {
+    pub abi_identity: AbiIdentity,
     pub calling_convention: CallingConvention,
     pub kind: BridgeKind,
     pub parameters: Vec<ClassifiedType>,
@@ -369,6 +382,8 @@ pub struct VaArgPlan {
     pub result_align: u64,
     pub overflow_size: u64,
     pub overflow_align: u64,
+    /// The argument slot contains a pointer to the requested object.
+    pub indirect: bool,
 }
 
 pub(crate) fn hex(bytes: &[u8]) -> String {

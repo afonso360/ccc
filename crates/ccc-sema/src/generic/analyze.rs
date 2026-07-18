@@ -3610,10 +3610,6 @@ impl<'a> Analyzer<'a> {
             .map_err(|error| {
                 self.emit("CCC2408", expression.span, error.to_string());
             })?;
-        let TypeKind::Array(array) = self.types.kind(va_list).clone() else {
-            unreachable!("the target va_list contract is an array")
-        };
-        let parameter_pointer = self.types.pointer(array.element);
         let typed = self.analyze_expression(expression)?;
         if typed.ty.ty == va_list {
             if typed.category != ValueCategory::Lvalue
@@ -3630,8 +3626,11 @@ impl<'a> Analyzer<'a> {
             }
             return Ok(typed);
         }
-        if typed.ty.ty == parameter_pointer {
-            return self.value_conversion(typed);
+        if let TypeKind::Array(array) = self.types.kind(va_list).clone() {
+            let parameter_pointer = self.types.pointer(array.element);
+            if typed.ty.ty == parameter_pointer {
+                return self.value_conversion(typed);
+            }
         }
         self.fail(
             "CCC2411",

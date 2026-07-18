@@ -239,6 +239,7 @@ impl BridgeManifestV1 {
             let Ok(name) = symbol.name() else {
                 continue;
             };
+            let name = canonical_symbol_name(object.format(), name);
             if name.is_empty() {
                 continue;
             }
@@ -278,6 +279,14 @@ impl BridgeManifestV1 {
             }
         }
         Ok(())
+    }
+}
+
+pub(crate) fn canonical_symbol_name(format: BinaryFormat, name: &str) -> &str {
+    if format == BinaryFormat::MachO {
+        name.strip_prefix('_').unwrap_or(name)
+    } else {
+        name
     }
 }
 

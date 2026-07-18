@@ -46,7 +46,10 @@ pub(crate) fn plan_function_type(
     validate_target(config)?;
     let signature = function_signature(types, signature)?;
     if signature.variadic {
-        return Err(variadic_transport_error("function type"));
+        return Err(AbiError::new(
+            "CCC3510",
+            "a variadic boundary must use an explicit bridge plan",
+        ));
     }
     plan_native_signature(types, &signature, config)
 }
@@ -59,7 +62,25 @@ pub(crate) fn plan_boundary_type(
     validate_target(config)?;
     let signature = function_signature(types, signature)?;
     if signature.variadic {
-        return Err(variadic_transport_error("function definition"));
+        let FunctionParameters::Prototype(parameters) = &signature.parameters else {
+            return Err(AbiError::new(
+                "CCC3506",
+                "a function type without a prototype has no ABI boundary plan",
+            ));
+        };
+        let actual = parameters
+            .iter()
+            .map(|parameter| parameter.ty)
+            .collect::<Vec<_>>();
+        return Ok(BoundaryPlan::Bridge(plan_bridge(
+            types,
+            &signature,
+            parameters,
+            &actual,
+            parameters.len(),
+            BridgeKind::VariadicEntry,
+            config,
+        )?));
     }
     Ok(BoundaryPlan::Native(plan_native_signature(
         types, &signature, config,
@@ -67,24 +88,60 @@ pub(crate) fn plan_boundary_type(
 }
 
 pub(crate) fn plan_variadic_call(
-    _types: &TypeStore,
-    _signature: TypeId,
-    _actual_types: &[TypeId],
-    _variadic_boundary: usize,
+    types: &TypeStore,
+    signature: TypeId,
+    actual_types: &[TypeId],
+    variadic_boundary: usize,
     config: &EffectiveCompilationConfig,
 ) -> Result<BridgeBoundaryPlan, AbiError> {
     validate_target(config)?;
-    Err(variadic_transport_error("variadic call"))
+    let signature = function_signature(types, signature)?;
+    if !signature.variadic {
+        return Err(AbiError::new(
+            "CCC3511",
+            "a nonvariadic function type does not require a variadic call bridge",
+        ));
+    }
+    let FunctionParameters::Prototype(fixed) = &signature.parameters else {
+        return Err(AbiError::new(
+            "CCC3506",
+            "a function type without a prototype has no variadic bridge plan",
+        ));
+    };
+    plan_bridge(
+        types,
+        &signature,
+        fixed,
+        actual_types,
+        variadic_boundary,
+        BridgeKind::VariadicCall,
+        config,
+    )
 }
 
 pub(crate) fn plan_unprototyped_call(
-    _types: &TypeStore,
-    _signature: TypeId,
-    _promoted_actual_types: &[TypeId],
+    types: &TypeStore,
+    signature: TypeId,
+    promoted_actual_types: &[TypeId],
     config: &EffectiveCompilationConfig,
 ) -> Result<BridgeBoundaryPlan, AbiError> {
     validate_target(config)?;
-    Err(variadic_transport_error("unprototyped call"))
+    let signature = function_signature(types, signature)?;
+    if !matches!(signature.parameters, FunctionParameters::Unspecified) || signature.variadic {
+        return Err(AbiError::new(
+            "CCC3511",
+            "a function type with a prototype does not require an unprototyped call bridge",
+        ));
+    }
+    plan_bridge(
+        types,
+        &signature,
+        &[],
+        promoted_actual_types,
+        0,
+        BridgeKind::UnprototypedCall,
+        config,
+    )
 }
 
 pub(crate) fn classify_type(
@@ -97,19 +154,35 @@ pub(crate) fn classify_type(
 }
 
 pub(crate) fn plan_va_arg(
-    _types: &TypeStore,
-    _ty: TypeId,
+    types: &TypeStore,
+    ty: TypeId,
     config: &EffectiveCompilationConfig,
 ) -> Result<VaArgPlan, AbiError> {
     validate_target(config)?;
-    Err(variadic_transport_error("va_arg"))
-}
-
-fn variadic_transport_error(boundary: &str) -> AbiError {
-    AbiError::new(
-        "CCC3520",
-        format!("{boundary} requires the RISC-V LP64D variadic transport adapter"),
-    )
+    let classified = classify(types, ty, config, "va_arg")?;
+    if classified.passing == PassingMode::Void {
+        return Err(AbiError::new("CCC3514", "`va_arg` cannot request `void`"));
+    }
+    let indirect = classified.passing == PassingMode::Memory;
+    let payload_size = if indirect { 8 } else { classified.size };
+    Ok(VaArgPlan {
+        result_size: classified.size,
+        result_align: classified.align,
+        overflow_size: align_up(payload_size, 8)?,
+        overflow_align: if indirect {
+            8
+        } else {
+            classified.align.clamp(8, 16)
+        },
+        gp_slots: if indirect {
+            1
+        } else {
+            payload_size.div_ceil(8) as u8
+        },
+        sse_slots: 0,
+        classified,
+        indirect,
+    })
 }
 
 fn function_signature(types: &TypeStore, signature: TypeId) -> Result<FunctionType, AbiError> {
@@ -357,6 +430,333 @@ fn push_carrier(
         purpose,
     });
     Ok(index)
+}
+
+fn plan_bridge(
+    types: &TypeStore,
+    signature: &FunctionType,
+    fixed: &[ccc_types::QualifiedType],
+    actual_types: &[TypeId],
+    variadic_boundary: usize,
+    kind: BridgeKind,
+    config: &EffectiveCompilationConfig,
+) -> Result<BridgeBoundaryPlan, AbiError> {
+    if variadic_boundary != fixed.len() || actual_types.len() < fixed.len() {
+        return Err(AbiError::new(
+            "CCC3512",
+            format!(
+                "variadic call has boundary {variadic_boundary} and {} actual types for {} fixed parameters",
+                actual_types.len(),
+                fixed.len()
+            ),
+        ));
+    }
+    for (index, (actual, expected)) in actual_types.iter().zip(fixed).enumerate() {
+        if *actual != expected.ty {
+            return Err(AbiError::new(
+                "CCC3512",
+                format!(
+                    "variadic call fixed argument {index} has type `{}`, expected `{}`",
+                    types.display(*actual),
+                    types.display(expected.ty)
+                ),
+            ));
+        }
+    }
+
+    let result = classify(types, signature.result.ty, config, "return")?;
+    reject_array_boundary(types, signature.result.ty, "return")?;
+    let hidden_return = result.passing == PassingMode::Memory;
+    let mut gp_used = u8::from(hidden_return);
+    let mut fp_used = 0u8;
+    let mut stack_size = 0u64;
+    let mut variadic_stack_started = false;
+    let mut parameters = Vec::with_capacity(actual_types.len());
+    let mut parameter_pieces = Vec::new();
+    let mut fixed_stack_end = (variadic_boundary == 0).then_some(0);
+
+    for (source_index, ty) in actual_types.iter().copied().enumerate() {
+        reject_array_boundary(types, ty, "parameter")?;
+        let classified = classify(types, ty, config, "parameter")?;
+        if classified.passing == PassingMode::Void {
+            return Err(AbiError::new(
+                "CCC3507",
+                "`void` cannot appear as a function parameter type",
+            ));
+        }
+        let extension = if classified.passing == PassingMode::Scalar {
+            scalar_extension(boundary_scalar(types, ty, config, "parameter")?)
+        } else {
+            IntegerExtension::None
+        };
+        allocate_bridge_argument(
+            &classified,
+            source_index as u32,
+            extension,
+            source_index >= variadic_boundary,
+            &mut gp_used,
+            &mut fp_used,
+            &mut stack_size,
+            &mut variadic_stack_started,
+            &mut parameter_pieces,
+        )?;
+        parameters.push(classified);
+        if source_index + 1 == variadic_boundary {
+            fixed_stack_end = Some(stack_size);
+        }
+    }
+    let fixed_stack_end = fixed_stack_end.unwrap_or(stack_size);
+    let stack_size = u32::try_from(align_up(stack_size, 16)?)
+        .map_err(|_| AbiError::new("CCC3503", "RISC-V bridge stack payload is too large"))?;
+    let result_extension = if result.passing == PassingMode::Scalar {
+        scalar_extension(boundary_scalar(
+            types,
+            signature.result.ty,
+            config,
+            "return",
+        )?)
+    } else {
+        IntegerExtension::None
+    };
+    Ok(BridgeBoundaryPlan {
+        abi_identity: AbiIdentity::RiscvLp64d,
+        calling_convention: config.target.abi.calling_convention(),
+        kind,
+        parameters,
+        parameter_pieces,
+        result_pieces: bridge_result_pieces(&result, result_extension),
+        result,
+        hidden_return,
+        overflow_arg_offset: u32::try_from(fixed_stack_end).map_err(|_| {
+            AbiError::new("CCC3503", "RISC-V variadic overflow offset is too large")
+        })?,
+        stack_size,
+        gp_used,
+        xmm_used: fp_used,
+        variadic_sse_count: 0,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn allocate_bridge_argument(
+    classified: &ClassifiedType,
+    source_index: u32,
+    extension: IntegerExtension,
+    unnamed: bool,
+    gp_used: &mut u8,
+    fp_used: &mut u8,
+    stack_size: &mut u64,
+    variadic_stack_started: &mut bool,
+    pieces: &mut Vec<BridgePiecePlan>,
+) -> Result<(), AbiError> {
+    if classified.passing == PassingMode::Memory {
+        let pointer_piece = AbiPiece {
+            index: 0,
+            offset: 0,
+            valid_bytes: 8,
+            class: AbiClass::Integer,
+        };
+        let location =
+            allocate_integer_slot(1, 8, unnamed, gp_used, stack_size, variadic_stack_started)?
+                .into_iter()
+                .next()
+                .expect("one pointer slot");
+        pieces.push(BridgePiecePlan {
+            source_index: Some(source_index),
+            piece: pointer_piece,
+            extension: IntegerExtension::None,
+            indirect: true,
+            location,
+        });
+        return Ok(());
+    }
+
+    if !unnamed
+        && classified.passing == PassingMode::Scalar
+        && classified.pieces[0].class == AbiClass::Sse
+        && *fp_used < ARGUMENT_REGISTERS
+    {
+        pieces.push(BridgePiecePlan {
+            source_index: Some(source_index),
+            piece: classified.pieces[0].clone(),
+            extension,
+            indirect: false,
+            location: BridgeLocation::Register(RegisterSlot::float(*fp_used)),
+        });
+        *fp_used += 1;
+        return Ok(());
+    }
+
+    if !unnamed && uses_hardware_float(classified) {
+        let gp_needed = classified
+            .pieces
+            .iter()
+            .filter(|piece| piece.class == AbiClass::Integer)
+            .count() as u8;
+        let fp_needed = classified
+            .pieces
+            .iter()
+            .filter(|piece| piece.class == AbiClass::Sse)
+            .count() as u8;
+        if gp_used.saturating_add(gp_needed) <= ARGUMENT_REGISTERS
+            && fp_used.saturating_add(fp_needed) <= ARGUMENT_REGISTERS
+        {
+            for piece in &classified.pieces {
+                let register = if piece.class == AbiClass::Sse {
+                    let register = RegisterSlot::float(*fp_used);
+                    *fp_used += 1;
+                    register
+                } else {
+                    let register = RegisterSlot::integer(*gp_used);
+                    *gp_used += 1;
+                    register
+                };
+                pieces.push(BridgePiecePlan {
+                    source_index: Some(source_index),
+                    piece: piece.clone(),
+                    extension,
+                    indirect: false,
+                    location: BridgeLocation::Register(register),
+                });
+            }
+            return Ok(());
+        }
+    }
+
+    let integer = if classified.passing == PassingMode::Scalar {
+        classified.clone()
+    } else {
+        integer_aggregate_classification(classified)
+    };
+    let slot_count = integer.size.div_ceil(8).max(1) as u8;
+    let locations = allocate_integer_slot(
+        slot_count,
+        integer.align,
+        unnamed,
+        gp_used,
+        stack_size,
+        variadic_stack_started,
+    )?;
+    for (index, location) in locations.into_iter().enumerate() {
+        let piece = if integer.passing == PassingMode::Scalar {
+            integer.pieces[0].clone()
+        } else {
+            integer.pieces[index].clone()
+        };
+        pieces.push(BridgePiecePlan {
+            source_index: Some(source_index),
+            piece,
+            extension,
+            indirect: false,
+            location,
+        });
+    }
+    Ok(())
+}
+
+fn allocate_integer_slot(
+    slots: u8,
+    align: u64,
+    unnamed: bool,
+    gp_used: &mut u8,
+    stack_size: &mut u64,
+    variadic_stack_started: &mut bool,
+) -> Result<Vec<BridgeLocation>, AbiError> {
+    if align >= 16 && *gp_used < ARGUMENT_REGISTERS && !gp_used.is_multiple_of(2) {
+        *gp_used += 1;
+    }
+    let pair_must_fit = unnamed && slots == 2 && align >= 16;
+    let registers_available = ARGUMENT_REGISTERS.saturating_sub(*gp_used);
+    let use_stack = (unnamed && *variadic_stack_started)
+        || (pair_must_fit && registers_available < slots)
+        || registers_available == 0;
+    if use_stack {
+        if unnamed {
+            *variadic_stack_started = true;
+        }
+        *stack_size = align_up(*stack_size, align.clamp(8, 16))?;
+        let base = *stack_size;
+        *stack_size = stack_size
+            .checked_add(u64::from(slots) * 8)
+            .ok_or_else(|| AbiError::new("CCC3503", "RISC-V bridge stack size overflow"))?;
+        return (0..slots)
+            .map(|index| {
+                Ok(BridgeLocation::Stack {
+                    offset: u32::try_from(base + u64::from(index) * 8).map_err(|_| {
+                        AbiError::new("CCC3503", "RISC-V bridge stack offset overflow")
+                    })?,
+                })
+            })
+            .collect();
+    }
+
+    let register_slots = slots.min(registers_available);
+    let mut locations = Vec::with_capacity(slots as usize);
+    for _ in 0..register_slots {
+        locations.push(BridgeLocation::Register(RegisterSlot::integer(*gp_used)));
+        *gp_used += 1;
+    }
+    if register_slots < slots {
+        *stack_size = align_up(*stack_size, 8)?;
+        let base = *stack_size;
+        for index in register_slots..slots {
+            locations.push(BridgeLocation::Stack {
+                offset: u32::try_from(base + u64::from(index - register_slots) * 8)
+                    .map_err(|_| AbiError::new("CCC3503", "RISC-V bridge stack offset overflow"))?,
+            });
+        }
+        *stack_size = stack_size
+            .checked_add(u64::from(slots - register_slots) * 8)
+            .ok_or_else(|| AbiError::new("CCC3503", "RISC-V bridge stack size overflow"))?;
+        if unnamed {
+            *variadic_stack_started = true;
+        }
+    }
+    Ok(locations)
+}
+
+fn bridge_result_pieces(
+    classified: &ClassifiedType,
+    extension: IntegerExtension,
+) -> Vec<BridgePiecePlan> {
+    if !matches!(
+        classified.passing,
+        PassingMode::Scalar | PassingMode::Registers
+    ) {
+        return Vec::new();
+    }
+    let mut gp = 0u8;
+    let mut fp = 0u8;
+    classified
+        .pieces
+        .iter()
+        .map(|piece| {
+            let register = if piece.class == AbiClass::Sse {
+                let register = RegisterSlot::float(fp);
+                fp += 1;
+                register
+            } else {
+                let register = RegisterSlot::integer(gp);
+                gp += 1;
+                register
+            };
+            BridgePiecePlan {
+                source_index: None,
+                piece: piece.clone(),
+                extension,
+                indirect: false,
+                location: BridgeLocation::Register(register),
+            }
+        })
+        .collect()
+}
+
+fn align_up(value: u64, align: u64) -> Result<u64, AbiError> {
+    debug_assert!(align != 0 && align.is_power_of_two());
+    value
+        .checked_add(align - 1)
+        .map(|value| value & !(align - 1))
+        .ok_or_else(|| AbiError::new("CCC3503", "RISC-V ABI size overflow"))
 }
 
 fn classify(

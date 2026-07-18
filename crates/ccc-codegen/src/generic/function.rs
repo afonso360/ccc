@@ -402,11 +402,15 @@ impl FunctionState<'_> {
         self.variadic_frame = Some(*frame);
         self.variadic_state = Some(address_offset(builder, *frame, 8)?);
         if plan.hidden_return {
-            let saved_rdi = address_offset(builder, *frame, 32)?;
+            let saved_sret = address_offset(
+                builder,
+                *frame,
+                bridge_frame_layout(plan.abi_identity).entry_indirect_result,
+            )?;
             self.sret = Some(
                 builder
                     .ins()
-                    .load(ir::types::I64, MemFlags::new(), saved_rdi, 0),
+                    .load(ir::types::I64, MemFlags::new(), saved_sret, 0),
             );
         }
         if plan.parameters.len() != self.function.parameters.len() {
@@ -443,6 +447,21 @@ impl FunctionState<'_> {
                 let padded = align_up_u64(classified.size, 8)?;
                 let result = create_stack_backing(builder, padded, classified.align)?;
                 zero_memory(builder, result, padded)?;
+                if let Some(piece) = pieces.iter().find(|piece| piece.indirect) {
+                    let slot =
+                        variadic_parameter_piece_address(builder, *frame, plan, piece.location)?;
+                    let source = builder.ins().load(ir::types::I64, MemFlags::new(), slot, 0);
+                    copy_memory(
+                        builder,
+                        result,
+                        source,
+                        classified.size,
+                        gir::MemoryAccess::default(),
+                        gir::MemoryAccess::default(),
+                    )?;
+                    self.set_value(incoming, result)?;
+                    continue;
+                }
                 for piece in pieces {
                     let source =
                         variadic_parameter_piece_address(builder, *frame, plan, piece.location)?;
@@ -984,7 +1003,7 @@ impl FunctionState<'_> {
                         builder,
                         self.value(*destination)?,
                         self.value(*source)?,
-                        24,
+                        va_list_size(self.config),
                         gir::MemoryAccess::default(),
                         gir::MemoryAccess::default(),
                     )?;
@@ -1177,7 +1196,7 @@ impl FunctionState<'_> {
             builder,
             destination,
             initial,
-            24,
+            va_list_size(self.config),
             gir::MemoryAccess::default(),
             gir::MemoryAccess::default(),
         )
@@ -1208,11 +1227,31 @@ impl FunctionState<'_> {
         }
         let result = create_stack_backing(builder, plan.result_size, plan.result_align)?;
         zero_memory(builder, result, plan.result_size)?;
-        if plan.classified.passing == ccc_abi::PassingMode::Memory {
-            self.va_arg_overflow(builder, list, result, plan)?;
-            return va_arg_result(builder, &self.module.types, requested, result, self.config);
+        match self.config.target.abi {
+            ccc_target::AbiIdentity::SysvAmd64Lp64 => {
+                self.va_arg_sysv_amd64(builder, list, result, plan)?
+            }
+            ccc_target::AbiIdentity::Aapcs64Lp64 => {
+                self.va_arg_aapcs64(builder, list, result, plan)?
+            }
+            ccc_target::AbiIdentity::RiscvLp64d | ccc_target::AbiIdentity::DarwinArm64 => {
+                self.va_arg_cursor(builder, list, result, plan)?
+            }
         }
+        va_arg_result(builder, &self.module.types, requested, result, self.config)
+    }
 
+    fn va_arg_sysv_amd64(
+        &self,
+        builder: &mut FunctionBuilder<'_>,
+        list: ir::Value,
+        result: ir::Value,
+        plan: &ccc_abi::VaArgPlan,
+    ) -> Result<(), CodegenError> {
+        if plan.classified.passing == ccc_abi::PassingMode::Memory {
+            let overflow_address = address_offset(builder, list, 8)?;
+            return self.va_arg_cursor(builder, overflow_address, result, plan);
+        }
         let gp_offset_address = list;
         let fp_offset_address = address_offset(builder, list, 4)?;
         let gp_offset = builder
@@ -1307,29 +1346,148 @@ impl FunctionState<'_> {
         builder.ins().jump(merge_block, &[]);
 
         builder.switch_to_block(overflow_block);
-        self.va_arg_overflow(builder, list, result, plan)?;
+        let overflow_address = address_offset(builder, list, 8)?;
+        self.va_arg_cursor(builder, overflow_address, result, plan)?;
         builder.ins().jump(merge_block, &[]);
 
         builder.switch_to_block(merge_block);
-        va_arg_result(builder, &self.module.types, requested, result, self.config)
+        Ok(())
     }
 
-    fn va_arg_overflow(
+    fn va_arg_aapcs64(
         &self,
         builder: &mut FunctionBuilder<'_>,
         list: ir::Value,
         result: ir::Value,
         plan: &ccc_abi::VaArgPlan,
     ) -> Result<(), CodegenError> {
-        let overflow_address = address_offset(builder, list, 8)?;
-        let overflow = builder
+        let gr_offset_address = address_offset(builder, list, 24)?;
+        let vr_offset_address = address_offset(builder, list, 28)?;
+        let gr_offset = builder
             .ins()
-            .load(ir::types::I64, MemFlags::new(), overflow_address, 0);
+            .load(ir::types::I32, MemFlags::new(), gr_offset_address, 0);
+        let vr_offset = builder
+            .ins()
+            .load(ir::types::I32, MemFlags::new(), vr_offset_address, 0);
+        let gr_available = if plan.gp_slots == 0 {
+            builder.ins().iconst(ir::types::I8, 1)
+        } else {
+            builder.ins().icmp_imm(
+                IntCC::SignedLessThanOrEqual,
+                gr_offset,
+                -i64::from(plan.gp_slots) * 8,
+            )
+        };
+        let vr_available = if plan.sse_slots == 0 {
+            builder.ins().iconst(ir::types::I8, 1)
+        } else {
+            builder.ins().icmp_imm(
+                IntCC::SignedLessThanOrEqual,
+                vr_offset,
+                -i64::from(plan.sse_slots) * 16,
+            )
+        };
+        let registers_available = builder.ins().band(gr_available, vr_available);
+        let register_block = builder.create_block();
+        let overflow_block = builder.create_block();
+        let merge_block = builder.create_block();
+        builder.ins().brif(
+            registers_available,
+            register_block,
+            &[],
+            overflow_block,
+            &[],
+        );
+
+        builder.switch_to_block(register_block);
+        let gr_top_address = address_offset(builder, list, 8)?;
+        let vr_top_address = address_offset(builder, list, 16)?;
+        let gr_top = builder
+            .ins()
+            .load(ir::types::I64, MemFlags::new(), gr_top_address, 0);
+        let vr_top = builder
+            .ins()
+            .load(ir::types::I64, MemFlags::new(), vr_top_address, 0);
+        let mut next_gr = gr_offset;
+        let mut next_vr = vr_offset;
+        if plan.indirect {
+            let offset = builder.ins().sextend(ir::types::I64, next_gr);
+            let slot = builder.ins().iadd(gr_top, offset);
+            let source = builder.ins().load(ir::types::I64, MemFlags::new(), slot, 0);
+            copy_memory(
+                builder,
+                result,
+                source,
+                plan.result_size,
+                gir::MemoryAccess::default(),
+                gir::MemoryAccess::default(),
+            )?;
+            next_gr = builder.ins().iadd_imm(next_gr, 8);
+        } else {
+            for piece in &plan.classified.pieces {
+                let source = match piece.class {
+                    ccc_abi::AbiClass::Integer => {
+                        let offset = builder.ins().sextend(ir::types::I64, next_gr);
+                        next_gr = builder.ins().iadd_imm(next_gr, 8);
+                        builder.ins().iadd(gr_top, offset)
+                    }
+                    ccc_abi::AbiClass::Sse => {
+                        let offset = builder.ins().sextend(ir::types::I64, next_vr);
+                        next_vr = builder.ins().iadd_imm(next_vr, 16);
+                        builder.ins().iadd(vr_top, offset)
+                    }
+                    class => {
+                        return Err(error(format!(
+                            "AAPCS64 va_arg register path contains unsupported class {class:?}"
+                        )));
+                    }
+                };
+                let destination = address_offset(builder, result, piece.offset)?;
+                copy_memory(
+                    builder,
+                    destination,
+                    source,
+                    u64::from(piece.valid_bytes),
+                    gir::MemoryAccess::default(),
+                    gir::MemoryAccess::default(),
+                )?;
+            }
+        }
+        if plan.gp_slots != 0 {
+            builder
+                .ins()
+                .store(MemFlags::new(), next_gr, gr_offset_address, 0);
+        }
+        if plan.sse_slots != 0 {
+            builder
+                .ins()
+                .store(MemFlags::new(), next_vr, vr_offset_address, 0);
+        }
+        builder.ins().jump(merge_block, &[]);
+
+        builder.switch_to_block(overflow_block);
+        self.va_arg_cursor(builder, list, result, plan)?;
+        builder.ins().jump(merge_block, &[]);
+
+        builder.switch_to_block(merge_block);
+        Ok(())
+    }
+
+    fn va_arg_cursor(
+        &self,
+        builder: &mut FunctionBuilder<'_>,
+        cursor_address: ir::Value,
+        result: ir::Value,
+        plan: &ccc_abi::VaArgPlan,
+    ) -> Result<(), CodegenError> {
+        let cursor = builder
+            .ins()
+            .load(ir::types::I64, MemFlags::new(), cursor_address, 0);
         let aligned = if plan.overflow_align <= 1 {
-            overflow
+            cursor
         } else {
             let added = builder.ins().iadd_imm(
-                overflow,
+                cursor,
                 i64::try_from(plan.overflow_align - 1)
                     .map_err(|_| error("va_arg overflow alignment is too large"))?,
             );
@@ -1339,10 +1497,17 @@ impl FunctionState<'_> {
                     .map_err(|_| error("va_arg overflow alignment is too large"))?,
             )
         };
+        let source = if plan.indirect {
+            builder
+                .ins()
+                .load(ir::types::I64, MemFlags::new(), aligned, 0)
+        } else {
+            aligned
+        };
         copy_memory(
             builder,
             result,
-            aligned,
+            source,
             plan.result_size,
             gir::MemoryAccess::default(),
             gir::MemoryAccess::default(),
@@ -1354,7 +1519,7 @@ impl FunctionState<'_> {
         );
         builder
             .ins()
-            .store(MemFlags::new(), next, overflow_address, 0);
+            .store(MemFlags::new(), next, cursor_address, 0);
         Ok(())
     }
 
@@ -1561,14 +1726,36 @@ impl FunctionState<'_> {
             .references
             .call_helper
             .ok_or_else(|| error("variadic call bridge has no translation-unit helper"))?;
-        let frame_size = 256u64
+        let layout = bridge_frame_layout(plan.abi_identity);
+        let frame_size = layout
+            .call_fixed_size
             .checked_add(u64::from(plan.stack_size))
             .ok_or_else(|| error("variadic call frame size overflow"))?;
         let frame = create_stack_backing(builder, frame_size, 16)?;
         zero_memory(builder, frame, frame_size)?;
         store_integer(builder, frame, 0, ir::types::I32, 0x4642_4343)?;
-        store_integer(builder, frame, 4, ir::types::I16, 1)?;
-        store_integer(builder, frame, 6, ir::types::I16, 32)?;
+        store_integer(
+            builder,
+            frame,
+            4,
+            ir::types::I16,
+            if plan.abi_identity == ccc_target::AbiIdentity::SysvAmd64Lp64 {
+                1
+            } else {
+                2
+            },
+        )?;
+        store_integer(
+            builder,
+            frame,
+            6,
+            ir::types::I16,
+            if plan.abi_identity == ccc_target::AbiIdentity::SysvAmd64Lp64 {
+                32
+            } else {
+                48
+            },
+        )?;
         store_value(builder, frame, 8, target)?;
         store_integer(
             builder,
@@ -1605,11 +1792,12 @@ impl FunctionState<'_> {
         let result_storage = if plan.hidden_return {
             let result = create_stack_backing(builder, plan.result.size, plan.result.align)?;
             zero_memory(builder, result, plan.result.size)?;
-            store_value(builder, frame, 32, result)?;
+            store_value(builder, frame, layout.indirect_result, result)?;
             Some(result)
         } else {
             None
         };
+        let mut indirect_stages = HashMap::<u32, ir::Value>::new();
         for piece in &plan.parameter_pieces {
             let source_index = piece
                 .source_index
@@ -1621,7 +1809,26 @@ impl FunctionState<'_> {
                 .parameters
                 .get(source_index as usize)
                 .ok_or_else(|| error("variadic bridge parameter plan is absent"))?;
-            let destination = bridge_argument_piece_address(builder, frame, piece.location)?;
+            let destination = bridge_argument_piece_address(builder, frame, plan, piece.location)?;
+            if piece.indirect {
+                let stage = if let Some(stage) = indirect_stages.get(&source_index) {
+                    *stage
+                } else {
+                    let stage = create_stack_backing(builder, classified.size, classified.align)?;
+                    copy_memory(
+                        builder,
+                        stage,
+                        self.value(argument_id)?,
+                        classified.size,
+                        gir::MemoryAccess::default(),
+                        gir::MemoryAccess::default(),
+                    )?;
+                    indirect_stages.insert(source_index, stage);
+                    stage
+                };
+                store_value(builder, destination, 0, stage)?;
+                continue;
+            }
             if classified.passing == ccc_abi::PassingMode::Scalar {
                 let mut value = self.value(argument_id)?;
                 let value_type = builder.func.dfg.value_type(value);
@@ -1668,7 +1875,7 @@ impl FunctionState<'_> {
                     .result_pieces
                     .first()
                     .ok_or_else(|| error("variadic scalar result has no bridge piece"))?;
-                let source = bridge_result_piece_address(builder, frame, piece.location)?;
+                let source = bridge_result_piece_address(builder, frame, plan, piece.location)?;
                 Ok(Some(builder.ins().load(
                     scalar_type(
                         &self.module.types,
@@ -1684,7 +1891,7 @@ impl FunctionState<'_> {
                 let result = create_stack_backing(builder, plan.result.size, plan.result.align)?;
                 zero_memory(builder, result, plan.result.size)?;
                 for piece in &plan.result_pieces {
-                    let source = bridge_result_piece_address(builder, frame, piece.location)?;
+                    let source = bridge_result_piece_address(builder, frame, plan, piece.location)?;
                     let destination = address_offset(builder, result, piece.piece.offset)?;
                     copy_memory(
                         builder,
@@ -1942,7 +2149,8 @@ impl FunctionState<'_> {
                     .result_pieces
                     .first()
                     .ok_or_else(|| error("variadic scalar result has no bridge piece"))?;
-                let destination = variadic_result_piece_address(builder, frame, piece.location)?;
+                let destination =
+                    variadic_result_piece_address(builder, frame, plan, piece.location)?;
                 builder
                     .ins()
                     .store(MemFlags::new(), self.value(value)?, destination, 0);
@@ -1952,7 +2160,7 @@ impl FunctionState<'_> {
                 for piece in &plan.result_pieces {
                     let piece_source = address_offset(builder, source, piece.piece.offset)?;
                     let destination =
-                        variadic_result_piece_address(builder, frame, piece.location)?;
+                        variadic_result_piece_address(builder, frame, plan, piece.location)?;
                     copy_memory(
                         builder,
                         destination,
@@ -2124,6 +2332,14 @@ fn native_carrier_type(carrier: ccc_abi::AbiCarrier) -> ir::Type {
     }
 }
 
+fn va_list_size(config: &EffectiveCompilationConfig) -> u64 {
+    match config.target.abi {
+        ccc_target::AbiIdentity::SysvAmd64Lp64 => 24,
+        ccc_target::AbiIdentity::Aapcs64Lp64 => 32,
+        ccc_target::AbiIdentity::RiscvLp64d | ccc_target::AbiIdentity::DarwinArm64 => 8,
+    }
+}
+
 fn coerce_carrier_value(
     builder: &mut FunctionBuilder<'_>,
     value: ir::Value,
@@ -2147,40 +2363,82 @@ fn coerce_carrier_value(
     )))
 }
 
+#[derive(Clone, Copy)]
+struct BridgeFrameLayout {
+    call_fixed_size: u64,
+    call_integer_arguments: u64,
+    call_float_arguments: u64,
+    entry_integer_arguments: u64,
+    entry_float_arguments: u64,
+    integer_results: u64,
+    float_results: u64,
+    indirect_result: u64,
+    entry_indirect_result: u64,
+}
+
+fn bridge_frame_layout(abi: ccc_target::AbiIdentity) -> BridgeFrameLayout {
+    match abi {
+        ccc_target::AbiIdentity::SysvAmd64Lp64 => BridgeFrameLayout {
+            call_fixed_size: 256,
+            call_integer_arguments: 32,
+            call_float_arguments: 80,
+            entry_integer_arguments: 32,
+            entry_float_arguments: 80,
+            integer_results: 208,
+            float_results: 224,
+            indirect_result: 32,
+            entry_indirect_result: 32,
+        },
+        ccc_target::AbiIdentity::Aapcs64Lp64 | ccc_target::AbiIdentity::DarwinArm64 => {
+            BridgeFrameLayout {
+                call_fixed_size: 320,
+                call_integer_arguments: 48,
+                call_float_arguments: 112,
+                entry_integer_arguments: 48,
+                entry_float_arguments: 112,
+                integer_results: 240,
+                float_results: 256,
+                indirect_result: 32,
+                entry_indirect_result: 40,
+            }
+        }
+        ccc_target::AbiIdentity::RiscvLp64d => BridgeFrameLayout {
+            call_fixed_size: 320,
+            call_integer_arguments: 48,
+            call_float_arguments: 112,
+            // The entry's integer save area ends exactly at the incoming
+            // stack argument area, making the public pointer va_list cursor
+            // contiguous across saved a-registers and caller stack slots.
+            entry_integer_arguments: 448,
+            entry_float_arguments: 288,
+            integer_results: 240,
+            float_results: 256,
+            indirect_result: 48,
+            entry_indirect_result: 448,
+        },
+    }
+}
+
 fn variadic_parameter_piece_address(
     builder: &mut FunctionBuilder<'_>,
     frame: ir::Value,
     plan: &ccc_abi::BridgeBoundaryPlan,
     location: ccc_abi::BridgeLocation,
 ) -> Result<ir::Value, CodegenError> {
+    let layout = bridge_frame_layout(plan.abi_identity);
     match location {
-        ccc_abi::BridgeLocation::Gp(register) => {
-            let index = match register {
-                ccc_abi::GpRegister::Rdi => 0,
-                ccc_abi::GpRegister::Rsi => 1,
-                ccc_abi::GpRegister::Rdx => 2,
-                ccc_abi::GpRegister::Rcx => 3,
-                ccc_abi::GpRegister::R8 => 4,
-                ccc_abi::GpRegister::R9 => 5,
-                ccc_abi::GpRegister::Rax => {
-                    return Err(error("RAX is not an incoming variadic argument register"));
+        ccc_abi::BridgeLocation::Register(register) => address_offset(
+            builder,
+            frame,
+            match register.bank {
+                ccc_abi::RegisterBank::Integer => {
+                    layout.entry_integer_arguments + u64::from(register.index) * 8
                 }
-            };
-            address_offset(builder, frame, 32 + index * 8)
-        }
-        ccc_abi::BridgeLocation::Sse(register) => {
-            let index = match register {
-                ccc_abi::SseRegister::Xmm0 => 0,
-                ccc_abi::SseRegister::Xmm1 => 1,
-                ccc_abi::SseRegister::Xmm2 => 2,
-                ccc_abi::SseRegister::Xmm3 => 3,
-                ccc_abi::SseRegister::Xmm4 => 4,
-                ccc_abi::SseRegister::Xmm5 => 5,
-                ccc_abi::SseRegister::Xmm6 => 6,
-                ccc_abi::SseRegister::Xmm7 => 7,
-            };
-            address_offset(builder, frame, 80 + index * 16)
-        }
+                ccc_abi::RegisterBank::Float => {
+                    layout.entry_float_arguments + u64::from(register.index) * 16
+                }
+            },
+        ),
         ccc_abi::BridgeLocation::Stack { offset } => {
             let overflow_slot = address_offset(builder, frame, 16)?;
             let overflow = builder
@@ -2201,14 +2459,25 @@ fn variadic_parameter_piece_address(
 fn variadic_result_piece_address(
     builder: &mut FunctionBuilder<'_>,
     frame: ir::Value,
+    plan: &ccc_abi::BridgeBoundaryPlan,
     location: ccc_abi::BridgeLocation,
 ) -> Result<ir::Value, CodegenError> {
-    let offset = match location {
-        ccc_abi::BridgeLocation::Gp(ccc_abi::GpRegister::Rax) => 208,
-        ccc_abi::BridgeLocation::Gp(ccc_abi::GpRegister::Rdx) => 216,
-        ccc_abi::BridgeLocation::Sse(ccc_abi::SseRegister::Xmm0) => 224,
-        ccc_abi::BridgeLocation::Sse(ccc_abi::SseRegister::Xmm1) => 240,
+    let register = match location {
+        ccc_abi::BridgeLocation::Register(register)
+            if match register.bank {
+                ccc_abi::RegisterBank::Integer => register.index < 2,
+                ccc_abi::RegisterBank::Float => register.index < 4,
+            } =>
+        {
+            register
+        }
         _ => return Err(error("unsupported variadic result bridge location")),
+    };
+    // Result banks occupy identical offsets in call and entry frames.
+    let layout = bridge_frame_layout(plan.abi_identity);
+    let offset = match register.bank {
+        ccc_abi::RegisterBank::Integer => layout.integer_results + u64::from(register.index) * 8,
+        ccc_abi::RegisterBank::Float => layout.float_results + u64::from(register.index) * 16,
     };
     address_offset(builder, frame, offset)
 }
@@ -2216,35 +2485,20 @@ fn variadic_result_piece_address(
 fn bridge_argument_piece_address(
     builder: &mut FunctionBuilder<'_>,
     frame: ir::Value,
+    plan: &ccc_abi::BridgeBoundaryPlan,
     location: ccc_abi::BridgeLocation,
 ) -> Result<ir::Value, CodegenError> {
+    let layout = bridge_frame_layout(plan.abi_identity);
     let offset = match location {
-        ccc_abi::BridgeLocation::Gp(register) => {
-            32 + match register {
-                ccc_abi::GpRegister::Rdi => 0,
-                ccc_abi::GpRegister::Rsi => 8,
-                ccc_abi::GpRegister::Rdx => 16,
-                ccc_abi::GpRegister::Rcx => 24,
-                ccc_abi::GpRegister::R8 => 32,
-                ccc_abi::GpRegister::R9 => 40,
-                ccc_abi::GpRegister::Rax => {
-                    return Err(error("RAX is not a variadic argument location"));
-                }
+        ccc_abi::BridgeLocation::Register(register) => match register.bank {
+            ccc_abi::RegisterBank::Integer => {
+                layout.call_integer_arguments + u64::from(register.index) * 8
             }
-        }
-        ccc_abi::BridgeLocation::Sse(register) => {
-            80 + match register {
-                ccc_abi::SseRegister::Xmm0 => 0,
-                ccc_abi::SseRegister::Xmm1 => 16,
-                ccc_abi::SseRegister::Xmm2 => 32,
-                ccc_abi::SseRegister::Xmm3 => 48,
-                ccc_abi::SseRegister::Xmm4 => 64,
-                ccc_abi::SseRegister::Xmm5 => 80,
-                ccc_abi::SseRegister::Xmm6 => 96,
-                ccc_abi::SseRegister::Xmm7 => 112,
+            ccc_abi::RegisterBank::Float => {
+                layout.call_float_arguments + u64::from(register.index) * 16
             }
-        }
-        ccc_abi::BridgeLocation::Stack { offset } => 256 + u64::from(offset),
+        },
+        ccc_abi::BridgeLocation::Stack { offset } => layout.call_fixed_size + u64::from(offset),
     };
     address_offset(builder, frame, offset)
 }
@@ -2252,9 +2506,10 @@ fn bridge_argument_piece_address(
 fn bridge_result_piece_address(
     builder: &mut FunctionBuilder<'_>,
     frame: ir::Value,
+    plan: &ccc_abi::BridgeBoundaryPlan,
     location: ccc_abi::BridgeLocation,
 ) -> Result<ir::Value, CodegenError> {
-    variadic_result_piece_address(builder, frame, location)
+    variadic_result_piece_address(builder, frame, plan, location)
 }
 
 fn store_integer(

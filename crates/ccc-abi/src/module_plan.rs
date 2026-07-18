@@ -175,7 +175,13 @@ pub fn plan_module(
             }
         }
     }
-    let artifacts = plan_artifacts(module, &definitions, &calls, translation_unit_digest)?;
+    let artifacts = plan_artifacts(
+        module,
+        &definitions,
+        &calls,
+        translation_unit_digest,
+        config.target.abi,
+    )?;
     Ok(ModuleAbiPlan {
         config_key,
         ir_shape_digest,
@@ -195,6 +201,7 @@ fn plan_artifacts(
         CallPlan,
     >,
     translation_unit_digest: crate::TranslationUnitDigest,
+    abi_identity: ccc_target::AbiIdentity,
 ) -> Result<BridgeArtifactPlan, AbiError> {
     let call_sites = calls
         .iter()
@@ -210,7 +217,11 @@ fn plan_artifacts(
             None,
         ),
         call_sites,
-        frame_version: 1,
+        frame_version: if abi_identity == ccc_target::AbiIdentity::SysvAmd64Lp64 {
+            1
+        } else {
+            2
+        },
     });
 
     let mut variadic_entries = std::collections::BTreeMap::new();
@@ -255,8 +266,16 @@ fn plan_artifacts(
                     *function,
                     None,
                 ),
-                frame_version: 1,
-                va_state_version: 1,
+                frame_version: if abi_identity == ccc_target::AbiIdentity::SysvAmd64Lp64 {
+                    1
+                } else {
+                    2
+                },
+                va_state_version: if abi_identity == ccc_target::AbiIdentity::SysvAmd64Lp64 {
+                    1
+                } else {
+                    2
+                },
             },
         );
     }
@@ -287,7 +306,8 @@ fn plan_artifacts(
             generated_assembly_units,
             requires_assembler: needs_packaging,
             requires_relocatable_link: needs_packaging,
-            requires_object_copier: needs_packaging,
+            requires_object_copier: needs_packaging
+                && abi_identity != ccc_target::AbiIdentity::DarwinArm64,
             exact_localization_symbols,
         },
     })
@@ -690,7 +710,8 @@ fn dump_boundary(output: &mut String, boundary: &BoundaryPlan, indent: &str) {
         BoundaryPlan::Bridge(bridge) => {
             writeln!(
                 output,
-                "{indent}transport=bridge kind={} stack-size={} overflow-arg-offset={} gp-used={} xmm-used={} al={} hidden-return={}",
+                "{indent}transport=bridge abi={} kind={} stack-size={} overflow-arg-offset={} gp-used={} xmm-used={} al={} hidden-return={}",
+                bridge.abi_identity.name(),
                 match bridge.kind {
                     crate::BridgeKind::UnprototypedCall => "unprototyped-call",
                     crate::BridgeKind::VariadicCall => "variadic-call",
@@ -719,7 +740,7 @@ fn dump_boundary(output: &mut String, boundary: &BoundaryPlan, indent: &str) {
             for piece in &bridge.parameter_pieces {
                 writeln!(
                     output,
-                    "{indent}parameter-piece source={} index={} class={} offset={} valid={} extension={} location={}",
+                    "{indent}parameter-piece source={} index={} class={} offset={} valid={} extension={} indirect={} location={}",
                     piece
                         .source_index
                         .map_or_else(|| "result".to_owned(), |index| index.to_string()),
@@ -728,6 +749,7 @@ fn dump_boundary(output: &mut String, boundary: &BoundaryPlan, indent: &str) {
                     piece.piece.offset,
                     piece.piece.valid_bytes,
                     extension_name(piece.extension),
+                    piece.indirect,
                     render_location(piece.location)
                 )
                 .unwrap();
@@ -746,12 +768,13 @@ fn dump_boundary(output: &mut String, boundary: &BoundaryPlan, indent: &str) {
             for piece in &bridge.result_pieces {
                 writeln!(
                     output,
-                    "{indent}result-piece index={} class={} offset={} valid={} extension={} location={}",
+                    "{indent}result-piece index={} class={} offset={} valid={} extension={} indirect={} location={}",
                     piece.piece.index,
                     class_name(piece.piece.class),
                     piece.piece.offset,
                     piece.piece.valid_bytes,
                     extension_name(piece.extension),
+                    piece.indirect,
                     render_location(piece.location)
                 )
                 .unwrap();
@@ -847,34 +870,15 @@ fn passing_name(passing: PassingMode) -> &'static str {
 
 fn render_location(location: BridgeLocation) -> String {
     match location {
-        BridgeLocation::Gp(register) => format!("gp:{}", gp_register_name(register)),
-        BridgeLocation::Sse(register) => format!("sse:{}", sse_register_name(register)),
+        BridgeLocation::Register(register) => format!(
+            "{}:{}",
+            match register.bank {
+                crate::RegisterBank::Integer => "integer",
+                crate::RegisterBank::Float => "float",
+            },
+            register.index
+        ),
         BridgeLocation::Stack { offset } => format!("stack:+{offset}"),
-    }
-}
-
-fn gp_register_name(register: crate::GpRegister) -> &'static str {
-    match register {
-        crate::GpRegister::Rax => "rax",
-        crate::GpRegister::Rdi => "rdi",
-        crate::GpRegister::Rsi => "rsi",
-        crate::GpRegister::Rdx => "rdx",
-        crate::GpRegister::Rcx => "rcx",
-        crate::GpRegister::R8 => "r8",
-        crate::GpRegister::R9 => "r9",
-    }
-}
-
-fn sse_register_name(register: crate::SseRegister) -> &'static str {
-    match register {
-        crate::SseRegister::Xmm0 => "xmm0",
-        crate::SseRegister::Xmm1 => "xmm1",
-        crate::SseRegister::Xmm2 => "xmm2",
-        crate::SseRegister::Xmm3 => "xmm3",
-        crate::SseRegister::Xmm4 => "xmm4",
-        crate::SseRegister::Xmm5 => "xmm5",
-        crate::SseRegister::Xmm6 => "xmm6",
-        crate::SseRegister::Xmm7 => "xmm7",
     }
 }
 

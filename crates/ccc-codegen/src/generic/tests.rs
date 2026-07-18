@@ -96,6 +96,55 @@ fn enabled_non_x86_targets_emit_native_objects_with_fixed_aggregate_calls() {
 }
 
 #[test]
+fn enabled_non_x86_targets_plan_target_variadics_and_emit_matching_adapters() {
+    let source = "typedef __builtin_va_list va_list;\n\
+                  struct Pair { long first, second; };\n\
+                  long collect(int count, ...) {\n\
+                    va_list list; struct Pair pair; long integer; double floating;\n\
+                    __builtin_va_start(list, count);\n\
+                    integer = __builtin_va_arg(list, long);\n\
+                    floating = __builtin_va_arg(list, double);\n\
+                    pair = __builtin_va_arg(list, struct Pair);\n\
+                    __builtin_va_end(list);\n\
+                    return integer + (long)floating + pair.first + pair.second;\n\
+                  }\n\
+                  long invoke(void) { struct Pair pair = { 3, 4 };\n\
+                    return collect(3, 1L, 2.0, pair); }";
+    for (config, expected) in [
+        (
+            EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+            "str q7, [sp, #224]",
+        ),
+        (
+            EffectiveCompilationConfig::aarch64_apple_darwin(),
+            ".subsections_via_symbols",
+        ),
+        (
+            EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
+            "sd a7, 504(sp)",
+        ),
+    ] {
+        let output = emit_source_with_config(source, &config);
+        assert_eq!(output.assemblies.len(), 2);
+        assert!(
+            output
+                .assemblies
+                .iter()
+                .any(|assembly| assembly.source().contains(expected)),
+            "{} adapter did not contain `{expected}`",
+            config.target.triple
+        );
+        assert!(
+            output
+                .manifest
+                .symbols()
+                .iter()
+                .any(|symbol| symbol.kind == ccc_link::bridge::GeneratedSymbolKind::CallHelper)
+        );
+    }
+}
+
+#[test]
 fn emitted_functions_have_relocatable_system_v_call_frames() {
     use gimli::UnwindSection as _;
 
@@ -478,7 +527,7 @@ fn complete_abi_plan_and_aggregate_clif_have_exact_snapshots() {
     assert!(dump.contains("packaging assembly-units=2"), "{dump}");
     assert_eq!(
         sha256(&dump),
-        "184145d0df795011821666eb33da6450a0d28c6548ce7e7bf8ead4952cd677c3"
+        "1767a26a4561b575946dc1649df6e1cdcfcc198112f3fe7aa1cb972eb3af7a61"
     );
 
     let output = emit(&module, &config, Options { emit_clif: true }).unwrap();

@@ -6,6 +6,8 @@ use std::mem::offset_of;
 
 use sha2::{Digest as _, Sha256};
 
+use ccc_target::AbiIdentity;
+
 use crate::{LinkError, artifact_error};
 
 /// Magic identifying a generated call frame in diagnostic output.
@@ -372,6 +374,68 @@ fn function_footer(symbol: &str, output: &mut String) {
     output.push_str(".section .note.GNU-stack,\"\",@progbits\n");
 }
 
+fn target_symbol(symbol: &str, abi: AbiIdentity) -> String {
+    if abi == AbiIdentity::DarwinArm64 {
+        format!("_{symbol}")
+    } else {
+        symbol.to_owned()
+    }
+}
+
+fn target_function_header(
+    symbol: &str,
+    linkage: AssemblyFunctionLinkage,
+    abi: AbiIdentity,
+    output: &mut String,
+) {
+    output.push_str(".text\n.p2align 2\n");
+    let assembly_symbol = target_symbol(symbol, abi);
+    if abi == AbiIdentity::DarwinArm64 {
+        if linkage != AssemblyFunctionLinkage::Internal {
+            writeln!(output, ".globl {assembly_symbol}").unwrap();
+        } else {
+            // The primary Mach-O object references this definition, so it is
+            // private external until the relocatable link resolves the pair.
+            writeln!(output, ".globl {assembly_symbol}").unwrap();
+        }
+        if linkage != AssemblyFunctionLinkage::ExternalDefault {
+            writeln!(output, ".private_extern {assembly_symbol}").unwrap();
+        }
+    } else {
+        match linkage {
+            AssemblyFunctionLinkage::ExternalDefault => {
+                writeln!(output, ".globl {assembly_symbol}").unwrap();
+            }
+            AssemblyFunctionLinkage::ExternalHidden | AssemblyFunctionLinkage::Internal => {
+                writeln!(output, ".globl {assembly_symbol}").unwrap();
+                writeln!(output, ".hidden {assembly_symbol}").unwrap();
+            }
+            AssemblyFunctionLinkage::ExternalProtected => {
+                writeln!(output, ".globl {assembly_symbol}").unwrap();
+                writeln!(output, ".protected {assembly_symbol}").unwrap();
+            }
+            AssemblyFunctionLinkage::ExternalInternal => {
+                writeln!(output, ".globl {assembly_symbol}").unwrap();
+                writeln!(output, ".internal {assembly_symbol}").unwrap();
+            }
+        }
+        writeln!(output, ".type {assembly_symbol}, @function").unwrap();
+    }
+    writeln!(output, "{assembly_symbol}:").unwrap();
+    output.push_str(".cfi_startproc\n");
+}
+
+fn target_function_footer(symbol: &str, abi: AbiIdentity, output: &mut String) {
+    output.push_str(".cfi_endproc\n");
+    let assembly_symbol = target_symbol(symbol, abi);
+    if abi == AbiIdentity::DarwinArm64 {
+        output.push_str(".subsections_via_symbols\n");
+    } else {
+        writeln!(output, ".size {assembly_symbol}, .-{assembly_symbol}").unwrap();
+        output.push_str(".section .note.GNU-stack,\"\",@progbits\n");
+    }
+}
+
 /// Renders the translation-unit call helper used by ABI bridge frames.
 pub fn render_generic_call_helper(symbol: &str) -> Result<GeneratedAssembly, LinkError> {
     validate_symbol(symbol)?;
@@ -434,6 +498,176 @@ pub fn render_generic_call_helper(symbol: &str) -> Result<GeneratedAssembly, Lin
     )
 }
 
+/// Renders the call-frame helper for the selected CCC ABI identity.
+pub fn render_target_call_helper(
+    symbol: &str,
+    abi: AbiIdentity,
+) -> Result<GeneratedAssembly, LinkError> {
+    match abi {
+        AbiIdentity::SysvAmd64Lp64 => render_generic_call_helper(symbol),
+        AbiIdentity::Aapcs64Lp64 | AbiIdentity::DarwinArm64 => {
+            render_arm64_call_helper(symbol, abi)
+        }
+        AbiIdentity::RiscvLp64d => render_riscv64_call_helper(symbol),
+    }
+}
+
+fn render_arm64_call_helper(
+    symbol: &str,
+    abi: AbiIdentity,
+) -> Result<GeneratedAssembly, LinkError> {
+    validate_symbol(symbol)?;
+    let mut source = String::new();
+    target_function_header(
+        symbol,
+        AssemblyFunctionLinkage::ExternalHidden,
+        abi,
+        &mut source,
+    );
+    source.push_str(
+        "stp x29, x30, [sp, #-32]!\n\
+         .cfi_def_cfa_offset 32\n\
+         .cfi_offset x29, -32\n\
+         .cfi_offset x30, -24\n\
+         stp x19, x20, [sp, #16]\n\
+         .cfi_offset x19, -16\n\
+         .cfi_offset x20, -8\n\
+         mov x29, sp\n\
+         .cfi_def_cfa_register x29\n\
+         mov x19, x0\n\
+         ldr w20, [x19, #16]\n\
+         add x20, x20, #15\n\
+         and x20, x20, #-16\n\
+         sub sp, sp, x20\n\
+         ldr w2, [x19, #16]\n\
+         cbz x2, 2f\n\
+         add x1, x19, #320\n\
+         mov x0, sp\n\
+         1:\n\
+         ldrb w3, [x1], #1\n\
+         strb w3, [x0], #1\n\
+         subs x2, x2, #1\n\
+         b.ne 1b\n\
+         2:\n\
+         ldr x16, [x19, #8]\n\
+         ldr q0, [x19, #112]\n\
+         ldr q1, [x19, #128]\n\
+         ldr q2, [x19, #144]\n\
+         ldr q3, [x19, #160]\n\
+         ldr q4, [x19, #176]\n\
+         ldr q5, [x19, #192]\n\
+         ldr q6, [x19, #208]\n\
+         ldr q7, [x19, #224]\n\
+         ldr x0, [x19, #48]\n\
+         ldr x1, [x19, #56]\n\
+         ldr x2, [x19, #64]\n\
+         ldr x3, [x19, #72]\n\
+         ldr x4, [x19, #80]\n\
+         ldr x5, [x19, #88]\n\
+         ldr x6, [x19, #96]\n\
+         ldr x7, [x19, #104]\n\
+         ldr x8, [x19, #32]\n\
+         blr x16\n\
+         stp x0, x1, [x19, #240]\n\
+         str q0, [x19, #256]\n\
+         str q1, [x19, #272]\n\
+         str q2, [x19, #288]\n\
+         str q3, [x19, #304]\n\
+         mov sp, x29\n\
+         ldp x19, x20, [sp, #16]\n\
+         ldp x29, x30, [sp], #32\n\
+         .cfi_def_cfa sp, 0\n\
+         ret\n",
+    );
+    target_function_footer(symbol, abi, &mut source);
+    GeneratedAssembly::new(
+        "call-helper",
+        source,
+        vec![symbol.to_owned()],
+        vec![LogicalDebugLocation::generated(1)],
+    )
+}
+
+fn render_riscv64_call_helper(symbol: &str) -> Result<GeneratedAssembly, LinkError> {
+    validate_symbol(symbol)?;
+    let mut source = String::new();
+    target_function_header(
+        symbol,
+        AssemblyFunctionLinkage::ExternalHidden,
+        AbiIdentity::RiscvLp64d,
+        &mut source,
+    );
+    source.push_str(
+        "addi sp, sp, -32\n\
+         .cfi_def_cfa_offset 32\n\
+         sd ra, 24(sp)\n\
+         .cfi_offset ra, -8\n\
+         sd s0, 16(sp)\n\
+         .cfi_offset s0, -16\n\
+         sd s1, 8(sp)\n\
+         .cfi_offset s1, -24\n\
+         sd s2, 0(sp)\n\
+         .cfi_offset s2, -32\n\
+         addi s0, sp, 32\n\
+         mv s1, a0\n\
+         lwu s2, 16(s1)\n\
+         addi s2, s2, 15\n\
+         andi s2, s2, -16\n\
+         sub sp, sp, s2\n\
+         lwu t2, 16(s1)\n\
+         beqz t2, 2f\n\
+         addi t0, s1, 320\n\
+         mv t1, sp\n\
+         1:\n\
+         lbu t3, 0(t0)\n\
+         sb t3, 0(t1)\n\
+         addi t0, t0, 1\n\
+         addi t1, t1, 1\n\
+         addi t2, t2, -1\n\
+         bnez t2, 1b\n\
+         2:\n\
+         ld t0, 8(s1)\n\
+         fld fa0, 112(s1)\n\
+         fld fa1, 128(s1)\n\
+         fld fa2, 144(s1)\n\
+         fld fa3, 160(s1)\n\
+         fld fa4, 176(s1)\n\
+         fld fa5, 192(s1)\n\
+         fld fa6, 208(s1)\n\
+         fld fa7, 224(s1)\n\
+         ld a0, 48(s1)\n\
+         ld a1, 56(s1)\n\
+         ld a2, 64(s1)\n\
+         ld a3, 72(s1)\n\
+         ld a4, 80(s1)\n\
+         ld a5, 88(s1)\n\
+         ld a6, 96(s1)\n\
+         ld a7, 104(s1)\n\
+         jalr t0\n\
+         sd a0, 240(s1)\n\
+         sd a1, 248(s1)\n\
+         fsd fa0, 256(s1)\n\
+         fsd fa1, 272(s1)\n\
+         fsd fa2, 288(s1)\n\
+         fsd fa3, 304(s1)\n\
+         addi sp, s0, -32\n\
+         ld s2, 0(sp)\n\
+         ld s1, 8(sp)\n\
+         ld s0, 16(sp)\n\
+         ld ra, 24(sp)\n\
+         addi sp, sp, 32\n\
+         .cfi_def_cfa_offset 0\n\
+         ret\n",
+    );
+    target_function_footer(symbol, AbiIdentity::RiscvLp64d, &mut source);
+    GeneratedAssembly::new(
+        "call-helper",
+        source,
+        vec![symbol.to_owned()],
+        vec![LogicalDebugLocation::generated(1)],
+    )
+}
+
 /// Precomputed information needed to render a public variadic entry.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VariadicEntryPlan {
@@ -454,7 +688,7 @@ pub struct VariadicEntryPlan {
 }
 
 impl VariadicEntryPlan {
-    fn validate(&self) -> Result<(), LinkError> {
+    fn validate(&self, abi: AbiIdentity) -> Result<(), LinkError> {
         validate_symbol(&self.public_symbol)?;
         validate_symbol(&self.hidden_body_symbol)?;
         if self.public_symbol == self.hidden_body_symbol {
@@ -462,9 +696,14 @@ impl VariadicEntryPlan {
                 "a variadic entry and its hidden body must use distinct symbols",
             ));
         }
-        if self.fixed_gp_used > 6 || self.fixed_sse_used > 8 {
+        let gp_limit = if abi == AbiIdentity::SysvAmd64Lp64 {
+            6
+        } else {
+            8
+        };
+        if self.fixed_gp_used > gp_limit || self.fixed_sse_used > 8 {
             return Err(artifact_error(
-                "variadic fixed-prefix register counts exceed the SysV AMD64 register areas",
+                "variadic fixed-prefix register counts exceed the target register areas",
             ));
         }
         if !self.overflow_arg_offset.is_multiple_of(8) {
@@ -472,9 +711,15 @@ impl VariadicEntryPlan {
                 "the variadic overflow argument offset must be eight-byte aligned",
             ));
         }
-        if self.gp_results > 2 || self.xmm_results > 2 {
+        let float_result_limit =
+            if matches!(abi, AbiIdentity::Aapcs64Lp64 | AbiIdentity::DarwinArm64) {
+                4
+            } else {
+                2
+            };
+        if self.gp_results > 2 || self.xmm_results > float_result_limit {
             return Err(artifact_error(
-                "a variadic entry supports at most two GP and two SSE result registers",
+                "a variadic entry result exceeds the target register banks",
             ));
         }
         if self.hidden_return && (self.gp_results != 0 || self.xmm_results != 0) {
@@ -488,8 +733,28 @@ impl VariadicEntryPlan {
 
 /// Renders the public assembly entry for a compiler-defined variadic function.
 pub fn render_variadic_entry(plan: &VariadicEntryPlan) -> Result<GeneratedAssembly, LinkError> {
-    plan.validate()?;
+    render_target_variadic_entry(plan, AbiIdentity::SysvAmd64Lp64)
+}
 
+/// Renders a public variadic entry for the selected CCC ABI identity.
+pub fn render_target_variadic_entry(
+    plan: &VariadicEntryPlan,
+    abi: AbiIdentity,
+) -> Result<GeneratedAssembly, LinkError> {
+    plan.validate(abi)?;
+
+    match abi {
+        AbiIdentity::SysvAmd64Lp64 => render_sysv_amd64_variadic_entry(plan),
+        AbiIdentity::Aapcs64Lp64 | AbiIdentity::DarwinArm64 => {
+            render_arm64_variadic_entry(plan, abi)
+        }
+        AbiIdentity::RiscvLp64d => render_riscv64_variadic_entry(plan),
+    }
+}
+
+fn render_sysv_amd64_variadic_entry(
+    plan: &VariadicEntryPlan,
+) -> Result<GeneratedAssembly, LinkError> {
     let mut source = String::new();
     assembly_prelude(&mut source);
     function_header(&plan.public_symbol, plan.linkage, &mut source);
@@ -590,6 +855,206 @@ pub fn render_variadic_entry(plan: &VariadicEntryPlan) -> Result<GeneratedAssemb
     }
     source.push_str("leave\n.cfi_def_cfa %rsp, 8\nret\n");
     function_footer(&plan.public_symbol, &mut source);
+    GeneratedAssembly::new(
+        format!("variadic-entry-{}", short_stem(&plan.public_symbol)),
+        source,
+        vec![plan.public_symbol.clone()],
+        vec![LogicalDebugLocation::generated(plan.logical_line.max(1))],
+    )
+}
+
+fn render_arm64_variadic_entry(
+    plan: &VariadicEntryPlan,
+    abi: AbiIdentity,
+) -> Result<GeneratedAssembly, LinkError> {
+    let mut source = String::new();
+    target_function_header(&plan.public_symbol, plan.linkage, abi, &mut source);
+    source.push_str(
+        "stp x29, x30, [sp, #-16]!\n\
+         .cfi_def_cfa_offset 16\n\
+         .cfi_offset x29, -16\n\
+         .cfi_offset x30, -8\n\
+         mov x29, sp\n\
+         .cfi_def_cfa_register x29\n\
+         sub sp, sp, #320\n\
+         stp x0, x1, [sp, #48]\n\
+         stp x2, x3, [sp, #64]\n\
+         stp x4, x5, [sp, #80]\n\
+         stp x6, x7, [sp, #96]\n\
+         str q0, [sp, #112]\n\
+         str q1, [sp, #128]\n\
+         str q2, [sp, #144]\n\
+         str q3, [sp, #160]\n\
+         str q4, [sp, #176]\n\
+         str q5, [sp, #192]\n\
+         str q6, [sp, #208]\n\
+         str q7, [sp, #224]\n\
+         str x8, [sp, #40]\n",
+    );
+    source.push_str(
+        "mov w9, #0x4343\n\
+         movk w9, #0x4156, lsl #16\n\
+         str w9, [sp]\n\
+         mov w9, #2\n\
+         strh w9, [sp, #4]\n",
+    );
+    if abi == AbiIdentity::Aapcs64Lp64 {
+        writeln!(
+            source,
+            "add x9, x29, #{}",
+            16_u32.saturating_add(plan.overflow_arg_offset)
+        )
+        .unwrap();
+        source.push_str("str x9, [sp, #8]\nadd x9, sp, #112\nstr x9, [sp, #16]\nadd x9, sp, #240\nstr x9, [sp, #24]\n");
+        writeln!(
+            source,
+            "mov w9, #{}\nstr w9, [sp, #32]",
+            i32::from(plan.fixed_gp_used) * 8 - 64
+        )
+        .unwrap();
+        writeln!(
+            source,
+            "mov w9, #{}\nstr w9, [sp, #36]",
+            i32::from(plan.fixed_sse_used) * 16 - 128
+        )
+        .unwrap();
+    } else {
+        writeln!(
+            source,
+            "add x9, x29, #{}",
+            16_u32.saturating_add(plan.overflow_arg_offset)
+        )
+        .unwrap();
+        source.push_str("str x9, [sp, #8]\n");
+    }
+    source.push_str(
+        "stp xzr, xzr, [sp, #240]\n\
+         movi v31.2d, #0\n\
+         str q31, [sp, #256]\n\
+         str q31, [sp, #272]\n\
+         str q31, [sp, #288]\n\
+         str q31, [sp, #304]\n\
+         mov x0, sp\n",
+    );
+    writeln!(
+        source,
+        "bl {}",
+        target_symbol(&plan.hidden_body_symbol, abi)
+    )
+    .unwrap();
+    if !plan.hidden_return {
+        if plan.gp_results >= 1 {
+            source.push_str("ldr x0, [sp, #240]\n");
+        }
+        if plan.gp_results >= 2 {
+            source.push_str("ldr x1, [sp, #248]\n");
+        }
+        for index in 0..plan.xmm_results {
+            writeln!(
+                source,
+                "ldr q{index}, [sp, #{}]",
+                256 + u32::from(index) * 16
+            )
+            .unwrap();
+        }
+    }
+    source.push_str(
+        "mov sp, x29\n\
+         ldp x29, x30, [sp], #16\n\
+         .cfi_def_cfa sp, 0\n\
+         ret\n",
+    );
+    target_function_footer(&plan.public_symbol, abi, &mut source);
+    GeneratedAssembly::new(
+        format!("variadic-entry-{}", short_stem(&plan.public_symbol)),
+        source,
+        vec![plan.public_symbol.clone()],
+        vec![LogicalDebugLocation::generated(plan.logical_line.max(1))],
+    )
+}
+
+fn render_riscv64_variadic_entry(plan: &VariadicEntryPlan) -> Result<GeneratedAssembly, LinkError> {
+    let abi = AbiIdentity::RiscvLp64d;
+    let mut source = String::new();
+    target_function_header(&plan.public_symbol, plan.linkage, abi, &mut source);
+    source.push_str(
+        "addi sp, sp, -512\n\
+         .cfi_def_cfa_offset 512\n\
+         sd s0, 416(sp)\n\
+         .cfi_offset s0, -96\n\
+         sd ra, 424(sp)\n\
+         .cfi_offset ra, -88\n\
+         addi s0, sp, 512\n\
+         sd a0, 448(sp)\n\
+         sd a1, 456(sp)\n\
+         sd a2, 464(sp)\n\
+         sd a3, 472(sp)\n\
+         sd a4, 480(sp)\n\
+         sd a5, 488(sp)\n\
+         sd a6, 496(sp)\n\
+         sd a7, 504(sp)\n\
+         fsd fa0, 288(sp)\n\
+         fsd fa1, 304(sp)\n\
+         fsd fa2, 320(sp)\n\
+         fsd fa3, 336(sp)\n\
+         fsd fa4, 352(sp)\n\
+         fsd fa5, 368(sp)\n\
+         fsd fa6, 384(sp)\n\
+         fsd fa7, 400(sp)\n",
+    );
+    writeln!(source, "li t0, {VA_STATE_MAGIC}\nsw t0, 0(sp)").unwrap();
+    source.push_str("li t0, 2\nsh t0, 4(sp)\n");
+    if plan.fixed_gp_used < 8 {
+        writeln!(
+            source,
+            "addi t0, sp, {}",
+            448 + u32::from(plan.fixed_gp_used) * 8
+        )
+        .unwrap();
+    } else if plan.overflow_arg_offset == 0 {
+        source.push_str("mv t0, s0\n");
+    } else {
+        writeln!(
+            source,
+            "li t0, {}\nadd t0, s0, t0",
+            plan.overflow_arg_offset
+        )
+        .unwrap();
+    }
+    source.push_str(
+        "sd t0, 8(sp)\n\
+         sd zero, 240(sp)\n\
+         sd zero, 248(sp)\n\
+         sd zero, 256(sp)\n\
+         sd zero, 264(sp)\n\
+         sd zero, 272(sp)\n\
+         sd zero, 280(sp)\n\
+         sd zero, 288(sp)\n\
+         sd zero, 296(sp)\n\
+         sd zero, 304(sp)\n\
+         sd zero, 312(sp)\n\
+         mv a0, sp\n",
+    );
+    writeln!(source, "call {}", plan.hidden_body_symbol).unwrap();
+    if !plan.hidden_return {
+        if plan.gp_results >= 1 {
+            source.push_str("ld a0, 240(sp)\n");
+        }
+        if plan.gp_results >= 2 {
+            source.push_str("ld a1, 248(sp)\n");
+        }
+        for index in 0..plan.xmm_results {
+            writeln!(source, "fld fa{index}, {}(sp)", 256 + u32::from(index) * 16).unwrap();
+        }
+    }
+    source.push_str(
+        "ld s0, 416(sp)\n\
+         ld ra, 424(sp)\n\
+         addi sp, sp, 512\n\
+         .cfi_def_cfa_offset 0\n\
+         ret\n",
+    );
+    target_function_footer(&plan.public_symbol, abi, &mut source);
     GeneratedAssembly::new(
         format!("variadic-entry-{}", short_stem(&plan.public_symbol)),
         source,

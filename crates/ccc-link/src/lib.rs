@@ -119,6 +119,19 @@ impl ToolchainRequirements {
             archiver: false,
         }
     }
+
+    /// Mach-O bridge assembly uses private-external symbols and therefore
+    /// needs no GNU-style post-link symbol localization tool.
+    pub const fn package_generated_macho_assembly() -> Self {
+        Self {
+            system_headers: false,
+            disable_system_headers: false,
+            assembler: false,
+            linker: false,
+            object_copier: false,
+            archiver: false,
+        }
+    }
 }
 
 /// A command invocation used by an injectable toolchain probe runner.

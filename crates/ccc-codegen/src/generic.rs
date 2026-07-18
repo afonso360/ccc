@@ -228,6 +228,7 @@ fn emit_inner(
     let object = product.emit().map_err(module_error)?;
     let (assemblies, manifest) = generated_bridge_artifacts(
         module,
+        config,
         abi_plan,
         &declarations.hidden_body_symbols,
         declarations.call_helper_symbol.as_deref(),
@@ -289,6 +290,7 @@ fn parse_darwin_version(version: &str) -> Result<(u16, u8, u8), CodegenError> {
 
 fn generated_bridge_artifacts(
     _module: &gir::FullModule,
+    config: &EffectiveCompilationConfig,
     abi_plan: ccc_abi::VerifiedModuleAbiPlan<'_>,
     hidden_body_symbols: &HashMap<u32, String>,
     call_helper_symbol: Option<&str>,
@@ -301,14 +303,15 @@ fn generated_bridge_artifacts(
 > {
     use ccc_link::artifact::{BridgeManifestV1, GeneratedSymbol, GeneratedSymbolOwner};
     use ccc_link::bridge::{
-        AssemblyFunctionLinkage, GeneratedSymbolKind, VariadicEntryPlan,
-        render_generic_call_helper, render_variadic_entry,
+        AssemblyFunctionLinkage, GeneratedSymbolKind, VariadicEntryPlan, render_target_call_helper,
+        render_target_variadic_entry,
     };
 
     let mut assemblies = Vec::new();
     let mut symbols = Vec::new();
     if let Some(helper) = call_helper_symbol {
-        let assembly = render_generic_call_helper(helper).map_err(module_error)?;
+        let assembly =
+            render_target_call_helper(helper, config.target.abi).map_err(module_error)?;
         symbols.push(GeneratedSymbol::internal(
             helper,
             GeneratedSymbolKind::CallHelper,
@@ -355,18 +358,21 @@ fn generated_bridge_artifacts(
             .filter(|piece| piece.piece.class == ccc_abi::AbiClass::Integer)
             .count() as u8;
         let xmm_results = plan.result_pieces.len() as u8 - gp_results;
-        let assembly = render_variadic_entry(&VariadicEntryPlan {
-            public_symbol: public_symbol.clone(),
-            hidden_body_symbol: hidden_body.clone(),
-            linkage,
-            fixed_gp_used: plan.gp_used,
-            fixed_sse_used: plan.xmm_used,
-            overflow_arg_offset: plan.overflow_arg_offset,
-            gp_results,
-            xmm_results,
-            hidden_return: plan.hidden_return,
-            logical_line: 1,
-        })
+        let assembly = render_target_variadic_entry(
+            &VariadicEntryPlan {
+                public_symbol: public_symbol.clone(),
+                hidden_body_symbol: hidden_body.clone(),
+                linkage,
+                fixed_gp_used: plan.gp_used,
+                fixed_sse_used: plan.xmm_used,
+                overflow_arg_offset: plan.overflow_arg_offset,
+                gp_results,
+                xmm_results,
+                hidden_return: plan.hidden_return,
+                logical_line: 1,
+            },
+            config.target.abi,
+        )
         .map_err(module_error)?;
         let entry_symbol = match linkage {
             AssemblyFunctionLinkage::ExternalDefault => GeneratedSymbol::public(

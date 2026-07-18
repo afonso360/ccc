@@ -1431,12 +1431,13 @@ impl FunctionVerifier<'_> {
         let va_list = types
             .target_builtin_id(TargetBuiltinType::VaList)
             .ok_or_else(|| IrError::verify("variadic IR has no target va_list type"))?;
-        let Some(TypeKind::Array(array)) = types.try_kind(va_list) else {
-            return Err(IrError::verify("target va_list is not an array type"));
-        };
         let pointee = pointer_pointee(types, self.value_type(value)?.ty)
             .ok_or_else(|| IrError::verify("va_list operand is not an address"))?;
-        if pointee.ty != va_list && pointee.ty != array.element.ty {
+        let parameter_element = match types.try_kind(va_list) {
+            Some(TypeKind::Array(array)) => Some(array.element.ty),
+            _ => None,
+        };
+        if pointee.ty != va_list && parameter_element != Some(pointee.ty) {
             return Err(IrError::verify(
                 "va_list operand points to an unrelated object",
             ));

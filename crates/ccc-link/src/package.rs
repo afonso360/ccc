@@ -8,14 +8,14 @@ use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use ccc_target::{EffectiveCompilationConfig, ToolCommandSpec, ToolchainSpec};
+use ccc_target::{BinaryFormat, EffectiveCompilationConfig, ToolCommandSpec, ToolchainSpec};
 use object::SymbolScope;
 use object::read::{Object as _, ObjectSection as _, ObjectSymbol as _};
 use sha2::{Digest as _, Sha256};
 
 use crate::artifact::{
     ArtifactBundle, GeneratedSymbolOwner, GeneratedSymbolVisibility, VerifiedArtifactBundle,
-    parse_relocatable,
+    canonical_symbol_name, parse_relocatable,
 };
 use crate::bridge::is_bridge_generated_symbol;
 use crate::{
@@ -55,8 +55,12 @@ pub fn package_artifact_bundle(
         });
     }
 
-    let toolchain = ToolchainResolver::new(config)
-        .resolve(ToolchainRequirements::package_generated_assembly())?;
+    let requirements = if config.target.triple.binary_format == BinaryFormat::Macho {
+        ToolchainRequirements::package_generated_macho_assembly()
+    } else {
+        ToolchainRequirements::package_generated_assembly()
+    };
+    let toolchain = ToolchainResolver::new(config).resolve(requirements)?;
     package_with_runner(
         &verified,
         output,
@@ -83,11 +87,15 @@ pub fn package_artifact_bundle_with_runner<R: ProbeRunner>(
             object_copier: None,
         });
     }
-    let copier = toolchain.object_copier.clone().ok_or_else(|| LinkError {
-        code: "CCC5011",
-        message: "resolved toolchain has no object copier for generated assembly".to_owned(),
-    })?;
-    package_with_runner(&verified, output, config, toolchain, runner, vec![copier])
+    let candidates = if config.target.triple.binary_format == BinaryFormat::Macho {
+        Vec::new()
+    } else {
+        vec![toolchain.object_copier.clone().ok_or_else(|| LinkError {
+            code: "CCC5011",
+            message: "resolved toolchain has no object copier for generated assembly".to_owned(),
+        })?]
+    };
+    package_with_runner(&verified, output, config, toolchain, runner, candidates)
 }
 
 fn publish_bridge_free(bundle: &VerifiedArtifactBundle, output: &Path) -> Result<(), LinkError> {
@@ -117,7 +125,17 @@ fn package_with_runner<R: ProbeRunner>(
             ),
         })?;
     let workspace = ArtifactWorkspace::create(output)?;
-    let copier = probe_packaging_capabilities(workspace.path(), driver, &candidates, runner)?;
+    let macho = config.target.triple.binary_format == BinaryFormat::Macho;
+    let copier = if macho {
+        None
+    } else {
+        Some(probe_packaging_capabilities(
+            workspace.path(),
+            driver,
+            &candidates,
+            runner,
+        )?)
+    };
 
     let primary = workspace.path().join("primary.o");
     write_file(&primary, bundle.primary_object())?;
@@ -143,6 +161,15 @@ fn package_with_runner<R: ProbeRunner>(
     partial_link(runner, driver, &objects, &combined)?;
     inspect_combined_object(&combined, bundle, false)?;
 
+    if macho {
+        inspect_combined_object(&combined, bundle, true)?;
+        workspace.publish(&combined, output)?;
+        return Ok(PackagingReport {
+            used_generated_assembly: true,
+            object_copier: None,
+        });
+    }
+
     let localization_file = workspace.path().join("localize-symbols.txt");
     let mut localization = bundle.manifest().localization_symbols().join("\n");
     if !localization.is_empty() {
@@ -153,7 +180,10 @@ fn package_with_runner<R: ProbeRunner>(
     let final_object = workspace.path().join("final.o");
     localize_symbols(
         runner,
-        &copier.command,
+        &copier
+            .as_ref()
+            .expect("non-Mach-O packaging probes an object copier")
+            .command,
         &localization_file,
         &combined,
         &final_object,
@@ -162,7 +192,7 @@ fn package_with_runner<R: ProbeRunner>(
     workspace.publish(&final_object, output)?;
     Ok(PackagingReport {
         used_generated_assembly: true,
-        object_copier: Some(copier),
+        object_copier: copier,
     })
 }
 
@@ -455,10 +485,14 @@ fn inspect_combined_object(
     }
     let mut symbols = BTreeMap::new();
     for symbol in object.symbols() {
-        if symbol.is_undefined() && symbol.name().is_ok_and(is_bridge_generated_symbol) {
+        let name = symbol
+            .name()
+            .ok()
+            .map(|name| canonical_symbol_name(object.format(), name));
+        if symbol.is_undefined() && name.is_some_and(is_bridge_generated_symbol) {
             return Err(artifact_error(format!(
                 "packaged object retains unresolved generated symbol `{}`",
-                symbol.name().unwrap_or("<invalid>")
+                name.unwrap_or("<invalid>")
             )));
         }
         if symbol.is_undefined() {
@@ -470,7 +504,7 @@ fn inspect_combined_object(
         ) {
             continue;
         }
-        if let Ok(name) = symbol.name()
+        if let Some(name) = name
             && !name.is_empty()
         {
             symbols.insert(
@@ -485,22 +519,27 @@ fn inspect_combined_object(
         }
     }
     if bundle.needs_packaging_tools() {
-        if object.section_by_name(".eh_frame").is_none() {
+        let is_elf = object.format() == object::BinaryFormat::Elf;
+        if object.section_by_name(".eh_frame").is_none()
+            && object.section_by_name("__eh_frame").is_none()
+        {
             return Err(artifact_error(
-                "packaged bridge object is missing unwind information in `.eh_frame`",
+                "packaged bridge object is missing unwind information",
             ));
         }
-        let stack_note = object
-            .section_by_name(".note.GNU-stack")
-            .ok_or_else(|| artifact_error("packaged bridge object is missing `.note.GNU-stack`"))?;
-        if matches!(
-            stack_note.flags(),
-            object::SectionFlags::Elf { sh_flags }
-                if sh_flags & u64::from(object::elf::SHF_EXECINSTR) != 0
-        ) {
-            return Err(artifact_error(
-                "packaged bridge object requests an executable process stack",
-            ));
+        if is_elf {
+            let stack_note = object.section_by_name(".note.GNU-stack").ok_or_else(|| {
+                artifact_error("packaged bridge object is missing `.note.GNU-stack`")
+            })?;
+            if matches!(
+                stack_note.flags(),
+                object::SectionFlags::Elf { sh_flags }
+                    if sh_flags & u64::from(object::elf::SHF_EXECINSTR) != 0
+            ) {
+                return Err(artifact_error(
+                    "packaged bridge object requests an executable process stack",
+                ));
+            }
         }
     }
     for forbidden in [
@@ -540,7 +579,11 @@ fn inspect_combined_object(
         })?;
         if localized
             && expected.visibility == GeneratedSymbolVisibility::Internal
-            && facts.scope != SymbolScope::Compilation
+            && if object.format() == object::BinaryFormat::MachO {
+                facts.scope == SymbolScope::Dynamic
+            } else {
+                facts.scope != SymbolScope::Compilation
+            }
         {
             return Err(artifact_error(format!(
                 "generated symbol `{}` was not localized",
@@ -550,7 +593,11 @@ fn inspect_combined_object(
         if localized {
             match expected.visibility {
                 GeneratedSymbolVisibility::SourceInternal
-                    if facts.scope != SymbolScope::Compilation =>
+                    if if object.format() == object::BinaryFormat::MachO {
+                        facts.scope == SymbolScope::Dynamic
+                    } else {
+                        facts.scope != SymbolScope::Compilation
+                    } =>
                 {
                     return Err(artifact_error(format!(
                         "source-internal symbol `{}` did not retain local binding",
@@ -570,7 +617,8 @@ fn inspect_combined_object(
                 }
                 _ => {}
             }
-            if expected.visibility == GeneratedSymbolVisibility::SourceHidden
+            if object.format() == object::BinaryFormat::Elf
+                && expected.visibility == GeneratedSymbolVisibility::SourceHidden
                 && facts.elf_visibility != Some(object::elf::STV_HIDDEN)
             {
                 return Err(artifact_error(format!(
@@ -578,7 +626,8 @@ fn inspect_combined_object(
                     expected.name
                 )));
             }
-            if expected.visibility == GeneratedSymbolVisibility::SourceProtected
+            if object.format() == object::BinaryFormat::Elf
+                && expected.visibility == GeneratedSymbolVisibility::SourceProtected
                 && facts.elf_visibility != Some(object::elf::STV_PROTECTED)
             {
                 return Err(artifact_error(format!(
@@ -586,7 +635,8 @@ fn inspect_combined_object(
                     expected.name
                 )));
             }
-            if expected.visibility == GeneratedSymbolVisibility::SourceElfInternal
+            if object.format() == object::BinaryFormat::Elf
+                && expected.visibility == GeneratedSymbolVisibility::SourceElfInternal
                 && facts.elf_visibility != Some(object::elf::STV_INTERNAL)
             {
                 return Err(artifact_error(format!(
@@ -594,7 +644,8 @@ fn inspect_combined_object(
                     expected.name
                 )));
             }
-            if expected.visibility == GeneratedSymbolVisibility::Public
+            if object.format() == object::BinaryFormat::Elf
+                && expected.visibility == GeneratedSymbolVisibility::Public
                 && !matches!(facts.elf_visibility, None | Some(object::elf::STV_DEFAULT))
             {
                 return Err(artifact_error(format!(
@@ -615,6 +666,7 @@ fn inspect_combined_object(
         let Ok(name) = symbol.name() else {
             continue;
         };
+        let name = canonical_symbol_name(primary.format(), name);
         if name.is_empty() {
             continue;
         }

@@ -9,25 +9,6 @@ use ccc_types::{
 
 use crate::{AbiError, model::*};
 
-const GP_ARGUMENTS: [GpRegister; 6] = [
-    GpRegister::Rdi,
-    GpRegister::Rsi,
-    GpRegister::Rdx,
-    GpRegister::Rcx,
-    GpRegister::R8,
-    GpRegister::R9,
-];
-const SSE_ARGUMENTS: [SseRegister; 8] = [
-    SseRegister::Xmm0,
-    SseRegister::Xmm1,
-    SseRegister::Xmm2,
-    SseRegister::Xmm3,
-    SseRegister::Xmm4,
-    SseRegister::Xmm5,
-    SseRegister::Xmm6,
-    SseRegister::Xmm7,
-];
-
 pub fn plan_function_type(
     types: &TypeStore,
     signature: TypeId,
@@ -182,6 +163,7 @@ pub fn plan_va_arg(
         classified,
         gp_slots,
         sse_slots,
+        indirect: false,
     })
 }
 
@@ -524,6 +506,7 @@ fn plan_bridge(
     };
     let result_pieces = bridge_result_pieces(&result, result_extension);
     Ok(BridgeBoundaryPlan {
+        abi_identity: ccc_target::AbiIdentity::SysvAmd64Lp64,
         calling_convention: CallingConvention::SystemV,
         kind,
         parameters,
@@ -558,14 +541,14 @@ fn allocate_bridge_argument(
         for piece in effective_pieces(classified) {
             let location = match piece.class {
                 AbiClass::Integer => {
-                    let register = GP_ARGUMENTS[*gp_used as usize];
+                    let register = RegisterSlot::integer(*gp_used);
                     *gp_used += 1;
-                    BridgeLocation::Gp(register)
+                    BridgeLocation::Register(register)
                 }
                 AbiClass::Sse | AbiClass::SseUp => {
-                    let register = SSE_ARGUMENTS[*sse_used as usize];
+                    let register = RegisterSlot::float(*sse_used);
                     *sse_used += 1;
-                    BridgeLocation::Sse(register)
+                    BridgeLocation::Register(register)
                 }
                 _ => unreachable!("unsupported bridge register class"),
             };
@@ -573,6 +556,7 @@ fn allocate_bridge_argument(
                 source_index: Some(source_index),
                 piece,
                 extension,
+                indirect: false,
                 location,
             });
         }
@@ -587,6 +571,7 @@ fn allocate_bridge_argument(
             source_index: Some(source_index),
             piece,
             extension,
+            indirect: false,
             location: BridgeLocation::Stack {
                 offset: piece_offset,
             },
@@ -615,14 +600,12 @@ fn bridge_result_pieces(
         .map(|piece| {
             let location = match piece.class {
                 AbiClass::Integer => {
-                    let registers = [GpRegister::Rax, GpRegister::Rdx];
-                    let location = BridgeLocation::Gp(registers[gp]);
+                    let location = BridgeLocation::Register(RegisterSlot::integer(gp as u8));
                     gp += 1;
                     location
                 }
                 AbiClass::Sse | AbiClass::SseUp => {
-                    let registers = [SseRegister::Xmm0, SseRegister::Xmm1];
-                    let location = BridgeLocation::Sse(registers[sse]);
+                    let location = BridgeLocation::Register(RegisterSlot::float(sse as u8));
                     sse += 1;
                     location
                 }
@@ -632,6 +615,7 @@ fn bridge_result_pieces(
                 source_index: None,
                 piece,
                 extension,
+                indirect: false,
                 location,
             }
         })
@@ -1560,7 +1544,7 @@ mod tests {
         assert_eq!(plan.stack_size, 0);
         assert!(plan.parameter_pieces.iter().any(|piece| {
             piece.source_index == Some(1)
-                && piece.location == BridgeLocation::Sse(SseRegister::Xmm0)
+                && piece.location == BridgeLocation::Register(RegisterSlot::float(0))
         }));
     }
 
