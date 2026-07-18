@@ -20,10 +20,15 @@ pub use target_lexicon::{
     Triple, Vendor,
 };
 
-/// The relocation contract used by generated objects.
+/// The relocation and executable-output contract used by code generation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RelocationModel {
+    /// Generate code that may only be linked at a fixed address.
     Static,
+    /// Generate position-independent code suitable for PIE and shared objects.
+    Pic,
+    /// Generate position-independent code and advertise a PIE compilation.
+    Pie,
 }
 
 /// Compiler-provided C types whose representation is selected by the target
@@ -626,7 +631,7 @@ impl EffectiveCompilationConfig {
             target_macros,
             resource_dir: None,
             toolchain: ToolchainSpec::default(),
-            relocation_model: RelocationModel::Static,
+            relocation_model: RelocationModel::Pie,
         }
     }
 
@@ -763,6 +768,7 @@ mod tests {
         );
         assert_eq!(config.language.mode, LanguageMode::Gnu11);
         assert!(!config.language.trigraphs_enabled());
+        assert_eq!(config.relocation_model, RelocationModel::Pie);
         assert_eq!(
             config.gnu_profile.as_ref().map(|profile| profile.version),
             Some(CompatibilityVersion::new(4, 2, 1))

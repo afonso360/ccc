@@ -123,6 +123,68 @@ fn execution_programs_produce_the_expected_exit_status() {
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
+fn default_link_produces_a_working_position_independent_executable() {
+    use object::{Object as _, ObjectKind, ObjectSection as _};
+
+    let directory = test_directory("position-independent-executable");
+    let source = directory.join("position-independent-executable.c");
+    let executable = directory.join("position-independent-executable");
+    fs::write(
+        &source,
+        r#"
+int stored_value = 35;
+int *stored_pointer = &stored_value;
+
+int add_seven(int value) {
+    return value + 7;
+}
+
+int (*stored_function)(int) = add_seven;
+
+int main(void) {
+    return stored_function(*stored_pointer) == 42 ? 0 : 1;
+}
+"#,
+    )
+    .unwrap();
+
+    let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+        .arg(&source)
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .unwrap();
+    assert!(
+        compilation.status.success(),
+        "ccc failed: {}",
+        String::from_utf8_lossy(&compilation.stderr)
+    );
+
+    let bytes = fs::read(&executable).unwrap();
+    let file = object::File::parse(bytes.as_slice()).unwrap();
+    assert_eq!(file.kind(), ObjectKind::Dynamic);
+    let text = file.section_by_name(".text").unwrap();
+    let text_start = text.address();
+    let text_end = text_start + text.size();
+    assert!(
+        file.dynamic_relocations()
+            .unwrap()
+            .all(|(address, _)| address < text_start || address >= text_end),
+        "PIE has a dynamic relocation in executable text"
+    );
+
+    let execution = Command::new(&executable).output().unwrap();
+    assert_eq!(
+        execution.status.code(),
+        Some(0),
+        "PIE failed: {}",
+        String::from_utf8_lossy(&execution.stderr)
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
 fn an_invalid_computed_goto_target_traps() {
     use std::os::unix::process::ExitStatusExt as _;
 

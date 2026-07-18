@@ -54,6 +54,83 @@ fn debug_and_optimization_compatibility_options_preserve_baseline_object() {
     fs::remove_dir_all(directory).unwrap();
 }
 
+#[test]
+fn default_objects_use_position_independent_text_relocations() {
+    let directory = test_directory("position-independent-relocations");
+    let source = directory.join("position-independent-relocations.c");
+    let output = directory.join("position-independent-relocations.o");
+    fs::write(
+        &source,
+        r#"
+extern int imported_data;
+extern int imported_function(void);
+int local_data = 7;
+
+int *local_address(void) {
+    return &local_data;
+}
+
+int read_imported(void) {
+    return imported_data;
+}
+
+int call_imported(void) {
+    return imported_function();
+}
+"#,
+    )
+    .unwrap();
+    compile_ccc(&source, &output);
+
+    let bytes = fs::read(&output).unwrap();
+    let file = object::File::parse(bytes.as_slice()).unwrap();
+    let text = file.section_by_name(".text").unwrap();
+    let relocations = text
+        .relocations()
+        .filter_map(|(_, relocation)| {
+            let RelocationTarget::Symbol(index) = relocation.target() else {
+                return None;
+            };
+            let name = file.symbol_by_index(index).ok()?.name().ok()?;
+            Some((name.to_owned(), relocation.flags()))
+        })
+        .collect::<Vec<_>>();
+
+    for name in ["local_data", "imported_data"] {
+        assert!(
+            relocations.iter().any(|(target, flags)| {
+                target == name
+                    && *flags
+                        == RelocationFlags::Elf {
+                            r_type: object::elf::R_X86_64_GOTPCREL,
+                        }
+            }),
+            "missing position-independent data relocation to `{name}`: {relocations:?}"
+        );
+    }
+    assert!(
+        relocations.iter().any(|(target, flags)| {
+            target == "imported_function"
+                && *flags
+                    == RelocationFlags::Elf {
+                        r_type: object::elf::R_X86_64_PLT32,
+                    }
+        }),
+        "missing PLT-relative call relocation: {relocations:?}"
+    );
+    assert!(
+        relocations.iter().all(|(_, flags)| !matches!(
+            flags,
+            RelocationFlags::Elf {
+                r_type: object::elf::R_X86_64_32 | object::elf::R_X86_64_32S
+            }
+        )),
+        "position-independent text contains an absolute relocation: {relocations:?}"
+    );
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
 fn render_output(output: &Output) -> String {
     format!(
         "status: {}\nstdout:\n{}\nstderr:\n{}",
@@ -341,7 +418,6 @@ impl ReferenceCompiler {
     {
         let result = self
             .command()
-            .arg("-no-pie")
             .args(objects)
             .arg("-o")
             .arg(output)

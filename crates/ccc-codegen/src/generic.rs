@@ -73,6 +73,9 @@ fn emit_inner(
     let mut flag_builder = settings::builder();
     match config.relocation_model {
         RelocationModel::Static => flag_builder.set("is_pic", "false").map_err(module_error)?,
+        RelocationModel::Pic | RelocationModel::Pie => {
+            flag_builder.set("is_pic", "true").map_err(module_error)?
+        }
     }
     flag_builder
         .set("enable_llvm_abi_extensions", "false")
