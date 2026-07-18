@@ -283,7 +283,7 @@ fn weak_binding_reaches_defined_and_undefined_elf_symbols() {
 fn thread_local_accesses_use_manifested_generated_accessors() {
     const SOURCE: &str = "_Thread_local int external_value = 7;\n\
          int read_values(void) {\n\
-             _Thread_local int block_value = 5;\n\
+             static _Thread_local int block_value = 5;\n\
              ++external_value;\n\
              return external_value + block_value;\n\
          }";

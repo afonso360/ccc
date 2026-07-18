@@ -151,7 +151,7 @@ _Thread_local int local_exec
 _Thread_local int zero_tls;
 
 int *block_tls_address(void) {
-    _Thread_local int block_tls = 8;
+    static _Thread_local int block_tls = 8;
     return &block_tls;
 }
 

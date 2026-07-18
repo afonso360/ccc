@@ -11,7 +11,7 @@ extern int pthread_join(pthread_t thread, void **result);
 _Thread_local int external_value = 11;
 
 static int *block_value_address(void) {
-    _Thread_local int block_value = 17;
+    static _Thread_local int block_value = 17;
     return &block_value;
 }
 
