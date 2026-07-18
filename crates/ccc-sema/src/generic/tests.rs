@@ -111,6 +111,90 @@ fn zero_length_arrays_are_limited_to_gnu_language_mode() {
 }
 
 #[test]
+fn label_tokens_and_computed_goto_have_exact_typed_semantics() {
+    let source = "int dispatch(int opcode) {\n\
+         static const void *const table[2] = {&&zero, &&one};\n\
+         goto *table[opcode];\n\
+     zero: return 10;\n\
+     one: return 20;\n\
+     }";
+    let unit = analyze_source(source).unwrap();
+    assert_eq!(
+        dump_frontend_typed_ast(&unit),
+        concat!(
+            "translation-unit full-typed\n",
+            "function @0 dispatch : int (int) storage=Extern linkage=External visibility=Default inline=false noreturn=false definition\n",
+            "  parameter %0 opcode : int\n",
+            "  compound\n",
+            "    local %1 table : array[2] of const pointer to const void storage=Static duration=Static\n",
+            "      data symbol=__ccc_block_static.dispatch.0.1.table visibility=Internal section=None align=None tls=None\n",
+            "      initializer : array[2] of const pointer to const void\n",
+            "        subobject [Index(0)]\n",
+            "          initializer : const pointer to const void\n",
+            "            convert PointerConversion : pointer to const void Value\n",
+            "              constant Address(RelocatableAddress { base: Label { function: FullFunctionId(0), label: LabelId(0) }, addend: 0, one_past: false }) : pointer to void Value\n",
+            "        subobject [Index(1)]\n",
+            "          initializer : const pointer to const void\n",
+            "            convert PointerConversion : pointer to const void Value\n",
+            "              constant Address(RelocatableAddress { base: Label { function: FullFunctionId(0), label: LabelId(1) }, addend: 0, one_past: false }) : pointer to void Value\n",
+            "    computed-goto\n",
+            "      convert LvalueToValue { access: AccessSemantics { volatile: false, atomic: false } } : pointer to const void Value\n",
+            "        subscript : const pointer to const void Lvalue\n",
+            "          convert ArrayToPointer : pointer to const pointer to const void Value\n",
+            "            decl-ref Local(FullLocalId(1)) : array[2] of const pointer to const void Lvalue\n",
+            "          convert LvalueToValue { access: AccessSemantics { volatile: false, atomic: false } } : int Value\n",
+            "            decl-ref Local(FullLocalId(0)) : int Lvalue\n",
+            "    label ^0 zero\n",
+            "      return\n",
+            "        constant Signed(10) : int Value\n",
+            "    label ^1 one\n",
+            "      return\n",
+            "        constant Signed(20) : int Value\n",
+        )
+    );
+}
+
+#[test]
+fn computed_goto_rejects_nonpointers_label_arithmetic_and_missing_labels() {
+    analyze_source(
+        "int f(void) { void *token = &&done; void *copy = token; goto *copy; done: return 1; }",
+    )
+    .unwrap();
+    analyze_source(
+        "int f(void) { return &&left == &&left && &&left != &&right && !((long)&&left == 0); left: return 1; right: return 2; }",
+    )
+    .unwrap();
+    assert_eq!(
+        diagnostic_codes("int f(void) { goto *1; }"),
+        vec!["CCC2424"]
+    );
+    assert_eq!(
+        diagnostic_codes("void *target = &&missing;"),
+        vec!["CCC2427"]
+    );
+    for source in [
+        "int f(int offset) { goto *(&&base + offset); base: return 0; }",
+        "int f(void) { return (int)(&&right - &&left); left: return 1; right: return 2; }",
+        "int f(void) { return (long)&&left * 2; left: return 1; }",
+        "int f(void) { return (long)&&left << 1; left: return 1; }",
+        "int f(void) { return (long)&&left | 2; left: return 1; }",
+        "int f(void) { return -(long)&&left; left: return 1; }",
+        "int f(void) { return ~(long)&&left; left: return 1; }",
+        "int f(void) { return &&left < &&right; left: return 1; right: return 2; }",
+        "int f(int choose) { return (long)(choose ? &&left : &&right) * 2; left: return 1; right: return 2; }",
+        "int f(void) { long value = 1; value *= (long)&&left; return value; left: return 1; }",
+        "int f(void) { int values[3] = {0}; return values[(long)&&left]; left: return 1; }",
+        "int f(void) { return ((char *)&&left)[0]; left: return 1; }",
+    ] {
+        assert_eq!(diagnostic_codes(source), vec!["CCC2425"], "{source}");
+    }
+    assert_eq!(
+        diagnostic_codes("int f(void) { void *target = &&missing; return target != 0; }"),
+        vec!["CCC2363"]
+    );
+}
+
+#[test]
 fn function_visibility_attributes_survive_redeclarations() {
     let unit = analyze_source(
         "int hidden(int) __attribute__((visibility(\"hidden\")));\n\
@@ -526,6 +610,150 @@ fn types_sync_synchronize_as_a_registry_gated_sequentially_consistent_fence() {
             .collect::<Vec<_>>(),
         ["CCC2407"]
     );
+}
+
+#[test]
+fn types_expect_and_huge_val_from_the_builtin_registry() {
+    let unit = analyze_preprocessed_source(
+        "scalar-builtins.c",
+        "#if !__has_builtin(__builtin_expect)\n\
+         #error missing expect builtin\n\
+         #endif\n\
+         #if !__has_builtin(__builtin_huge_val)\n\
+         #error missing huge-value builtin\n\
+         #endif\n\
+         enum { expectation = 1, folded = __builtin_expect(7, expectation) };\n\
+         _Static_assert(__builtin_expect(1, expectation), \"folded expectation\");\n\
+         long choose(signed char value) {\n\
+             return __builtin_expect(value, (0, 1));\n\
+         }\n\
+         double infinity(void) { return __builtin_huge_val(); }",
+    )
+    .unwrap();
+
+    let choose = unit
+        .functions
+        .iter()
+        .find(|function| function.name == "choose")
+        .unwrap();
+    let FullTypedStatementKind::Compound(items) = &choose.body.as_ref().unwrap().kind else {
+        panic!("choose has a compound body")
+    };
+    let FullTypedBlockItem::Statement(statement) = &items[0] else {
+        panic!("choose has a return statement")
+    };
+    let FullTypedStatementKind::Return(Some(expression)) = &statement.kind else {
+        panic!("choose returns an expression")
+    };
+    let FullTypedExpressionKind::BuiltinExpect { value, expected } = &expression.kind else {
+        panic!("choose returns builtin expect")
+    };
+    assert_eq!(expression.ty.ty, TypeId::LONG);
+    assert_eq!(value.ty.ty, TypeId::LONG);
+    assert_eq!(expected.ty.ty, TypeId::LONG);
+    assert_eq!(expected.constant, Some(ConstantValue::Signed(1)));
+
+    let infinity = unit
+        .functions
+        .iter()
+        .find(|function| function.name == "infinity")
+        .unwrap();
+    let FullTypedStatementKind::Compound(items) = &infinity.body.as_ref().unwrap().kind else {
+        panic!("infinity has a compound body")
+    };
+    let FullTypedBlockItem::Statement(statement) = &items[0] else {
+        panic!("infinity has a return statement")
+    };
+    let FullTypedStatementKind::Return(Some(expression)) = &statement.kind else {
+        panic!("infinity returns an expression")
+    };
+    assert_eq!(expression.ty.ty, TypeId::DOUBLE);
+    assert!(matches!(
+        expression.constant,
+        Some(ConstantValue::Floating(value)) if value.is_infinite() && value.is_sign_positive()
+    ));
+
+    assert_eq!(
+        diagnostic_codes("long f(void) { return __builtin_expect(1, missing); }"),
+        vec!["CCC2274"]
+    );
+    assert_eq!(
+        diagnostic_codes(
+            "struct Pair { int value; }; long f(struct Pair pair) { return __builtin_expect(1, pair); }"
+        ),
+        vec!["CCC2336"]
+    );
+    for source in [
+        "long f(long expected) { return __builtin_expect(1, expected); }",
+        "long side_effect(void); long f(void) { return __builtin_expect(1, side_effect()); }",
+        "long side_effect(void); long f(void) { return __builtin_expect(1, (side_effect(), 1)); }",
+    ] {
+        assert_eq!(diagnostic_codes(source), vec!["CCC2428"], "{source}");
+    }
+
+    for (name, source) in [
+        (
+            "__builtin_expect",
+            "long choose(void) { return __builtin_expect(1, 1); }",
+        ),
+        (
+            "__builtin_huge_val",
+            "double infinity(void) { return __builtin_huge_val(); }",
+        ),
+    ] {
+        let mut config = EffectiveCompilationConfig::default();
+        config
+            .capabilities
+            .insert(CapabilityKind::Builtin, name, CapabilityState::ParseOnly);
+        let diagnostics = analyze_source_with_config(source, &config).unwrap_err();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code.as_str())
+                .collect::<Vec<_>>(),
+            ["CCC2407"],
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn builtin_expect_uses_folded_constant_semantics() {
+    for source in [
+        "long f(void) { return __builtin_expect(1, (0, 1)); }",
+        "long f(void) { return __builtin_expect(1, 1.0); }",
+        "long side_effect(void); long f(void) { return __builtin_expect(1, 1 ? 1 : side_effect()); }",
+        "long side_effect(void); long f(void) { return __builtin_expect(1, 0 ? side_effect() : 1); }",
+        "long side_effect(void); long f(void) { return __builtin_expect(1, 0 && side_effect()); }",
+        "long side_effect(void); long f(void) { return __builtin_expect(1, 1 || side_effect()); }",
+    ] {
+        analyze_source(source).unwrap_or_else(|diagnostics| panic!("{source}: {diagnostics:#?}"));
+    }
+
+    for source in [
+        "long f(long expected) { return __builtin_expect(1, expected); }",
+        "long side_effect(void); long f(void) { return __builtin_expect(1, side_effect()); }",
+        "long side_effect(void); long f(void) { return __builtin_expect(1, (side_effect(), 1)); }",
+        "long side_effect(void); long f(void) { return __builtin_expect(1, 1 ? side_effect() : 1); }",
+        "long side_effect(void); long f(void) { return __builtin_expect(1, 0 ? 1 : side_effect()); }",
+        "long side_effect(void); long f(void) { return __builtin_expect(1, 1 && side_effect()); }",
+        "long side_effect(void); long f(void) { return __builtin_expect(1, 0 || side_effect()); }",
+    ] {
+        let diagnostics = analyze_source(source).unwrap_err();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code.as_str())
+                .collect::<Vec<_>>(),
+            ["CCC2428"],
+            "{source}: {diagnostics:#?}"
+        );
+        assert_eq!(
+            diagnostics[0].message,
+            "the second argument to `__builtin_expect` must be a compile-time constant",
+            "{source}"
+        );
+    }
 }
 
 #[test]
@@ -1296,6 +1524,77 @@ fn ordinary_strings_initialize_all_character_array_types() {
     }
 
     assert!(diagnostic_codes("unsigned short words[] = \"xy\";").contains(&"CCC2312".to_owned()));
+}
+
+#[test]
+fn string_array_initializers_may_be_enclosed_in_braces() {
+    let unit = analyze_source(
+        "static char output[] = { \"luac\" \".out\" };\n\
+         static char extension[] = { __extension__ \"xy\" };\n\
+         int f(void) { char local[2] = { (\"xy\") }; return local[0]; }",
+    )
+    .unwrap();
+
+    let output = unit
+        .globals
+        .iter()
+        .find(|global| global.name == "output")
+        .unwrap();
+    let TypeKind::Array(output_array) = unit.types.kind(output.ty.ty) else {
+        panic!("output should have array type")
+    };
+    assert_eq!(output_array.length, ArrayLength::Constant(9));
+    assert!(matches!(
+        output
+            .initializer
+            .as_ref()
+            .map(|initializer| &initializer.kind),
+        Some(FullTypedInitializerKind::String(_))
+    ));
+
+    let extension = unit
+        .globals
+        .iter()
+        .find(|global| global.name == "extension")
+        .unwrap();
+    let TypeKind::Array(extension_array) = unit.types.kind(extension.ty.ty) else {
+        panic!("extension should have array type")
+    };
+    assert_eq!(extension_array.length, ArrayLength::Constant(3));
+    assert!(matches!(
+        extension
+            .initializer
+            .as_ref()
+            .map(|initializer| &initializer.kind),
+        Some(FullTypedInitializerKind::String(_))
+    ));
+
+    let local = first_local(
+        unit.functions
+            .iter()
+            .find(|function| function.name == "f")
+            .unwrap(),
+    );
+    let TypeKind::Array(local_array) = unit.types.kind(local.ty.ty) else {
+        panic!("local should have array type")
+    };
+    assert_eq!(local_array.length, ArrayLength::Constant(2));
+    assert!(matches!(
+        local
+            .initializer
+            .as_ref()
+            .map(|initializer| &initializer.kind),
+        Some(FullTypedInitializerKind::String(_))
+    ));
+
+    let pointer_array = analyze_source("char *strings[] = { \"x\" };").unwrap();
+    assert!(matches!(
+        pointer_array.globals[0]
+            .initializer
+            .as_ref()
+            .map(|initializer| &initializer.kind),
+        Some(FullTypedInitializerKind::Aggregate(_))
+    ));
 }
 
 #[test]

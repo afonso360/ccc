@@ -216,16 +216,19 @@ result is captured, so a pointer result does not extend the VLA's lifetime.
 `&&label` produces a function-local opaque label token stored in a pointer-typed
 value. Tokens may be copied, stored, compared for equality, placed in direct
 pointer tables, selected by ordinary indexing, and consumed by
-`goto *expression`. Lowering maps address-taken labels to per-function indices
+`goto *expression`. Lowering maps function labels to per-function indices
 and uses `br_table`; it never exposes machine code addresses.
 
-Label provenance remains visible through semantic analysis. Arithmetic on a
-label token is unsupported and receives a dedicated diagnostic, including the
-position-independent difference-table idiom `&&target - &&base` and
-reconstruction such as `&&base + offsets[i]`. No label-difference relocation is
-emitted. A Lua-style table that stores the direct `&&label` tokens remains in
-the supported subset. Cross-function use is undefined and diagnosed when
-detectable.
+Direct label-token expressions retain semantic provenance. Arithmetic is
+unsupported and receives a dedicated diagnostic while that provenance remains
+detectable, including the position-independent difference-table idiom
+`&&target - &&base` and reconstruction such as `&&base + offsets[i]`. Loading a
+token from object storage erases that diagnostic provenance: unmodified copies
+remain valid dispatch tokens, but arithmetic after storage is outside the
+supported behavior and is not guaranteed a diagnostic. No label-difference
+relocation is emitted. A Lua-style table that stores direct `&&label` tokens
+remains in the supported subset. Cross-function use is undefined and diagnosed
+when detectable.
 
 ### Wide integer extension
 

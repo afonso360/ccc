@@ -340,6 +340,45 @@ fn function_clif<'a>(clif: &'a str, name: &str) -> &'a str {
     &body[..end]
 }
 
+#[test]
+fn computed_goto_uses_a_dense_br_table_and_nonrelocatable_label_tokens() {
+    let output = emit_source(
+        "int dispatch(int which) {\n\
+             static void *table[2] = {&&left, &&right};\n\
+             goto *table[which];\n\
+         left: return 11;\n\
+         right: return 22;\n\
+         }\n\
+         int invalid(void) { goto *(void *)0; unused: return 0; }",
+    );
+    let dispatch = function_clif(&output.clif, "dispatch");
+    assert_eq!(dispatch.matches("br_table").count(), 1, "{dispatch}");
+    assert!(dispatch.contains("[block0, block1]"), "{dispatch}");
+    assert!(dispatch.contains("trap user1"), "{dispatch}");
+
+    let invalid = function_clif(&output.clif, "invalid");
+    assert!(invalid.contains("iconst.i32 0"), "{invalid}");
+    assert!(
+        invalid.contains("iadd_imm") && invalid.contains("-1"),
+        "{invalid}"
+    );
+    assert!(invalid.contains("icmp_imm ugt"), "{invalid}");
+    assert!(invalid.contains("br_table"), "{invalid}");
+    assert!(invalid.contains("trap user1"), "{invalid}");
+
+    let table_name = "__ccc_block_static.dispatch.0.1.table";
+    assert_eq!(
+        symbol_bytes(&output.object, table_name),
+        [1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0]
+    );
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    let table = object.symbol_by_name(table_name).unwrap();
+    let section = object
+        .section_by_index(table.section_index().unwrap())
+        .unwrap();
+    assert_eq!(section.relocations().count(), 0);
+}
+
 fn sha256(text: &str) -> String {
     Sha256::digest(text.as_bytes())
         .iter()

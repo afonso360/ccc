@@ -121,6 +121,30 @@ fn execution_programs_produce_the_expected_exit_status() {
     }
 }
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn an_invalid_computed_goto_target_traps() {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let directory = test_directory("computed-goto-null");
+    let executable = directory.join("program");
+    let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+        .arg(fixture("computed_goto_null.c"))
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .unwrap();
+    assert!(
+        compilation.status.success(),
+        "ccc failed: {}",
+        String::from_utf8_lossy(&compilation.stderr)
+    );
+    let execution = Command::new(&executable).output().unwrap();
+    assert_eq!(execution.status.code(), None);
+    assert_eq!(execution.status.signal(), Some(4));
+    fs::remove_dir_all(directory).unwrap();
+}
+
 #[cfg_attr(
     not(all(target_arch = "x86_64", target_os = "linux")),
     allow(dead_code)
@@ -161,7 +185,7 @@ fn execution_cases() -> &'static [ExecutionExpectation] {
     &EXECUTION_CASES
 }
 
-static EXECUTION_CASES: [ExecutionExpectation; 41] = [
+static EXECUTION_CASES: [ExecutionExpectation; 43] = [
     exit_status("return_constant.c", 42),
     exit_status("arithmetic_precedence.c", 14),
     exit_status("unary_arithmetic.c", 3),
@@ -196,6 +220,8 @@ static EXECUTION_CASES: [ExecutionExpectation; 41] = [
     exit_status("floating_point.c", 51),
     exit_status("operators_and_conversions.c", 52),
     exit_status("integer_to_pointer.c", 55),
+    exit_status("scalar_builtins.c", 56),
+    exit_status("computed_goto.c", 57),
     exit_status("combined_language_features.c", 53),
     exit_status("semantic_regressions.c", 54),
     exit_status("aggregate_calls.c", 63),

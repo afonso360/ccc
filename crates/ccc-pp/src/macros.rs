@@ -115,6 +115,7 @@ pub(crate) struct ExpansionLocation<'a> {
 pub(crate) struct ExpansionResult {
     pub tokens: Vec<PpToken>,
     pub diagnostics: Vec<PpDiagnostic>,
+    pub trailing_function_macro_can_continue: bool,
 }
 
 pub(crate) fn expand(
@@ -134,9 +135,15 @@ pub(crate) fn expand(
     };
     let expanded = expander.expand_sequence(tokens);
     ExpansionResult {
-        tokens: expanded,
+        tokens: expanded.tokens,
         diagnostics: expander.diagnostics,
+        trailing_function_macro_can_continue: expanded.trailing_function_macro_can_continue,
     }
+}
+
+struct SequenceExpansion {
+    tokens: Vec<PpToken>,
+    trailing_function_macro_can_continue: bool,
 }
 
 struct Expander<'a, 'location> {
@@ -149,13 +156,14 @@ struct Expander<'a, 'location> {
 }
 
 impl Expander<'_, '_> {
-    fn expand_sequence(&mut self, tokens: &[PpToken]) -> Vec<PpToken> {
+    fn expand_sequence(&mut self, tokens: &[PpToken]) -> SequenceExpansion {
         // Replacement tokens are spliced into the unconsumed input instead of
         // expanded in isolation.  Besides matching phase-4 rescanning, this is
         // what lets an object-like replacement become a function-like macro
         // invocation with a following `(` from the caller's token stream.
         let mut stream = tokens.to_vec();
         let mut output = Vec::new();
+        let mut trailing_function_macro_can_continue = false;
         let mut index = 0;
         while index < stream.len() {
             if self.emitted_tokens >= self.options.limits.output_tokens {
@@ -169,6 +177,7 @@ impl Expander<'_, '_> {
             let token = stream[index].clone();
             if token.kind != PpTokenKind::Identifier {
                 output.push(token);
+                trailing_function_macro_can_continue = false;
                 self.emitted_tokens += 1;
                 index += 1;
                 continue;
@@ -177,6 +186,7 @@ impl Expander<'_, '_> {
             let name = token.identifier_key();
             if token.hide_set.contains(&name) {
                 output.push(token);
+                trailing_function_macro_can_continue = false;
                 self.emitted_tokens += 1;
                 index += 1;
                 continue;
@@ -184,18 +194,21 @@ impl Expander<'_, '_> {
             if token.expansion_depth > self.options.limits.expansion_depth {
                 self.error(&token, "CCC1101", "macro expansion depth limit exceeded");
                 output.push(token);
+                trailing_function_macro_can_continue = false;
                 self.emitted_tokens += 1;
                 index += 1;
                 continue;
             }
             if let Some(dynamic) = self.expand_dynamic(&token, &name) {
                 output.push(dynamic);
+                trailing_function_macro_can_continue = false;
                 self.emitted_tokens += 1;
                 index += 1;
                 continue;
             }
             let Some(definition) = self.table.get(&name).cloned() else {
                 output.push(token);
+                trailing_function_macro_can_continue = false;
                 self.emitted_tokens += 1;
                 index += 1;
                 continue;
@@ -229,6 +242,7 @@ impl Expander<'_, '_> {
                 } => {
                     if stream.get(index + 1).map(|next| next.spelling.as_str()) != Some("(") {
                         output.push(token);
+                        trailing_function_macro_can_continue = index + 1 == stream.len();
                         self.emitted_tokens += 1;
                         index += 1;
                         continue;
@@ -237,6 +251,7 @@ impl Expander<'_, '_> {
                         self.parse_arguments(&stream, index + 1, parameters.len(), *variadic)
                     else {
                         output.push(token);
+                        trailing_function_macro_can_continue = false;
                         self.emitted_tokens += 1;
                         index += 1;
                         continue;
@@ -266,7 +281,10 @@ impl Expander<'_, '_> {
                 }
             }
         }
-        output
+        SequenceExpansion {
+            tokens: output,
+            trailing_function_macro_can_continue,
+        }
     }
 
     fn expand_dynamic(&mut self, token: &PpToken, name: &str) -> Option<PpToken> {
@@ -447,9 +465,12 @@ impl Expander<'_, '_> {
                     arguments.get(parameter_index).cloned().unwrap_or_default()
                 } else {
                     if expanded_arguments[parameter_index].is_none() {
-                        expanded_arguments[parameter_index] = Some(self.expand_sequence(
-                            arguments.get(parameter_index).map_or(&[], Vec::as_slice),
-                        ));
+                        expanded_arguments[parameter_index] = Some(
+                            self.expand_sequence(
+                                arguments.get(parameter_index).map_or(&[], Vec::as_slice),
+                            )
+                            .tokens,
+                        );
                     }
                     expanded_arguments[parameter_index]
                         .clone()
@@ -477,7 +498,7 @@ impl Expander<'_, '_> {
                         for argument_index in fixed_count..arguments.len() {
                             if expanded_arguments[argument_index].is_none() {
                                 expanded_arguments[argument_index] =
-                                    Some(self.expand_sequence(&arguments[argument_index]));
+                                    Some(self.expand_sequence(&arguments[argument_index]).tokens);
                             }
                             expanded.push(
                                 expanded_arguments[argument_index]

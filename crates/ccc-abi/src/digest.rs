@@ -729,6 +729,14 @@ fn encode_terminator(encoder: &mut Encoder, terminator: &gir::FullTerminator) {
             encoder.option_u64(value.map(|value| u64::from(value.0)));
         }
         gir::FullTerminator::Unreachable => encoder.tag(4),
+        gir::FullTerminator::IndirectBranch { selector, targets } => {
+            encoder.tag(5);
+            encoder.u32(selector.0);
+            encoder.len(targets.len());
+            for target in targets {
+                encode_edge(encoder, target);
+            }
+        }
     }
 }
 

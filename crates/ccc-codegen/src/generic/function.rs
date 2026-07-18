@@ -1881,6 +1881,46 @@ impl FunctionState<'_> {
                 }
                 self.jump(builder, default)
             }
+            gir::FullTerminator::IndirectBranch { selector, targets } => {
+                let selector = self.value(*selector)?;
+                let selector_ty = builder.func.dfg.value_type(selector);
+                if !selector_ty.is_int() {
+                    return Err(error(
+                        "computed goto selector is not represented as an integer",
+                    ));
+                }
+                let index = builder.ins().iadd_imm(selector, -1);
+                let trap = builder.create_block();
+                if selector_ty.bits() > 32 {
+                    let dispatch = builder.create_block();
+                    let out_of_range = builder.ins().icmp_imm(
+                        IntCC::UnsignedGreaterThan,
+                        index,
+                        i64::from(u32::MAX),
+                    );
+                    builder.ins().brif(out_of_range, trap, &[], dispatch, &[]);
+                    builder.seal_block(dispatch);
+                    builder.switch_to_block(dispatch);
+                }
+                let index = match selector_ty.bits() {
+                    bits if bits > 32 => builder.ins().ireduce(ir::types::I32, index),
+                    bits if bits < 32 => builder.ins().uextend(ir::types::I32, index),
+                    _ => index,
+                };
+                let default_call = builder.func.dfg.block_call(trap, &[]);
+                let mut target_calls = Vec::with_capacity(targets.len());
+                for target in targets {
+                    let block = self.block(target.target.0)?;
+                    target_calls.push(builder.func.dfg.block_call(block, &[]));
+                }
+                let table =
+                    builder.create_jump_table(ir::JumpTableData::new(default_call, &target_calls));
+                builder.ins().br_table(index, table);
+                builder.seal_block(trap);
+                builder.switch_to_block(trap);
+                builder.ins().trap(TrapCode::unwrap_user(1));
+                Ok(())
+            }
             gir::FullTerminator::Return(value) => self.lower_return(builder, *value),
             gir::FullTerminator::Unreachable => {
                 builder.ins().trap(TrapCode::unwrap_user(1));

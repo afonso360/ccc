@@ -1115,6 +1115,19 @@ impl Parser<'_> {
             return self.for_statement(keyword.span);
         }
         if let Some(keyword) = self.consume_keyword(Keyword::Goto) {
+            if self.language_mode == LanguageMode::Gnu11
+                && self.consume_punctuator(Punctuator::Star).is_some()
+            {
+                let expression = self.expression()?;
+                let semicolon = self.expect_punctuator(
+                    Punctuator::Semicolon,
+                    "expected `;` after computed goto expression",
+                )?;
+                return Ok(Statement {
+                    span: span_through(keyword.span, semicolon.span),
+                    kind: StatementKind::ComputedGoto(Box::new(expression)),
+                });
+            }
             let label = self.identifier()?;
             let semicolon =
                 self.expect_punctuator(Punctuator::Semicolon, "expected `;` after goto label")?;
@@ -1322,6 +1335,15 @@ impl Parser<'_> {
     }
 
     fn unary_expression(&mut self) -> Result<Expression, ParseError> {
+        if self.language_mode == LanguageMode::Gnu11
+            && let Some(operator) = self.consume_punctuator(Punctuator::AmpAmp)
+        {
+            let label = self.identifier()?;
+            return Ok(Expression {
+                span: span_through(operator.span, label.span),
+                kind: ExpressionKind::LabelAddress(label),
+            });
+        }
         if let Some(extension) = self.consume_keyword(Keyword::Extension) {
             let expression = self.nested(Self::cast_expression)?;
             return Ok(Expression {
@@ -1471,6 +1493,12 @@ impl Parser<'_> {
         }
         if token.spelling == "__builtin_va_end" {
             return self.builtin_va_end();
+        }
+        if token.spelling == "__builtin_expect" {
+            return self.builtin_expect();
+        }
+        if token.spelling == "__builtin_huge_val" {
+            return self.builtin_huge_val();
         }
         if token.spelling == "__sync_synchronize" {
             return self.builtin_sync_synchronize();
@@ -1708,6 +1736,52 @@ impl Parser<'_> {
             kind: ExpressionKind::BuiltinVaEnd {
                 list: Box::new(list),
             },
+            span: span_through(builtin.span, right.span),
+        })
+    }
+
+    fn builtin_expect(&mut self) -> Result<Expression, ParseError> {
+        let builtin = self
+            .current_token()
+            .expect("caller checked builtin")
+            .clone();
+        self.position += 1;
+        self.expect_punctuator(
+            Punctuator::LeftParen,
+            "expected `(` after `__builtin_expect`",
+        )?;
+        let value = self.assignment_expression()?;
+        self.expect_punctuator(Punctuator::Comma, "expected `,` after predicted value")?;
+        let expected = self.assignment_expression()?;
+        let right = self.expect_punctuator(
+            Punctuator::RightParen,
+            "expected `)` after `__builtin_expect` arguments",
+        )?;
+        Ok(Expression {
+            kind: ExpressionKind::BuiltinExpect {
+                value: Box::new(value),
+                expected: Box::new(expected),
+            },
+            span: span_through(builtin.span, right.span),
+        })
+    }
+
+    fn builtin_huge_val(&mut self) -> Result<Expression, ParseError> {
+        let builtin = self
+            .current_token()
+            .expect("caller checked builtin")
+            .clone();
+        self.position += 1;
+        self.expect_punctuator(
+            Punctuator::LeftParen,
+            "expected `(` after `__builtin_huge_val`",
+        )?;
+        let right = self.expect_punctuator(
+            Punctuator::RightParen,
+            "`__builtin_huge_val` requires exactly zero arguments",
+        )?;
+        Ok(Expression {
+            kind: ExpressionKind::BuiltinHugeVal,
             span: span_through(builtin.span, right.span),
         })
     }

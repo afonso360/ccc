@@ -1461,6 +1461,41 @@ impl FunctionVerifier<'_> {
                 }
                 self.edge(block, default)?;
             }
+            FullTerminator::IndirectBranch { selector, targets } => {
+                if pointer_pointee(&self.module.types, self.value_type(*selector)?.ty).is_none() {
+                    return Err(IrError::verify(
+                        "computed goto selector does not have pointer type",
+                    ));
+                }
+                if targets.is_empty() {
+                    return Err(IrError::verify("computed goto has no target blocks"));
+                }
+                let mut blocks = HashSet::new();
+                for target in targets {
+                    if !blocks.insert(target.target) {
+                        return Err(IrError::verify(
+                            "computed goto contains duplicate target blocks",
+                        ));
+                    }
+                    if !target.arguments.is_empty() {
+                        return Err(IrError::verify(
+                            "computed goto target edge must not carry arguments",
+                        ));
+                    }
+                    if self
+                        .function
+                        .blocks
+                        .get(target.target.0 as usize)
+                        .filter(|destination| destination.id == target.target)
+                        .is_some_and(|destination| !destination.parameters.is_empty())
+                    {
+                        return Err(IrError::verify(
+                            "computed goto target block must not have parameters",
+                        ));
+                    }
+                    self.edge(block, target)?;
+                }
+            }
             FullTerminator::Return(value) => match value {
                 Some(value) => {
                     if self.value_type(*value)?.ty != self.function.result_type.ty {
@@ -1725,6 +1760,13 @@ fn terminator_operands(terminator: &FullTerminator) -> Vec<ValueId> {
             )
             .chain(default.arguments.iter().copied())
             .collect(),
+        FullTerminator::IndirectBranch { selector, targets } => std::iter::once(*selector)
+            .chain(
+                targets
+                    .iter()
+                    .flat_map(|target| target.arguments.iter().copied()),
+            )
+            .collect(),
         FullTerminator::Return(value) => value.iter().copied().collect(),
         FullTerminator::Unreachable => Vec::new(),
     }
@@ -1746,6 +1788,7 @@ fn terminator_edges(terminator: &FullTerminator) -> impl Iterator<Item = &FullEd
             edges.extend(cases.iter().map(|case| &case.edge));
             edges.push(default);
         }
+        FullTerminator::IndirectBranch { targets, .. } => edges.extend(targets),
         FullTerminator::Return(_) | FullTerminator::Unreachable => {}
     }
     edges.into_iter()

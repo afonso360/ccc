@@ -203,6 +203,56 @@ mod tests {
     }
 
     #[test]
+    fn parses_computed_goto_and_label_addresses_exactly_in_gnu_mode() {
+        let source = "int dispatch(int opcode) {\n\
+             static const void *const table[2] = {&&zero, &&one};\n\
+             goto *table[opcode];\n\
+         zero: return 10;\n\
+         one: return 20;\n\
+         }";
+        let unit = parse_source_with_mode(source, LanguageMode::Gnu11).unwrap();
+        assert_eq!(
+            dump_ast(&unit),
+            concat!(
+                "translation-unit\n",
+                "  function-definition dispatch\n",
+                "    type Int\n",
+                "    declarator dispatch(1)\n",
+                "    compound\n",
+                "      declaration\n",
+                "        storage Static\n",
+                "        qualifier Const\n",
+                "        type Void\n",
+                "        declarator *table[]\n",
+                "          initializer-list\n",
+                "            initializer-entry\n",
+                "              label-address zero\n",
+                "            initializer-entry\n",
+                "              label-address one\n",
+                "      computed-goto\n",
+                "        subscript\n",
+                "          name table\n",
+                "          name opcode\n",
+                "      label\n",
+                "        return\n",
+                "          integer 10\n",
+                "      label\n",
+                "        return\n",
+                "          integer 20\n",
+            )
+        );
+
+        assert!(parse_source_with_mode(source, LanguageMode::C11).is_err());
+        assert!(
+            parse_source_with_mode(
+                "int f(void) { return &&done != 0; done: return 0; }",
+                LanguageMode::C11
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn parses_standard_digraph_punctuators() {
         let unit = parse_source(
             "int values<:2:> = <% 3, 4 %>;\n\
@@ -348,6 +398,28 @@ mod tests {
                 error.message.contains("__sync_synchronize"),
                 "{source}: {error}"
             );
+        }
+    }
+
+    #[test]
+    fn parses_expect_and_huge_val_with_their_exact_builtin_arity() {
+        let unit = parse_source(
+            "long choose(int value, int expected) {\n\
+                 return __builtin_expect(value, expected);\n\
+             }\n\
+             double infinity(void) { return __builtin_huge_val(); }",
+        )
+        .unwrap();
+        let dump = dump_ast(&unit);
+        assert!(dump.contains("builtin-expect"), "{dump}");
+        assert!(dump.contains("builtin-huge-val"), "{dump}");
+
+        for source in [
+            "long choose(void) { return __builtin_expect(1); }",
+            "long choose(void) { return __builtin_expect(1, 0, 2); }",
+            "double infinity(void) { return __builtin_huge_val(1); }",
+        ] {
+            assert!(parse_source(source).is_err(), "{source}");
         }
     }
 

@@ -68,7 +68,7 @@ pub fn lower_frontend(unit: &FullTypedTranslationUnit) -> Result<FullModule, IrE
                 .initializer
                 .as_ref()
                 .map(|initializer| {
-                    lower_initializer_graph(initializer, &file_data, &static_data, unit)
+                    lower_initializer_graph(initializer, &file_data, &static_data, unit, None)
                 })
                 .transpose()?,
             tentative: global.tentative,
@@ -102,7 +102,13 @@ pub fn lower_frontend(unit: &FullTypedTranslationUnit) -> Result<FullModule, IrE
                 .initializer
                 .as_ref()
                 .map(|initializer| {
-                    lower_initializer_graph(initializer, &file_data, &static_data, unit)
+                    lower_initializer_graph(
+                        initializer,
+                        &file_data,
+                        &static_data,
+                        unit,
+                        Some(function),
+                    )
                 })
                 .transpose()?,
             tentative: false,
@@ -218,7 +224,12 @@ fn collect_static_declarations_in_statement<'a>(
         S::Switch { statement, .. } | S::While { statement, .. } | S::DoWhile { statement, .. } => {
             collect_static_declarations_in_statement(function, statement, declarations);
         }
-        S::Expression(_) | S::Goto { .. } | S::Continue | S::Break | S::Return(_) => {}
+        S::Expression(_)
+        | S::Goto { .. }
+        | S::ComputedGoto(_)
+        | S::Continue
+        | S::Break
+        | S::Return(_) => {}
     }
 }
 
@@ -227,6 +238,7 @@ struct InitializerBuilder<'a> {
     file_data: &'a BTreeMap<GlobalId, DataId>,
     static_data: &'a BTreeMap<(FullFunctionId, FullLocalId), (DataId, StorageDuration)>,
     unit: &'a FullTypedTranslationUnit,
+    function: Option<FullFunctionId>,
 }
 
 fn lower_initializer_graph(
@@ -234,12 +246,14 @@ fn lower_initializer_graph(
     file_data: &BTreeMap<GlobalId, DataId>,
     static_data: &BTreeMap<(FullFunctionId, FullLocalId), (DataId, StorageDuration)>,
     unit: &FullTypedTranslationUnit,
+    function: Option<FullFunctionId>,
 ) -> Result<InitializerGraph, IrError> {
     let mut builder = InitializerBuilder {
         nodes: Vec::new(),
         file_data,
         static_data,
         unit,
+        function,
     };
     let root = builder.initializer(initializer)?;
     Ok(InitializerGraph {
@@ -278,6 +292,7 @@ impl InitializerBuilder<'_> {
                     self.file_data,
                     self.static_data,
                     self.unit,
+                    self.function,
                     expression.span,
                 )?
             }
@@ -372,6 +387,7 @@ fn constant_initializer(
     file_data: &BTreeMap<GlobalId, DataId>,
     static_data: &BTreeMap<(FullFunctionId, FullLocalId), (DataId, StorageDuration)>,
     unit: &FullTypedTranslationUnit,
+    initializer_function: Option<FullFunctionId>,
     span: Span,
 ) -> Result<InitializerNodeKind, IrError> {
     Ok(match constant {
@@ -434,6 +450,22 @@ fn constant_initializer(
                     RelocationTarget::String(string),
                     RelocationKind::StringAddress,
                 ),
+                ccc_sema::generic::RelocatableBase::Label { function, label } => {
+                    if initializer_function != Some(function)
+                        || address.addend != 0
+                        || address.one_past
+                        || label.0 == u32::MAX
+                    {
+                        return Err(IrError::lower(
+                            LOWERING_ERROR,
+                            span,
+                            "invalid cross-function or adjusted label address in static initializer",
+                        ));
+                    }
+                    return Ok(InitializerNodeKind::Scalar(ScalarConstant::Unsigned(
+                        u128::from(label.0) + 1,
+                    )));
+                }
             };
             InitializerNodeKind::Relocation {
                 target,
@@ -491,8 +523,45 @@ fn local_facts(
     if let Some(body) = &function.body {
         collect_automatic_local_facts(body, types, &mut facts);
         scan_statement_for_address_taken(body, &mut facts);
+        if contains_computed_goto(body) {
+            for fact in facts.values_mut() {
+                fact.reasons
+                    .insert(MemoryResidencyReason::IndirectControlFlow);
+            }
+        }
     }
     facts
+}
+
+fn contains_computed_goto(statement: &FullTypedStatement) -> bool {
+    use FullTypedStatementKind as S;
+    match &statement.kind {
+        S::ComputedGoto(_) => true,
+        S::Label { statement, .. }
+        | S::Case { statement, .. }
+        | S::Default(statement)
+        | S::Switch { statement, .. }
+        | S::While { statement, .. }
+        | S::DoWhile { statement, .. }
+        | S::For { statement, .. } => contains_computed_goto(statement),
+        S::Compound(items) => items.iter().any(|item| {
+            matches!(
+                item,
+                FullTypedBlockItem::Statement(statement) if contains_computed_goto(statement)
+            )
+        }),
+        S::If {
+            then_statement,
+            else_statement,
+            ..
+        } => {
+            contains_computed_goto(then_statement)
+                || else_statement
+                    .as_deref()
+                    .is_some_and(contains_computed_goto)
+        }
+        S::Expression(_) | S::Goto { .. } | S::Continue | S::Break | S::Return(_) => false,
+    }
 }
 
 fn make_local_fact(
@@ -601,7 +670,12 @@ fn collect_automatic_local_facts(
         S::Switch { statement, .. } | S::While { statement, .. } | S::DoWhile { statement, .. } => {
             collect_automatic_local_facts(statement, types, facts);
         }
-        S::Expression(_) | S::Goto { .. } | S::Continue | S::Break | S::Return(_) => {}
+        S::Expression(_)
+        | S::Goto { .. }
+        | S::ComputedGoto(_)
+        | S::Continue
+        | S::Break
+        | S::Return(_) => {}
     }
 }
 
@@ -728,6 +802,7 @@ fn scan_statement_for_address_taken(
                 scan_expression_for_address_taken(expression, facts);
             }
         }
+        S::ComputedGoto(expression) => scan_expression_for_address_taken(expression, facts),
         S::Goto { .. } | S::Continue | S::Break => {}
     }
 }
@@ -804,6 +879,9 @@ fn scan_expression_for_address_taken(
             for expression in expressions {
                 scan_expression_for_address_taken(expression, facts);
             }
+        }
+        E::BuiltinExpect { value, expected: _ } => {
+            scan_expression_for_address_taken(value, facts);
         }
         E::VaStart { list, .. } | E::VaArg { list, .. } | E::VaEnd { list } => {
             scan_expression_for_address_taken(list, facts);
@@ -1645,6 +1723,12 @@ fn remap_terminator_values(
             }
             remap_edge_values(default, aliases, remap)?;
         }
+        FullTerminator::IndirectBranch { selector, targets } => {
+            remap_value(selector, aliases, remap)?;
+            for target in targets {
+                remap_edge_values(target, aliases, remap)?;
+            }
+        }
         FullTerminator::Return(value) => {
             if let Some(value) = value {
                 remap_value(value, aliases, remap)?;
@@ -1668,6 +1752,7 @@ fn terminator_edges_mut(terminator: &mut FullTerminator) -> Vec<&mut FullEdge> {
             .map(|case| &mut case.edge)
             .chain(std::iter::once(default))
             .collect(),
+        FullTerminator::IndirectBranch { targets, .. } => targets.iter_mut().collect(),
         FullTerminator::Return(_) | FullTerminator::Unreachable => Vec::new(),
     }
 }
@@ -1786,6 +1871,28 @@ impl FunctionBuilder<'_> {
                         )
                     })?;
                     self.branch(target)?;
+                }
+            }
+            S::ComputedGoto(expression) => {
+                if self.current.is_some() {
+                    if self.label_blocks.is_empty() {
+                        return Err(IrError::lower(
+                            LOWERING_ERROR,
+                            statement.span,
+                            "a computed goto requires at least one label in its function",
+                        ));
+                    }
+                    let selector = self.expect_value(expression)?;
+                    let targets = self
+                        .label_blocks
+                        .values()
+                        .copied()
+                        .map(|target| FullEdge {
+                            target,
+                            arguments: Vec::new(),
+                        })
+                        .collect();
+                    self.terminate(FullTerminator::IndirectBranch { selector, targets })?;
                 }
             }
             S::Continue => {
@@ -1990,7 +2097,12 @@ impl FunctionBuilder<'_> {
                         .record(record)
                         .and_then(|record| record.fields.as_ref())
                         .and_then(|fields| fields.get(*index))
-                        .map(|field| field.ty)
+                        .map(|field| {
+                            QualifiedType::new(
+                                field.ty.ty,
+                                field.ty.qualifiers | record_ty.qualifiers,
+                            )
+                        })
                         .ok_or_else(|| {
                             IrError::lower(
                                 LOWERING_ERROR,
@@ -2403,6 +2515,7 @@ impl FunctionBuilder<'_> {
                 }
                 Ok(result)
             }
+            E::BuiltinExpect { value, expected: _ } => self.expression(value),
             E::Sizeof { size, .. } => self
                 .emit_result(
                     FullInstructionKind::Constant(ScalarConstant::Unsigned(*size as u128)),
@@ -2561,6 +2674,26 @@ impl FunctionBuilder<'_> {
                     }
                     ccc_sema::generic::RelocatableBase::String(string) => {
                         RelocationTarget::String(string)
+                    }
+                    ccc_sema::generic::RelocatableBase::Label { function, label } => {
+                        if function != self.function.id
+                            || address.addend != 0
+                            || address.one_past
+                            || label.0 == u32::MAX
+                        {
+                            return Err(IrError::lower(
+                                LOWERING_ERROR,
+                                span,
+                                "invalid cross-function or adjusted label address",
+                            ));
+                        }
+                        return self.emit_result(
+                            FullInstructionKind::Constant(ScalarConstant::Unsigned(
+                                u128::from(label.0) + 1,
+                            )),
+                            ty,
+                            span,
+                        );
                     }
                 };
                 self.emit_result(
@@ -3570,6 +3703,7 @@ fn collect_switch_labels(
         S::Switch { .. }
         | S::Expression(_)
         | S::Goto { .. }
+        | S::ComputedGoto(_)
         | S::Continue
         | S::Break
         | S::Return(_) => {}
@@ -3614,7 +3748,12 @@ fn collect_labels(statement: &FullTypedStatement, labels: &mut Vec<LabelId>) {
         | S::While { statement, .. }
         | S::DoWhile { statement, .. }
         | S::For { statement, .. } => collect_labels(statement, labels),
-        S::Expression(_) | S::Goto { .. } | S::Continue | S::Break | S::Return(_) => {}
+        S::Expression(_)
+        | S::Goto { .. }
+        | S::ComputedGoto(_)
+        | S::Continue
+        | S::Break
+        | S::Return(_) => {}
     }
 }
 

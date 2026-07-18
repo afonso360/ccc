@@ -2178,6 +2178,30 @@ impl<'a> Analyzer<'a> {
                         name: label.name.clone(),
                     }
                 }
+                S::ComputedGoto(expression) => {
+                    let expression = self.analyze_expression(expression)?;
+                    let expression = self.value_conversion(expression)?;
+                    if self.pointer_pointee(expression.ty.ty).is_none() {
+                        return self.fail(
+                            "CCC2424",
+                            expression.span,
+                            "a computed goto target must have pointer type",
+                        );
+                    }
+                    if let Some(ConstantValue::Address(RelocatableAddress {
+                        base: RelocatableBase::Label { function, .. },
+                        ..
+                    })) = expression.constant
+                        && Some(function) != self.function.as_ref().map(|state| state.id)
+                    {
+                        return self.fail(
+                            "CCC2426",
+                            expression.span,
+                            "a computed goto cannot use a label from another function",
+                        );
+                    }
+                    FullTypedStatementKind::ComputedGoto(expression)
+                }
                 S::Continue => {
                     if self
                         .function
@@ -2328,6 +2352,7 @@ impl<'a> Analyzer<'a> {
         use syntax::ExpressionKind as E;
         match &expression.kind {
             E::Identifier(identifier) => self.analyze_identifier(identifier),
+            E::LabelAddress(label) => self.analyze_label_address(label, expression.span),
             E::Integer(integer) => self.analyze_integer_literal(*integer, expression.span),
             E::Floating(floating) => {
                 let ty = match floating.suffix {
@@ -2489,8 +2514,58 @@ impl<'a> Analyzer<'a> {
                 source,
             } => self.analyze_va_copy(destination, source, expression.span),
             E::BuiltinVaEnd { list } => self.analyze_va_end(list, expression.span),
+            E::BuiltinExpect { value, expected } => {
+                self.analyze_builtin_expect(value, expected, expression.span)
+            }
+            E::BuiltinHugeVal => self.analyze_builtin_huge_val(expression.span),
             E::BuiltinSyncSynchronize => self.analyze_sync_synchronize(expression.span),
         }
+    }
+
+    fn analyze_builtin_expect(
+        &mut self,
+        value: &syntax::Expression,
+        expected: &syntax::Expression,
+        span: Span,
+    ) -> AnalysisResult<FullTypedExpression> {
+        self.require_builtin("__builtin_expect", span)?;
+        let long = QualifiedType::unqualified(TypeId::LONG);
+        let typed_value = self.analyze_expression(value)?;
+        let value = self.assignment_conversion(typed_value, long, value.span)?;
+        let typed_expected = self.analyze_expression(expected)?;
+        let expected = self.assignment_conversion(typed_expected, long, expected.span)?;
+        if expected.constant.and_then(ConstantValue::as_i128).is_none()
+            || !builtin_expect_folded_constant(&expected)
+        {
+            return self.fail(
+                "CCC2428",
+                expected.span,
+                "the second argument to `__builtin_expect` must be a compile-time constant",
+            );
+        }
+        let constant = value.constant;
+        let constant_expression_kind = value.constant_expression_kind;
+        Ok(FullTypedExpression {
+            kind: FullTypedExpressionKind::BuiltinExpect {
+                value: Box::new(value),
+                expected: Box::new(expected),
+            },
+            ty: long,
+            category: ValueCategory::Value,
+            place: None,
+            constant,
+            constant_expression_kind,
+            span,
+        })
+    }
+
+    fn analyze_builtin_huge_val(&mut self, span: Span) -> AnalysisResult<FullTypedExpression> {
+        self.require_builtin("__builtin_huge_val", span)?;
+        Ok(self.constant_expression(
+            ConstantValue::Floating(f64::INFINITY),
+            QualifiedType::unqualified(TypeId::DOUBLE),
+            span,
+        ))
     }
 
     fn analyze_sync_synchronize(&mut self, span: Span) -> AnalysisResult<FullTypedExpression> {
@@ -2875,6 +2950,37 @@ impl<'a> Analyzer<'a> {
         })
     }
 
+    fn analyze_label_address(
+        &mut self,
+        label: &syntax::Identifier,
+        span: Span,
+    ) -> AnalysisResult<FullTypedExpression> {
+        let (function, label_id) = {
+            let Some(function) = self.function.as_mut() else {
+                return self.fail(
+                    "CCC2427",
+                    span,
+                    "a label address is only valid inside a function",
+                );
+            };
+            let label_id = function.labels.note_use(&label.name, label.span);
+            (function.id, label_id)
+        };
+        let pointer = self.types.pointer(QualifiedType::unqualified(TypeId::VOID));
+        Ok(self.constant_expression(
+            ConstantValue::Address(RelocatableAddress {
+                base: RelocatableBase::Label {
+                    function,
+                    label: label_id,
+                },
+                addend: 0,
+                one_past: false,
+            }),
+            QualifiedType::unqualified(pointer),
+            span,
+        ))
+    }
+
     fn analyze_integer_literal(
         &mut self,
         integer: ccc_pp::IntegerConstant,
@@ -3092,6 +3198,13 @@ impl<'a> Analyzer<'a> {
             U::Plus | U::Minus | U::BitwiseNot => {
                 let operand = self.analyze_expression(operand)?;
                 let operand = self.value_conversion(operand)?;
+                if has_direct_label_address_provenance(&operand) {
+                    return self.fail(
+                        "CCC2425",
+                        span,
+                        "arithmetic on a label address is not supported",
+                    );
+                }
                 let operand =
                     self.integer_or_arithmetic_promotion(operand, operator != U::BitwiseNot, span)?;
                 self.reject_long_double_operation(&[operand.ty], span)?;
@@ -3143,6 +3256,18 @@ impl<'a> Analyzer<'a> {
         let left = self.value_conversion(left)?;
         let right = self.analyze_expression(right)?;
         let right = self.value_conversion(right)?;
+        if !matches!(
+            operator,
+            B::Equal | B::NotEqual | B::LogicalAnd | B::LogicalOr
+        ) && (has_direct_label_address_provenance(&left)
+            || has_direct_label_address_provenance(&right))
+        {
+            return self.fail(
+                "CCC2425",
+                span,
+                "arithmetic on a label address is not supported",
+            );
+        }
         if matches!(operator, B::LogicalAnd | B::LogicalOr) {
             let left = self.convert_to_boolean(left)?;
             let right = self.convert_to_boolean(right)?;
@@ -3401,6 +3526,13 @@ impl<'a> Analyzer<'a> {
         };
         let right = self.analyze_expression(value)?;
         let right = self.value_conversion(right)?;
+        if has_direct_label_address_provenance(&right) {
+            return self.fail(
+                "CCC2425",
+                span,
+                "arithmetic on a label address is not supported",
+            );
+        }
         use syntax::BinaryOperator as B;
         let load = target
             .place
@@ -3597,6 +3729,14 @@ impl<'a> Analyzer<'a> {
         let mut base = self.value_conversion(base)?;
         let index = self.analyze_expression(index)?;
         let mut index = self.value_conversion(index)?;
+        if has_direct_label_address_provenance(&base) || has_direct_label_address_provenance(&index)
+        {
+            return self.fail(
+                "CCC2425",
+                span,
+                "arithmetic on a label address is not supported",
+            );
+        }
         if self.pointer_pointee(base.ty.ty).is_none() && self.pointer_pointee(index.ty.ty).is_some()
         {
             std::mem::swap(&mut base, &mut index);
@@ -4125,6 +4265,13 @@ impl<'a> Analyzer<'a> {
                 }
                 match self.types.try_kind(ty.ty).cloned() {
                     Some(TypeKind::Array(array)) => {
+                        if let [entry] = entries.as_slice()
+                            && entry.designation.is_empty()
+                            && let syntax::Initializer::Expression(expression) = &entry.initializer
+                            && self.string_literal_matches_array(&array, expression.as_ref())
+                        {
+                            return self.analyze_initializer(ty, &entry.initializer);
+                        }
                         self.analyze_array_initializer(ty, array, entries, *span)
                     }
                     Some(TypeKind::Record(record)) => {
@@ -4141,6 +4288,29 @@ impl<'a> Analyzer<'a> {
                 }
             }
         }
+    }
+
+    fn string_literal_matches_array(
+        &self,
+        array: &ArrayType,
+        expression: &syntax::Expression,
+    ) -> bool {
+        let Some(literal) = initializer_string_literal(expression) else {
+            return false;
+        };
+        let literal_element = match literal.prefix {
+            StringLiteralPrefix::None | StringLiteralPrefix::Utf8 => TypeId::CHAR,
+            StringLiteralPrefix::Wide => self.wchar_type(),
+            StringLiteralPrefix::Utf16 => TypeId::UNSIGNED_SHORT,
+            StringLiteralPrefix::Utf32 => TypeId::UNSIGNED_INT,
+        };
+        matches!(
+            literal.prefix,
+            StringLiteralPrefix::None | StringLiteralPrefix::Utf8
+        ) && matches!(
+            array.element.ty,
+            TypeId::CHAR | TypeId::SIGNED_CHAR | TypeId::UNSIGNED_CHAR
+        ) || self.type_ids_compatible(array.element.ty, literal_element)
     }
 
     fn analyze_array_initializer(
@@ -6071,7 +6241,12 @@ impl<'a> Analyzer<'a> {
                     self.collect_labels(statement);
                 }
             }
-            S::Expression(_) | S::Goto(_) | S::Continue | S::Break | S::Return(_) => {}
+            S::Expression(_)
+            | S::Goto(_)
+            | S::ComputedGoto(_)
+            | S::Continue
+            | S::Break
+            | S::Return(_) => {}
         }
     }
 
@@ -6081,11 +6256,7 @@ impl<'a> Analyzer<'a> {
         };
         let missing = function.labels.undefined_uses();
         for (name, span) in missing {
-            self.emit(
-                "CCC2363",
-                span,
-                format!("goto uses undefined label `{name}`"),
-            );
+            self.emit("CCC2363", span, format!("use of undefined label `{name}`"));
         }
     }
 
@@ -6198,6 +6369,16 @@ impl<'a> Analyzer<'a> {
     ) -> AnalysisResult<T> {
         self.emit(code, span, message);
         Err(())
+    }
+}
+
+fn initializer_string_literal(expression: &syntax::Expression) -> Option<&ccc_pp::StringLiteral> {
+    match &expression.kind {
+        syntax::ExpressionKind::String(literal) => Some(literal),
+        syntax::ExpressionKind::Parenthesized(inner) | syntax::ExpressionKind::Extension(inner) => {
+            initializer_string_literal(inner)
+        }
+        _ => None,
     }
 }
 
@@ -6348,6 +6529,90 @@ fn conditional_constant_expression_kind(
         ConstantExpressionKind::Integer
     } else {
         ConstantExpressionKind::UnevaluatedOnly
+    }
+}
+
+fn builtin_expect_folded_constant(expression: &FullTypedExpression) -> bool {
+    use FullTypedExpressionKind as E;
+    use syntax::BinaryOperator as B;
+
+    match &expression.kind {
+        E::Constant(_)
+        | E::StringLiteral(_)
+        | E::Sizeof { .. }
+        | E::Alignof { .. }
+        | E::Offsetof { .. } => true,
+        E::DeclRef(SymbolReference::Enumerator { .. }) => true,
+        E::DeclRef(_) => false,
+        E::Conversion {
+            kind: ConversionKind::LvalueToValue { .. },
+            ..
+        } => false,
+        E::Conversion {
+            kind: ConversionKind::ArrayToPointer | ConversionKind::FunctionToPointer,
+            ..
+        } => expression.constant.is_some(),
+        E::Conversion {
+            kind: ConversionKind::ToVoid,
+            expression,
+        } => builtin_expect_folded_constant(expression),
+        E::Conversion {
+            expression: operand,
+            ..
+        } => expression.constant.is_some() && builtin_expect_folded_constant(operand),
+        E::Unary { operand, .. } => {
+            expression.constant.is_some() && builtin_expect_folded_constant(operand)
+        }
+        E::Binary {
+            operator: operator @ (B::LogicalAnd | B::LogicalOr),
+            left,
+            right,
+        } => {
+            if expression.constant.is_none() || !builtin_expect_folded_constant(left) {
+                return false;
+            }
+            match (*operator, left.constant) {
+                (B::LogicalAnd, Some(value)) if value.is_zero() => true,
+                (B::LogicalOr, Some(value)) if !value.is_zero() => true,
+                (B::LogicalAnd | B::LogicalOr, Some(_)) => builtin_expect_folded_constant(right),
+                _ => false,
+            }
+        }
+        E::Binary { left, right, .. } => {
+            expression.constant.is_some()
+                && builtin_expect_folded_constant(left)
+                && builtin_expect_folded_constant(right)
+        }
+        E::AddressOf(_) => expression.constant.is_some(),
+        E::Conditional {
+            condition,
+            then_expression,
+            else_expression,
+        } => {
+            if expression.constant.is_none() || !builtin_expect_folded_constant(condition) {
+                return false;
+            }
+            match condition.constant {
+                Some(value) if value.is_zero() => builtin_expect_folded_constant(else_expression),
+                Some(_) => builtin_expect_folded_constant(then_expression),
+                None => false,
+            }
+        }
+        E::Comma(expressions) => expressions.iter().all(builtin_expect_folded_constant),
+        E::BuiltinExpect { value, expected: _ } => {
+            expression.constant.is_some() && builtin_expect_folded_constant(value)
+        }
+        E::Dereference(_)
+        | E::Subscript { .. }
+        | E::Member { .. }
+        | E::Assignment { .. }
+        | E::Increment { .. }
+        | E::Call { .. }
+        | E::VaStart { .. }
+        | E::VaArg { .. }
+        | E::VaCopy { .. }
+        | E::VaEnd { .. }
+        | E::MemoryFence { .. } => false,
     }
 }
 
@@ -6571,6 +6836,42 @@ fn evaluate_binary_constant(
             _ => None,
         },
         _ => None,
+    }
+}
+
+fn has_direct_label_address_provenance(expression: &FullTypedExpression) -> bool {
+    if matches!(
+        expression.constant,
+        Some(ConstantValue::Address(RelocatableAddress {
+            base: RelocatableBase::Label { .. },
+            ..
+        }))
+    ) {
+        return true;
+    }
+    match &expression.kind {
+        FullTypedExpressionKind::Conversion { expression, .. } => {
+            has_direct_label_address_provenance(expression)
+        }
+        FullTypedExpressionKind::Conditional {
+            condition,
+            then_expression,
+            else_expression,
+        } => match condition.constant {
+            Some(value) if value.is_zero() => has_direct_label_address_provenance(else_expression),
+            Some(_) => has_direct_label_address_provenance(then_expression),
+            None => {
+                has_direct_label_address_provenance(then_expression)
+                    || has_direct_label_address_provenance(else_expression)
+            }
+        },
+        FullTypedExpressionKind::Comma(expressions) => expressions
+            .last()
+            .is_some_and(has_direct_label_address_provenance),
+        FullTypedExpressionKind::BuiltinExpect { value, .. } => {
+            has_direct_label_address_provenance(value)
+        }
+        _ => false,
     }
 }
 

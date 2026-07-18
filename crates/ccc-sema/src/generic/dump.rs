@@ -242,6 +242,10 @@ fn dump_statement(
         FullTypedStatementKind::Goto { label, name } => {
             line(output, indent, format_args!("goto ^{} {name}", label.0));
         }
+        FullTypedStatementKind::ComputedGoto(expression) => {
+            line(output, indent, format_args!("computed-goto"));
+            dump_expression(output, unit, expression, indent + 1);
+        }
         FullTypedStatementKind::Continue => line(output, indent, format_args!("continue")),
         FullTypedStatementKind::Break => line(output, indent, format_args!("break")),
         FullTypedStatementKind::Return(expression) => {
@@ -547,6 +551,11 @@ fn dump_expression(
             for expression in expressions {
                 dump_expression(output, unit, expression, indent + 1);
             }
+        }
+        FullTypedExpressionKind::BuiltinExpect { value, expected } => {
+            line(output, indent, format_args!("builtin-expect{suffix}"));
+            dump_expression(output, unit, value, indent + 1);
+            dump_expression(output, unit, expected, indent + 1);
         }
         FullTypedExpressionKind::Sizeof { operand_ty, size } => line(
             output,

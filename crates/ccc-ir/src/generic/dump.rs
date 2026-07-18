@@ -547,6 +547,15 @@ fn display_terminator(terminator: &FullTerminator) -> String {
                 .join(", "),
             display_edge(default)
         ),
+        FullTerminator::IndirectBranch { selector, targets } => format!(
+            "br_table v{} [{}]",
+            selector.0,
+            targets
+                .iter()
+                .map(display_edge)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         FullTerminator::Return(Some(value)) => format!("return v{}", value.0),
         FullTerminator::Return(None) => "return".to_owned(),
         FullTerminator::Unreachable => "unreachable".to_owned(),

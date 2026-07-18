@@ -274,6 +274,7 @@ pub enum FullTypedStatementKind {
         label: LabelId,
         name: String,
     },
+    ComputedGoto(FullTypedExpression),
     Continue,
     Break,
     Return(Option<FullTypedExpression>),
@@ -392,6 +393,10 @@ pub enum RelocatableBase {
     },
     Function(FullFunctionId),
     String(StringId),
+    Label {
+        function: FullFunctionId,
+        label: LabelId,
+    },
 }
 
 impl ConstantValue {
@@ -470,6 +475,10 @@ pub enum FullTypedExpressionKind {
         else_expression: Box<FullTypedExpression>,
     },
     Comma(Vec<FullTypedExpression>),
+    BuiltinExpect {
+        value: Box<FullTypedExpression>,
+        expected: Box<FullTypedExpression>,
+    },
     Sizeof {
         operand_ty: QualifiedType,
         size: u64,

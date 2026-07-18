@@ -191,6 +191,12 @@ impl TargetSpec {
             "__SIZEOF_LONG_DOUBLE__",
             (self.data_layout.long_double_width / 8).to_string(),
         );
+        // A 64-bit double in the enabled target data-layout contract uses the
+        // IEEE 754 binary64 representation. Keep the hosted `float.h` family
+        // together so its precision, ranges, and exact boundary values agree.
+        if self.data_layout.double_width == 64 {
+            insert_binary64_compatibility_facts(&mut facts);
+        }
         facts.insert(
             "__SIZEOF_SIZE_T__",
             (self.data_layout.pointer_width / 8).to_string(),
@@ -237,6 +243,30 @@ impl TargetSpec {
             facts.insert("_LP64", "1");
         }
         facts
+    }
+}
+
+fn insert_binary64_compatibility_facts(facts: &mut PredefinedMacroFacts) {
+    facts.insert("__FLT_RADIX__", "2");
+    facts.insert("__FLT_EVAL_METHOD__", "0");
+    for (suffix, replacement) in [
+        ("MANT_DIG", "53"),
+        ("DIG", "15"),
+        ("MIN_EXP", "(-1021)"),
+        ("MIN_10_EXP", "(-307)"),
+        ("MAX_EXP", "1024"),
+        ("MAX_10_EXP", "308"),
+        ("DECIMAL_DIG", "17"),
+        ("HAS_DENORM", "1"),
+        ("HAS_INFINITY", "1"),
+        ("HAS_QUIET_NAN", "1"),
+        ("MAX", "0x1.fffffffffffffp+1023"),
+        ("NORM_MAX", "0x1.fffffffffffffp+1023"),
+        ("EPSILON", "0x1p-52"),
+        ("MIN", "0x1p-1022"),
+        ("DENORM_MIN", "0x1p-1074"),
+    ] {
+        facts.insert(format!("__DBL_{suffix}__"), replacement);
     }
 }
 
@@ -758,6 +788,27 @@ mod tests {
         let facts = &EffectiveCompilationConfig::default().target_macros;
         assert_eq!(facts.get("__SIZEOF_POINTER__"), Some("8"));
         assert_eq!(facts.get("__SIZEOF_LONG_DOUBLE__"), Some("16"));
+        for (name, expected) in [
+            ("__FLT_RADIX__", "2"),
+            ("__FLT_EVAL_METHOD__", "0"),
+            ("__DBL_MANT_DIG__", "53"),
+            ("__DBL_DIG__", "15"),
+            ("__DBL_MIN_EXP__", "(-1021)"),
+            ("__DBL_MIN_10_EXP__", "(-307)"),
+            ("__DBL_MAX_EXP__", "1024"),
+            ("__DBL_MAX_10_EXP__", "308"),
+            ("__DBL_DECIMAL_DIG__", "17"),
+            ("__DBL_HAS_DENORM__", "1"),
+            ("__DBL_HAS_INFINITY__", "1"),
+            ("__DBL_HAS_QUIET_NAN__", "1"),
+            ("__DBL_MAX__", "0x1.fffffffffffffp+1023"),
+            ("__DBL_NORM_MAX__", "0x1.fffffffffffffp+1023"),
+            ("__DBL_EPSILON__", "0x1p-52"),
+            ("__DBL_MIN__", "0x1p-1022"),
+            ("__DBL_DENORM_MIN__", "0x1p-1074"),
+        ] {
+            assert_eq!(facts.get(name), Some(expected), "unexpected {name}");
+        }
         assert_eq!(facts.get("__SIZEOF_SIZE_T__"), Some("8"));
         assert_eq!(facts.get("__SIZE_TYPE__"), Some("long unsigned int"));
         assert_eq!(facts.get("__PTRDIFF_TYPE__"), Some("long int"));

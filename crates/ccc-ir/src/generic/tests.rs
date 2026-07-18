@@ -1,5 +1,8 @@
 use ccc_pp::{PpItem, lex};
-use ccc_sema::generic::analyze_frontend;
+use ccc_sema::generic::{
+    ConstantValue, FullTypedBlockItem, FullTypedInitializer, FullTypedInitializerKind,
+    FullTypedStatementKind, analyze_frontend,
+};
 use ccc_session::SourceMap;
 use ccc_syntax::frontend as syntax;
 use ccc_target::EffectiveCompilationConfig;
@@ -32,6 +35,267 @@ fn rejects_unlowered_variable_bound_effects() {
         assert_eq!(error.code, "CCC3101");
         assert!(error.message.contains("bounds are not yet lowered"));
     }
+}
+
+#[test]
+fn computed_goto_has_exact_dense_table_ir_and_owned_static_tokens() {
+    let module = lower_source(
+        "int dispatch(int opcode) {\n\
+             static const void *const table[2] = {&&zero, &&one};\n\
+             goto *table[opcode];\n\
+         zero: return 10;\n\
+         one: return 20;\n\
+         }",
+    );
+    verify_frontend(&module).unwrap();
+    assert_eq!(
+        module.globals[0].source,
+        DataOrigin::BlockStatic {
+            function: ccc_sema::generic::FullFunctionId(0),
+            local: ccc_sema::generic::FullLocalId(1),
+        }
+    );
+    assert_eq!(
+        dump_frontend_ir(&module),
+        concat!(
+            "data d0 @__ccc_block_static.dispatch.0.1.table : array[2] of const pointer to const void [block-static:f0:l1 linkage=None duration=Static visibility=Internal definition=Definition]\n",
+            "  initializer root=n2 {\n",
+            "    n0: const pointer to const void = const unsigned:1\n",
+            "    n1: const pointer to const void = const unsigned:2\n",
+            "    n2: array[2] of const pointer to const void = aggregate [[0] -> n0, [1] -> n1]\n",
+            "  }\n",
+            "function f0 @dispatch(v0 %opcode: int -> m0) -> int [signature=int (int) linkage=External visibility=Default inline=false noreturn=false] {\n",
+            "  storage m0 l0 %opcode: int [Automatic; IndirectControlFlow]\n",
+            "  b0():\n",
+            "    i8: v8: int = const signed:10\n",
+            "    return v8\n",
+            "  b1():\n",
+            "    i9: v9: int = const signed:20\n",
+            "    return v9\n",
+            "  b2(v0: int):\n",
+            "    i0: v1: pointer to int = address.storage m0\n",
+            "    i1: store v0 -> v1 object=int [plain]\n",
+            "    i2: v2: pointer to array[2] of const pointer to const void = address.data d0\n",
+            "    i3: v3: pointer to const pointer to const void = convert.array-to-pointer v2 array[2] of const pointer to const void -> pointer to const pointer to const void\n",
+            "    i4: v4: pointer to int = address.storage m0\n",
+            "    i5: v5: int = load v4 object=int [plain]\n",
+            "    i6: v6: pointer to const pointer to const void = pointer.offset v3, v5 element=const pointer to const void\n",
+            "    i7: v7: pointer to const void = load v6 object=const pointer to const void [plain]\n",
+            "    br_table v7 [b0(), b1()]\n",
+            "}\n",
+        )
+    );
+}
+
+#[test]
+fn computed_goto_retains_current_local_state_in_memory() {
+    let module = lower_source(
+        "int f(int limit) {\n\
+             void *target = &&step;\n\
+             int state = 0;\n\
+             goto *target;\n\
+         again:\n\
+             state += 10;\n\
+             goto *target;\n\
+         step:\n\
+             state++;\n\
+             if (state < limit) goto again;\n\
+             return state;\n\
+         }",
+    );
+    verify_frontend(&module).unwrap();
+    assert_eq!(
+        dump_frontend_ir(&module),
+        concat!(
+            "function f0 @f(v0 %limit: int -> m0) -> int [signature=int (int) linkage=External visibility=Default inline=false noreturn=false] {\n",
+            "  storage m0 l0 %limit: int [Automatic; IndirectControlFlow]\n",
+            "  storage m1 l1 %target: pointer to void [Automatic; IndirectControlFlow]\n",
+            "  storage m2 l2 %state: int [Automatic; IndirectControlFlow]\n",
+            "  b0():\n",
+            "    i11: v9: pointer to int = address.storage m2\n",
+            "    i12: v10: int = load v9 object=int [plain]\n",
+            "    i13: v11: int = const signed:10\n",
+            "    i14: v12: int = add v10, v11\n",
+            "    i15: store v12 -> v9 object=int [plain]\n",
+            "    i16: v13: pointer to pointer to void = address.storage m1\n",
+            "    i17: v14: pointer to void = load v13 object=pointer to void [plain]\n",
+            "    br_table v14 [b0(), b1()]\n",
+            "  b1():\n",
+            "    i18: v15: pointer to int = address.storage m2\n",
+            "    i19: v16: int = load v15 object=int [plain]\n",
+            "    i20: v17: int = const signed:1\n",
+            "    i21: v18: int = add v16, v17\n",
+            "    i22: store v18 -> v15 object=int [plain]\n",
+            "    i23: v19: pointer to int = address.storage m2\n",
+            "    i24: v20: int = load v19 object=int [plain]\n",
+            "    i25: v21: pointer to int = address.storage m0\n",
+            "    i26: v22: int = load v21 object=int [plain]\n",
+            "    i27: v23: int = less v20, v22\n",
+            "    i28: v24: int = convert.to-boolean v23 int -> int\n",
+            "    conditional v24 ? b3() : b4()\n",
+            "  b2(v0: int):\n",
+            "    i0: v1: pointer to int = address.storage m0\n",
+            "    i1: store v0 -> v1 object=int [plain]\n",
+            "    i2: v2: pointer to pointer to void = address.storage m1\n",
+            "    i3: v3: pointer to void = const unsigned:2\n",
+            "    i4: v4: pointer to void = convert.pointer-conversion v3 pointer to void -> pointer to void\n",
+            "    i5: store v4 -> v2 object=pointer to void [plain]\n",
+            "    i6: v5: pointer to int = address.storage m2\n",
+            "    i7: v6: int = const signed:0\n",
+            "    i8: store v6 -> v5 object=int [plain]\n",
+            "    i9: v7: pointer to pointer to void = address.storage m1\n",
+            "    i10: v8: pointer to void = load v7 object=pointer to void [plain]\n",
+            "    br_table v8 [b0(), b1()]\n",
+            "  b3():\n",
+            "    branch b0()\n",
+            "  b4():\n",
+            "    branch b5()\n",
+            "  b5():\n",
+            "    i29: v25: pointer to int = address.storage m2\n",
+            "    i30: v26: int = load v25 object=int [plain]\n",
+            "    return v26\n",
+            "}\n",
+        )
+    );
+}
+
+#[test]
+fn label_addresses_alone_do_not_disable_scalar_promotion() {
+    let module = lower_source(
+        "int f(int value) { void *token = &&done; done: return value + (token != 0); }",
+    );
+    assert!(module.functions[0].storage.is_empty());
+    assert!(module.functions[0].blocks.iter().all(|block| !matches!(
+        block.terminator,
+        Some(FullTerminator::IndirectBranch { .. })
+    )));
+}
+
+#[test]
+fn verifier_rejects_invalid_computed_goto_target_tables() {
+    let module = lower_source("int f(void) { goto *&&done; done: return 0; }");
+
+    let mut empty = module.clone();
+    let terminator = empty.functions[0]
+        .blocks
+        .iter_mut()
+        .find_map(|block| match block.terminator.as_mut() {
+            Some(FullTerminator::IndirectBranch { targets, .. }) => Some(targets),
+            _ => None,
+        })
+        .unwrap();
+    terminator.clear();
+    assert!(
+        verify_frontend(&empty)
+            .unwrap_err()
+            .message
+            .contains("no target blocks")
+    );
+
+    let mut duplicate = module.clone();
+    let terminator = duplicate.functions[0]
+        .blocks
+        .iter_mut()
+        .find_map(|block| match block.terminator.as_mut() {
+            Some(FullTerminator::IndirectBranch { targets, .. }) => Some(targets),
+            _ => None,
+        })
+        .unwrap();
+    terminator.push(terminator[0].clone());
+    assert!(
+        verify_frontend(&duplicate)
+            .unwrap_err()
+            .message
+            .contains("duplicate target blocks")
+    );
+
+    let mut with_arguments = module.clone();
+    let terminator = with_arguments.functions[0]
+        .blocks
+        .iter_mut()
+        .find_map(|block| match block.terminator.as_mut() {
+            Some(FullTerminator::IndirectBranch { selector, targets }) => {
+                Some((*selector, targets))
+            }
+            _ => None,
+        })
+        .unwrap();
+    terminator.1[0].arguments.push(terminator.0);
+    assert!(
+        verify_frontend(&with_arguments)
+            .unwrap_err()
+            .message
+            .contains("must not carry arguments")
+    );
+
+    let mut with_parameters = module;
+    let (selector, target) = with_parameters.functions[0]
+        .blocks
+        .iter()
+        .find_map(|block| match block.terminator.as_ref() {
+            Some(FullTerminator::IndirectBranch { selector, targets }) => {
+                Some((*selector, targets[0].target))
+            }
+            _ => None,
+        })
+        .unwrap();
+    let parameter = ValueId(with_parameters.functions[0].value_types.len() as u32);
+    let parameter_type = with_parameters.functions[0].value_types[selector.0 as usize];
+    with_parameters.functions[0]
+        .value_types
+        .push(parameter_type);
+    with_parameters.functions[0].blocks[target.0 as usize]
+        .parameters
+        .push(parameter);
+    assert!(
+        verify_frontend(&with_parameters)
+            .unwrap_err()
+            .message
+            .contains("must not have parameters")
+    );
+}
+
+#[test]
+fn lowering_rejects_missing_targets_and_cross_function_static_label_tokens() {
+    let error = lower_frontend(&typed_source("int f(void *target) { goto *target; }")).unwrap_err();
+    assert_eq!(error.code, "CCC3101");
+    assert!(error.message.contains("at least one label"));
+
+    let mut unit = typed_source(
+        "int first(void) { static void *table[1] = {&&done}; goto *table[0]; done: return 0; }\n\
+         int second(void) { return 0; }",
+    );
+    let FullTypedStatementKind::Compound(items) =
+        &mut unit.functions[0].body.as_mut().unwrap().kind
+    else {
+        panic!("expected compound function body");
+    };
+    let FullTypedBlockItem::Declaration(declaration) = &mut items[0] else {
+        panic!("expected static table declaration");
+    };
+    let Some(FullTypedInitializer {
+        kind: FullTypedInitializerKind::Aggregate(entries),
+        ..
+    }) = declaration.initializer.as_mut()
+    else {
+        panic!("expected aggregate initializer");
+    };
+    let FullTypedInitializerKind::Scalar(expression) = &mut entries[0].initializer.kind else {
+        panic!("expected scalar label token");
+    };
+    expression.constant = Some(ConstantValue::Address(
+        ccc_sema::generic::RelocatableAddress {
+            base: ccc_sema::generic::RelocatableBase::Label {
+                function: ccc_sema::generic::FullFunctionId(1),
+                label: ccc_sema::generic::LabelId(0),
+            },
+            addend: 0,
+            one_past: false,
+        },
+    ));
+    let error = lower_frontend(&unit).unwrap_err();
+    assert_eq!(error.code, "CCC3101");
+    assert!(error.message.contains("cross-function"));
 }
 
 #[test]
@@ -192,6 +456,70 @@ fn aggregate_rvalues_are_owned_and_project_field_index_paths() {
             "    return v17\n",
             "}\n",
         )
+    );
+}
+
+#[test]
+fn aggregate_initializer_field_addresses_inherit_record_qualifiers() {
+    let module = lower_source(
+        "struct Item { const char *name; int value; };\n\
+         static int consume(const struct Item *items) { return items[0].value; }\n\
+         int const_init(void) {\n\
+           const struct Item items[] = {{\"none\", 1}};\n\
+           return consume(items);\n\
+         }\n\
+         int mutable_init(void) {\n\
+           struct Item items[] = {{\"full\", 2}};\n\
+           return consume(items);\n\
+         }",
+    );
+    verify_frontend(&module).unwrap();
+
+    let projections = module
+        .functions
+        .iter()
+        .filter(|function| matches!(function.name.as_str(), "const_init" | "mutable_init"))
+        .flat_map(|function| {
+            function.blocks.iter().flat_map(|block| {
+                block.instructions.iter().filter_map(|instruction| {
+                    let FullInstructionKind::ProjectField {
+                        record,
+                        field_name: Some(field_name),
+                        ..
+                    } = &instruction.kind
+                    else {
+                        return None;
+                    };
+                    if field_name != "name" {
+                        return None;
+                    }
+                    let result = instruction.result.unwrap();
+                    Some((
+                        function.name.as_str(),
+                        module
+                            .types
+                            .display(function.value_types[result.0 as usize]),
+                        module.types.display_qualified(*record),
+                    ))
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        projections,
+        vec![
+            (
+                "const_init",
+                "pointer to const pointer to const char".to_owned(),
+                "const struct Item".to_owned(),
+            ),
+            (
+                "mutable_init",
+                "pointer to pointer to const char".to_owned(),
+                "struct Item".to_owned(),
+            ),
+        ]
     );
 }
 
@@ -383,6 +711,32 @@ fn lowers_sync_synchronize_to_a_sequentially_consistent_memory_fence() {
         module.functions.len(),
         1,
         "the builtin must not become a call"
+    );
+}
+
+#[test]
+fn lowers_scalar_builtins_to_value_preserving_ir_without_calls() {
+    let module = lower_source(
+        "long choose(int value) {\n\
+             return __builtin_expect(value, 1 ? 1 : ++value);\n\
+         }\n\
+         double infinity(void) { return __builtin_huge_val(); }",
+    );
+    verify_frontend(&module).unwrap();
+    assert_eq!(
+        dump_frontend_ir(&module),
+        concat!(
+            "function f0 @choose(v0 %value: int -> ssa) -> long int [signature=long int (int) linkage=External visibility=Default inline=false noreturn=false] {\n",
+            "  b0(v0: int):\n",
+            "    i0: v1: long int = convert.integer-conversion v0 int -> long int\n",
+            "    return v1\n",
+            "}\n",
+            "function f1 @infinity() -> double [signature=double () linkage=External visibility=Default inline=false noreturn=false] {\n",
+            "  b0():\n",
+            "    i0: v0: double = const float:0x7ff0000000000000\n",
+            "    return v0\n",
+            "}\n",
+        )
     );
 }
 
@@ -894,6 +1248,35 @@ fn emits_static_locals_as_data_and_limits_exact_bound_string_copies() {
             matches!(
                 instruction.kind,
                 FullInstructionKind::AddressOfGlobal { global: DataId(1) }
+            )
+        })
+    }));
+}
+
+#[test]
+fn lowers_braced_string_array_initializers_as_string_copies() {
+    let module = lower_source(
+        "char output[] = { \"luac\" \".out\" };\n\
+         int f(void) { char local[2] = { (\"xy\") }; return local[0]; }",
+    );
+    verify_frontend(&module).unwrap();
+
+    let graph = module.globals[0].initializer.as_ref().unwrap();
+    assert!(matches!(
+        graph.nodes[graph.root.0 as usize].kind,
+        InitializerNodeKind::StringData {
+            copy_code_units: 9,
+            ..
+        }
+    ));
+    assert!(module.functions[0].blocks.iter().any(|block| {
+        block.instructions.iter().any(|instruction| {
+            matches!(
+                instruction.kind,
+                FullInstructionKind::StringInitialize {
+                    copy_code_units: 2,
+                    ..
+                }
             )
         })
     }));

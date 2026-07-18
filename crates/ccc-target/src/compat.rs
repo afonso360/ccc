@@ -246,6 +246,18 @@ impl CapabilityRegistry {
             CapabilityState::Implemented,
             "the operator uses the canonical target layout engine",
         );
+        registry.insert_with_rationale(
+            CapabilityKind::Builtin,
+            "__builtin_expect",
+            CapabilityState::Implemented,
+            "the GNU 4.2 operator requires a folded compile-time integer expectation and evaluates only the long-converted value operand; backend branch metadata is optional",
+        );
+        registry.insert_with_rationale(
+            CapabilityKind::Builtin,
+            "__builtin_huge_val",
+            CapabilityState::Implemented,
+            "the operator produces the target binary64 positive-infinity constant",
+        );
         for name in [
             "__builtin_va_start",
             "__builtin_va_arg",
@@ -423,6 +435,8 @@ mod tests {
         assert!(!registry.is_available(CapabilityKind::Attribute, "__gnu_inline__"));
         for name in [
             "__builtin_offsetof",
+            "__builtin_expect",
+            "__builtin_huge_val",
             "__builtin_va_start",
             "__builtin_va_arg",
             "__builtin_va_copy",

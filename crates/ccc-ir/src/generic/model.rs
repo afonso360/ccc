@@ -214,6 +214,7 @@ pub enum MemoryResidencyReason {
     Aggregate,
     Atomic,
     VariablyModified,
+    IndirectControlFlow,
 }
 
 #[derive(Clone, Debug)]
@@ -494,6 +495,10 @@ pub enum FullTerminator {
         selector: ValueId,
         cases: Vec<SwitchEdge>,
         default: FullEdge,
+    },
+    IndirectBranch {
+        selector: ValueId,
+        targets: Vec<FullEdge>,
     },
     Return(Option<ValueId>),
     Unreachable,

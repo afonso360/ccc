@@ -284,6 +284,7 @@ pub struct Expression {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ExpressionKind {
     Identifier(Identifier),
+    LabelAddress(Identifier),
     Integer(IntegerConstant),
     Floating(FloatingConstant),
     Character(CharacterConstant),
@@ -359,6 +360,11 @@ pub enum ExpressionKind {
     BuiltinVaEnd {
         list: Box<Expression>,
     },
+    BuiltinExpect {
+        value: Box<Expression>,
+        expected: Box<Expression>,
+    },
+    BuiltinHugeVal,
     BuiltinSyncSynchronize,
 }
 
@@ -468,6 +474,7 @@ pub enum StatementKind {
         statement: Box<Statement>,
     },
     Goto(Identifier),
+    ComputedGoto(Box<Expression>),
     Continue,
     Break,
     Return(Option<Box<Expression>>),

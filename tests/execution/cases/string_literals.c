@@ -1,11 +1,13 @@
 static const char greeting[] = "hello" " " "world";
 static const char escapes[] = "\x41\101\n";
 static const char exact_bound[2] = "xy";
+static char braced_global[] = { "luac" ".out" };
 
 int main(void) {
     const char *pointer = "abc";
     char mutable_copy[] = "xy";
     char exact_local[2] = "ab";
+    char braced_local[2] = { ("xy") };
 
     if (sizeof(greeting) != 12 || greeting[5] != ' ' || greeting[11] != '\0')
         return 1;
@@ -21,5 +23,12 @@ int main(void) {
         || exact_bound[1] != 'y' || sizeof(exact_local) != 2
         || exact_local[0] != 'a' || exact_local[1] != 'b')
         return 5;
+    braced_global[0] = 'L';
+    braced_local[0] = 'z';
+    if (sizeof(braced_global) != 9 || braced_global[0] != 'L'
+        || braced_global[4] != '.' || braced_global[8] != '\0'
+        || sizeof(braced_local) != 2 || braced_local[0] != 'z'
+        || braced_local[1] != 'y')
+        return 6;
     return 46;
 }

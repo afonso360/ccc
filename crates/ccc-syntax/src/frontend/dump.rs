@@ -204,6 +204,7 @@ impl AstDumper {
             StatementKind::DoWhile { .. } => "do-while",
             StatementKind::For { .. } => "for",
             StatementKind::Goto(_) => "goto",
+            StatementKind::ComputedGoto(_) => "computed-goto",
             StatementKind::Continue => "continue",
             StatementKind::Break => "break",
             StatementKind::Return(_) => "return",
@@ -226,7 +227,8 @@ impl AstDumper {
                 }
             }
             StatementKind::Expression(Some(expression))
-            | StatementKind::Return(Some(expression)) => self.expression(expression, indent + 1),
+            | StatementKind::Return(Some(expression))
+            | StatementKind::ComputedGoto(expression) => self.expression(expression, indent + 1),
             StatementKind::If {
                 condition,
                 then_statement,
@@ -288,6 +290,9 @@ impl AstDumper {
         match &expression.kind {
             ExpressionKind::Identifier(identifier) => {
                 self.line(indent, &format!("name {}", identifier.name))
+            }
+            ExpressionKind::LabelAddress(label) => {
+                self.line(indent, &format!("label-address {}", label.name))
             }
             ExpressionKind::Integer(value) => {
                 self.line(indent, &format!("integer {}", value.value))
@@ -362,6 +367,14 @@ impl AstDumper {
             ExpressionKind::BuiltinVaEnd { list } => {
                 self.line(indent, "builtin-va-end");
                 self.expression(list, indent + 1);
+            }
+            ExpressionKind::BuiltinExpect { value, expected } => {
+                self.line(indent, "builtin-expect");
+                self.expression(value, indent + 1);
+                self.expression(expected, indent + 1);
+            }
+            ExpressionKind::BuiltinHugeVal => {
+                self.line(indent, "builtin-huge-val");
             }
             ExpressionKind::BuiltinSyncSynchronize => {
                 self.line(indent, "builtin-sync-synchronize");
