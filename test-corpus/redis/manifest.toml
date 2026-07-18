@@ -1,0 +1,177 @@
+format_version = 2
+name = "redis"
+version = "8.8.0"
+release_date = "2026-05-25"
+distribution = "official-core-source"
+origin = "https://download.redis.io/releases/redis-8.8.0.tar.gz"
+archive = "redis-8.8.0.tar.gz"
+archive_bytes = 4480031
+archive_sha256 = "88422181efb0c9c0abba332e3e391d409e1e13714b838931669235e5796f704b"
+archive_sha3_256 = "5c8df804f54e76fcdcf036cbe0d98b323815b794ff51f2fa2b4bd300f545bf1f"
+published_hash_origin = "https://github.com/redis/redis-hashes/blob/master/README"
+license = "AGPL-3.0-only OR RSAL-2.0 OR SSPL-1.0"
+upstream_license_file = "LICENSE.txt"
+fetched_not_vendored = true
+
+target = "x86_64-unknown-linux-gnu"
+language_mode = "gnu11"
+gnu_compatibility_tuple = "4.2.1"
+build_interface = "upstream-make-component-targets"
+build_targets = ["redis-server", "redis-cli"]
+source_translation_units = 178
+target_compiler = "ccc"
+link_driver = "gcc"
+native_link_commands = 2
+link_mode = "non-pie-executable"
+
+allocator = "libc"
+tls = false
+systemd = false
+vector_sets = false
+bundled_data_type_modules = false
+link_time_optimization = false
+c11_atomic_make_probe = false
+ndebug = false
+assertions = "enabled-with-portable-hosted-header"
+portable_assert_header = "compat/include/assert.h"
+portable_assert_header_sha256 = "f162e79da48d69e56378d7d720d3ab94a4a426da436c8f5880115a9ac27036b3"
+portable_assert_contract = "glibc-standard-c-macro"
+selected_atomic_backend = "legacy-sync-builtins"
+
+source_adjustment_patch = "source-adjustment.patch"
+source_adjustment_sha256 = "2d474385c7be86e4ed9722106d334d29d2b8f1b1c38d5efb134eb89a2cec22d6"
+source_adjustment_hashes = "source-adjustment-hashes.txt"
+source_adjustment_hashes_sha256 = "a9d2095781efabc511147d2a6b9d6919611edd5801b795193fb74d00d803f41d"
+source_adjustment_targets = 6
+source_adjustment_statement_expressions_removed = 1
+source_adjustment_inline_assembly_statements_removed = 6
+source_adjustment_xxhash_ccc_noop_definitions = 1
+source_adjustment_xxhash_guard_call_sites = 9
+source_adjustment_xxhash_clang_neon_guard_call_sites = 3
+source_adjustment_xxhash_selected_guard_expansions = 1
+source_adjustment_classification_calls_rewritten = 7
+source_adjustment_hiredis_classification_calls_rewritten = 1
+source_adjustment_cjson_classification_calls_rewritten = 5
+source_adjustment_cmsgpack_classification_calls_rewritten = 1
+source_adjustment_rationale = "replace one expression-valued CAS wrapper and bundled histogram x86 assembly with equivalent sequentially consistent legacy atomic builtins, express seven hiredis and bundled Lua binary64 classification calls without glibc's long-double generic arms, and select a behavior-compatible standard-C no-op for xxHash's compiler guard under CCC instead of its GNU inline-assembly guard"
+
+test_profile = "focused-server-cli-smoke"
+test_transport = "private-unix-domain-socket"
+test_commands = ["PING", "SET", "GET", "INCR", "LPUSH", "LRANGE", "HSET", "HGET", "EVAL", "DBSIZE"]
+upstream_full_test_suite = false
+
+required_tools = [
+    "ar",
+    "awk",
+    "bash",
+    "basename",
+    "cmp",
+    "cp",
+    "dirname",
+    "find",
+    "gcc",
+    "grep",
+    "id",
+    "make",
+    "mkdir",
+    "mktemp",
+    "mv",
+    "openssl",
+    "patch",
+    "ranlib",
+    "readelf",
+    "rm",
+    "sed",
+    "sleep",
+    "sort",
+    "tar",
+    "tee",
+    "tr",
+    "uname",
+    "wc",
+]
+conditional_download_tools = ["curl"]
+requires_non_root_user = true
+requires_native_linux_filesystem = true
+
+[expected_inventory]
+selected_builtins = [
+    "__builtin_bswap64",
+    "__builtin_clz",
+    "__builtin_clzl",
+    "__builtin_clzll",
+    "__builtin_ctzll",
+    "__builtin_expect",
+    "__builtin_popcount",
+    "__builtin_popcountll",
+    "__builtin_prefetch",
+    "__sync_add_and_fetch",
+    "__sync_bool_compare_and_swap",
+    "__sync_fetch_and_add",
+    "__sync_lock_test_and_set",
+    "__sync_sub_and_fetch",
+    "__sync_synchronize",
+    "__sync_val_compare_and_swap",
+]
+gnu_attributes = ["aligned", "deprecated-declarator", "format", "noinline", "packed"]
+gnu_operators = ["compound-literal"]
+statement_expression_uses = []
+adjusted_statement_expression_uses = ["atomicCompareExchange-sync-cas"]
+inline_assembly_forms = []
+adjusted_inline_assembly_forms = ["hdr-histogram-x86-atomic-operations"]
+unselected_builtin_families = ["__atomic", "__builtin_cpu_supports"]
+expanded_builtin_absent = [
+    "__builtin_add_overflow",
+    "__builtin_assume_aligned",
+    "__builtin_bswap32",
+    "__builtin_cpu_supports",
+    "__builtin_ctz",
+    "__builtin_ctzl",
+    "__builtin_frame_address",
+    "__builtin_mul_overflow",
+    "__builtin_popcountl",
+    "__builtin_return_address",
+    "__builtin_sub_overflow",
+    "__builtin_unreachable",
+    "__atomic_*",
+]
+unselected_optional_surfaces = ["jemalloc", "tls", "systemd", "vector-sets", "bundled-data-type-modules", "lto"]
+wide_integer_uses = []
+variable_length_array_objects = []
+expanded_builtin_bswap64 = 35
+expanded_builtin_clz = 168
+expanded_builtin_clzl = 85
+expanded_builtin_clzll = 83
+expanded_builtin_ctzll = 1
+expanded_builtin_popcount = 154
+expanded_builtin_popcountll = 4
+expanded_builtin_prefetch = 1
+
+[adapter_artifacts]
+retain = [
+    "build.log",
+    "capability-inventory.txt",
+    "compile-commands.txt",
+    "effective-macros.txt",
+    "expanded-builtins.txt",
+    "elf-dynamic-tags.txt",
+    "elf-headers.txt",
+    "expected-source-inputs.txt",
+    "inline-assembly-inventory.txt",
+    "link-driver-identity.txt",
+    "link-driver-macros.txt",
+    "patch-identity.txt",
+    "portable-assert.h",
+    "predicate-probe.txt",
+    "preprocessed-source-inputs.txt",
+    "server.log",
+    "smoke.log",
+    "source-adjustment-apply.log",
+    "source-adjustment-audit.txt",
+    "source-adjustment-hashes.txt",
+    "source-adjustment-reapply.log",
+    "source-adjustment.patch",
+    "source-adjustment.txt",
+    "source-inputs.txt",
+    "version.log",
+]

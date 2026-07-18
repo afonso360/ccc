@@ -91,6 +91,11 @@ expand. No `bswap32`, `ctz`, `ctzl`, `popcountl`, unreachable, overflow, or
 CPU-support builtin is selected. These results do not admit neighboring
 family spellings.
 
+The same inventory found that xxHash selects its empty GNU inline-assembly
+compiler guard from the compatibility tuple; an exact-hash adjustment selects
+a standard-C no-op under `__CCC__`, and the adapter requires exactly one marked
+no-op expansion and zero expanded inline-assembly forms.
+
 The builtin registry admits `__sync_synchronize` and the exact implemented
 legacy operation set (`__sync_add_and_fetch`, `__sync_fetch_and_add`,
 `__sync_sub_and_fetch`, both compare-and-swap result forms, and

@@ -181,10 +181,11 @@ Every enabled target has a required matrix entry. A target without an execution 
 
 ## Real-code corpus
 
-SQLite, Lua, zlib, musl, tcc, selected libc-header fixtures, and c-testsuite
-exercise drop-in compatibility. Each integration records the exact build
-command, enabled features, patches if any, expected exclusions, and whether
-success means preprocess, compile, link, or run. “Builds unmodified” is used
+SQLite, Lua, Redis, bzip2, zstd, zlib, musl, tcc, selected libc-header
+fixtures, and c-testsuite exercise drop-in compatibility. Each integration
+records the exact build command, enabled features, patches if any, expected
+exclusions, and whether success means preprocess, compile, link, or run.
+“Builds unmodified” is used
 only when no source or build-system patch is applied.
 
 Hosted-header preprocessing, parsing, and code generation are separate gates.
@@ -250,6 +251,71 @@ does not replace focused computed-goto or nonlocal-control tests. The official
 complete and internal profiles remain distinct contracts because they add
 position-independent shared test modules, GNU assertion statement expressions,
 and an instrumented runtime. musl feeds `$CC` assembly files.
+
+Redis is pinned by its [corpus manifest](../../test-corpus/redis/manifest.toml)
+to the official 8.8.0 core archive. The selected upstream build produces
+`redis-server` and `redis-cli` with the libc allocator while disabling TLS,
+systemd, optional vector sets, bundled data-type modules, and link-time
+optimization. All 178 selected C translation units pass through CCC in GNU11
+mode; native GCC receives only the resulting objects and archives for two
+non-PIE links. The wrapper mirrors each real translation with a preprocessing
+pass under the same effective language, macro, include, warning, and
+optimization arguments. The adapter requires exactly 178 nonempty captures,
+compares their relative paths to the pinned source set, and records exact
+expanded-builtin counts. It also audits the complete compiled source multiset,
+compiler identity, link inputs, ELF executable type, and absence of dynamic
+text relocations.
+
+Redis assertions remain enabled. A forced compatibility `assert.h` selects
+glibc's standard-C macro and uses the C11 `__func__` identifier for the
+diagnostic function name, then restores GNU mode for the source build. Six
+exact-hash source adjustments express Redis's expression-valued sync-CAS loop
+through a standard-C helper, replace the bundled HDR Histogram x86 atomic
+assembly with the selected sequentially consistent legacy builtins, and express
+binary64 classification in hiredis and the bundled Lua extensions without
+semantically visiting glibc's native-`long double` generic arms. The sixth
+selects a behavior-compatible standard-C no-op for xxHash's compiler guard
+under CCC instead of the GNU inline-assembly guard chosen by the compatibility
+tuple. The adapter
+audits each removed construct and its replacement count explicitly.
+
+The Redis execution profile starts the CCC-built server on a private Unix
+domain socket and drives `PING`, string, counter, list, hash, Lua `EVAL`, and
+database-size checks through the CCC-built client. It is deliberately a
+focused build-and-smoke contract: the upstream full test suite is not invoked.
+
+bzip2 is pinned by its [corpus manifest](../../test-corpus/bzip2/manifest.toml)
+to the official 1.0.8 archive and a full commit and tree from the official
+`bzip2-tests` repository. The upstream Makefile selects nine of the archive's
+13 C files to build `libbz2.a`, `bzip2`, and `bzip2recover`; CCC must compile
+each selected input exactly once, and native GCC performs only the two
+source-free non-PIE program links. The build inventory also proves that the
+four developer utilities were not silently substituted into the product set.
+
+The bzip2 execution gate combines the six byte-for-byte comparisons from
+upstream `make check`, an independent level-9 integrity/round-trip fixture,
+and the pinned extended runner over 38 valid and eight deliberately malformed
+streams. The extended profile requires exactly 440 pass records and its final
+success marker. Optional Valgrind discovery is disabled explicitly; decoder,
+corruption, small-memory, and recovery behavior remain exercised.
+
+zstd is pinned by its [corpus manifest](../../test-corpus/zstd/manifest.toml) to
+the official 1.5.7 release archive. Its selected `make check` build routes 50
+C translation occurrences through CCC, including two exact-byte pthread
+capability probes produced during recursive Make evaluation. Native GCC sees
+only objects for four source-free links. Pthread support and legacy decoding
+are enabled; optional zlib, liblzma, and liblz4 format wrappers, stand-alone
+assembly, and host-dependent unaligned scalar accesses are disabled.
+
+The zstd adapter applies an exact-hash extension of upstream's no-assembly
+guards to existing generic C fallbacks, supplies the documented
+`ZSTD_DEPS_COMMON` libc-memory boundary, and forces a portable assertion header
+without changing GNU identity. Every adjustment and compatibility header is
+hashed and audited on each run. Upstream's bounded quick smoke target covers
+compression, decompression, streaming, dictionaries, file handling, corruption
+rejection, sparse files, and the selected threaded path; deterministic file and
+stream round trips add byte-for-byte checks. Long-running fuzz and stress
+profiles are not part of this gate.
 
 A curated execute-only compiler torture subset may supplement focused fixtures.
 It is fetched rather than vendored, and its corpus manifest records the exact

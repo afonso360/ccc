@@ -1,0 +1,188 @@
+--- a/src/zmalloc.c
++++ b/src/zmalloc.c
+@@ -115,6 +115,17 @@ static redisAtomic size_t zmalloc_peak = 0;
+ static redisAtomic time_t zmalloc_peak_time = 0;
+ static __thread long my_thread_index = -1;
+ 
++static inline int zmalloc_compare_exchange_peak(size_t *expected, size_t desired) {
++    size_t observed = __sync_val_compare_and_swap(&zmalloc_peak, *expected, desired);
++
++    if (observed == *expected) {
++        return 1;
++    }
++
++    *expected = observed;
++    return 0;
++}
++
+ static inline void init_my_thread_index(void) {
+     if (unlikely(my_thread_index == -1)) {
+         long idx;
+@@ -204,7 +215,8 @@ static inline void update_zmalloc_stat_alloc(long long bytes_delta) {
+              * on failure, `old_peak` is refreshed with the latest peak value, and we
+              * retry only while our snapshot still exceeds it. */
+             size_t old_peak = published_peak;
+-            while (used_mem > old_peak && !atomicCompareExchange(size_t, zmalloc_peak, old_peak, used_mem)) {
++            while (used_mem > old_peak &&
++                   !zmalloc_compare_exchange_peak(&old_peak, used_mem)) {
+                 /* CAS failed: `old_peak` now holds the current `zmalloc_peak`. */
+             }
+ 
+--- a/deps/hdr_histogram/hdr_atomic.h
++++ b/deps/hdr_histogram/hdr_atomic.h
+@@ -96,45 +96,38 @@
+ 
+ static inline void* hdr_atomic_load_pointer(void** pointer)
+ {
+-   void* p =  *pointer;
+-	asm volatile ("" ::: "memory");
+-	return p;
++    return __sync_val_compare_and_swap(pointer, (void *)0, (void *)0);
+ }
+ 
+ static inline void hdr_atomic_store_pointer(void** pointer, void* value)
+ {
+-    asm volatile ("lock; xchgq %0, %1" : "+q" (value), "+m" (*pointer));
++    (void)__sync_lock_test_and_set(pointer, value);
+ }
+ 
+ static inline int64_t hdr_atomic_load_64(int64_t* field)
+ {
+-    int64_t i = *field;
+-	asm volatile ("" ::: "memory");
+-	return i;
++    return __sync_val_compare_and_swap(field, 0, 0);
+ }
+ 
+ static inline void hdr_atomic_store_64(int64_t* field, int64_t value)
+ {
+-    asm volatile ("lock; xchgq %0, %1" : "+q" (value), "+m" (*field));
++    (void)__sync_lock_test_and_set(field, value);
+ }
+ 
+ static inline int64_t hdr_atomic_exchange_64(volatile int64_t* field, int64_t value)
+ {
+-    int64_t result = 0;
+-    asm volatile ("lock; xchgq %1, %2" : "=r" (result), "+q" (value), "+m" (*field));
+-    return result;
++    return __sync_lock_test_and_set(field, value);
+ }
+ 
+ static inline int64_t hdr_atomic_add_fetch_64(volatile int64_t* field, int64_t value)
+ {
+     return __sync_add_and_fetch(field, value);
+ }
+ 
+ static inline bool hdr_atomic_compare_exchange_64(volatile int64_t* field, int64_t* expected, int64_t desired)
+ {
+-    int64_t original;
+-    asm volatile( "lock; cmpxchgq %2, %1" : "=a"(original), "+m"(*field) : "q"(desired), "0"(*expected));
++    int64_t original = __sync_val_compare_and_swap(field, *expected, desired);
+     return original == *expected;
+ }
+ 
+ #else
+--- a/deps/hiredis/read.c
++++ b/deps/hiredis/read.c
+@@ -40,6 +40,7 @@
+ #include <errno.h>
+ #include <ctype.h>
+ #include <limits.h>
++#include <float.h>
+ #include <math.h>
+ 
+ #include "alloc.h"
+@@ -312,7 +313,8 @@ static void *processItem(const redisReadTask *cur) {
+                  * strtod() allows other variations on infinity,
+                  * etc. We explicity handle our two allowed infinite cases and NaN
+                  * above, so strtod() should only result in finite values. */
+-                if (buf[0] == '\0' || eptr != &buf[len] || !isfinite(d)) {
++                if (buf[0] == '\0' || eptr != &buf[len] ||
++                    !(d >= -DBL_MAX && d <= DBL_MAX)) {
+                     __redisReaderSetError(r,REDIS_ERR_PROTOCOL,
+                             "Bad double value");
+                     return REDIS_ERR;
+--- a/deps/lua/src/lua_cjson.c
++++ b/deps/lua/src/lua_cjson.c
+@@ -39,6 +39,7 @@
+ #include <assert.h>
+ #include <string.h>
+ #include <math.h>
++#include <float.h>
+ #include <stdint.h>
+ #include <limits.h>
+ #include "lua.h"
+@@ -62,6 +63,15 @@
+ #define isinf(x) (!isnan(x) && isnan((x) - (x)))
+ #endif
+ 
++static int json_is_nan(double value) {
++    return value != value;
++}
++
++static int json_is_inf(double value) {
++    return value == value &&
++           !(value >= -DBL_MAX && value <= DBL_MAX);
++}
++
+ #define DEFAULT_SPARSE_CONVERT 0
+ #define DEFAULT_SPARSE_RATIO 2
+ #define DEFAULT_SPARSE_SAFE 10
+@@ -606,18 +616,18 @@ static void json_append_number(lua_State *l, json_config_t *cfg,
+ 
+     if (cfg->encode_invalid_numbers == 0) {
+         /* Prevent encoding invalid numbers */
+-        if (isinf(num) || isnan(num))
++        if (json_is_inf(num) || json_is_nan(num))
+             json_encode_exception(l, cfg, json, lindex, "must not be NaN or Inf");
+     } else if (cfg->encode_invalid_numbers == 1) {
+         /* Encode invalid numbers, but handle "nan" separately
+          * since some platforms may encode as "-nan". */
+-        if (isnan(num)) {
++        if (json_is_nan(num)) {
+             strbuf_append_mem(json, "nan", 3);
+             return;
+         }
+     } else {
+         /* Encode invalid numbers as "null" */
+-        if (isinf(num) || isnan(num)) {
++        if (json_is_inf(num) || json_is_nan(num)) {
+             strbuf_append_mem(json, "null", 4);
+             return;
+         }
+--- a/deps/lua/src/lua_cmsgpack.c
++++ b/deps/lua/src/lua_cmsgpack.c
+@@ -1,4 +1,4 @@
+-#include <math.h>
++#include <float.h>
+ #include <stdlib.h>
+ #include <stdint.h>
+ #include <string.h>
+@@ -18,8 +18,13 @@
+     #define LUACMSGPACK_MAX_NESTING  16 /* Max tables nesting. */
+ #endif
+ 
++static int cmsgpack_is_inf(double value) {
++    return value == value &&
++           !(value >= -DBL_MAX && value <= DBL_MAX);
++}
++
+ /* Check if float or double can be an integer without loss of precision */
+-#define IS_INT_TYPE_EQUIVALENT(x, T) (!isinf(x) && (T)(x) == (x))
++#define IS_INT_TYPE_EQUIVALENT(x, T) (!cmsgpack_is_inf(x) && (T)(x) == (x))
+ 
+ #define IS_INT64_EQUIVALENT(x) IS_INT_TYPE_EQUIVALENT(x, int64_t)
+ #define IS_INT_EQUIVALENT(x) IS_INT_TYPE_EQUIVALENT(x, int)
+--- a/deps/xxhash/xxhash.h
++++ b/deps/xxhash/xxhash.h
+@@ -2535,7 +2535,9 @@
+  * We also use it to prevent unwanted constant folding for AArch64 in
+  * XXH3_initCustomSecret_scalar().
+  */
+-#if defined(__GNUC__) || defined(__clang__)
++#if defined(__CCC__)
++#  define XXH_COMPILER_GUARD(var) ((void)sizeof("ccc-xxhash-compiler-guard-noop"))
++#elif defined(__GNUC__) || defined(__clang__)
+ #  define XXH_COMPILER_GUARD(var) __asm__("" : "+r" (var))
+ #else
+ #  define XXH_COMPILER_GUARD(var) ((void)0)
