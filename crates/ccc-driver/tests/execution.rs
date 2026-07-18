@@ -236,6 +236,69 @@ fn invalid_runtime_sized_storage_extents_trap() {
     }
 }
 
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn runtime_sized_storage_links_with_gcc_as_pie_and_has_no_leaks() {
+    let directory = test_directory("runtime-sized-storage-external-link");
+    let source = directory.join("runtime-sized-storage-external-link.c");
+    let object = directory.join("runtime-sized-storage-external-link.o");
+    let executable = directory.join("runtime-sized-storage-external-link");
+    fs::write(
+        &source,
+        r#"
+static int exercise(int extent) {
+    _Alignas(64) int values[extent];
+    values[extent - 1] = extent;
+    return values[extent - 1] != extent;
+}
+
+int main(void) {
+    for (int extent = 1; extent <= 128; ++extent) {
+        if (exercise(extent) != 0) return 1;
+    }
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+
+    let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+        .arg("-c")
+        .arg(&source)
+        .arg("-o")
+        .arg(&object)
+        .output()
+        .unwrap();
+    assert!(
+        compilation.status.success(),
+        "ccc failed: {}",
+        String::from_utf8_lossy(&compilation.stderr)
+    );
+    let link = Command::new("gcc")
+        .arg("-fsanitize=address")
+        .arg(&object)
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .unwrap();
+    assert!(
+        link.status.success(),
+        "gcc failed: {}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+    let execution = Command::new(&executable)
+        .env("ASAN_OPTIONS", "detect_leaks=1:halt_on_error=1:exitcode=97")
+        .output()
+        .unwrap();
+    assert_eq!(
+        execution.status.code(),
+        Some(0),
+        "sanitized PIE failed: {}",
+        String::from_utf8_lossy(&execution.stderr)
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
 #[cfg_attr(
     not(all(target_arch = "x86_64", target_os = "linux")),
     allow(dead_code)
