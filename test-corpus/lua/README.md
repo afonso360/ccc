@@ -24,9 +24,10 @@ than being hidden by a command count.
 
 CCC emits position-independent objects, and Lua's native GCC link steps use
 their normal executable defaults without an adapter-supplied relocation flag.
-After linking, the adapter requires both programs to be ELF `DYN` files and
-rejects `TEXTREL` dynamic tags. The retained ELF headers, dynamic tags, and
-exact link commands make this boundary auditable.
+After linking, the adapter requires both programs to be ELF `DYN` files with
+the `DF_1_PIE` dynamic flag and rejects `TEXTREL` dynamic tags. The retained
+ELF headers, dynamic tags, and exact link commands make this boundary
+auditable.
 The adapter rejects a native driver that does not identify as GCC, targets a
 non-GNU x86-64 Linux ABI, or exposes Clang identity macros. Its resolved path,
 target, version, complete `--version` output, and predefined macros are retained

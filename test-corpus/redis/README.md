@@ -10,6 +10,21 @@ The core archive does not contain Redis's separately distributed module
 bundle. This profile builds only `redis-server` and `redis-cli`; it does not
 silently fetch modules or optional dependencies.
 
+## Current compiler boundary
+
+The adapter and its shell regressions are complete, but the pinned server is
+not yet an executable corpus pass. Redis uses native x86-64 `long double`
+unconditionally in core translation units, including arithmetic, conversions,
+internal calls and returns, `strtold`, and variadic `%Lf` formatting. CCC
+preserves the platform f80 representation and currently rejects those
+operations and boundaries with `CCC2343`/`CCC3509`; Redis has no upstream build
+switch that removes them. Consequently `run.sh` fails loudly during CCC
+translation and does not claim the server/CLI smoke artifacts described below.
+Raising the advertised GNU version does not affect this unconditional source
+surface. A passing unmodified run requires native f80 lowering and x87/libc ABI
+bridges; the adapter must not substitute `double`, inject an ABI-changing mode,
+or hide the boundary with another source adjustment.
+
 ## Build interface
 
 The adapter uses Redis's upstream component Makefiles on x86-64 Linux. It

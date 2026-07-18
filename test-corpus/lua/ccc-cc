@@ -2,6 +2,9 @@
 
 set -euo pipefail
 
+script_directory=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+source "$script_directory/../adapter-environment.sh"
+
 : "${CCC:?set CCC to the ccc executable}"
 : "${CCC_RESOURCE_DIR:?set CCC_RESOURCE_DIR to the shipped resource directory}"
 : "${CCC_LINK_CC:=gcc}"
@@ -97,7 +100,11 @@ for ((index = 0; index < ${#arguments[@]}; index++)); do
       frontend_only=true
       compile_arguments+=("$argument")
       ;;
-    -l?* | -L?* | -Wl,* | -pie | -no-pie)
+    -fPIE | -fpie | -fno-PIE | -fno-pie | -fno-PIC | -fno-pic | \
+      -pie | --pie | -no-pie | --no-pie | -nopie)
+      # Exercise CCC's platform-default relocation policy.
+      ;;
+    -l?* | -L?* | -Wl,* | -Wl=* | -Xlinker=*)
       ;;
     -l | -L | -Xlinker)
       if ((index + 1 >= ${#arguments[@]})); then
@@ -138,13 +145,38 @@ for ((index = 0; index < ${#arguments[@]}; index++)); do
   esac
 done
 
+unresolved_link_arguments=()
+for ((index = 0; index < ${#arguments[@]}; index++)); do
+  argument=${arguments[index]}
+  case "$argument" in
+    -std=*)
+      ;;
+    -Xlinker)
+      if ((index + 1 >= ${#arguments[@]})); then
+        echo "ccc-cc: -Xlinker requires an argument" >&2
+        exit 2
+      fi
+      linker_argument=${arguments[index + 1]}
+      if ! linker_token_overrides_default_pie "$linker_argument"; then
+        unresolved_link_arguments+=("$argument" "$linker_argument")
+      fi
+      ((index += 1))
+      ;;
+    *)
+      if filtered_argument=$(filter_default_pie_driver_argument "$argument"); then
+        unresolved_link_arguments+=("$filtered_argument")
+      fi
+      ;;
+  esac
+done
+
 if ((${#sources[@]} == 0)); then
   if ((${#arguments[@]} == 1)) && [[ "${arguments[0]}" == "--version" ]]; then
     printf 'ccc Lua corpus adapter (C translation by %s; linking by %s)\n' \
       "$CCC" "$CCC_LINK_CC"
     exit 0
   fi
-  run_linker "${arguments[@]}"
+  run_linker "${unresolved_link_arguments[@]}"
   exit $?
 fi
 
@@ -202,8 +234,7 @@ fi
 
 link_arguments=()
 source_index=0
-for ((index = 0; index < ${#arguments[@]}; index++)); do
-  argument=${arguments[index]}
+for argument in "${unresolved_link_arguments[@]}"; do
   case "$argument" in
     *.c)
       link_arguments+=("${objects[source_index]}")

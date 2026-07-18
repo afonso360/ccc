@@ -147,7 +147,9 @@ After the selected suite returns, the adapter rechecks the canonical
 `sqlite3.c` hash and rejects any native link record that contains C or
 preprocessed-C input. For `full`, it additionally requires both `fuzzcheck` and
 `sessionfuzz` and retains separate ELF header and dynamic-tag evidence proving
-that each is a PIE `DYN` file without dynamic text relocations.
+that each is a PIE `DYN` file with the `DF_1_PIE` dynamic flag and without
+dynamic text relocations. Requiring both properties distinguishes a PIE
+executable from an arbitrary shared object with ELF type `DYN`.
 
 Run the adapter as a non-root user on a native Linux filesystem. SQLite's Tcl
 suite deliberately checks that a mode-`0000` file is unreadable; it rejects UID

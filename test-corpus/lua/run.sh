@@ -344,6 +344,8 @@ for executable in lua luac; do
   elf_type=$(readelf --file-header "$binary" | awk '/^[[:space:]]*Type:/{print $2; exit}')
   [[ "$elf_type" == DYN ]] ||
     die "Lua $executable is $elf_type rather than the required PIE executable type"
+  readelf --dynamic "$binary" | grep -Eq '\(FLAGS_1\).*PIE' ||
+    die "Lua $executable does not carry the PIE dynamic flag"
   if readelf --dynamic "$binary" | grep -Eq '\(TEXTREL\)|FLAGS.*TEXTREL'; then
     die "Lua $executable contains dynamic text relocations"
   fi

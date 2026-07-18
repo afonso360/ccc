@@ -95,4 +95,28 @@ for variable in GNUMAKEFLAGS MAKEFILES MAKEFLAGS MAKEOVERRIDES MFLAGS; do
   fi
 done
 
+for option in \
+  -fPIE -fpie -fno-PIE -fno-pie -fno-PIC -fno-pic \
+  -pie --pie -no-pie --no-pie -nopie; do
+  compiler_option_overrides_default_pie "$option"
+  if filter_default_pie_driver_argument "$option" >/dev/null; then
+    echo "PIE compiler override was unexpectedly retained: $option" >&2
+    exit 1
+  fi
+done
+
+for token in -pie pie --pie -no-pie no-pie --no-pie -nopie nopie; do
+  linker_token_overrides_default_pie "$token"
+done
+
+[[ "$(filter_default_pie_driver_argument '-Wl,-z,now,-pie,--as-needed')" == \
+  '-Wl,-z,now,--as-needed' ]]
+[[ "$(filter_default_pie_driver_argument '-Wl=-no-pie,-z,relro')" == \
+  '-Wl,-z,relro' ]]
+if filter_default_pie_driver_argument '-Xlinker=-pie' >/dev/null; then
+  echo "-Xlinker PIE override was unexpectedly retained" >&2
+  exit 1
+fi
+[[ "$(filter_default_pie_driver_argument '-Wl,-z,now')" == '-Wl,-z,now' ]]
+
 echo "corpus adapter environment tests passed"

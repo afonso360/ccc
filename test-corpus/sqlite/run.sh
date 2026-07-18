@@ -42,6 +42,8 @@ verify_pie_executable() {
   program_type=$(awk '/^[[:space:]]*Type:/{print $2; exit}' "$header_artifact")
   [[ "$program_type" == DYN ]] ||
     die "SQLite $program is $program_type rather than the required PIE executable type"
+  grep -Eq '\(FLAGS_1\).*PIE' "$dynamic_artifact" ||
+    die "SQLite $program does not carry the PIE dynamic flag"
   if grep -Eq '\(TEXTREL\)|FLAGS.*TEXTREL' "$dynamic_artifact"; then
     die "SQLite $program contains dynamic text relocations"
   fi
