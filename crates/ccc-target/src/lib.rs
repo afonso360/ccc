@@ -191,6 +191,12 @@ impl TargetSpec {
             "__SIZEOF_LONG_DOUBLE__",
             (self.data_layout.long_double_width / 8).to_string(),
         );
+        // A 32-bit float in the enabled target data-layout contract uses the
+        // IEEE 754 binary32 representation.  Hosted GCC headers spell their
+        // <float.h> limits in terms of this predefined-macro family.
+        if self.data_layout.float_width == 32 {
+            insert_binary32_compatibility_facts(&mut facts);
+        }
         // A 64-bit double in the enabled target data-layout contract uses the
         // IEEE 754 binary64 representation. Keep the hosted `float.h` family
         // together so its precision, ranges, and exact boundary values agree.
@@ -243,6 +249,28 @@ impl TargetSpec {
             facts.insert("_LP64", "1");
         }
         facts
+    }
+}
+
+fn insert_binary32_compatibility_facts(facts: &mut PredefinedMacroFacts) {
+    for (suffix, replacement) in [
+        ("MANT_DIG", "24"),
+        ("DIG", "6"),
+        ("MIN_EXP", "(-125)"),
+        ("MIN_10_EXP", "(-37)"),
+        ("MAX_EXP", "128"),
+        ("MAX_10_EXP", "38"),
+        ("DECIMAL_DIG", "9"),
+        ("HAS_DENORM", "1"),
+        ("HAS_INFINITY", "1"),
+        ("HAS_QUIET_NAN", "1"),
+        ("MAX", "0x1.fffffep+127F"),
+        ("NORM_MAX", "0x1.fffffep+127F"),
+        ("EPSILON", "0x1p-23F"),
+        ("MIN", "0x1p-126F"),
+        ("DENORM_MIN", "0x1p-149F"),
+    ] {
+        facts.insert(format!("__FLT_{suffix}__"), replacement);
     }
 }
 
@@ -791,6 +819,21 @@ mod tests {
         for (name, expected) in [
             ("__FLT_RADIX__", "2"),
             ("__FLT_EVAL_METHOD__", "0"),
+            ("__FLT_MANT_DIG__", "24"),
+            ("__FLT_DIG__", "6"),
+            ("__FLT_MIN_EXP__", "(-125)"),
+            ("__FLT_MIN_10_EXP__", "(-37)"),
+            ("__FLT_MAX_EXP__", "128"),
+            ("__FLT_MAX_10_EXP__", "38"),
+            ("__FLT_DECIMAL_DIG__", "9"),
+            ("__FLT_HAS_DENORM__", "1"),
+            ("__FLT_HAS_INFINITY__", "1"),
+            ("__FLT_HAS_QUIET_NAN__", "1"),
+            ("__FLT_MAX__", "0x1.fffffep+127F"),
+            ("__FLT_NORM_MAX__", "0x1.fffffep+127F"),
+            ("__FLT_EPSILON__", "0x1p-23F"),
+            ("__FLT_MIN__", "0x1p-126F"),
+            ("__FLT_DENORM_MIN__", "0x1p-149F"),
             ("__DBL_MANT_DIG__", "53"),
             ("__DBL_DIG__", "15"),
             ("__DBL_MIN_EXP__", "(-1021)"),
