@@ -1620,6 +1620,45 @@ fn separates_integer_constant_expression_rules_from_value_folding() {
 }
 
 #[test]
+fn folds_unsigned_integer_operations_at_their_type_width() {
+    analyze_source(
+        "_Static_assert((0ULL - 1) == (unsigned long long)-1, \"converted maximum\");\n\
+         _Static_assert((0ULL - 1) == 18446744073709551615ULL, \"64-bit subtraction\");\n\
+         _Static_assert(-1U == 4294967295U, \"32-bit unary minus\");\n\
+         _Static_assert(~0U == 4294967295U, \"32-bit bitwise complement\");\n\
+         _Static_assert(4294967295U + 1U == 0U, \"32-bit addition\");\n\
+         _Static_assert(2147483648U * 2U == 0U, \"32-bit multiplication\");\n\
+         _Static_assert((2147483648U << 1) == 0U, \"32-bit left shift\");\n\
+         _Static_assert((1 << 30) == 1073741824, \"valid signed left shift\");\n\
+         _Static_assert((1LL << 62) == 4611686018427387904LL, \"valid 64-bit signed left shift\");\n\
+         _Static_assert((-2 >> 1) == -1, \"arithmetic signed right shift\");\n\
+         void exact_array_bound(void) {\n\
+             (void)sizeof(char[((0ULL - 1) == (unsigned long long)-1) ? 1 : -1]);\n\
+         }",
+    )
+    .unwrap();
+}
+
+#[test]
+fn does_not_fold_undefined_signed_overflow_or_invalid_shifts() {
+    for source in [
+        "_Static_assert(2147483647 + 1, \"signed addition overflow\");",
+        "_Static_assert((-2147483647 - 1) - 1, \"signed subtraction overflow\");",
+        "_Static_assert(1073741824 * 2, \"signed multiplication overflow\");",
+        "_Static_assert(-(-2147483647 - 1), \"signed negation overflow\");",
+        "_Static_assert((-2147483647 - 1) / -1, \"signed division overflow\");",
+        "_Static_assert((-2147483647 - 1) % -1, \"signed remainder overflow\");",
+        "_Static_assert(1 << 31, \"signed left shift overflow\");",
+        "_Static_assert(1LL << 63, \"64-bit signed left shift overflow\");",
+        "_Static_assert(-1 << 1, \"negative signed left shift\");",
+        "_Static_assert(1U << 32, \"shift count equals width\");",
+        "_Static_assert(1U << -1, \"negative shift count\");",
+    ] {
+        assert_eq!(diagnostic_codes(source), vec!["CCC2338"], "{source}");
+    }
+}
+
+#[test]
 fn rejects_incompatible_constant_array_composites() {
     assert_eq!(
         diagnostic_codes("extern int values[2]; extern int values[3];"),

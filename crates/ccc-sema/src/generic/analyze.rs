@@ -3810,25 +3810,11 @@ impl<'a> Analyzer<'a> {
                 let operand =
                     self.integer_or_arithmetic_promotion(operand, operator != U::BitwiseNot, span)?;
                 self.reject_long_double_operation(&[operand.ty], span)?;
-                let constant = operand.constant.and_then(|value| match (operator, value) {
-                    (U::Plus, value) => Some(value),
-                    (U::Minus, ConstantValue::Signed(value)) => {
-                        value.checked_neg().map(ConstantValue::Signed)
-                    }
-                    (U::Minus, ConstantValue::Unsigned(value)) => {
-                        Some(ConstantValue::Unsigned(value.wrapping_neg()))
-                    }
-                    (U::Minus, ConstantValue::Floating(value)) => {
-                        Some(ConstantValue::Floating(-value))
-                    }
-                    (U::BitwiseNot, ConstantValue::Signed(value)) => {
-                        Some(ConstantValue::Signed(!value))
-                    }
-                    (U::BitwiseNot, ConstantValue::Unsigned(value)) => {
-                        Some(ConstantValue::Unsigned(!value))
-                    }
-                    _ => None,
-                });
+                let constant = evaluate_unary_constant(
+                    operator,
+                    operand.constant,
+                    self.integer_constant_type(operand.ty.ty),
+                );
                 let constant_expression_kind = integer_constant_expression_kind(&[&operand]);
                 Ok(FullTypedExpression {
                     kind: FullTypedExpressionKind::Unary {
@@ -3873,7 +3859,7 @@ impl<'a> Analyzer<'a> {
         if matches!(operator, B::LogicalAnd | B::LogicalOr) {
             let left = self.convert_to_boolean(left)?;
             let right = self.convert_to_boolean(right)?;
-            let constant = evaluate_binary_constant(operator, left.constant, right.constant);
+            let constant = evaluate_binary_constant(operator, left.constant, right.constant, None);
             let constant_expression_kind =
                 logical_constant_expression_kind(operator, &left, &right);
             return Ok(FullTypedExpression {
@@ -3975,7 +3961,7 @@ impl<'a> Analyzer<'a> {
             || self.pointer_pointee(right.ty.ty).is_some())
         {
             let (left, right) = self.convert_pointer_comparison(left, right, span)?;
-            let constant = evaluate_binary_constant(operator, left.constant, right.constant);
+            let constant = evaluate_binary_constant(operator, left.constant, right.constant, None);
             let constant_expression_kind = integer_constant_expression_kind(&[&left, &right]);
             return Ok(FullTypedExpression {
                 kind: FullTypedExpressionKind::Binary {
@@ -3998,7 +3984,12 @@ impl<'a> Analyzer<'a> {
             }
             let left = self.integer_promote(left)?;
             let right = self.integer_promote(right)?;
-            let constant = evaluate_binary_constant(operator, left.constant, right.constant);
+            let constant = evaluate_binary_constant(
+                operator,
+                left.constant,
+                right.constant,
+                self.integer_constant_type(left.ty.ty),
+            );
             let constant_expression_kind = integer_constant_expression_kind(&[&left, &right]);
             return Ok(FullTypedExpression {
                 kind: FullTypedExpressionKind::Binary {
@@ -4036,7 +4027,12 @@ impl<'a> Analyzer<'a> {
         } else {
             common
         };
-        let constant = evaluate_binary_constant(operator, left.constant, right.constant);
+        let constant = evaluate_binary_constant(
+            operator,
+            left.constant,
+            right.constant,
+            self.integer_constant_type(common.ty),
+        );
         let constant_expression_kind = integer_constant_expression_kind(&[&left, &right]);
         Ok(FullTypedExpression {
             kind: FullTypedExpressionKind::Binary {
@@ -5929,6 +5925,14 @@ impl<'a> Analyzer<'a> {
         }
     }
 
+    fn integer_constant_type(&self, ty: TypeId) -> Option<IntegerConstantType> {
+        let kind = self.integer_representation(ty)?;
+        Some(IntegerConstantType {
+            width: self.integer_width(kind),
+            signed: self.integer_kind_is_signed(kind),
+        })
+    }
+
     fn integer_representation(&self, ty: TypeId) -> Option<BuiltinType> {
         if let Some(kind) = self.types.builtin_type(ty) {
             return Some(kind);
@@ -7439,10 +7443,72 @@ fn unsigned_max(width: u8) -> u128 {
     }
 }
 
+#[derive(Clone, Copy)]
+struct IntegerConstantType {
+    width: u8,
+    signed: bool,
+}
+
+fn signed_integer_constant(
+    value: i128,
+    integer_type: Option<IntegerConstantType>,
+) -> Option<ConstantValue> {
+    let integer_type = integer_type?;
+    if !integer_type.signed
+        || value < signed_min(integer_type.width)
+        || value > signed_max(integer_type.width) as i128
+    {
+        return None;
+    }
+    Some(ConstantValue::Signed(value))
+}
+
+fn unsigned_integer_constant(
+    value: u128,
+    integer_type: Option<IntegerConstantType>,
+) -> Option<ConstantValue> {
+    let integer_type = integer_type?;
+    if integer_type.signed {
+        return None;
+    }
+    Some(ConstantValue::Unsigned(truncate_to_width(
+        value,
+        integer_type.width,
+    )))
+}
+
+fn evaluate_unary_constant(
+    operator: syntax::UnaryOperator,
+    operand: Option<ConstantValue>,
+    integer_type: Option<IntegerConstantType>,
+) -> Option<ConstantValue> {
+    use syntax::UnaryOperator as U;
+    match (operator, operand?) {
+        (U::Plus, value @ ConstantValue::Floating(_)) => Some(value),
+        (U::Plus, ConstantValue::Signed(value)) => signed_integer_constant(value, integer_type),
+        (U::Plus, ConstantValue::Unsigned(value)) => unsigned_integer_constant(value, integer_type),
+        (U::Minus, ConstantValue::Signed(value)) => value
+            .checked_neg()
+            .and_then(|value| signed_integer_constant(value, integer_type)),
+        (U::Minus, ConstantValue::Unsigned(value)) => {
+            unsigned_integer_constant(value.wrapping_neg(), integer_type)
+        }
+        (U::Minus, ConstantValue::Floating(value)) => Some(ConstantValue::Floating(-value)),
+        (U::BitwiseNot, ConstantValue::Signed(value)) => {
+            signed_integer_constant(!value, integer_type)
+        }
+        (U::BitwiseNot, ConstantValue::Unsigned(value)) => {
+            unsigned_integer_constant(!value, integer_type)
+        }
+        _ => None,
+    }
+}
+
 fn evaluate_binary_constant(
     operator: syntax::BinaryOperator,
     left: Option<ConstantValue>,
     right: Option<ConstantValue>,
+    integer_type: Option<IntegerConstantType>,
 ) -> Option<ConstantValue> {
     use syntax::BinaryOperator as B;
     let left = left?;
@@ -7458,6 +7524,7 @@ fn evaluate_binary_constant(
     let right = right?;
     let boolean = |value: bool| Some(ConstantValue::Signed(i128::from(value)));
     if matches!(operator, B::LeftShift | B::RightShift) {
+        let integer_type = integer_type?;
         let count = match right {
             ConstantValue::Signed(value) => u32::try_from(value).ok()?,
             ConstantValue::Unsigned(value) => u32::try_from(value).ok()?,
@@ -7465,35 +7532,57 @@ fn evaluate_binary_constant(
                 return None;
             }
         };
+        if count >= u32::from(integer_type.width) {
+            return None;
+        }
         return match (operator, left) {
-            (B::LeftShift, ConstantValue::Signed(value)) => {
-                value.checked_shl(count).map(ConstantValue::Signed)
+            (B::LeftShift, ConstantValue::Signed(value)) if value >= 0 => {
+                let maximum = (signed_max(integer_type.width) as i128).checked_shr(count)?;
+                if value > maximum {
+                    return None;
+                }
+                value
+                    .checked_shl(count)
+                    .and_then(|value| signed_integer_constant(value, Some(integer_type)))
             }
-            (B::RightShift, ConstantValue::Signed(value)) => {
-                value.checked_shr(count).map(ConstantValue::Signed)
-            }
+            (B::RightShift, ConstantValue::Signed(value)) => value
+                .checked_shr(count)
+                .and_then(|value| signed_integer_constant(value, Some(integer_type))),
             (B::LeftShift, ConstantValue::Unsigned(value)) => {
-                value.checked_shl(count).map(ConstantValue::Unsigned)
+                unsigned_integer_constant(value.wrapping_shl(count), Some(integer_type))
             }
             (B::RightShift, ConstantValue::Unsigned(value)) => {
-                value.checked_shr(count).map(ConstantValue::Unsigned)
+                unsigned_integer_constant(value.checked_shr(count)?, Some(integer_type))
             }
             _ => None,
         };
     }
     match (left, right) {
         (ConstantValue::Signed(left), ConstantValue::Signed(right)) => match operator {
-            B::Multiply => left.checked_mul(right).map(ConstantValue::Signed),
-            B::Divide => (right != 0)
-                .then(|| left.checked_div(right))
-                .flatten()
-                .map(ConstantValue::Signed),
-            B::Remainder => (right != 0)
-                .then(|| left.checked_rem(right))
-                .flatten()
-                .map(ConstantValue::Signed),
-            B::Add => left.checked_add(right).map(ConstantValue::Signed),
-            B::Subtract => left.checked_sub(right).map(ConstantValue::Signed),
+            B::Multiply => left
+                .checked_mul(right)
+                .and_then(|value| signed_integer_constant(value, integer_type)),
+            B::Divide | B::Remainder => {
+                let integer_type = integer_type?;
+                if !integer_type.signed
+                    || right == 0
+                    || (left == signed_min(integer_type.width) && right == -1)
+                {
+                    return None;
+                }
+                let value = if operator == B::Divide {
+                    left.checked_div(right)?
+                } else {
+                    left.checked_rem(right)?
+                };
+                signed_integer_constant(value, Some(integer_type))
+            }
+            B::Add => left
+                .checked_add(right)
+                .and_then(|value| signed_integer_constant(value, integer_type)),
+            B::Subtract => left
+                .checked_sub(right)
+                .and_then(|value| signed_integer_constant(value, integer_type)),
             B::LeftShift | B::RightShift => unreachable!("shift constants are handled above"),
             B::Less => boolean(left < right),
             B::LessEqual => boolean(left <= right),
@@ -7501,18 +7590,22 @@ fn evaluate_binary_constant(
             B::GreaterEqual => boolean(left >= right),
             B::Equal => boolean(left == right),
             B::NotEqual => boolean(left != right),
-            B::BitwiseAnd => Some(ConstantValue::Signed(left & right)),
-            B::BitwiseXor => Some(ConstantValue::Signed(left ^ right)),
-            B::BitwiseOr => Some(ConstantValue::Signed(left | right)),
+            B::BitwiseAnd => signed_integer_constant(left & right, integer_type),
+            B::BitwiseXor => signed_integer_constant(left ^ right, integer_type),
+            B::BitwiseOr => signed_integer_constant(left | right, integer_type),
             B::LogicalAnd => boolean(left != 0 && right != 0),
             B::LogicalOr => boolean(left != 0 || right != 0),
         },
         (ConstantValue::Unsigned(left), ConstantValue::Unsigned(right)) => match operator {
-            B::Multiply => Some(ConstantValue::Unsigned(left.wrapping_mul(right))),
-            B::Divide => (right != 0).then_some(ConstantValue::Unsigned(left / right)),
-            B::Remainder => (right != 0).then_some(ConstantValue::Unsigned(left % right)),
-            B::Add => Some(ConstantValue::Unsigned(left.wrapping_add(right))),
-            B::Subtract => Some(ConstantValue::Unsigned(left.wrapping_sub(right))),
+            B::Multiply => unsigned_integer_constant(left.wrapping_mul(right), integer_type),
+            B::Divide => {
+                (right != 0).then(|| unsigned_integer_constant(left / right, integer_type))?
+            }
+            B::Remainder => {
+                (right != 0).then(|| unsigned_integer_constant(left % right, integer_type))?
+            }
+            B::Add => unsigned_integer_constant(left.wrapping_add(right), integer_type),
+            B::Subtract => unsigned_integer_constant(left.wrapping_sub(right), integer_type),
             B::LeftShift | B::RightShift => unreachable!("shift constants are handled above"),
             B::Less => boolean(left < right),
             B::LessEqual => boolean(left <= right),
@@ -7520,9 +7613,9 @@ fn evaluate_binary_constant(
             B::GreaterEqual => boolean(left >= right),
             B::Equal => boolean(left == right),
             B::NotEqual => boolean(left != right),
-            B::BitwiseAnd => Some(ConstantValue::Unsigned(left & right)),
-            B::BitwiseXor => Some(ConstantValue::Unsigned(left ^ right)),
-            B::BitwiseOr => Some(ConstantValue::Unsigned(left | right)),
+            B::BitwiseAnd => unsigned_integer_constant(left & right, integer_type),
+            B::BitwiseXor => unsigned_integer_constant(left ^ right, integer_type),
+            B::BitwiseOr => unsigned_integer_constant(left | right, integer_type),
             B::LogicalAnd => boolean(left != 0 && right != 0),
             B::LogicalOr => boolean(left != 0 || right != 0),
         },
