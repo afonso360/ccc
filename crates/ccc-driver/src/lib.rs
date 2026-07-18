@@ -1322,7 +1322,7 @@ mod tests {
             ),
             (
                 "wide-literal.c",
-                "int main(void) { return 18446744073709551616ULL; }",
+                "int main(void) { return 170141183460469231731687303715884105728; }",
                 "CCC2276",
             ),
             (
