@@ -177,7 +177,13 @@ Wide-integer proof covers high-bit constants, signed and unsigned arithmetic,
 division and remainder traps, floating conversions, layout, varargs, mixed
 register pressure, and GCC/Clang cross-linking in both directions. Object and
 link-plan checks require the exact `ti` helper symbols selected by each
-operation. No corpus result substitutes for this matrix.
+operation. LLVM 18 and 19 have a documented x86-64 ABI bug that keeps `%r9`
+reserved after atomically spilling an `__int128` argument
+([LLVM #123935](https://github.com/llvm/llvm-project/issues/123935)). Those
+versions still execute the spilled wide argument in both cross-link directions,
+but the exact following-scalar placement is exercised with GCC and Clang 20 or
+newer and locked independently by the ABI-plan assertion. No corpus result
+substitutes for this matrix.
 
 ## Differential testing and undefined behavior
 

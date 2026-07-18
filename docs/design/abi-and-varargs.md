@@ -227,7 +227,9 @@ can still require cross-object resolution.
 - register- and memory-class aggregates containing 128-bit integers,
   mixed SSE/wide fixed signatures, pair rollback with reuse of the stranded GP
   register, TLS values, weak definitions, and direct/indirect calls in both
-  cross-link directions;
+  cross-link directions; the exact stranded-register execution requires GCC or
+  Clang 20 and newer because LLVM 18 and 19 disagree with the psABI in that one
+  signature ([LLVM #123935](https://github.com/llvm/llvm-project/issues/123935));
 - direct and indirect variadic calls with zero, one, eight, and more than eight
   floating actuals, including a disassembly assertion for `%al` saturation;
 - zero-argument, promoted scalar, direct, and function-pointer unprototyped
