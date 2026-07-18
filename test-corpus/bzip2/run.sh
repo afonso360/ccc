@@ -77,12 +77,29 @@ download_archive() {
   local partial="$destination.part.$$"
   if [[ ! -f "$destination" ]]; then
     require_tool curl
-    if ! curl --fail --location --output "$partial" "$origin"; then
+    if ! curl --fail --location --retry 3 --retry-delay 2 --show-error \
+      --output "$partial" "$origin"; then
       rm -f -- "$partial"
+      echo "failed to download pinned bzip2 archive: $origin" >&2
       return 1
     fi
     mv "$partial" "$destination"
   fi
+}
+
+fetch_test_commit() {
+  local repository=$1
+  local origin=$2
+  local commit=$3
+  local attempt
+
+  for attempt in 1 2 3; do
+    if git -C "$repository" fetch --depth=1 "$origin" "$commit"; then
+      return 0
+    fi
+    echo "bzip2 test repository fetch attempt $attempt failed" >&2
+  done
+  return 1
 }
 
 prepare_test_repository() {
@@ -103,11 +120,15 @@ prepare_test_repository() {
     partial="$cache.partial.$$"
     rm -rf -- "$partial"
     git init --bare "$partial" >/dev/null
-    git -C "$partial" fetch --depth=1 "$origin" "$commit"
+    fetch_test_commit "$partial" "$origin" "$commit" || {
+      rm -rf -- "$partial"
+      die "failed to fetch the pinned bzip2 test commit"
+    }
     git -C "$partial" update-ref refs/ccc/pinned-test FETCH_HEAD
     mv "$partial" "$cache"
   elif ! git -C "$cache" cat-file -e "$commit^{commit}" 2>/dev/null; then
-    git -C "$cache" fetch --depth=1 "$origin" "$commit"
+    fetch_test_commit "$cache" "$origin" "$commit" ||
+      die "failed to fetch the pinned bzip2 test commit"
     git -C "$cache" update-ref refs/ccc/pinned-test FETCH_HEAD
   fi
   absolute_directory "$cache"

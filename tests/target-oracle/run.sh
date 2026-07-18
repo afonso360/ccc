@@ -90,7 +90,10 @@ case $target_name in
         qemu_root=${CCC_QEMU_ROOT:-/usr/riscv64-linux-gnu}
         ccc_min=("$ccc_bin" "--target=$triple")
         ccc_full=("$ccc_bin" "--target=$triple" -march=rv64gc -mcpu=generic -mabi=lp64d)
-        reference_cc=("$reference_driver" -march=rv64gc -mabi=lp64d)
+        # Debian's RISC-V GCC does not emit unwind tables for C functions by
+        # default.  The oracle must be able to cross the reference frames
+        # before it can validate the CCC frames on the other side.
+        reference_cc=("$reference_driver" -march=rv64gc -mabi=lp64d -funwind-tables)
         ;;
     darwin-arm64)
         platform=macho
@@ -197,15 +200,28 @@ link_ref() {
 run_executable() {
     local executable=$1
     if [[ $platform == elf ]]; then
-        local interpreter
+        local interpreter status
         interpreter=$($readelf_tool -l "$executable" | awk '/Requesting program interpreter/ { value=$NF; gsub(/\]/, "", value); print value; exit }')
         if [[ -z $interpreter || ! -e $qemu_root$interpreter ]]; then
             echo "target interpreter is absent from QEMU root: ${interpreter:-<none>}" >&2
             return 1
         fi
-        "${runner[@]}" "$executable"
+        if "${runner[@]}" "$executable"; then
+            return 0
+        else
+            status=$?
+            echo "target executable failed with status $status: $executable" >&2
+            return "$status"
+        fi
     else
-        "$executable"
+        local status
+        if "$executable"; then
+            return 0
+        else
+            status=$?
+            echo "native executable failed with status $status: $executable" >&2
+            return "$status"
+        fi
     fi
 }
 
