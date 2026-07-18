@@ -28,8 +28,8 @@ installed globally on the runner.
 
 The workflow installs this package set for each required run, then checks and
 records the resulting command, compiler, Tcl, and zlib identities. The manually
-dispatched Csmith job remains on the private runner and verifies its own larger
-prerequisite set independently.
+dispatched Csmith job also uses Ubuntu 24.04, installs its larger build-tool set
+for each run, and verifies that set independently.
 
 ## Cross-Linux target runners
 

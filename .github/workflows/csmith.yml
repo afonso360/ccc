@@ -19,7 +19,7 @@ permissions:
 
 jobs:
   differential:
-    runs-on: [self-hosted, Linux, X64, homelab]
+    runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
       - name: Initialize artifacts
@@ -33,6 +33,11 @@ jobs:
             printf 'start_seed=%s\n' "$CSMITH_START_SEED_INPUT"
           } >"$RUNNER_TEMP/ccc-csmith-artifacts/dispatch-inputs.txt"
       - uses: actions/checkout@v7
+      - name: Install Csmith differential prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            binutils clang cmake coreutils curl g++ gcc m4 make openssl tar
       - name: Verify runner prerequisites
         shell: bash
         run: |
