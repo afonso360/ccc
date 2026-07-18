@@ -339,7 +339,7 @@ fn execution_cases() -> &'static [ExecutionExpectation] {
     &EXECUTION_CASES
 }
 
-static EXECUTION_CASES: [ExecutionExpectation; 51] = [
+static EXECUTION_CASES: [ExecutionExpectation; 52] = [
     exit_status("return_constant.c", 42),
     exit_status("arithmetic_precedence.c", 14),
     exit_status("unary_arithmetic.c", 3),
@@ -384,6 +384,7 @@ static EXECUTION_CASES: [ExecutionExpectation; 51] = [
     exit_status("predefined_function_name.c", 62),
     exit_status("alignment_and_transparent_union.c", 65),
     exit_status("runtime_sized_storage.c", 0),
+    exit_status("runtime_sized_storage_reuse.c", 66),
     exit_status("combined_language_features.c", 53),
     exit_status("semantic_regressions.c", 54),
     exit_status("aggregate_calls.c", 63),

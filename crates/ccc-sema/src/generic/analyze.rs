@@ -1857,6 +1857,13 @@ impl<'a> Analyzer<'a> {
                     "a file-scope initializer must be a constant or relocatable address expression",
                 );
             }
+            if self.initializer_references_thread_storage(&typed) {
+                return self.fail(
+                    "CCC2344",
+                    span,
+                    "a file-scope initializer cannot contain the address of a thread-local object",
+                );
+            }
             Some(typed)
         } else {
             None
@@ -2340,6 +2347,15 @@ impl<'a> Analyzer<'a> {
                             "CCC2367",
                             init.span,
                             "a static- or thread-duration block object requires a constant initializer",
+                        );
+                    }
+                    if duration != StorageDuration::Automatic
+                        && self.initializer_references_thread_storage(&typed)
+                    {
+                        return self.fail(
+                            "CCC2367",
+                            init.span,
+                            "a static- or thread-duration initializer cannot contain the address of a thread-local object",
                         );
                     }
                     (Some(typed), completed)
@@ -7602,6 +7618,35 @@ impl<'a> Analyzer<'a> {
         let missing = function.labels.undefined_uses();
         for (name, span) in missing {
             self.emit("CCC2363", span, format!("use of undefined label `{name}`"));
+        }
+    }
+
+    fn initializer_references_thread_storage(&self, initializer: &FullTypedInitializer) -> bool {
+        match &initializer.kind {
+            FullTypedInitializerKind::Scalar(expression) => {
+                let Some(ConstantValue::Address(address)) = expression.constant else {
+                    return false;
+                };
+                match address.base {
+                    RelocatableBase::Global(id) => self
+                        .globals
+                        .get(id.0 as usize)
+                        .is_some_and(|global| global.duration == StorageDuration::Thread),
+                    RelocatableBase::BlockStatic { function, local } => self
+                        .function
+                        .as_ref()
+                        .filter(|state| state.id == function)
+                        .and_then(|state| state.static_duration_locals.get(&local))
+                        .is_some_and(|duration| *duration == StorageDuration::Thread),
+                    RelocatableBase::Function(_)
+                    | RelocatableBase::String(_)
+                    | RelocatableBase::Label { .. } => false,
+                }
+            }
+            FullTypedInitializerKind::Aggregate(entries) => entries
+                .iter()
+                .any(|entry| self.initializer_references_thread_storage(&entry.initializer)),
+            FullTypedInitializerKind::String(_) | FullTypedInitializerKind::Zero => false,
         }
     }
 

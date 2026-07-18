@@ -174,12 +174,14 @@ the containing object actually has sufficient trailing storage.
 
 ### Variably modified types
 
-Expression bounds, prototype `[*]`, parameter adjustment, runtime `sizeof`,
-and multidimensional strides follow the provider-independent type contract in
-[the conformance policy](conformance.md#variable-length-arrays). Physical
-runtime-sized object storage remains separately gated by
-[ADR-0011](../adr/0011-arena-backed-runtime-sized-automatic-storage.md). Type
-support neither implies native-stack mutation nor enables GNU `alloca`.
+Expression bounds, prototype `[*]`, parameter adjustment, automatic object
+allocation, and multidimensional strides follow the provider-independent type
+contract in [the conformance policy](conformance.md#variable-length-arrays).
+Automatic VLA objects use the hosted arena in
+[ADR-0011](../adr/0011-arena-backed-runtime-sized-automatic-storage.md).
+Runtime `sizeof` and several variably modified typedef/type-name contexts remain
+explicit boundaries, so the complete VLA capability is not yet advertised.
+Arena storage neither implies native-stack mutation nor enables GNU `alloca`.
 
 ## GNU C semantics
 

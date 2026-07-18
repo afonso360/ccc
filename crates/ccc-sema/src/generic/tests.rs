@@ -2941,6 +2941,21 @@ fn accepts_automatic_variable_length_and_thread_local_objects() {
             .any(|diagnostic| diagnostic.code == "CCC2346")
     );
     assert!(analyze_source("__thread int value;").is_ok());
+    assert!(analyze_source("int value; _Thread_local int *pointer = &value;").is_ok());
+    assert_eq!(
+        diagnostic_codes("_Thread_local int value; int *pointer = &value;"),
+        vec!["CCC2344"]
+    );
+    assert_eq!(
+        diagnostic_codes(
+            "int function(void) {
+                 static _Thread_local int value;
+                 static int *pointer = &value;
+                 return pointer != 0;
+             }"
+        ),
+        vec!["CCC2367"]
+    );
     assert_eq!(
         diagnostic_codes("__thread int function(void);"),
         vec!["CCC2374"]

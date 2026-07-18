@@ -81,48 +81,40 @@ failure, never an implicit skip.
 
 Provider-independent tests first prove that nonconstant array extents are
 evaluated once and retained in the typed AST, including parameter-order binding,
-runtime `sizeof`, and multidimensional pointer strides. Diagnostics distinguish
-prototype-scope `[*]`, legal fixed-size objects with variably modified types,
-runtime-sized objects whose provider is unavailable, invalid bounds, illegal
-storage classes, and control-flow ingress that bypasses a declaration.
+and multidimensional pointer strides. Diagnostics distinguish prototype-scope
+`[*]`, legal fixed-size objects with variably modified types, nonautomatic VLA
+objects, invalid bounds, and illegal storage classes. Runtime `sizeof` and
+control-flow ingress that bypasses a declaration remain explicit gates before
+the complete VLA capability can be advertised.
 
-Enabling an automatic-storage provider additionally requires exact CCC-IR
-goldens for region entry, allocation, and restoration, plus verifier mutations
-for mismatched merges, address-before-entry, non-LIFO restoration, and return
-with active storage. Execution fixtures cover normal fallthrough, nested
-blocks, `break`, `continue`, outward and backward `goto`, return-value
-evaluation, switch ingress, computed-goto cleanup when both capabilities are
-enabled, recursion, concurrent invocations, and statement-expression lifetime.
+CCC-IR tests pin runtime storage identities, allocation effects, retained
+extents, dynamic pointer strides, verifier type/dominance checks, and append-only
+digest tags. Execution fixtures cover bound-once evaluation, multidimensional
+access, normal return cleanup, recursion, concurrent invocations, and
+over-alignment. Named/switch/computed-goto ingress and runtime `sizeof` remain
+negative capability gates rather than silently approximated behavior.
 
 Provider tests inject nonpositive bounds, extent and alignment overflow,
 allocation failure, and alignments through over-aligned `_Alignas` declarations.
 On System V AMD64 every VLA allocation is checked for the target's 16-byte
-minimum as well as stronger declared alignment. Long-running loop fixtures
-measure bounded high-water reuse: after restoration, an allocation that fits
-retained capacity must make zero further allocator calls. Each target provider
-descriptor commits maximum allocation-count, hot-call latency-regression, and
-code-size budgets together with the pinned runner class, sampling protocol, and
-tolerance; the benchmark is a failing gate rather than an informational
-recording. Allocator accounting and LeakSanitizer runs cover every ordinary exit
-shape.
+minimum as well as stronger declared alignment. An instrumented descending-size
+loop proves that one growth serves every later execution of the declaration and
+that normal return releases it once. An external GCC default-PIE link runs the
+same provider surface under AddressSanitizer and LeakSanitizer. Native x86 tests
+execute the nonpositive and overflow traps; object inspection verifies their
+`ud2` failure paths when the development host's amd64 emulator cannot deliver
+those trap signals correctly.
 
-The scoped-arena profile has explicit nonlocal-control tests. A same-function
-combination with a returns-twice call remains a compile-fail case until its
-checkpoint protocol is verified. A cross-invocation `longjmp` fixture abandons
-one invocation while another arena is active and proves that the surviving
-arena remains intact. The harness reports the abandoned invocation's expected
-unreclaimed bytes separately so only that specified `longjmp` loss is exempt
-from leak-freedom assertions. Configuration snapshots pin the provider's
-negative async-signal-safety and cross-language-unwind facts; a call that may
-unwind across active arena storage remains diagnosed until cleanup integration
-is proved.
+Returns-twice and cross-language unwinding remain separate hard gates. A
+nonlocal exit may strand the abandoned invocation's cached allocations, as C
+permits for VLA storage, but cannot share or corrupt another invocation's state.
+The provider is not async-signal-safe because growth calls the hosted allocator.
 
 Object and disassembly checks prove that affected user functions keep their
-ordinary Cranelift frame, support definitions have local binding, and the only
-external provider references match the runtime manifest. A mixed-link test
-links a CCC-produced object with an external GCC- and Clang-compatible driver
-and resolves only the declared hosted dependencies. Negative feature-predicate
-tests keep `__builtin_alloca` unavailable for an arena-only profile.
+ordinary Cranelift frame and import only the declared hosted dependencies. A
+mixed-link test links a CCC-produced object with an external GCC-compatible
+driver as PIE. Negative feature-predicate tests keep `__builtin_alloca`
+unavailable for an arena-only profile.
 
 ## C11 and GNU capability fixtures
 

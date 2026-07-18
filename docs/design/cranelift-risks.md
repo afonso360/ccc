@@ -19,34 +19,37 @@ Each item records a backend mismatch and the behavior CCC requires. A feature is
 | 11  | **CPU features and SIMD**                                     | Normalize `-march`/`-mcpu`/`-m*` into one feature set used by predefined macros, type legality, ABI classification, and Cranelift ISA flags. A vector type or intrinsic is enabled only when all four agree.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | 12  | **`setjmp`/`longjmp`**                                        | Mark calls as returns-twice in CCC-IR. Materialize locals live across the call, preserve volatile locals, insert compiler/memory barriers, disable incompatible motion/tail-call transformations, and require a backend capability test proving register allocation and frame restoration. A function that also owns an arena needs an explicit checkpoint at the returns-twice boundary; until verified, diagnose that combination. A nonlocal exit across another invocation may strand its arena, as C permits VLA storage to be squandered, but cannot corrupt shared active state.                                                                                                                                                                                                                                          |
 | 13  | **Large frames and stack probes**                             | Compute static-frame obligations and use the target's native probe rules. Native dynamic-stack operations must compose with guard pages and stack-clash probes. Arena-backed automatic storage instead requires checked size/alignment, deterministic allocator failure, and memory-reuse tests; it does not satisfy native stack-usage or stack-clash claims. Probe symbols are resolved through the target runtime, not the host runtime.                                                                                                                                                                                                                                                                                                                                                                                      |
-| 14  | **Compiler-emitted helper calls**                             | A target runtime manifest maps every external helper signature and symbol to compiler-rt, libgcc, libatomic, libc, or a versioned CCC shim. Link-time availability is probed and helper ABI is covered by cross-linked tests. The arena provider's local CLIF support functions are primary-object definitions; their `malloc`, `free`, and non-returning `abort` dependencies are exact hosted-libc manifest entries.                                                                                                                                                                                                                                                                                                                                                                                                           |
+| 14  | **Compiler-emitted helper calls**                             | A target runtime manifest maps every external helper signature and symbol to compiler-rt, libgcc, libatomic, libc, or a versioned CCC shim. Link-time availability is probed and helper ABI is covered by cross-linked tests. The hosted arena imports the profile's exact `realloc` and `free` dependencies; external-driver PIE links and LeakSanitizer execution verify that surface.                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | 15  | **`_Complex`**                                                | Expose the capability only with typed pair operations, floating-point edge-case tests, libc/header support, and per-target ABI plans. Otherwise advertise `__STDC_NO_COMPLEX__` and reject semantic use.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | 16  | **Optimization expectations**                                 | Each `-O` level has a documented pass set and predefined-macro behavior. Higher levels may share a pass set, but the driver does not claim an optimization or aliasing contract it does not implement.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | 17  | **Computed goto and labels-as-values**                        | Cranelift has no indirect branch to arbitrary code addresses. `&&label` lowers to a per-function index and `goto *e` to a `br_table` dispatch on that index; indices are carried in pointer-typed values so storage, direct pointer tables, equality comparisons, and unmodified copied tokens behave. Direct expressions retain enough provenance to diagnose `&&b - &&a`, `&&a + offsets[i]`, and other difference-table reconstruction. Loading a token from object storage erases that provenance, so post-storage arithmetic is outside the supported behavior and is not guaranteed a diagnostic. The model exposes no machine address or PIC label-difference relocation. Cross-function label values remain undefined behavior and are diagnosed where detectable. Lua-style direct-token VM dispatch remains supported. |
 
 ## Runtime-sized automatic storage contract
 
-Runtime extents are evaluated once at the declaration and retained for runtime
-`sizeof` and multidimensional pointer strides. The complete byte size uses
-checked `size_t` arithmetic. Each declaration receives a provider mark and a
-stable pointer aligned to the greater of its declared alignment and the target
-VLA minimum. A nonpositive bound, arithmetic overflow, or provider failure
-enters a non-returning failure path.
+Runtime extents are evaluated once at the declaration and retained for
+multidimensional pointer strides. The complete byte size uses checked `size_t`
+arithmetic. CCC-IR assigns each syntactic runtime-sized declaration its own
+provider-neutral storage identity and an explicit allocation effect.
 
-CCC-IR represents region entry, allocation, and restoration explicitly. Its
-verifier requires identical active-region stacks at CFG merges, permits a
-runtime-sized storage address only while its region is active, and requires
-ordinary return edges to restore every active region. Semantic analysis rejects
-named `goto` and switch ingress that bypass a variably modified declaration.
-Lowering restores the active suffix on normal fallthrough, `break`, `continue`,
-outward and backward `goto`, and return after evaluating the return operand.
-Computed-goto dispatch must either preserve the same region state or select a
-target-specific cleanup edge; it cannot enter a deeper or unrelated region.
+The hosted lowering gives each identity a fixed `{base, capacity}` state slot.
+It reuses the existing allocation when capacity is sufficient, otherwise grows
+it with `realloc`, and returns a stable address aligned to the greater of the
+declared alignment and the target VLA minimum. A nonpositive bound, arithmetic
+overflow, or provider failure enters a non-returning failure path. Physical
+capacity may remain reserved after the C lifetime ends, but it is unreachable
+from defined C execution, bounded by the number of syntactic declarations, and
+released on every ordinary function return after the return value is evaluated.
+
+Semantic analysis must reject named-goto and switch ingress that bypasses a
+variably modified declaration before the complete VLA capability is advertised.
+Computed-goto dispatch cannot enter a deeper or unrelated VLA scope. Runtime
+`sizeof` remains a separate frontend/IR boundary.
 
 The selected hosted provider is the per-invocation arena recorded by
-[ADR-0011](../adr/0011-arena-backed-runtime-sized-automatic-storage.md). The
-capability remains unavailable until semantic, IR, provider, link, failure,
-leak, alignment, recursion, concurrency, and performance tests all pass.
+[ADR-0011](../adr/0011-arena-backed-runtime-sized-automatic-storage.md).
+Automatic object allocation is enabled; `__STDC_NO_VLA__` remains defined until
+the outstanding runtime-layout, control-flow-ingress, and variably modified
+type-context gates pass.
 
 ## Native dynamic-stack capability contract
 
