@@ -191,12 +191,13 @@ jobs:
     runs-on: macos-26
     env:
       DEVELOPER_DIR: /Library/Developer/CommandLineTools
-      ARTIFACT_DIR: ${{ runner.temp }}/ccc-target-darwin-arm64-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.96.0
       - name: Verify pinned Darwin ABI source and toolchain identity
         shell: bash
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/ccc-target-darwin-arm64-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
           mkdir -p "$ARTIFACT_DIR"
@@ -236,6 +237,8 @@ jobs:
           } > "$ARTIFACT_DIR/pinned-tool-identities.txt" 2>&1
       - name: Run native Darwin ABI, header, debugger, and corpus evidence
         shell: bash
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/ccc-target-darwin-arm64-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           set -euo pipefail
           cargo build --locked -p ccc-driver
