@@ -30,7 +30,7 @@ build_command = "make linux CC=<ccc-adapter>"
 source_translation_units = 34
 target_compiler = "ccc"
 link_driver = "gcc"
-link_mode = "pie-executable"
+link_mode = "platform-default-pie-executable"
 
 test_profile = "basic"
 test_entrypoint = "all.lua"

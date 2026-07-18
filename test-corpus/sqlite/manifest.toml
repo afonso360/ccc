@@ -37,7 +37,7 @@ supported_test_suites = ["veryquick", "quick", "all", "full"]
 build_compiler = "gcc"
 target_compiler = "ccc"
 link_driver = "gcc"
-link_mode = "pie-executable"
+link_mode = "platform-default-pie-executable"
 configure_arguments = [
     "--disable-shared",
     "--disable-readline",

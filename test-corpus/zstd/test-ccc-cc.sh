@@ -117,15 +117,17 @@ set -e
   "$source_directory/tests/b.c" -o "$temporary_directory/program" \
   -I"$source_directory/lib" \
   -include "$source_directory/lib/deps.h" \
-  -pthread -Wl,-z,now -z relro -lm
+  -pthread -fPIE -fno-pie -Wl,-pie,-z,now -Xlinker -no-pie \
+  -z relro -lm
 [[ -f "$temporary_directory/program" ]]
 [[ "$(grep -c '^ccc ' "$TRACE")" == 2 ]]
 [[ "$(grep -c '^link ' "$TRACE")" == 1 ]]
 ! grep '^link ' "$TRACE" | grep -Eq '\.(c|i)( |$)'
-! grep '^ccc ' "$CCC_ZSTD_COMMAND_LOG" | grep -Eq -- '-std=|-pthread|-Wl,|-z relro|-lm'
+! grep '^ccc ' "$CCC_ZSTD_COMMAND_LOG" | grep -Eq -- '-std=|-pthread|-fPIE|-fno-pie|-Wl,|-z relro|-lm'
+[[ "$(grep '^ccc ' "$CCC_ZSTD_COMMAND_LOG" | grep -c -- ' -D_REENTRANT=1' || true)" == 2 ]]
 [[ "$(grep '^ccc ' "$CCC_ZSTD_COMMAND_LOG" | grep -Fc -- " -include $quoted_dependency_override")" == 2 ]]
 grep '^link ' "$CCC_ZSTD_COMMAND_LOG" | grep -q -- ' -pthread'
-! grep '^link ' "$CCC_ZSTD_COMMAND_LOG" | grep -Eq -- ' -pie( |$)| -no-pie( |$)'
+! grep '^link ' "$CCC_ZSTD_COMMAND_LOG" | grep -Eq -- ' -std=| -fPIE| -fno-pie| -pie( |$)| -no-pie( |$)'
 grep '^link ' "$CCC_ZSTD_COMMAND_LOG" | grep -Fq -- ' -Wl\,-z\,now'
 ! grep '^link ' "$CCC_ZSTD_COMMAND_LOG" | grep -Fq -- "$source_directory/lib/deps.h"
 ! grep '^link ' "$CCC_ZSTD_COMMAND_LOG" | grep -Fq -- "$source_directory/lib"

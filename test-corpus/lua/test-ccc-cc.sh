@@ -85,13 +85,14 @@ grep -Fxq "$source_directory/a.c" "$CCC_LUA_SOURCE_LOG"
 : >"$CCC_LUA_SOURCE_LOG"
 "$script_directory/ccc-cc" -std=gnu99 "$source_directory/a.c" \
   "$source_directory/b.c" -o "$temporary_directory/program" \
-  -Wl,-E -ldl -lm
+  -fPIE -fno-pie -pie -no-pie \
+  -Wl,-pie,-E -Xlinker -no-pie -ldl -lm
 [[ -f "$temporary_directory/program" ]]
 [[ "$(grep -c '^ccc ' "$TRACE")" == 2 ]]
 [[ "$(grep -c '^link ' "$TRACE")" == 1 ]]
 ! grep '^link ' "$TRACE" | grep -Eq '\.(c|i)( |$)'
-! grep '^ccc ' "$CCC_LUA_COMMAND_LOG" | grep -Eq -- '-no-pie|-Wl,-E|-ldl|-lm'
-! grep '^link ' "$CCC_LUA_COMMAND_LOG" | grep -q -- ' -no-pie'
+! grep '^ccc ' "$CCC_LUA_COMMAND_LOG" | grep -Eq -- '-fPIE|-fno-pie|-pie|-no-pie|-Wl,-E|-ldl|-lm'
+! grep '^link ' "$CCC_LUA_COMMAND_LOG" | grep -Eq -- ' -fPIE| -fno-pie| -pie| -no-pie| -std='
 ! grep '^ccc ' "$CCC_LUA_COMMAND_LOG" | grep -q -- ' -std='
 grep '^link ' "$CCC_LUA_COMMAND_LOG" | grep -Fq -- ' -Wl\,-E'
 grep '^link ' "$CCC_LUA_COMMAND_LOG" | grep -q -- ' -ldl'

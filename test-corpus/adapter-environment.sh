@@ -56,3 +56,69 @@ record_native_gcc_driver() {
 clear_ambient_make_injection() {
   unset GNUMAKEFLAGS MAKEFILES MAKEFLAGS MAKEOVERRIDES MFLAGS
 }
+
+compiler_option_overrides_default_pie() {
+  case "$1" in
+    -fPIE | -fpie | -fno-PIE | -fno-pie | -fno-PIC | -fno-pic | \
+      -pie | --pie | -no-pie | --no-pie | -nopie)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+linker_token_overrides_default_pie() {
+  case "$1" in
+    -pie | pie | --pie | -no-pie | no-pie | --no-pie | -nopie | nopie)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# Print one driver argument with any explicit PIE-control token removed.  A
+# status of one means the whole argument was a PIE control and should be
+# omitted.  For a mixed -Wl bundle, retain every unrelated linker token.
+filter_default_pie_driver_argument() {
+  local argument=$1
+  local payload token joined=
+  local tokens=()
+  local retained=()
+
+  if compiler_option_overrides_default_pie "$argument"; then
+    return 1
+  fi
+
+  case "$argument" in
+    -Wl,* | -Wl=*)
+      payload=${argument#-Wl,}
+      payload=${payload#-Wl=}
+      IFS=',' read -r -a tokens <<<"$payload"
+      for token in "${tokens[@]}"; do
+        if ! linker_token_overrides_default_pie "$token"; then
+          retained+=("$token")
+        fi
+      done
+      ((${#retained[@]})) || return 1
+      for token in "${retained[@]}"; do
+        if [[ -n "$joined" ]]; then
+          joined+=,
+        fi
+        joined+=$token
+      done
+      printf '%s\n' "-Wl,$joined"
+      ;;
+    -Xlinker=*)
+      payload=${argument#-Xlinker=}
+      linker_token_overrides_default_pie "$payload" && return 1
+      printf '%s\n' "$argument"
+      ;;
+    *)
+      printf '%s\n' "$argument"
+      ;;
+  esac
+}

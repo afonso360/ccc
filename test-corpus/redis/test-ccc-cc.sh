@@ -107,13 +107,17 @@ grep -Fxq "$source_directory/a.c" "$CCC_REDIS_SOURCE_LOG"
 : >"$CCC_REDIS_SOURCE_LOG"
 "$script_directory/ccc-cc" -std=gnu99 \
   "$source_directory/a.c" "$source_directory/b.c" \
-  -o "$temporary_directory/program" -L. -lhiredis
+  -o "$temporary_directory/program" -pthread -fPIE -fno-pie \
+  -Wl,-pie,-z,now -Xlinker -no-pie -L. -lhiredis
 [[ -f "$temporary_directory/program" ]]
 [[ "$(grep -c '^ccc ' "$TRACE")" == 4 ]]
 [[ "$(grep -c '^link ' "$TRACE")" == 1 ]]
 ! grep '^link ' "$TRACE" | grep -Eq '\.(c|i)( |$)'
-! grep '^ccc ' "$CCC_REDIS_COMMAND_LOG" | grep -Eq -- '-std=|-L\.|-lhiredis'
-! grep '^link ' "$CCC_REDIS_COMMAND_LOG" | grep -Eq -- ' -pie( |$)| -no-pie( |$)'
+! grep '^ccc ' "$CCC_REDIS_COMMAND_LOG" | grep -Eq -- '-std=|-pthread|-fPIE|-fno-pie|-L\.|-lhiredis'
+[[ "$(grep '^ccc ' "$CCC_REDIS_COMMAND_LOG" | grep -c -- ' -D_REENTRANT=1' || true)" == 2 ]]
+! grep '^link ' "$CCC_REDIS_COMMAND_LOG" | grep -Eq -- ' -std=| -fPIE| -fno-pie| -pie( |$)| -no-pie( |$)'
+grep '^link ' "$CCC_REDIS_COMMAND_LOG" | grep -q -- ' -pthread'
+grep '^link ' "$CCC_REDIS_COMMAND_LOG" | grep -Fq -- ' -Wl\,-z\,now'
 grep '^link ' "$CCC_REDIS_COMMAND_LOG" | grep -Fq -- ' -L.'
 grep '^link ' "$CCC_REDIS_COMMAND_LOG" | grep -q -- ' -lhiredis'
 [[ "$(grep -c '^ccc ' "$CCC_REDIS_COMMAND_LOG")" == 2 ]]

@@ -24,6 +24,8 @@ target_compiler = "ccc"
 link_driver = "gcc"
 native_link_commands = 2
 link_mode = "platform-default-pie-executable"
+execution_status = "blocked-native-f80"
+required_unavailable_capability = "x86-64-f80-arithmetic-and-boundary-transport"
 
 allocator = "libc"
 tls = false

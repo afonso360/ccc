@@ -85,13 +85,15 @@ grep -Fxq "$source_directory/a.c" "$CCC_BZIP2_SOURCE_LOG"
 : >"$CCC_BZIP2_SOURCE_LOG"
 "$script_directory/ccc-cc" -std=c99 \
   "$source_directory/a.c" "$source_directory/b.c" \
-  -o "$temporary_directory/program" -L. -lbz2
+  -o "$temporary_directory/program" -fpie -fno-PIE \
+  -Wl,-pie,-z,now -Xlinker --no-pie -L. -lbz2
 [[ -f "$temporary_directory/program" ]]
 [[ "$(grep -c '^ccc ' "$TRACE")" == 2 ]]
 [[ "$(grep -c '^link ' "$TRACE")" == 1 ]]
 ! grep '^link ' "$TRACE" | grep -Eq '\.(c|i)( |$)'
-! grep '^ccc ' "$CCC_BZIP2_COMMAND_LOG" | grep -Eq -- '-std=|-L\.|-lbz2'
-! grep '^link ' "$CCC_BZIP2_COMMAND_LOG" | grep -Eq -- ' -pie( |$)| -no-pie( |$)'
+! grep '^ccc ' "$CCC_BZIP2_COMMAND_LOG" | grep -Eq -- '-std=|-fpie|-fno-PIE|-L\.|-lbz2'
+! grep '^link ' "$CCC_BZIP2_COMMAND_LOG" | grep -Eq -- ' -std=| -fpie| -fno-PIE| -pie( |$)| -no-pie( |$)| --no-pie'
+grep '^link ' "$CCC_BZIP2_COMMAND_LOG" | grep -Fq -- ' -Wl\,-z\,now'
 grep '^link ' "$CCC_BZIP2_COMMAND_LOG" | grep -Fq -- ' -L.'
 grep '^link ' "$CCC_BZIP2_COMMAND_LOG" | grep -q -- ' -lbz2'
 [[ "$(grep -c '^ccc ' "$CCC_BZIP2_COMMAND_LOG")" == 2 ]]
