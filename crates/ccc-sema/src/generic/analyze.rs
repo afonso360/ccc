@@ -1649,6 +1649,7 @@ impl<'a> Analyzer<'a> {
         attributes: Vec<FullTypedAttribute>,
         span: Span,
     ) -> AnalysisResult<TypedefId> {
+        self.reject_tls_model_attribute(&attributes, span)?;
         self.reject_weak_attribute(&attributes, span, "a typedef")?;
         if matches!(self.types.try_kind(ty.ty), Some(TypeKind::Array(_)))
             && self.type_contains_flexible_array_member(ty.ty)
@@ -1695,6 +1696,7 @@ impl<'a> Analyzer<'a> {
         asm_label: Option<FullTypedAsmLabel>,
         span: Span,
     ) -> AnalysisResult<FullFunctionId> {
+        self.reject_tls_model_attribute(&attributes, span)?;
         if !matches!(
             storage,
             None | Some(syntax::StorageClass::Extern | syntax::StorageClass::Static)
@@ -1831,6 +1833,9 @@ impl<'a> Analyzer<'a> {
         initializer: Option<&syntax::Initializer>,
         span: Span,
     ) -> AnalysisResult<GlobalId> {
+        if !thread_local {
+            self.reject_tls_model_attribute(&attributes, span)?;
+        }
         let is_definition = initializer.is_some();
         if matches!(
             storage,
@@ -2270,6 +2275,9 @@ impl<'a> Analyzer<'a> {
                 init.span,
                 "an object declaration",
             )?;
+            if !info.thread_local {
+                self.reject_tls_model_attribute(&attributes, init.span)?;
+            }
             if init.asm_label.is_some() {
                 return self.fail(
                     "CCC2257",
@@ -7380,6 +7388,24 @@ impl<'a> Analyzer<'a> {
                 }
                 _ => {}
             }
+        }
+        Ok(())
+    }
+
+    fn reject_tls_model_attribute(
+        &mut self,
+        attributes: &[FullTypedAttribute],
+        span: Span,
+    ) -> AnalysisResult<()> {
+        if attributes
+            .iter()
+            .any(|attribute| attribute_has_name(attribute, "tls_model"))
+        {
+            return self.fail(
+                "CCC2441",
+                span,
+                "`tls_model` is only valid on an object with thread storage duration",
+            );
         }
         Ok(())
     }

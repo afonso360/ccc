@@ -137,6 +137,7 @@ impl CapabilityRegistry {
             "__volatile__",
             "__alignof",
             "__alignof__",
+            "__thread",
             "gnu-declaration-asm-labels",
         ] {
             registry.insert(
@@ -153,7 +154,6 @@ impl CapabilityRegistry {
             "__attribute__",
             "__typeof",
             "__typeof__",
-            "__thread",
             "gnu-alternative-keywords",
             "gnu-attribute-specifiers",
             "gnu-typeof",
@@ -420,6 +420,7 @@ mod tests {
             "__restrict__",
             "__signed__",
             "__alignof__",
+            "__thread",
             "gnu-declaration-asm-labels",
         ] {
             assert_eq!(
@@ -428,13 +429,7 @@ mod tests {
                 "unexpected state for {name}"
             );
         }
-        for name in [
-            "__asm__",
-            "__attribute__",
-            "__typeof__",
-            "__thread",
-            "gnu-typeof",
-        ] {
+        for name in ["__asm__", "__attribute__", "__typeof__", "gnu-typeof"] {
             assert_eq!(
                 registry.state(CapabilityKind::Extension, name),
                 CapabilityState::ParseOnly,

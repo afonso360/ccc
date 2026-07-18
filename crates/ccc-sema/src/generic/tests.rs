@@ -2941,6 +2941,19 @@ fn accepts_automatic_variable_length_and_thread_local_objects() {
             .any(|diagnostic| diagnostic.code == "CCC2346")
     );
     assert!(analyze_source("__thread int value;").is_ok());
+    assert!(
+        analyze_source("__thread int value __attribute__((tls_model(\"initial-exec\")));").is_ok()
+    );
+    for source in [
+        "int value __attribute__((tls_model(\"initial-exec\")));",
+        "static int value __attribute__((tls_model(\"local-exec\")));",
+        "int function(void) __attribute__((tls_model(\"global-dynamic\")));",
+        "typedef int Alias __attribute__((tls_model(\"local-dynamic\")));",
+        "int function(void) { int value __attribute__((tls_model(\"initial-exec\"))); return value; }",
+        "int function(void) { static int value __attribute__((tls_model(\"local-exec\"))); return value; }",
+    ] {
+        assert_eq!(diagnostic_codes(source), vec!["CCC2441"], "{source}");
+    }
     assert!(analyze_source("int value; _Thread_local int *pointer = &value;").is_ok());
     assert_eq!(
         diagnostic_codes("_Thread_local int value; int *pointer = &value;"),
