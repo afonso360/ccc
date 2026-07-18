@@ -338,6 +338,7 @@ fn plan_artifacts(
                 function: *function,
                 kind: boundary.kind,
                 public_symbol: source.symbol_name.clone(),
+                public_symbol_is_exact: source.symbol_name_is_exact,
                 source_linkage,
                 source_visibility,
                 source_binding,
@@ -715,7 +716,7 @@ fn dump_artifacts(output: &mut String, artifacts: &BridgeArtifactPlan) {
     for entry in artifacts.bridge_entries.values() {
         writeln!(
             output,
-            "bridge-entry function={} kind={} public={} linkage={} visibility={} binding={} body={} frame-version={} va-state-version={}",
+            "bridge-entry function={} kind={} public={} exact={} linkage={} visibility={} binding={} body={} frame-version={} va-state-version={}",
             entry.function.0,
             match entry.kind {
                 crate::BridgeKind::FixedEntry => "fixed-entry",
@@ -723,6 +724,7 @@ fn dump_artifacts(output: &mut String, artifacts: &BridgeArtifactPlan) {
                 _ => "invalid-call-side-kind",
             },
             entry.public_symbol,
+            entry.public_symbol_is_exact,
             source_linkage_name(entry.source_linkage),
             source_visibility_name(entry.source_visibility),
             match entry.source_binding {

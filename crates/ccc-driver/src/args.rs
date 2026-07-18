@@ -117,6 +117,7 @@ pub(crate) struct DriverOptions {
 pub(crate) enum ParsedCommand {
     Run(Box<DriverOptions>),
     Help,
+    Version,
 }
 
 pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<ParsedCommand, String> {
@@ -257,6 +258,7 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
                 .targets
                 .push(DependencyTarget::Quoted(take_value(&mut arguments, "-MQ")?)),
             "-h" | "--help" => return Ok(ParsedCommand::Help),
+            "--version" => return Ok(ParsedCommand::Version),
             "--" => inputs.extend(arguments.by_ref().map(PathBuf::from)),
             _ if argument == "-std=gnu11" => language_mode = LanguageMode::Gnu11,
             _ if argument == "-std=c11" => language_mode = LanguageMode::C11,
@@ -502,6 +504,14 @@ mod tests {
         assert_eq!(options.include_paths.len(), 3);
         assert_eq!(options.include_paths[0].kind, IncludePathKind::Quote);
         assert_eq!(options.include_paths[2].kind, IncludePathKind::System);
+    }
+
+    #[test]
+    fn version_is_a_no_input_driver_action() {
+        assert!(matches!(
+            parse(["--version".to_owned()]),
+            Ok(ParsedCommand::Version)
+        ));
     }
 
     #[test]

@@ -292,6 +292,7 @@ pub struct BridgeEntryArtifactPlan {
     pub function: FullFunctionId,
     pub kind: BridgeKind,
     pub public_symbol: String,
+    pub public_symbol_is_exact: bool,
     pub source_linkage: SourceLinkage,
     pub source_visibility: SourceVisibility,
     pub source_binding: SourceBinding,

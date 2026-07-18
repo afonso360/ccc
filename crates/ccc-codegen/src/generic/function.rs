@@ -3084,6 +3084,11 @@ pub(super) fn scalar_type(
                 .to_owned(),
             span: None,
         }),
+        Some(TypeKind::Builtin(BuiltinType::Float16)) => Err(CodegenError {
+            code: "CCC3518",
+            message: "`_Float16` values require an enabled transport capability".to_owned(),
+            span: None,
+        }),
         Some(TypeKind::Builtin(BuiltinType::Int128 | BuiltinType::UnsignedInt128)) => {
             if config.target.abi.supports_int128_values() {
                 Ok(ir::types::I128)
@@ -3158,6 +3163,7 @@ fn is_signed(
             BuiltinType::Int128 => true,
             BuiltinType::UnsignedInt128 => false,
             BuiltinType::Void
+            | BuiltinType::Float16
             | BuiltinType::Float
             | BuiltinType::Double
             | BuiltinType::LongDouble => {
@@ -3186,7 +3192,12 @@ fn is_signed(
 fn is_float(types: &TypeStore, ty: QualifiedType) -> bool {
     matches!(
         types.builtin_type(ty.ty),
-        Some(BuiltinType::Float | BuiltinType::Double | BuiltinType::LongDouble)
+        Some(
+            BuiltinType::Float16
+                | BuiltinType::Float
+                | BuiltinType::Double
+                | BuiltinType::LongDouble
+        )
     )
 }
 

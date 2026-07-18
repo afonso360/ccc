@@ -348,6 +348,7 @@ fn assembly_labels_preserve_source_names_and_merge_redeclarations() {
         .find(|global| global.name == "source_object")
         .unwrap();
     assert_eq!(source_object.emission.symbol_name, "linked_object");
+    assert!(source_object.emission.symbol_name_is_exact);
     assert_eq!(
         source_object.asm_label.as_ref().unwrap().symbol,
         "linked_object"
@@ -3345,6 +3346,34 @@ fn compiler_128_bit_integers_have_target_gated_value_transport() {
         "signed __uint128_t invalid;",
         "__int128 int invalid;",
         "__int128_t __uint128_t invalid;",
+    ] {
+        assert_eq!(diagnostic_codes(source), ["CCC2218"], "{source}");
+    }
+}
+
+#[test]
+fn float16_supports_declarations_and_layout_without_value_transport() {
+    analyze_source(
+        "static _Float16 file_object;\n\
+         struct HalfPair { _Float16 first; _Float16 second; };\n\
+         _Static_assert(sizeof(_Float16) == 2, \"size\");\n\
+         _Static_assert(_Alignof(_Float16) == 2, \"alignment\");\n\
+         _Static_assert(sizeof(struct HalfPair) == 4, \"record size\");\n\
+         void storage(void) {\n\
+             _Float16 local;\n\
+             _Float16 values[2];\n\
+             _Float16 *pointer = &local;\n\
+             _Static_assert(sizeof values == 4, \"array size\");\n\
+             (void)pointer;\n\
+         }\n\
+         extern _Float16 declaration_only(_Float16);",
+    )
+    .unwrap();
+
+    for source in [
+        "unsigned _Float16 invalid;",
+        "long _Float16 invalid;",
+        "_Float16 double invalid;",
     ] {
         assert_eq!(diagnostic_codes(source), ["CCC2218"], "{source}");
     }

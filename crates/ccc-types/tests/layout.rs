@@ -60,6 +60,7 @@ fn x86_64_builtin_and_pointer_layouts_are_explicit() {
             SizeAlign { size: 8, align: 8 },
         ),
         (BuiltinType::Float, SizeAlign { size: 4, align: 4 }),
+        (BuiltinType::Float16, SizeAlign { size: 2, align: 2 }),
         (BuiltinType::Double, SizeAlign { size: 8, align: 8 }),
         (
             BuiltinType::LongDouble,

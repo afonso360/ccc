@@ -509,7 +509,11 @@ fn function_footer(symbol: &str, output: &mut String) {
 }
 
 fn target_symbol(symbol: &str, abi: AbiIdentity) -> String {
-    if abi == AbiIdentity::DarwinArm64 {
+    target_symbol_with_exactness(symbol, abi, false)
+}
+
+fn target_symbol_with_exactness(symbol: &str, abi: AbiIdentity, exact: bool) -> String {
+    if abi == AbiIdentity::DarwinArm64 && !exact {
         format!("_{symbol}")
     } else {
         symbol.to_owned()
@@ -518,13 +522,14 @@ fn target_symbol(symbol: &str, abi: AbiIdentity) -> String {
 
 fn target_function_header(
     symbol: &str,
+    symbol_is_exact: bool,
     linkage: AssemblyFunctionLinkage,
     weak: bool,
     abi: AbiIdentity,
     output: &mut String,
 ) {
     output.push_str(".text\n.p2align 2\n");
-    let assembly_symbol = target_symbol(symbol, abi);
+    let assembly_symbol = target_symbol_with_exactness(symbol, abi, symbol_is_exact);
     if abi == AbiIdentity::DarwinArm64 {
         if linkage != AssemblyFunctionLinkage::Internal {
             writeln!(output, ".globl {assembly_symbol}").unwrap();
@@ -583,9 +588,14 @@ fn target_function_header(
     output.push_str(".cfi_startproc\n");
 }
 
-fn target_function_footer(symbol: &str, abi: AbiIdentity, output: &mut String) {
+fn target_function_footer(
+    symbol: &str,
+    symbol_is_exact: bool,
+    abi: AbiIdentity,
+    output: &mut String,
+) {
     output.push_str(".cfi_endproc\n");
-    let assembly_symbol = target_symbol(symbol, abi);
+    let assembly_symbol = target_symbol_with_exactness(symbol, abi, symbol_is_exact);
     if abi == AbiIdentity::DarwinArm64 {
         output.push_str(".subsections_via_symbols\n");
     } else {
@@ -683,6 +693,7 @@ fn render_arm64_call_helper(
     let mut source = String::new();
     target_function_header(
         symbol,
+        false,
         AssemblyFunctionLinkage::ExternalHidden,
         false,
         abi,
@@ -748,7 +759,7 @@ fn render_arm64_call_helper(
          .cfi_def_cfa sp, 0\n\
          ret\n",
     );
-    target_function_footer(symbol, abi, &mut source);
+    target_function_footer(symbol, false, abi, &mut source);
     GeneratedAssembly::new(
         "call-helper",
         source,
@@ -762,6 +773,7 @@ fn render_riscv64_call_helper(symbol: &str) -> Result<GeneratedAssembly, LinkErr
     let mut source = String::new();
     target_function_header(
         symbol,
+        false,
         AssemblyFunctionLinkage::ExternalHidden,
         false,
         AbiIdentity::RiscvLp64d,
@@ -835,7 +847,7 @@ fn render_riscv64_call_helper(symbol: &str) -> Result<GeneratedAssembly, LinkErr
          .cfi_def_cfa sp, 0\n\
          ret\n",
     );
-    target_function_footer(symbol, AbiIdentity::RiscvLp64d, &mut source);
+    target_function_footer(symbol, false, AbiIdentity::RiscvLp64d, &mut source);
     GeneratedAssembly::new(
         "call-helper",
         source,
@@ -848,6 +860,9 @@ fn render_riscv64_call_helper(symbol: &str) -> Result<GeneratedAssembly, LinkErr
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BridgeEntryPlan {
     pub public_symbol: String,
+    /// The public spelling is an explicit object-file symbol from a
+    /// declaration assembly label and must bypass target C-name mangling.
+    pub public_symbol_is_exact: bool,
     pub hidden_body_symbol: String,
     pub linkage: AssemblyFunctionLinkage,
     pub weak: bool,
@@ -1093,6 +1108,7 @@ fn render_arm64_variadic_entry(
     let mut source = String::new();
     target_function_header(
         &plan.public_symbol,
+        plan.public_symbol_is_exact,
         plan.linkage,
         plan.weak,
         abi,
@@ -1196,7 +1212,12 @@ fn render_arm64_variadic_entry(
          .cfi_def_cfa sp, 0\n\
          ret\n",
     );
-    target_function_footer(&plan.public_symbol, abi, &mut source);
+    target_function_footer(
+        &plan.public_symbol,
+        plan.public_symbol_is_exact,
+        abi,
+        &mut source,
+    );
     GeneratedAssembly::new(
         format!("variadic-entry-{}", short_stem(&plan.public_symbol)),
         source,
@@ -1210,6 +1231,7 @@ fn render_riscv64_variadic_entry(plan: &BridgeEntryPlan) -> Result<GeneratedAsse
     let mut source = String::new();
     target_function_header(
         &plan.public_symbol,
+        plan.public_symbol_is_exact,
         plan.linkage,
         plan.weak,
         abi,
@@ -1297,7 +1319,12 @@ fn render_riscv64_variadic_entry(plan: &BridgeEntryPlan) -> Result<GeneratedAsse
          .cfi_def_cfa_offset 0\n\
          ret\n",
     );
-    target_function_footer(&plan.public_symbol, abi, &mut source);
+    target_function_footer(
+        &plan.public_symbol,
+        plan.public_symbol_is_exact,
+        abi,
+        &mut source,
+    );
     GeneratedAssembly::new(
         format!("variadic-entry-{}", short_stem(&plan.public_symbol)),
         source,
@@ -1492,6 +1519,7 @@ mod tests {
     fn variadic_entry_builds_the_public_va_list_view() {
         let assembly = render_variadic_entry(&BridgeEntryPlan {
             public_symbol: "consume".to_owned(),
+            public_symbol_is_exact: false,
             hidden_body_symbol: "__ccc_variadic_body_test".to_owned(),
             linkage: AssemblyFunctionLinkage::ExternalHidden,
             weak: false,
@@ -1524,6 +1552,7 @@ mod tests {
         let assembly = render_target_fixed_entry(
             &BridgeEntryPlan {
                 public_symbol: "fixed_wide".to_owned(),
+                public_symbol_is_exact: false,
                 hidden_body_symbol: "__ccc_fixed_body_test".to_owned(),
                 linkage: AssemblyFunctionLinkage::ExternalDefault,
                 weak: true,
@@ -1552,6 +1581,7 @@ mod tests {
     fn variadic_entry_rejects_conflicting_indirect_and_register_results() {
         let error = render_variadic_entry(&BridgeEntryPlan {
             public_symbol: "consume".to_owned(),
+            public_symbol_is_exact: false,
             hidden_body_symbol: "hidden".to_owned(),
             linkage: AssemblyFunctionLinkage::Internal,
             weak: false,
@@ -1575,6 +1605,7 @@ mod tests {
     fn variadic_entry_retains_internal_source_linkage() {
         let assembly = render_variadic_entry(&BridgeEntryPlan {
             public_symbol: "local_consume".to_owned(),
+            public_symbol_is_exact: false,
             hidden_body_symbol: "__ccc_variadic_body_local".to_owned(),
             linkage: AssemblyFunctionLinkage::Internal,
             weak: false,
@@ -1610,6 +1641,7 @@ mod tests {
         ] {
             let assembly = render_variadic_entry(&BridgeEntryPlan {
                 public_symbol: "consume".to_owned(),
+                public_symbol_is_exact: false,
                 hidden_body_symbol: "__ccc_variadic_body_visibility".to_owned(),
                 linkage,
                 weak: false,
@@ -1635,9 +1667,56 @@ mod tests {
     }
 
     #[test]
+    fn darwin_variadic_entry_preserves_exact_assembly_label_spelling() {
+        let render = |public_symbol: &str, public_symbol_is_exact: bool| {
+            render_target_variadic_entry(
+                &BridgeEntryPlan {
+                    public_symbol: public_symbol.to_owned(),
+                    public_symbol_is_exact,
+                    hidden_body_symbol: "__ccc_variadic_body_darwin_label".to_owned(),
+                    linkage: AssemblyFunctionLinkage::ExternalDefault,
+                    weak: false,
+                    fixed_gp_used: 1,
+                    fixed_sse_used: 0,
+                    overflow_arg_offset: 0,
+                    gp_results: 1,
+                    xmm_results: 0,
+                    hidden_return: false,
+                    logical_line: 1,
+                },
+                AbiIdentity::DarwinArm64,
+            )
+            .unwrap()
+        };
+
+        let exact = render("_physical_variadic", true);
+        assert!(exact.source().contains(".globl _physical_variadic\n"));
+        assert!(exact.source().contains("_physical_variadic:\n"));
+        assert!(!exact.source().contains("__physical_variadic"));
+
+        let exact_without_prefix = render("physical_variadic", true);
+        assert!(
+            exact_without_prefix
+                .source()
+                .contains(".globl physical_variadic\n")
+        );
+        assert!(
+            exact_without_prefix
+                .source()
+                .contains("physical_variadic:\n")
+        );
+        assert!(!exact_without_prefix.source().contains("_physical_variadic"));
+
+        let ordinary = render("_ordinary_variadic", false);
+        assert!(ordinary.source().contains(".globl __ordinary_variadic\n"));
+        assert!(ordinary.source().contains("__ordinary_variadic:\n"));
+    }
+
+    #[test]
     fn variadic_entry_guards_each_xmm_save_with_the_incoming_al_bound() {
         let assembly = render_variadic_entry(&BridgeEntryPlan {
             public_symbol: "consume".to_owned(),
+            public_symbol_is_exact: false,
             hidden_body_symbol: "__ccc_variadic_body_al_bound".to_owned(),
             linkage: AssemblyFunctionLinkage::ExternalDefault,
             weak: false,

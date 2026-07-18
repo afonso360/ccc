@@ -187,17 +187,11 @@ pub(crate) fn plan_va_arg(
     };
     let overflow_align = if indirect {
         8
-    } else if config.target.abi == AbiIdentity::DarwinArm64 {
-        classified.align.clamp(1, 16)
     } else {
         classified.align.clamp(8, 16)
     };
     let payload_size = if indirect { 8 } else { classified.size };
-    let overflow_size = if config.target.abi == AbiIdentity::DarwinArm64 {
-        align_up(payload_size, overflow_align)?
-    } else {
-        align_up(payload_size, 8)?
-    };
+    let overflow_size = align_up(payload_size, 8)?;
     Ok(VaArgPlan {
         result_size: classified.size,
         result_align: classified.align,
@@ -646,7 +640,7 @@ fn allocate_bridge_argument(
             *gp_used += 1;
             location
         } else {
-            stack_location(stack_size, 8, 8, abi)?
+            stack_location(stack_size, 8, 8)?
         };
         pieces.push(BridgePiecePlan {
             source_index: Some(source_index),
@@ -664,6 +658,7 @@ fn allocate_bridge_argument(
             source_index,
             extension,
             abi,
+            true,
             stack_size,
             pieces,
         );
@@ -692,6 +687,7 @@ fn allocate_bridge_argument(
             source_index,
             extension,
             abi,
+            false,
             stack_size,
             pieces,
         );
@@ -721,7 +717,15 @@ fn allocate_bridge_argument(
     // AAPCS64 C.13-C.15 exhaust NGRN and place the complete composite at the
     // naturally aligned NSAA. AAPCS32's register/stack split does not apply.
     *gp_used = MAX_ARGUMENT_REGISTERS;
-    allocate_whole_on_stack(classified, source_index, extension, abi, stack_size, pieces)
+    allocate_whole_on_stack(
+        classified,
+        source_index,
+        extension,
+        abi,
+        false,
+        stack_size,
+        pieces,
+    )
 }
 
 fn allocate_whole_on_stack(
@@ -729,10 +733,15 @@ fn allocate_whole_on_stack(
     source_index: u32,
     extension: IntegerExtension,
     abi: AbiIdentity,
+    darwin_unnamed: bool,
     stack_size: &mut u64,
     pieces: &mut Vec<BridgePiecePlan>,
 ) -> Result<(), AbiError> {
-    let alignment = classified.align.clamp(1, 16);
+    let alignment = if abi == AbiIdentity::DarwinArm64 && darwin_unnamed {
+        classified.align.clamp(8, 16)
+    } else {
+        classified.align.clamp(1, 16)
+    };
     *stack_size = align_up(*stack_size, alignment)?;
     let base = *stack_size;
     for piece in &classified.pieces {
@@ -748,27 +757,22 @@ fn allocate_whole_on_stack(
         });
     }
     *stack_size = if abi == AbiIdentity::DarwinArm64 {
-        align_up(base + classified.size, alignment)?
+        if darwin_unnamed {
+            align_up(base + classified.size, 8)?
+        } else {
+            align_up(base + classified.size, alignment)?
+        }
     } else {
         align_up(base + classified.size, 8)?
     };
     Ok(())
 }
 
-fn stack_location(
-    stack_size: &mut u64,
-    size: u64,
-    align: u64,
-    abi: AbiIdentity,
-) -> Result<BridgeLocation, AbiError> {
+fn stack_location(stack_size: &mut u64, size: u64, align: u64) -> Result<BridgeLocation, AbiError> {
     *stack_size = align_up(*stack_size, align)?;
     let offset = u32::try_from(*stack_size)
         .map_err(|_| AbiError::new("CCC3503", "arm64 bridge stack offset overflow"))?;
-    *stack_size = if abi == AbiIdentity::DarwinArm64 {
-        align_up(*stack_size + size, align)?
-    } else {
-        align_up(*stack_size + size, 8)?
-    };
+    *stack_size = align_up(*stack_size + size, 8)?;
     Ok(BridgeLocation::Stack { offset })
 }
 
@@ -1553,6 +1557,69 @@ mod tests {
                 .iter()
                 .all(|piece| matches!(piece.location, BridgeLocation::Stack { .. }))
         );
+    }
+
+    #[test]
+    fn darwin_variadic_stack_uses_eight_byte_scalar_slots() {
+        // Apple Clang 21 targeting arm64-apple-macos11 stores unnamed `int`,
+        // `int`, `double` arguments at sp+0, sp+8, and sp+16. Fixed overflow
+        // `int` arguments remain compact at sp+0 and sp+4, so this rounding is
+        // deliberately confined to the unnamed variadic portion.
+        let config = EffectiveCompilationConfig::aarch64_apple_darwin();
+        let mut types = TypeStore::default();
+        let signature = types.function_type(FunctionType::variadic(
+            QualifiedType::unqualified(TypeId::LONG),
+            vec![QualifiedType::unqualified(TypeId::INT)],
+        ));
+        let actual = [TypeId::INT, TypeId::INT, TypeId::INT, TypeId::DOUBLE];
+        let plan = plan_variadic_call(&types, signature, &actual, 1, &config).unwrap();
+        let offsets = plan
+            .parameter_pieces
+            .iter()
+            .filter_map(|piece| match piece.location {
+                BridgeLocation::Stack { offset } => Some(offset),
+                BridgeLocation::Register(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(offsets, [0, 8, 16]);
+        assert_eq!(
+            plan_va_arg(&types, TypeId::INT, &config)
+                .unwrap()
+                .overflow_size,
+            8
+        );
+        assert_eq!(
+            plan_va_arg(&types, TypeId::INT, &config)
+                .unwrap()
+                .overflow_align,
+            8
+        );
+
+        let mut fixed_parameters = vec![QualifiedType::unqualified(TypeId::LONG); 8];
+        fixed_parameters.extend([QualifiedType::unqualified(TypeId::INT); 2]);
+        let fixed_signature = types.function_type(FunctionType::variadic(
+            QualifiedType::unqualified(TypeId::LONG),
+            fixed_parameters,
+        ));
+        let mut mixed_actual = vec![TypeId::LONG; 8];
+        mixed_actual.extend([
+            TypeId::INT,
+            TypeId::INT,
+            TypeId::INT,
+            TypeId::INT,
+            TypeId::DOUBLE,
+        ]);
+        let fixed =
+            plan_variadic_call(&types, fixed_signature, &mixed_actual, 10, &config).unwrap();
+        let mixed_offsets = fixed
+            .parameter_pieces
+            .iter()
+            .filter_map(|piece| match piece.location {
+                BridgeLocation::Stack { offset } => Some((piece.source_index.unwrap(), offset)),
+                BridgeLocation::Register(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(mixed_offsets, [(8, 0), (9, 4), (10, 8), (11, 16), (12, 24)]);
     }
 
     #[test]

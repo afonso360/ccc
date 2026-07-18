@@ -142,7 +142,7 @@ pub fn ir_shape_digest(
     module: &gir::FullModule,
     key: &AbiConfigKey,
 ) -> Result<IrShapeDigest, AbiError> {
-    let mut encoder = Encoder::new(b"ccc-ir-shape-v1");
+    let mut encoder = Encoder::new(b"ccc-ir-shape-v2");
     encode_config_key(&mut encoder, key);
     encode_types(&mut encoder, &module.types)?;
     encoder.len(module.globals.len());
@@ -166,6 +166,7 @@ pub fn ir_shape_digest(
         encoder.tag(global.duration as u8);
         encoder.bool(global.tentative);
         encoder.string(&global.emission.symbol_name);
+        encoder.bool(global.emission.symbol_name_is_exact);
         encoder.tag(global.emission.binding as u8);
         encoder.tag(global.emission.visibility as u8);
         encoder.option_string(global.emission.section.as_deref());
@@ -197,7 +198,7 @@ pub fn translation_unit_digest(
     key: &AbiConfigKey,
     ir: IrShapeDigest,
 ) -> TranslationUnitDigest {
-    let mut encoder = Encoder::new(b"ccc-translation-unit-v1");
+    let mut encoder = Encoder::new(b"ccc-translation-unit-v2");
     encode_config_key(&mut encoder, key);
     encoder.bytes(&ir.0);
     let mut symbols = module
@@ -206,6 +207,7 @@ pub fn translation_unit_digest(
         .map(|function| {
             (
                 function.symbol_name.as_str(),
+                u8::from(function.symbol_name_is_exact),
                 function.linkage as u8,
                 function.binding as u8,
                 function.visibility as u8,
@@ -215,6 +217,7 @@ pub fn translation_unit_digest(
         .chain(module.globals.iter().map(|global| {
             (
                 global.emission.symbol_name.as_str(),
+                u8::from(global.emission.symbol_name_is_exact),
                 global.linkage as u8,
                 global.emission.binding as u8,
                 global.emission.visibility as u8,
@@ -224,8 +227,9 @@ pub fn translation_unit_digest(
         .collect::<Vec<_>>();
     symbols.sort_unstable();
     encoder.len(symbols.len());
-    for (name, linkage, binding, visibility, policy) in symbols {
+    for (name, exact, linkage, binding, visibility, policy) in symbols {
         encoder.string(name);
+        encoder.tag(exact);
         encoder.tag(linkage);
         encoder.tag(binding);
         encoder.tag(visibility);
@@ -457,6 +461,7 @@ fn encode_function(encoder: &mut Encoder, function: &gir::FullFunction) {
     encoder.bool(function.properties.inline);
     encoder.bool(function.properties.no_return);
     encoder.string(&function.symbol_name);
+    encoder.bool(function.symbol_name_is_exact);
     encoder.qualified(function.result_type);
     encoder.len(function.parameters.len());
     for parameter in &function.parameters {
@@ -1204,6 +1209,27 @@ mod tests {
         assert_eq!(
             crate::hex(&fingerprint),
             "430708c07b263997a5f6db5759624d2c42f0f3d68396cd9fd111b2c84db6ded8"
+        );
+    }
+
+    #[test]
+    fn empty_module_v2_digests_are_locked() {
+        let module = gir::FullModule {
+            types: TypeStore::default(),
+            globals: Vec::new(),
+            strings: Vec::new(),
+            functions: Vec::new(),
+        };
+        let key = abi_config_key(&EffectiveCompilationConfig::x86_64_unknown_linux_gnu()).unwrap();
+        let ir = ir_shape_digest(&module, &key).unwrap();
+        let translation_unit = translation_unit_digest(&module, &key, ir);
+        assert_eq!(
+            crate::hex(&ir.0),
+            "f89ea5d276f2c628e75874271d7cf43fc3dce97a1c52114148486e491af892cc"
+        );
+        assert_eq!(
+            crate::hex(&translation_unit.0),
+            "403fcbbf0155eff8563cc1ae9cdc4adc7791a1ced4a6301e40555e7f6ed9b77d"
         );
     }
 }

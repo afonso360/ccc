@@ -139,8 +139,6 @@ fn emit_inner(
         .verify_against(module, config)
         .map_err(abi_error)?;
     let declarations = declare_module(module, config, abi_plan, &mut object_module)?;
-    data::define_strings(module, &declarations, &mut object_module)?;
-    data::define_globals(module, config, &declarations, &mut object_module)?;
 
     let mut clif = String::new();
     for function in &module.functions {
@@ -209,11 +207,53 @@ fn emit_inner(
             .map_err(error)?;
     }
 
+    // Define code before data so Mach-O's `__text` section is created first.
+    // Apple's linker derives compact-unwind records from `.eh_frame`; when a
+    // data section precedes `__text`, its relocatable-link pass can associate
+    // a section-relative FDE with data after reordering the sections.  Data
+    // references only require declarations while functions are lowered, so
+    // deferring their definitions preserves those references and gives the
+    // object the conventional text-before-data section order.
+    data::define_strings(module, &declarations, &mut object_module)?;
+    data::define_globals(module, config, &declarations, &mut object_module)?;
+
     let mut product = object_module.finish();
     if config.target.abi == AbiIdentity::DarwinArm64 {
         product
             .object
             .set_macho_build_version(darwin_build_version(config)?);
+
+        // `object` applies Mach-O's ordinary C leading-underscore mangling to
+        // every function and data declaration.  A declaration assembly label
+        // is different: its string is already the exact physical symbol name,
+        // as required by Apple's SDK redirects.  Relocations refer to symbol
+        // IDs, so restoring the spelling after module finalization preserves
+        // both defined and undefined references without guessing from the
+        // label's contents.
+        for function in module
+            .functions
+            .iter()
+            .filter(|function| function.symbol_name_is_exact)
+        {
+            let Some(id) = declarations.functions.get(&function.id.0).copied() else {
+                continue;
+            };
+            product.object.symbol_mut(product.function_symbol(id)).name =
+                function.symbol_name.as_bytes().to_vec();
+        }
+        for global in module
+            .globals
+            .iter()
+            .filter(|global| global.emission.symbol_name_is_exact)
+        {
+            let Some(declaration) = declarations.globals.get(&global.id.0) else {
+                continue;
+            };
+            product
+                .object
+                .symbol_mut(product.data_symbol(declaration.id))
+                .name = global.emission.symbol_name.as_bytes().to_vec();
+        }
     }
     for common in &declarations.commons {
         let symbol = product.data_symbol(common.id);
@@ -389,11 +429,11 @@ fn generated_bridge_artifacts(
 ) -> Result<
     (
         Vec<ccc_link::bridge::GeneratedAssembly>,
-        ccc_link::artifact::BridgeManifestV1,
+        ccc_link::artifact::BridgeManifestV2,
     ),
     CodegenError,
 > {
-    use ccc_link::artifact::{BridgeManifestV1, GeneratedSymbol, GeneratedSymbolOwner};
+    use ccc_link::artifact::{BridgeManifestV2, GeneratedSymbol, GeneratedSymbolOwner};
     use ccc_link::bridge::{
         AssemblyFunctionLinkage, BridgeEntryPlan, ElfTlsAccessModel, ElfTlsSymbolVisibility,
         GeneratedSymbolKind, TlsAccessorPlan, render_target_call_helper, render_target_fixed_entry,
@@ -453,6 +493,7 @@ fn generated_bridge_artifacts(
         let xmm_results = plan.result_pieces.len() as u8 - gp_results;
         let entry_plan = BridgeEntryPlan {
             public_symbol: public_symbol.clone(),
+            public_symbol_is_exact: artifact.public_symbol_is_exact,
             hidden_body_symbol: hidden_body.clone(),
             linkage,
             weak: artifact.source_binding == ccc_abi::SourceBinding::Weak,
@@ -495,7 +536,7 @@ fn generated_bridge_artifacts(
             ),
             _ => unreachable!(),
         };
-        let entry_symbol = match linkage {
+        let mut entry_symbol = match linkage {
             AssemblyFunctionLinkage::ExternalDefault => GeneratedSymbol::public(
                 public_symbol,
                 entry_kind,
@@ -522,11 +563,12 @@ fn generated_bridge_artifacts(
                 GeneratedSymbolOwner::AssemblyUnit(assembly.stem().to_owned()),
             ),
         };
-        let entry_symbol = if artifact.source_binding == ccc_abi::SourceBinding::Weak {
-            entry_symbol.with_weak_binding()
-        } else {
-            entry_symbol
-        };
+        if artifact.source_binding == ccc_abi::SourceBinding::Weak {
+            entry_symbol = entry_symbol.with_weak_binding();
+        }
+        if artifact.public_symbol_is_exact {
+            entry_symbol = entry_symbol.with_exact_object_name();
+        }
         symbols.push(entry_symbol);
         symbols.push(GeneratedSymbol::internal(
             hidden_body,
@@ -592,7 +634,7 @@ fn generated_bridge_artifacts(
         }
         assemblies.push(assembly);
     }
-    let manifest = BridgeManifestV1::new(abi_plan.plan().translation_unit_digest.0, symbols);
+    let manifest = BridgeManifestV2::new(abi_plan.plan().translation_unit_digest.0, symbols);
     let actual_localization = manifest.localization_symbols();
     let expected_localization = &abi_plan
         .plan()

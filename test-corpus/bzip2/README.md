@@ -16,12 +16,15 @@ subdirectory retain their upstream license information.
 
 ## Build interface
 
-The adapter uses bzip2's upstream Makefile on x86-64 Linux. It builds
-`libbz2.a`, `bzip2`, and `bzip2recover` with the following owned inputs:
+The target must be selected explicitly with `--target` or `BZIP2_TARGET`.
+The adapter supports native x86-64 GNU/Linux, AArch64 GNU/Linux through
+QEMU user-mode execution, RISC-V RV64GC LP64D GNU/Linux through QEMU
+user-mode execution, and native Darwin arm64. It builds `libbz2.a`, `bzip2`,
+and `bzip2recover` with the following owned inputs:
 
 - `CC=ccc-cc`, relying on CCC's documented GNU C11 driver default;
 - `CFLAGS="-Wall -Winline -O2 -g -D_FILE_OFFSET_BITS=64"`;
-- resolved native `ar` and `ranlib` programs.
+- the `ar` and `ranlib` programs belonging to the selected target toolchain.
 
 CCC compiles all nine C translation units selected by those targets: the seven
 library inputs plus `bzip2.c` and `bzip2recover.c`. The four C files shipped as
@@ -31,18 +34,33 @@ not silently counted as part of the default product build. Both the complete
 checked, so an added, omitted, duplicated, substituted, or native-compiled
 input fails the run.
 
-The native GCC driver receives only objects and archives for the two final
-program links. A failed CCC translation is never retried with another
-compiler, and a native link command containing C or preprocessed-C input is
-rejected. The adapter verifies the native driver is GCC rather than Clang,
-targets the GNU x86-64 Linux ABI, and records its resolved path, version,
-target, complete identity output, and predefined macros.
+The selected target driver receives only objects and archives for the two
+final program links. A failed CCC translation is never retried with another
+compiler, and a link command containing C or preprocessed-C input is rejected.
+GNU/Linux profiles require a matching GCC driver and record its target,
+version, compiler sysroot, complete identity output, and predefined macros.
+The Darwin profile requires native Apple Clang, a macOS SDK, and a deployment
+target; those inputs are recorded and applied consistently to translation and
+linking.
 
-CCC emits position-independent objects, and the native GCC links use their
-platform defaults without an adapter-supplied relocation option. The resulting
-programs must be PIE executables with ELF type `DYN`, the PIE dynamic flag, and
-no dynamic text relocations. Exact compilation and link commands, source
-inputs, ELF headers, and dynamic tags remain in the retained work directory.
+The driver links with the platform default relocation policy. No profile adds
+a language-standard, PIE, architecture, or ABI selection flag, and the source
+archive is not patched. GNU/Linux outputs must be target-machine ELF `DYN`
+executables with the PIE dynamic flag, the expected ABI flags, an absolute
+interpreter, and no dynamic text relocations. Darwin outputs must be Mach-O
+arm64 executables with the PIE flag, `LC_BUILD_VERSION`, the selected minimum
+OS version, the expected public entry symbol, no writable-and-executable load
+segment, and no retained relocation entries. Exact commands, source inputs,
+headers, dynamic metadata, load commands, relocations, and symbols remain in
+the retained work directory.
+
+The AArch64 and RISC-V profiles require an explicit, non-host QEMU runtime
+root. The adapter reads each executable's interpreter from its ELF program
+headers and refuses to run unless that interpreter exists beneath the selected
+root. After auditing the real target executables it installs the tracked
+`qemu-launcher` at the upstream executable names. This preserves bzip2's
+unmodified `make check` command and the official test runner's convention of
+deriving `bzip2recover` from the `bzip2` pathname.
 
 Ambient Make injection and build flags are cleared before invoking the
 upstream Makefile. `BZIP` and `BZIP2` are also removed because the built
@@ -86,11 +104,23 @@ runner materially extends coverage of decoder edge cases and recovery without
 turning the adapter into an open-ended stress test. A zero exit status, exactly
 440 `PASS` records, and the terminal `All tests passed` marker are required.
 
-Run [`run.sh`](run.sh) on x86-64 Linux with `CCC` set to the compiler binary.
-Pass an already-downloaded archive with `--source-archive` and a Git repository
-containing the pinned test commit with `--test-repository`, or let the adapter
-populate its disposable cache. The work directory must be empty and is
-retained with the logs and round-trip artifacts named in `manifest.toml`.
+Set `CCC` to the compiler binary and invoke [`run.sh`](run.sh) with one of the
+four exact triples recorded in `manifest.toml`. `CCC_LINK_CC`, `BZIP2_AR`,
+`BZIP2_RANLIB`, and `BZIP2_READELF` can override the target-profile defaults.
+Cross-Linux execution additionally requires `BZIP2_QEMU_ROOT` and may override
+`BZIP2_QEMU`; `BZIP2_SYSROOT` controls the compiler sysroot independently from
+the runtime root. Darwin may override `BZIP2_SDKROOT` and
+`BZIP2_DEPLOYMENT_TARGET`.
+
+`BZIP2_OPENSSL` must name an OpenSSL implementation with SHA3-256. Darwin's
+system LibreSSL is not sufficient. `BZIP2_MD5SUM` must name a GNU-compatible
+MD5 utility. Darwin CI uses the tracked OpenSSL-backed `md5sum-darwin` adapter,
+including the checked-stdin mode required by the official suite. Both hash
+tools are probed before any download or build. Pass an already-downloaded
+archive with `--source-archive` and a Git repository containing the pinned test commit with
+`--test-repository`, or let the adapter populate its disposable cache. The
+work directory must be empty and is retained with the artifacts named in
+`manifest.toml`.
 
 The shell-only adapter regressions are available through
 [`test-run.sh`](test-run.sh).

@@ -111,6 +111,49 @@ fn wide_operations_select_only_manifested_helpers_that_are_actually_used() {
 }
 
 #[test]
+fn compiler_float16_storage_emits_but_scalar_lowering_fails_closed() {
+    for (config, symbol_name) in [
+        (EffectiveCompilationConfig::default(), "half_object"),
+        (
+            EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+            "half_object",
+        ),
+        (
+            EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
+            "half_object",
+        ),
+        (
+            EffectiveCompilationConfig::aarch64_apple_darwin(),
+            "_half_object",
+        ),
+    ] {
+        let output = emit_source_with_config(
+            "_Float16 half_object; void *address(void) { return &half_object; }",
+            &config,
+        );
+        let object = object::File::parse(output.object.as_slice()).unwrap();
+        let symbol = object.symbol_by_name(symbol_name).unwrap();
+        if object.format() == object::BinaryFormat::MachO {
+            let section = object
+                .section_by_index(symbol.section_index().unwrap())
+                .unwrap();
+            assert!(section.size() >= 2, "{}", config.target.triple);
+        } else {
+            assert_eq!(symbol.size(), 2, "{}", config.target.triple);
+        }
+
+        let types = TypeStore::default();
+        let error = super::function::scalar_type(
+            &types,
+            QualifiedType::unqualified(TypeId::FLOAT16),
+            &config,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "CCC3518", "{}", config.target.triple);
+    }
+}
+
+#[test]
 fn wide_static_initializers_and_bitfields_preserve_high_bytes() {
     let output = emit_source(
         "typedef unsigned __int128 u128;\n\
@@ -178,6 +221,36 @@ fn wide_integer_float_constants_round_at_float_precision() {
         symbol_bytes(&output.object, "unsigned_near_max"),
         unsigned_near_max
     );
+}
+
+#[test]
+fn unused_float16_sdk_prototypes_do_not_require_value_transport() {
+    let source = "extern _Float16 __fabsf16(_Float16);\n\
+                  extern _Float16 __fmaf16(_Float16, _Float16, _Float16);\n\
+                  int answer(void) { return 42; }";
+    let output =
+        emit_source_with_config(source, &EffectiveCompilationConfig::aarch64_apple_darwin());
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    assert!(object.symbol_by_name("_answer").is_some());
+    assert!(object.symbol_by_name("___fabsf16").unwrap().is_undefined());
+    assert!(object.symbol_by_name("___fmaf16").unwrap().is_undefined());
+}
+
+#[test]
+fn float16_value_transport_fails_with_one_stable_diagnostic() {
+    let config = EffectiveCompilationConfig::aarch64_apple_darwin();
+    for source in [
+        "_Float16 initialized = 1.0;",
+        "_Float16 defined(_Float16 value) { return value; }",
+        "extern _Float16 operation(_Float16); int call(void) { return operation(1.0) != 0; }",
+        "int arithmetic(void) { _Float16 value; return value + value != 0; }",
+        "typedef __builtin_va_list va_list; int read(int count, ...) { va_list list; __builtin_va_start(list, count); return __builtin_va_arg(list, _Float16) != 0; }",
+    ] {
+        let module = lower_source_with_config(source, &config);
+        let error = emit(&module, &config, Options { emit_clif: true }).unwrap_err();
+        assert_eq!(error.code, "CCC3518", "{source}: {error}");
+        assert!(error.message.contains("_Float16"), "{source}: {error}");
+    }
 }
 
 fn emit_source(source: &str) -> Output {
@@ -289,6 +362,32 @@ fn darwin_symbols_tentative_data_and_libcalls_match_apple_spelling() {
     let memcpy = object.symbol_by_name("_memcpy").unwrap();
     assert!(memcpy.is_undefined());
     assert!(object.symbol_by_name("__memcpy").is_none());
+}
+
+#[test]
+fn darwin_emits_text_before_data_for_linker_unwind_conversion() {
+    let output = emit_source_with_config(
+        "int first(void) { return \"x\"[0]; }\n\
+         int main(void) { return first() == 'x' ? 0 : 1; }",
+        &EffectiveCompilationConfig::aarch64_apple_darwin(),
+    );
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    let section_names = object
+        .sections()
+        .map(|section| section.name().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    let text = section_names
+        .iter()
+        .position(|name| name == "__text")
+        .expect("Darwin text section");
+    let data = section_names
+        .iter()
+        .position(|name| name == "__const")
+        .expect("Darwin constant-data section");
+    assert!(
+        text < data,
+        "Apple's linker requires text before data when deriving compact unwind: {section_names:?}"
+    );
 }
 
 #[test]
@@ -444,6 +543,104 @@ fn darwin_binary64_long_double_uses_the_double_transport() {
             .iter()
             .any(|assembly| { assembly.source().contains(".subsections_via_symbols") })
     );
+}
+
+#[test]
+fn darwin_declaration_assembly_labels_are_exact_physical_symbols() {
+    let config = EffectiveCompilationConfig::aarch64_apple_darwin();
+    let output = emit_source_with_config(
+        "extern int source_function(int) asm(\"_external_function\");\n\
+         extern int source_object asm(\"external_object\");\n\
+         int defined_function(int) asm(\"_defined_function\");\n\
+         int defined_function(int value) { return source_function(value) + source_object; }\n\
+         int defined_object asm(\"defined_object\") = 7;\n\
+         int _ordinary_leading(void) { return defined_object; }\n\
+         int ordinary_object;",
+        &config,
+    );
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    assert_eq!(object.format(), object::BinaryFormat::MachO);
+
+    for (name, kind, defined) in [
+        ("_external_function", object::SymbolKind::Unknown, false),
+        ("external_object", object::SymbolKind::Unknown, false),
+        ("_defined_function", object::SymbolKind::Text, true),
+        ("defined_object", object::SymbolKind::Data, true),
+        ("__ordinary_leading", object::SymbolKind::Text, true),
+        ("_ordinary_object", object::SymbolKind::Data, true),
+    ] {
+        let symbol = object
+            .symbol_by_name(name)
+            .unwrap_or_else(|| panic!("missing Mach-O symbol `{name}`"));
+        assert_eq!(symbol.kind(), kind, "{name}");
+        assert_eq!(symbol.is_definition(), defined, "{name}");
+    }
+    for incorrectly_mangled in [
+        "__external_function",
+        "_external_object",
+        "__defined_function",
+        "_defined_object",
+        "_ordinary_leading",
+        "ordinary_object",
+    ] {
+        assert!(
+            object.symbol_by_name(incorrectly_mangled).is_none(),
+            "unexpected Mach-O symbol `{incorrectly_mangled}`"
+        );
+    }
+
+    let relocation_targets = object
+        .sections()
+        .flat_map(|section| section.relocations())
+        .filter_map(|(_, relocation)| match relocation.target() {
+            object::RelocationTarget::Symbol(index) => object
+                .symbol_by_index(index)
+                .ok()
+                .and_then(|symbol| symbol.name().ok())
+                .map(str::to_owned),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for name in ["_external_function", "external_object", "defined_object"] {
+        assert!(
+            relocation_targets.iter().any(|target| target == name),
+            "missing relocation to `{name}`: {relocation_targets:?}"
+        );
+    }
+}
+
+#[test]
+fn darwin_variadic_bridge_preserves_exact_public_assembly_label() {
+    let config = EffectiveCompilationConfig::aarch64_apple_darwin();
+    let output = emit_source_with_config(
+        "int source_variadic(int fixed, ...) asm(\"physical_variadic\");\n\
+         int source_variadic(int fixed, ...) { return fixed; }\n\
+         int invoke(void) { return source_variadic(7); }",
+        &config,
+    );
+
+    let primary = object::File::parse(output.object.as_slice()).unwrap();
+    let entry = primary.symbol_by_name("physical_variadic").unwrap();
+    assert!(entry.is_undefined());
+    assert!(primary.symbol_by_name("_physical_variadic").is_none());
+
+    let assembly = output
+        .assemblies
+        .iter()
+        .find(|assembly| assembly.stem().starts_with("variadic-entry-"))
+        .expect("Darwin variadic entry assembly");
+    assert!(assembly.source().contains(".globl physical_variadic\n"));
+    assert!(assembly.source().contains("physical_variadic:\n"));
+    assert!(!assembly.source().contains("_physical_variadic"));
+
+    let manifest_entry = output
+        .manifest
+        .symbols()
+        .iter()
+        .find(|symbol| symbol.name == "physical_variadic")
+        .expect("variadic entry manifest symbol");
+    assert!(manifest_entry.object_name_is_exact);
+    output.into_artifact_bundle().verify().unwrap();
 }
 
 #[test]
@@ -904,7 +1101,7 @@ fn complete_abi_plan_and_aggregate_clif_have_exact_snapshots() {
     assert!(dump.contains("packaging assembly-units=2"), "{dump}");
     assert_eq!(
         sha256(&dump),
-        "04aaf96d1615fcc1cf3b74e17ef3433daf9220a3c4da648e3da036d17127e92e"
+        "915c6743c37ee3c161837fc9fd2acf88477bfe32c0d8410357aa1c3521f12d65"
     );
 
     let output = emit(&module, &config, Options { emit_clif: true }).unwrap();

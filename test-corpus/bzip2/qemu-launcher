@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+launcher_directory=$(cd "$(dirname "$0")" && pwd -P)
+configuration="$launcher_directory/.ccc-qemu-config"
+[[ -f "$configuration" ]] || {
+  echo "bzip2 QEMU launcher configuration is missing: $configuration" >&2
+  exit 126
+}
+source "$configuration"
+
+: "${CCC_BZIP2_QEMU:?bzip2 QEMU launcher has no emulator}"
+: "${CCC_BZIP2_QEMU_ROOT:?bzip2 QEMU launcher has no target root}"
+
+launcher="$launcher_directory/$(basename "$0")"
+target_program="$launcher.target"
+[[ -x "$CCC_BZIP2_QEMU" ]] || {
+  echo "bzip2 QEMU launcher emulator is not executable: $CCC_BZIP2_QEMU" >&2
+  exit 126
+}
+[[ -d "$CCC_BZIP2_QEMU_ROOT" ]] || {
+  echo "bzip2 QEMU launcher target root is unavailable: $CCC_BZIP2_QEMU_ROOT" >&2
+  exit 126
+}
+[[ -x "$target_program" ]] || {
+  echo "bzip2 QEMU target program is not executable: $target_program" >&2
+  exit 126
+}
+
+exec "$CCC_BZIP2_QEMU" -L "$CCC_BZIP2_QEMU_ROOT" -0 "$0" \
+  "$target_program" "$@"

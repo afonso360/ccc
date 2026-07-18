@@ -715,11 +715,14 @@ mod tests {
     }
 
     #[test]
-    fn ships_the_hosted_math_classification_wrapper() {
+    fn ships_the_hosted_math_and_apple_inline_policy_wrappers() {
         let resources = ResourceDirectory::discover(None).unwrap();
         let manifest_source = fs::read_to_string(resources.root().join("manifest.toml")).unwrap();
         let manifest = ResourceManifest::parse(&manifest_source).unwrap();
-        assert_eq!(manifest.headers.hosted_wrappers, vec!["math.h".to_owned()]);
+        assert_eq!(
+            manifest.headers.hosted_wrappers,
+            vec!["math.h".to_owned(), "sys/cdefs.h".to_owned()]
+        );
 
         let math = fs::read_to_string(resources.include().join("math.h")).unwrap();
         for contract in [
@@ -731,6 +734,19 @@ mod tests {
             assert!(
                 math.contains(contract),
                 "math.h is missing contract {contract:?}"
+            );
+        }
+
+        let cdefs = fs::read_to_string(resources.include().join("sys/cdefs.h")).unwrap();
+        for contract in [
+            "#include_next <sys/cdefs.h>",
+            "defined(__CCC__) && defined(__APPLE__) && defined(__aarch64__)",
+            "#define __header_inline static __inline",
+            "#define __header_always_inline static __inline",
+        ] {
+            assert!(
+                cdefs.contains(contract),
+                "sys/cdefs.h is missing contract {contract:?}"
             );
         }
     }

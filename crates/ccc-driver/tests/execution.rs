@@ -1,3 +1,8 @@
+#![cfg_attr(
+    not(all(target_arch = "x86_64", target_os = "linux")),
+    allow(dead_code)
+)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -22,12 +27,62 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+fn macos_sdk_root() -> String {
+    let output = Command::new("xcrun")
+        .args(["--sdk", "macosx", "--show-sdk-path"])
+        .output()
+        .expect("the Darwin execution gate requires xcrun");
+    assert!(
+        output.status.success(),
+        "xcrun could not locate the macOS SDK"
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+fn compile_and_run_darwin_header_program(name: &str, source_text: &str) {
+    let directory = test_directory(name);
+    let source = directory.join(format!("{name}.c"));
+    let executable = directory.join(name);
+    fs::write(&source, source_text).unwrap();
+    let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+        .arg("--target=aarch64-apple-darwin")
+        .args(["--sdk-root", &macos_sdk_root()])
+        .arg("-mmacosx-version-min=11.0")
+        .arg(&source)
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .unwrap();
+    assert!(
+        compilation.status.success(),
+        "ccc failed: {}",
+        String::from_utf8_lossy(&compilation.stderr)
+    );
+    let execution = Command::new(&executable).output().unwrap();
+    assert_eq!(
+        execution.status.code(),
+        Some(0),
+        "program failed: {}",
+        String::from_utf8_lossy(&execution.stderr)
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "riscv64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "macos")
+))]
 #[test]
-fn empty_translation_unit_emits_a_valid_object() {
+fn host_default_emits_a_native_relocatable_object() {
+    use object::{Architecture, Object as _, ObjectKind};
+
     let directory = test_directory("empty-object");
     let output = directory.join("empty.o");
     let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
-        .arg("--target=x86_64-unknown-linux-gnu")
         .arg("-c")
         .arg(fixture("empty.c"))
         .arg("-o")
@@ -39,11 +94,114 @@ fn empty_translation_unit_emits_a_valid_object() {
         "ccc failed: {}",
         String::from_utf8_lossy(&result.stderr)
     );
-    let object = fs::read(&output).unwrap();
-    assert!(ccc_driver::is_empty_elf64_relocatable(&object));
+    let bytes = fs::read(&output).unwrap();
+    let object = object::File::parse(bytes.as_slice()).unwrap();
+    let expected_architecture = if cfg!(target_arch = "x86_64") {
+        Architecture::X86_64
+    } else if cfg!(target_arch = "aarch64") {
+        Architecture::Aarch64
+    } else {
+        Architecture::Riscv64
+    };
+    assert_eq!(object.architecture(), expected_architecture);
+    assert_eq!(object.kind(), ObjectKind::Relocatable);
     fs::remove_dir_all(directory).unwrap();
 }
 
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[test]
+fn darwin_linker_accepts_unwind_when_functions_reference_constant_data() {
+    let directory = test_directory("darwin-text-before-data-unwind");
+    let source = directory.join("darwin-text-before-data-unwind.c");
+    let executable = directory.join("darwin-text-before-data-unwind");
+    fs::write(
+        &source,
+        "int first(void) { return \"x\"[0]; }\n\
+         int main(void) { return first() == 'x' ? 0 : 1; }\n",
+    )
+    .unwrap();
+
+    let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+        .arg("--target=aarch64-apple-darwin")
+        .arg("-nostdinc")
+        .arg(&source)
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .unwrap();
+    assert!(
+        compilation.status.success(),
+        "ccc failed: {}",
+        String::from_utf8_lossy(&compilation.stderr)
+    );
+    let execution = Command::new(&executable).output().unwrap();
+    assert_eq!(execution.status.code(), Some(0));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[test]
+fn apple_sdk_redirects_and_header_inline_fallback_link_and_execute() {
+    compile_and_run_darwin_header_program(
+        "darwin-sdk-redirects",
+        "#include <ctype.h>\n\
+         #include <stdio.h>\n\
+         int main(void) {\n\
+             FILE *stream = fopen(\"/dev/null\", \"wb\");\n\
+             if (!stream) return 1;\n\
+             if (!isalpha('A') || !iscntrl('\\n')) return 2;\n\
+             if (putc_unlocked('x', stream) < 0) return 3;\n\
+             if (fwrite(\"ok\", 1, 2, stream) != 2) return 4;\n\
+             return fclose(stream) != 0;\n\
+         }\n",
+    );
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[test]
+fn apple_math_public_classifiers_evaluate_once_and_fabsl_stays_a_library_call() {
+    compile_and_run_darwin_header_program(
+        "darwin-math-wrapper",
+        "#include <math.h>\n\
+         static int evaluations;\n\
+         static double once(double value) { ++evaluations; return value; }\n\
+         static long double once_long(long double value) { ++evaluations; return value; }\n\
+         int main(void) {\n\
+             evaluations = 0;\n\
+             if (!isfinite(once(1.0)) || evaluations != 1) return 1;\n\
+             evaluations = 0;\n\
+             if (!isinf(once(INFINITY)) || evaluations != 1) return 2;\n\
+             evaluations = 0;\n\
+             if (!isnan(once(NAN)) || evaluations != 1) return 3;\n\
+             evaluations = 0;\n\
+             if (!isfinite(once_long(1.0L)) || evaluations != 1) return 4;\n\
+             if (fabsl(-2.0L) != 2.0L) return 5;\n\
+             return 0;\n\
+         }\n",
+    );
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[test]
+fn apple_variadic_bridge_uses_the_exact_declaration_assembly_label() {
+    compile_and_run_darwin_header_program(
+        "darwin-exact-variadic-label",
+        "#include <stdarg.h>\n\
+         int source_sum(int count, ...) asm(\"_physical_sum\");\n\
+         int source_sum(int count, ...) {\n\
+             va_list list;\n\
+             int total = 0;\n\
+             int index;\n\
+             va_start(list, count);\n\
+             for (index = 0; index < count; ++index) total += va_arg(list, int);\n\
+             va_end(list);\n\
+             return total;\n\
+         }\n\
+         int main(void) { return source_sum(3, 4, 5, 6) != 15; }\n",
+    );
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
 fn execution_programs_emit_x86_64_objects() {
     use object::{Architecture, Object as _, ObjectSymbol as _};

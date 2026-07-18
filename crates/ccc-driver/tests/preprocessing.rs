@@ -44,6 +44,16 @@ impl TestDirectory {
             .env_remove("SOURCE_DATE_EPOCH");
         command
     }
+
+    fn host_command(&self) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ccc"));
+        command
+            .current_dir(&self.path)
+            .env("LC_ALL", "C")
+            .env("LANG", "C")
+            .env_remove("SOURCE_DATE_EPOCH");
+        command
+    }
 }
 
 impl Drop for TestDirectory {
@@ -124,6 +134,100 @@ fn repository_fixture(relative: impl AsRef<Path>) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join(relative)
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+fn macos_sdk_root() -> String {
+    let output = Command::new("xcrun")
+        .args(["--sdk", "macosx", "--show-sdk-path"])
+        .output()
+        .expect("the Darwin hosted-header gate requires xcrun");
+    assert!(
+        output.status.success(),
+        "xcrun could not locate the macOS SDK"
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[test]
+fn apple_math_private_builtin_adaptation_is_scoped_and_predicate_neutral() {
+    let directory = TestDirectory::new("apple-math-private-builtins");
+    let source = directory.write(
+        "apple-math.c",
+        concat!(
+            "#if __has_builtin(__builtin_fabsf)\n",
+            "#define CCC_FABSF_BEFORE 1\n",
+            "#else\n",
+            "#define CCC_FABSF_BEFORE 0\n",
+            "#endif\n",
+            "#if __has_builtin(__builtin_fabs)\n",
+            "#define CCC_FABS_BEFORE 1\n",
+            "#else\n",
+            "#define CCC_FABS_BEFORE 0\n",
+            "#endif\n",
+            "#if __has_builtin(__builtin_fabsl)\n",
+            "#define CCC_FABSL_BEFORE 1\n",
+            "#else\n",
+            "#define CCC_FABSL_BEFORE 0\n",
+            "#endif\n",
+            "#if __has_builtin(__builtin_inf)\n",
+            "#define CCC_INF_BEFORE 1\n",
+            "#else\n",
+            "#define CCC_INF_BEFORE 0\n",
+            "#endif\n",
+            "#include <math.h>\n",
+            "#ifdef __builtin_fabsf\n",
+            "#error private fabsf spelling leaked from math.h\n",
+            "#endif\n",
+            "#ifdef __builtin_fabs\n",
+            "#error private fabs spelling leaked from math.h\n",
+            "#endif\n",
+            "#ifdef __builtin_fabsl\n",
+            "#error private fabsl spelling leaked from math.h\n",
+            "#endif\n",
+            "#ifdef __builtin_inf\n",
+            "#error private inf spelling leaked from math.h\n",
+            "#endif\n",
+            "#ifdef __builtin_infl\n",
+            "#error private infl spelling leaked from math.h\n",
+            "#endif\n",
+            "#if CCC_FABSF_BEFORE != __has_builtin(__builtin_fabsf)\n",
+            "#error math.h changed __has_builtin(fabsf)\n",
+            "#endif\n",
+            "#if CCC_FABS_BEFORE != __has_builtin(__builtin_fabs)\n",
+            "#error math.h changed __has_builtin(fabs)\n",
+            "#endif\n",
+            "#if CCC_FABSL_BEFORE != __has_builtin(__builtin_fabsl)\n",
+            "#error math.h changed __has_builtin(fabsl)\n",
+            "#endif\n",
+            "#if CCC_INF_BEFORE != __has_builtin(__builtin_inf)\n",
+            "#error math.h changed __has_builtin(inf)\n",
+            "#endif\n",
+            "long double (*ccc_public_fabsl)(long double) = fabsl;\n",
+            "int ccc_public_isfinite(double value) { return isfinite(value); }\n",
+        ),
+    );
+
+    let sdk = macos_sdk_root();
+    let mut command = directory.host_command();
+    command
+        .args(["--target=aarch64-apple-darwin", "--sdk-root"])
+        .arg(sdk)
+        .args(["-E", "-P"])
+        .arg(source);
+    let result = run(command);
+    result.assert_success();
+    let output = squash_whitespace(&result.stdout);
+    assert!(output.contains("int__inline_isfinitef(float"), "{output}");
+    assert!(output.contains("__builtin_huge_val()"), "{output}");
+    assert!(!output.contains("__builtin_fabs"), "{output}");
+    assert!(!output.contains("__builtin_inf()"), "{output}");
+    assert!(!output.contains("__builtin_infl()"), "{output}");
+    assert!(
+        output.contains("longdouble(*ccc_public_fabsl)(longdouble)=fabsl;"),
+        "{output}"
+    );
 }
 
 fn normalize_fixture_snapshot(text: &str) -> String {
@@ -1694,7 +1798,7 @@ fn discovers_and_preprocesses_compiler_resource_headers() {
     );
     let resources = repository_fixture("resource-dir");
 
-    let mut command = directory.command();
+    let mut command = directory.host_command();
     command
         .args(["-E", "-P", "-resource-dir"])
         .arg(resources)
@@ -1745,7 +1849,7 @@ fn stdarg_resource_header_supports_repeated_and_partial_inclusion() {
     );
     let resources = repository_fixture("resource-dir");
 
-    let mut command = directory.command();
+    let mut command = directory.host_command();
     command
         .args(["-E", "-P", "-resource-dir"])
         .arg(resources)

@@ -26,6 +26,7 @@ impl TypeId {
     // TypeStore prefix interning order.
     pub const INT128: Self = Self(16);
     pub const UNSIGNED_INT128: Self = Self(17);
+    pub const FLOAT16: Self = Self(18);
 
     pub const fn index(self) -> usize {
         self.0 as usize
@@ -51,6 +52,7 @@ impl TypeId {
             BuiltinType::LongDouble => Self::LONG_DOUBLE,
             BuiltinType::Int128 => Self::INT128,
             BuiltinType::UnsignedInt128 => Self::UNSIGNED_INT128,
+            BuiltinType::Float16 => Self::FLOAT16,
         }
     }
 }
@@ -75,10 +77,11 @@ pub enum BuiltinType {
     LongDouble,
     Int128,
     UnsignedInt128,
+    Float16,
 }
 
 impl BuiltinType {
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 19] = [
         Self::Void,
         Self::Bool,
         Self::Char,
@@ -97,6 +100,7 @@ impl BuiltinType {
         Self::LongDouble,
         Self::Int128,
         Self::UnsignedInt128,
+        Self::Float16,
     ];
 
     pub const fn is_integer(self) -> bool {
@@ -120,7 +124,10 @@ impl BuiltinType {
     }
 
     pub const fn is_floating(self) -> bool {
-        matches!(self, Self::Float | Self::Double | Self::LongDouble)
+        matches!(
+            self,
+            Self::Float16 | Self::Float | Self::Double | Self::LongDouble
+        )
     }
 
     pub const fn spelling(self) -> &'static str {
@@ -143,6 +150,7 @@ impl BuiltinType {
             Self::LongDouble => "long double",
             Self::Int128 => "__int128",
             Self::UnsignedInt128 => "unsigned __int128",
+            Self::Float16 => "_Float16",
         }
     }
 }

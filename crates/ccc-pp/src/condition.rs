@@ -735,4 +735,40 @@ mod tests {
         assert!(result.value);
         assert!(result.diagnostics.is_empty());
     }
+
+    #[test]
+    fn generated_defined_operator_obeys_the_output_token_limit() {
+        let mut sources = SourceMap::new();
+        let file = sources.add_file("test.c", "CHECK");
+        let tokens = lex(file, sources.source(file).unwrap()).unwrap();
+        let replacement_file = sources.add_file("replacement", "defined(PRESENT)");
+        let mut table = MacroTable::default();
+        table.define(crate::macros::MacroDefinition {
+            name: "CHECK".to_owned(),
+            form: crate::macros::MacroForm::Object,
+            replacement: lex(replacement_file, sources.source(replacement_file).unwrap()).unwrap(),
+            definition_span: tokens[0].span,
+            predefined: false,
+        });
+        let mut options = PreprocessOptions::default();
+        options.limits.output_tokens = 3;
+        let result = evaluate(
+            &mut sources,
+            &mut table,
+            &tokens,
+            &options,
+            true,
+            ExpansionLocation {
+                logical_file: "test.c",
+                is_system_header: false,
+            },
+            |_, _, _| false,
+        );
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "CCC1102")
+        );
+    }
 }

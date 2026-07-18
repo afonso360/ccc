@@ -102,3 +102,168 @@ jobs:
           name: sysv-amd64-failure-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/ccc-sysv-amd64-artifacts
           if-no-files-found: error
+
+  target-oracle-linux:
+    runs-on: [self-hosted, Linux, X64, homelab]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: aarch64-linux
+            triple: aarch64-unknown-linux-gnu
+            driver: aarch64-linux-gnu-gcc
+            objcopy: aarch64-linux-gnu-objcopy
+            archiver: aarch64-linux-gnu-ar
+            ranlib: aarch64-linux-gnu-ranlib
+            readelf: aarch64-linux-gnu-readelf
+            qemu: qemu-aarch64
+            qemu_root: /usr/aarch64-linux-gnu
+          - name: riscv64-linux
+            triple: riscv64-unknown-linux-gnu
+            driver: riscv64-linux-gnu-gcc
+            objcopy: riscv64-linux-gnu-objcopy
+            archiver: riscv64-linux-gnu-ar
+            ranlib: riscv64-linux-gnu-ranlib
+            readelf: riscv64-linux-gnu-readelf
+            qemu: qemu-riscv64
+            qemu_root: /usr/riscv64-linux-gnu
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build pinned cross-target environment
+        run: |
+          command -v docker >/dev/null || {
+            echo "Docker is required for pinned cross-target evidence" >&2
+            exit 1
+          }
+          docker build \
+            --file .github/target-oracle-linux.Dockerfile \
+            --tag ccc-target-oracle-linux:${{ github.sha }} \
+            .
+      - name: Run cross-target ABI, header, debugger, and corpus evidence
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/ccc-target-${{ matrix.name }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$ARTIFACT_DIR"
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --volume "$PWD:/workspace" \
+            --volume "$ARTIFACT_DIR:/artifacts" \
+            --workdir /workspace \
+            --env HOME=/tmp/ccc-home \
+            --env CARGO_HOME=/tmp/ccc-cargo \
+            --env CCC_REQUIRE_TARGET_ORACLE=1 \
+            --env CCC_TARGET_ORACLE_ARTIFACTS=/artifacts/oracle \
+            --env CCC_OBJCOPY=${{ matrix.objcopy }} \
+            --env CCC_QEMU_ROOT=${{ matrix.qemu_root }} \
+            --env CCC_LINK_CC=${{ matrix.driver }} \
+            --env BZIP2_AR=${{ matrix.archiver }} \
+            --env BZIP2_RANLIB=${{ matrix.ranlib }} \
+            --env BZIP2_READELF=${{ matrix.readelf }} \
+            --env BZIP2_QEMU=${{ matrix.qemu }} \
+            --env BZIP2_QEMU_ROOT=${{ matrix.qemu_root }} \
+            ccc-target-oracle-linux:${{ github.sha }} \
+            bash -c '
+              set -euo pipefail
+              mkdir -p "$HOME" "$CARGO_HOME"
+              cargo build --locked -p ccc-driver
+              if CCC_BIN=/definitely/missing/ccc \
+                   CCC_TARGET_ORACLE_ARTIFACTS=/tmp/fail-closed-probe \
+                   tests/target-oracle/run.sh aarch64-linux; then
+                echo "target oracle masked a prerequisite failure" >&2
+                exit 1
+              fi
+              tests/target-oracle/run.sh "${{ matrix.name }}"
+              CCC=target/debug/ccc \
+                test-corpus/bzip2/run.sh \
+                --target "${{ matrix.triple }}" \
+                --work-dir /artifacts/bzip2
+            '
+      - name: Retain cross-target evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: target-${{ matrix.name }}-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ccc-target-${{ matrix.name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+
+  target-oracle-darwin-arm64:
+    runs-on: macos-26
+    env:
+      DEVELOPER_DIR: /Library/Developer/CommandLineTools
+      ARTIFACT_DIR: ${{ runner.temp }}/ccc-target-darwin-arm64-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - name: Verify pinned Darwin ABI source and toolchain identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$ARTIFACT_DIR"
+          for tool in curl file lldb nm otool shasum xcrun; do
+            command -v "$tool" >/dev/null || {
+              echo "missing required Darwin tool: $tool" >&2
+              exit 1
+            }
+          done
+          openssl_bin="$(brew --prefix openssl@3)/bin/openssl"
+          "$openssl_bin" dgst -sha3-256 /dev/null >/dev/null
+          clt_version=$(pkgutil --pkg-info=com.apple.pkg.CLTools_Executables | awk '/^version:/ { print $2 }')
+          sdk_version=$(xcrun --sdk macosx --show-sdk-version)
+          compiler_target=$(/usr/bin/cc -dumpmachine)
+          [[ "$clt_version" == 26.6.0.0.1.1781586589 || "$clt_version" == 26.6.0.0.1781586589 ]]
+          [[ "$sdk_version" == 26.5 ]]
+          [[ "$(/usr/bin/cc --version | head -n 1)" == "Apple clang version 21.0.0 (clang-2100.1.1.101)" ]]
+          [[ "$compiler_target" == arm64-apple-darwin25.* ]]
+          grep -Fq 'developer_tools = "Command Line Tools 26.6.0.0.1781586589"' docs/spec-sources/darwin-arm64.toml
+          grep -Fq 'sdk = "macOS 26.5"' docs/spec-sources/darwin-arm64.toml
+          grep -Fq 'compiler = "Apple clang 21.0.0 (clang-2100.1.1.101)"' docs/spec-sources/darwin-arm64.toml
+          grep -Fq 'compiler_host_target_family = "arm64-apple-darwin25.*"' docs/spec-sources/darwin-arm64.toml
+          grep -Fq 'compiler_reference_target = "arm64-apple-macos11"' docs/spec-sources/darwin-arm64.toml
+          curl --fail --silent --show-error --location --retry 3 \
+            https://docs.developer.apple.com/tutorials/data/documentation/xcode/writing-arm64-code-for-apple-platforms.md \
+            --output "$ARTIFACT_DIR/writing-arm64-code-for-apple-platforms.md"
+          echo "afe0badf53abe5510e610358ba81050080692af7df7715a44be55271904d3b3e  $ARTIFACT_DIR/writing-arm64-code-for-apple-platforms.md" \
+            | shasum -a 256 --check
+          {
+            echo "clt=$clt_version"
+            echo "sdk=$sdk_version"
+            echo "target=$compiler_target"
+            /usr/bin/cc --version
+            xcrun ld -version_details
+            /usr/bin/nmedit --version || true
+            lldb --version
+          } > "$ARTIFACT_DIR/pinned-tool-identities.txt" 2>&1
+      - name: Run native Darwin ABI, header, debugger, and corpus evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked -p ccc-driver
+          if CCC_REQUIRE_TARGET_ORACLE=1 \
+               CCC_BIN=/definitely/missing/ccc \
+               CCC_TARGET_ORACLE_ARTIFACTS="$ARTIFACT_DIR/fail-closed-probe" \
+               tests/target-oracle/run.sh darwin-arm64; then
+            echo "target oracle masked a prerequisite failure" >&2
+            exit 1
+          fi
+          CCC_REQUIRE_TARGET_ORACLE=1 \
+            CCC_NMEDIT=/usr/bin/nmedit \
+            CCC_TARGET_ORACLE_ARTIFACTS="$ARTIFACT_DIR/oracle" \
+            tests/target-oracle/run.sh darwin-arm64
+          CCC=target/debug/ccc \
+            CCC_NMEDIT=/usr/bin/nmedit \
+            CCC_LINK_CC=/usr/bin/cc \
+            BZIP2_OPENSSL="$(brew --prefix openssl@3)/bin/openssl" \
+            BZIP2_MD5SUM="$PWD/test-corpus/bzip2/md5sum-darwin" \
+            BZIP2_SDKROOT="$(xcrun --sdk macosx --show-sdk-path)" \
+            BZIP2_DEPLOYMENT_TARGET=11.0 \
+            test-corpus/bzip2/run.sh \
+            --target aarch64-apple-darwin \
+            --work-dir "$ARTIFACT_DIR/bzip2"
+      - name: Retain Darwin target evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: target-darwin-arm64-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ccc-target-darwin-arm64-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error

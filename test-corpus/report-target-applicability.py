@@ -116,6 +116,39 @@ def parse_applicability(path: Path) -> Mapping[str, Mapping[str, str]]:
     return entries
 
 
+def parse_top_level_string(path: Path, key: str) -> str:
+    for line_number, raw_line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw_line.strip()
+        if line.startswith("["):
+            break
+        if not line or line.startswith("#"):
+            continue
+        value_match = STRING_VALUE_RE.fullmatch(line)
+        if value_match is None or value_match.group(1) != key:
+            continue
+        return decode_basic_string(path, line_number, value_match.group(2))
+    return ""
+
+
+def reject_blocked_execution_claims(
+    manifest_path: Path, entries: Mapping[str, Mapping[str, str]]
+) -> None:
+    execution_status = parse_top_level_string(manifest_path, "execution_status")
+    if not execution_status.startswith("blocked"):
+        return
+    claimed_targets = sorted(
+        target
+        for target, entry in entries.items()
+        if entry.get("status") == "applicable"
+        and entry.get("evidence_kind") == "execution"
+    )
+    if claimed_targets:
+        raise MatrixError(
+            f"{manifest_path}: execution_status {execution_status!r} cannot claim "
+            f"execution evidence for {claimed_targets!r}"
+        )
+
+
 def validate_entry(
     corpus_directory: Path, target: str, entry: Mapping[str, str]
 ) -> Tuple[str, str, str, str]:
@@ -206,7 +239,13 @@ def render_table(rows: Sequence[Tuple[str, str, str, str, str, str]]) -> None:
 
 
 def main() -> int:
-    root = Path(__file__).resolve().parent
+    arguments = sys.argv[1:]
+    if not arguments:
+        root = Path(__file__).resolve().parent
+    elif len(arguments) == 2 and arguments[0] == "--root":
+        root = Path(arguments[1]).resolve()
+    else:
+        raise MatrixError("usage: report-target-applicability.py [--root DIRECTORY]")
     catalog_path = root / "target-applicability.toml"
     targets, corpora = parse_catalog(catalog_path)
 
@@ -229,6 +268,7 @@ def main() -> int:
         corpus_directory = root / corpus
         manifest_path = corpus_directory / "manifest.toml"
         entries = parse_applicability(manifest_path)
+        reject_blocked_execution_claims(manifest_path, entries)
         if set(entries) != set(targets):
             missing = sorted(set(targets) - set(entries))
             extra = sorted(set(entries) - set(targets))
@@ -256,6 +296,14 @@ def main() -> int:
         raise MatrixError(
             "enabled targets must each have applicable evidence; empty targets="
             f"{empty_targets!r}"
+        )
+    execution_empty_targets = [
+        target for target, count in execution_counts.items() if count == 0
+    ]
+    if execution_empty_targets:
+        raise MatrixError(
+            "enabled targets must each have execution evidence; empty targets="
+            f"{execution_empty_targets!r}"
         )
 
     render_table(rows)

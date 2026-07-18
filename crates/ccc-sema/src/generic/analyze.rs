@@ -843,6 +843,7 @@ impl<'a> Analyzer<'a> {
         let boolean = count(|item| matches!(item, syntax::TypeSpecifier::Bool));
         let complex = count(|item| matches!(item, syntax::TypeSpecifier::Complex));
         let imaginary = count(|item| matches!(item, syntax::TypeSpecifier::Imaginary));
+        let float16 = count(|item| matches!(item, syntax::TypeSpecifier::Float16));
         let int128 = count(|item| matches!(item, syntax::TypeSpecifier::Int128));
         let int128_t = count(|item| matches!(item, syntax::TypeSpecifier::Int128T));
         let uint128_t = count(|item| matches!(item, syntax::TypeSpecifier::UInt128T));
@@ -865,6 +866,7 @@ impl<'a> Analyzer<'a> {
             || signed > 1
             || unsigned > 1
             || boolean > 1
+            || float16 > 1
             || int128 > 1
             || int128_t > 1
             || uint128_t > 1
@@ -872,7 +874,9 @@ impl<'a> Analyzer<'a> {
             return self.fail("CCC2217", span, "invalid repetition of type specifiers");
         }
         let total = specifiers.len();
-        let builtin = if int128_t == 1 && total == 1 {
+        let builtin = if float16 == 1 && total == 1 {
+            BuiltinType::Float16
+        } else if int128_t == 1 && total == 1 {
             BuiltinType::Int128
         } else if uint128_t == 1 && total == 1 {
             BuiltinType::UnsignedInt128
@@ -2061,6 +2065,7 @@ impl<'a> Analyzer<'a> {
                 }
                 if let Some(asm_label) = asm_label {
                     global.emission.symbol_name = asm_label.symbol.clone();
+                    global.emission.symbol_name_is_exact = true;
                     global.asm_label = Some(asm_label);
                 }
                 if let Some(binding) = declared_binding {
@@ -2093,6 +2098,7 @@ impl<'a> Analyzer<'a> {
             .map_or_else(|| name.clone(), |label| label.symbol.clone());
         let mut emission = GlobalEmission {
             symbol_name,
+            symbol_name_is_exact: asm_label.is_some(),
             binding: declared_binding.unwrap_or_default(),
             visibility: SymbolVisibility::Default,
             section: None,
@@ -2466,6 +2472,7 @@ impl<'a> Analyzer<'a> {
                         "__ccc_block_static.{}.{}.{}.{}",
                         function.name, function.id.0, local.0, name
                     ),
+                    symbol_name_is_exact: false,
                     binding: SymbolBinding::Strong,
                     visibility: SymbolVisibility::Internal,
                     section: None,
@@ -6241,6 +6248,8 @@ impl<'a> Analyzer<'a> {
             TypeId::DOUBLE
         } else if left.ty.ty == TypeId::FLOAT || right.ty.ty == TypeId::FLOAT {
             TypeId::FLOAT
+        } else if left.ty.ty == TypeId::FLOAT16 || right.ty.ty == TypeId::FLOAT16 {
+            TypeId::FLOAT16
         } else {
             self.common_integer_type(left.ty.ty, right.ty.ty)
         };
@@ -6752,6 +6761,8 @@ impl<'a> Analyzer<'a> {
             TypeId::DOUBLE
         } else if left == TypeId::FLOAT || right == TypeId::FLOAT {
             TypeId::FLOAT
+        } else if left == TypeId::FLOAT16 || right == TypeId::FLOAT16 {
+            TypeId::FLOAT16
         } else {
             self.common_integer_type(left, right)
         }
@@ -6793,7 +6804,12 @@ impl<'a> Analyzer<'a> {
             }
         } else if matches!(
             self.types.builtin_type(target),
-            Some(BuiltinType::Float | BuiltinType::Double | BuiltinType::LongDouble)
+            Some(
+                BuiltinType::Float16
+                    | BuiltinType::Float
+                    | BuiltinType::Double
+                    | BuiltinType::LongDouble
+            )
         ) {
             let target = self.types.builtin_type(target)?;
             let value = match (target, value) {
@@ -6833,6 +6849,7 @@ impl<'a> Analyzer<'a> {
             BuiltinType::LongLong | BuiltinType::UnsignedLongLong => layout.long_long_width,
             BuiltinType::Int128 | BuiltinType::UnsignedInt128 => 128,
             BuiltinType::Void
+            | BuiltinType::Float16
             | BuiltinType::Float
             | BuiltinType::Double
             | BuiltinType::LongDouble => 0,
@@ -8667,7 +8684,11 @@ fn integer_rank(kind: BuiltinType) -> u8 {
         BuiltinType::Long | BuiltinType::UnsignedLong => 4,
         BuiltinType::LongLong | BuiltinType::UnsignedLongLong => 5,
         BuiltinType::Int128 | BuiltinType::UnsignedInt128 => 6,
-        BuiltinType::Void | BuiltinType::Float | BuiltinType::Double | BuiltinType::LongDouble => 0,
+        BuiltinType::Void
+        | BuiltinType::Float16
+        | BuiltinType::Float
+        | BuiltinType::Double
+        | BuiltinType::LongDouble => 0,
     }
 }
 

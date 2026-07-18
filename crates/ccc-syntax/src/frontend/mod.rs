@@ -538,6 +538,18 @@ mod tests {
     }
 
     #[test]
+    fn parses_float16_as_a_reserved_arithmetic_type() {
+        let unit = parse_source(
+            "_Float16 object;\n\
+             extern _Float16 operation(_Float16);\n\
+             struct Pair { _Float16 first; _Float16 second; };",
+        )
+        .unwrap();
+        let dump = dump_ast(&unit);
+        assert_eq!(dump.matches("type _Float16").count(), 4, "{dump}");
+    }
+
+    #[test]
     fn parses_sync_synchronize_only_with_exact_zero_argument_syntax() {
         let unit = parse_source("void synchronize(void) { __sync_synchronize(); }").unwrap();
         let dump = dump_ast(&unit);
