@@ -43,6 +43,8 @@ mod tests {
             (BuiltinType::Float, TypeId::FLOAT, 13),
             (BuiltinType::Double, TypeId::DOUBLE, 14),
             (BuiltinType::LongDouble, TypeId::LONG_DOUBLE, 15),
+            (BuiltinType::Int128, TypeId::INT128, 16),
+            (BuiltinType::UnsignedInt128, TypeId::UNSIGNED_INT128, 17),
         ];
         assert_eq!(BuiltinType::ALL.len(), expected.len());
 

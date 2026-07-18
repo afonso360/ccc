@@ -109,6 +109,9 @@ impl AstDumper {
             TypeSpecifier::Atomic(_) => self.line(indent, "type Atomic"),
             TypeSpecifier::Typeof(_) => self.line(indent, "type Typeof"),
             TypeSpecifier::BuiltinVaList => self.line(indent, "type __builtin_va_list"),
+            TypeSpecifier::Int128 => self.line(indent, "type __int128"),
+            TypeSpecifier::Int128T => self.line(indent, "type __int128_t"),
+            TypeSpecifier::UInt128T => self.line(indent, "type __uint128_t"),
             other => self.line(indent, &format!("type {other:?}")),
         }
     }

@@ -1506,6 +1506,14 @@ mod tests {
         assert_eq!(darwin.target_macros.get("__BIGGEST_ALIGNMENT__"), Some("8"));
         assert_eq!(darwin.target_macros.get("__LDBL_MANT_DIG__"), Some("53"));
         assert_eq!(darwin.target_macros.get("__LONG_DOUBLE_128__"), None);
+        for config in [x86, aarch64, riscv, darwin] {
+            assert_eq!(
+                config.frontend_predefined_macros().get("__SIZEOF_INT128__"),
+                None,
+                "{} must not advertise incomplete 128-bit value support",
+                config.target.triple
+            );
+        }
     }
 
     #[test]

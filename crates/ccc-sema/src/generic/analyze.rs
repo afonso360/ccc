@@ -441,6 +441,20 @@ impl<'a> Analyzer<'a> {
                 "a function definition declarator must have function type",
             );
         };
+        self.reject_int128_boundary_type(
+            signature.result.ty,
+            definition.declarator.span,
+            "function return",
+        )?;
+        if let FunctionParameters::Prototype(parameters) = &signature.parameters {
+            for parameter in parameters {
+                self.reject_int128_boundary_type(
+                    parameter.ty,
+                    definition.declarator.span,
+                    "function parameter",
+                )?;
+            }
+        }
         let mut attributes = info.attributes;
         attributes.extend(resolved.attributes);
         self.reject_packed_attribute(&attributes, definition.declarator.span)?;
@@ -819,6 +833,9 @@ impl<'a> Analyzer<'a> {
         let boolean = count(|item| matches!(item, syntax::TypeSpecifier::Bool));
         let complex = count(|item| matches!(item, syntax::TypeSpecifier::Complex));
         let imaginary = count(|item| matches!(item, syntax::TypeSpecifier::Imaginary));
+        let int128 = count(|item| matches!(item, syntax::TypeSpecifier::Int128));
+        let int128_t = count(|item| matches!(item, syntax::TypeSpecifier::Int128T));
+        let uint128_t = count(|item| matches!(item, syntax::TypeSpecifier::UInt128T));
 
         if complex != 0 || imaginary != 0 {
             return self.fail(
@@ -838,11 +855,24 @@ impl<'a> Analyzer<'a> {
             || signed > 1
             || unsigned > 1
             || boolean > 1
+            || int128 > 1
+            || int128_t > 1
+            || uint128_t > 1
         {
             return self.fail("CCC2217", span, "invalid repetition of type specifiers");
         }
         let total = specifiers.len();
-        let builtin = if void == 1 && total == 1 {
+        let builtin = if int128_t == 1 && total == 1 {
+            BuiltinType::Int128
+        } else if uint128_t == 1 && total == 1 {
+            BuiltinType::UnsignedInt128
+        } else if int128 == 1 && total == int128 + signed + unsigned {
+            if unsigned == 1 {
+                BuiltinType::UnsignedInt128
+            } else {
+                BuiltinType::Int128
+            }
+        } else if void == 1 && total == 1 {
             BuiltinType::Void
         } else if boolean == 1 && total == 1 {
             BuiltinType::Bool
@@ -3881,6 +3911,13 @@ impl<'a> Analyzer<'a> {
                 "`va_arg` does not support `long double` or an aggregate containing it",
             );
         }
+        if self.type_contains_int128(requested.ty, &mut HashSet::new()) {
+            return self.fail(
+                "CCC2443",
+                type_name.span,
+                "`va_arg` does not support a 128-bit integer or an aggregate containing it",
+            );
+        }
         let layout = self
             .types
             .layout_of(requested.ty, self.config)
@@ -4033,6 +4070,31 @@ impl<'a> Analyzer<'a> {
                     fields
                         .iter()
                         .any(|field| self.type_contains_long_double(field.ty.ty, seen))
+                }),
+            _ => false,
+        }
+    }
+
+    fn type_contains_int128(&self, ty: TypeId, seen: &mut HashSet<TypeId>) -> bool {
+        if matches!(
+            self.types.builtin_type(ty),
+            Some(BuiltinType::Int128 | BuiltinType::UnsignedInt128)
+        ) {
+            return true;
+        }
+        if !seen.insert(ty) {
+            return false;
+        }
+        match self.types.try_kind(ty) {
+            Some(TypeKind::Array(array)) => self.type_contains_int128(array.element.ty, seen),
+            Some(TypeKind::Record(record)) => self
+                .types
+                .record(*record)
+                .and_then(|record| record.fields.as_ref())
+                .is_some_and(|fields| {
+                    fields
+                        .iter()
+                        .any(|field| self.type_contains_int128(field.ty.ty, seen))
                 }),
             _ => false,
         }
@@ -4453,6 +4515,7 @@ impl<'a> Analyzer<'a> {
                 let operand =
                     self.integer_or_arithmetic_promotion(operand, operator != U::BitwiseNot, span)?;
                 self.reject_long_double_operation(&[operand.ty], span)?;
+                self.reject_int128_value_operation(&[operand.ty], span)?;
                 let constant = evaluate_unary_constant(
                     operator,
                     operand.constant,
@@ -4662,6 +4725,7 @@ impl<'a> Analyzer<'a> {
         }
         let (left, right, common) = self.usual_arithmetic_conversions(left, right, span)?;
         self.reject_long_double_operation(&[common], span)?;
+        self.reject_int128_value_operation(&[common], span)?;
         let result_ty = if matches!(
             operator,
             B::Less | B::LessEqual | B::Greater | B::GreaterEqual | B::Equal | B::NotEqual
@@ -4851,6 +4915,7 @@ impl<'a> Analyzer<'a> {
         let common = QualifiedType::unqualified(common_ty);
         let right = self.arithmetic_conversion(right, common)?;
         self.reject_long_double_operation(&[common], span)?;
+        self.reject_int128_value_operation(&[common], span)?;
         let result_conversion = (common.ty != target.ty.ty)
             .then_some(self.arithmetic_conversion_kind(common.ty, target.ty.ty));
         Ok((
@@ -4887,6 +4952,7 @@ impl<'a> Analyzer<'a> {
             );
         }
         self.reject_long_double_operation(&[operand.ty], span)?;
+        self.reject_int128_value_operation(&[operand.ty], span)?;
         let store = place.access;
         Ok(FullTypedExpression {
             kind: FullTypedExpressionKind::Increment {
@@ -5226,7 +5292,14 @@ impl<'a> Analyzer<'a> {
                 "called expression does not point to a function",
             );
         };
+        self.reject_int128_boundary_type(signature.result.ty, span, "function return")?;
+        if let FunctionParameters::Prototype(parameters) = &signature.parameters {
+            for parameter in parameters {
+                self.reject_int128_boundary_type(parameter.ty, span, "function parameter")?;
+            }
+        }
         self.reject_long_double_operation(&[signature.result], span)?;
+        self.reject_int128_value_operation(&[signature.result], span)?;
         let mut typed_arguments = Vec::new();
         let fixed = match &signature.parameters {
             FunctionParameters::Unspecified => 0,
@@ -5260,6 +5333,8 @@ impl<'a> Analyzer<'a> {
                 _ => self.default_argument_promotion(argument)?,
             };
             self.reject_long_double_operation(&[converted.ty], converted.span)?;
+            self.reject_int128_value_operation(&[converted.ty], converted.span)?;
+            self.reject_int128_boundary_type(converted.ty.ty, converted.span, "call argument")?;
             typed_arguments.push(converted);
         }
         Ok(FullTypedExpression {
@@ -5517,6 +5592,7 @@ impl<'a> Analyzer<'a> {
         ty: QualifiedType,
         initializer: &syntax::Initializer,
     ) -> AnalysisResult<(FullTypedInitializer, QualifiedType)> {
+        self.reject_int128_value_operation(&[ty], initializer.span())?;
         match initializer {
             syntax::Initializer::Expression(expression) => {
                 let expression = self.analyze_expression(expression)?;
@@ -5975,6 +6051,7 @@ impl<'a> Analyzer<'a> {
                 Ok(self.conversion(ConversionKind::FunctionToPointer, expression, target, None))
             }
             _ if expression.category == ValueCategory::Lvalue => {
+                self.reject_int128_value_operation(&[expression.ty], expression.span)?;
                 let access = expression
                     .place
                     .as_ref()
@@ -6170,6 +6247,7 @@ impl<'a> Analyzer<'a> {
         }
         if self.types.is_arithmetic(target.ty) && self.types.is_arithmetic(expression.ty.ty) {
             self.reject_long_double_operation(&[target, expression.ty], span)?;
+            self.reject_int128_value_operation(&[target, expression.ty], span)?;
             return self.arithmetic_conversion(expression, QualifiedType::unqualified(target.ty));
         }
         if self.pointer_pointee(target.ty).is_some() {
@@ -6240,6 +6318,7 @@ impl<'a> Analyzer<'a> {
             )));
         }
         self.reject_long_double_operation(&[target, expression.ty], span)?;
+        self.reject_int128_value_operation(&[target, expression.ty], span)?;
         if target.ty == TypeId::BOOL
             && (self.types.is_arithmetic(expression.ty.ty)
                 || self.pointer_pointee(expression.ty.ty).is_some())
@@ -6658,6 +6737,7 @@ impl<'a> Analyzer<'a> {
             BuiltinType::Int | BuiltinType::UnsignedInt => layout.int_width,
             BuiltinType::Long | BuiltinType::UnsignedLong => layout.long_width,
             BuiltinType::LongLong | BuiltinType::UnsignedLongLong => layout.long_long_width,
+            BuiltinType::Int128 | BuiltinType::UnsignedInt128 => 128,
             BuiltinType::Void
             | BuiltinType::Float
             | BuiltinType::Double
@@ -7142,6 +7222,45 @@ impl<'a> Analyzer<'a> {
                 "CCC2343",
                 span,
                 "long double layout is supported, but this operation requires unavailable arithmetic or ABI support",
+            )
+        } else {
+            Ok(())
+        }
+    }
+
+    fn reject_int128_value_operation(
+        &mut self,
+        types: &[QualifiedType],
+        span: Span,
+    ) -> AnalysisResult<()> {
+        if types
+            .iter()
+            .any(|ty| self.type_contains_int128(ty.ty, &mut HashSet::new()))
+        {
+            self.fail(
+                "CCC2443",
+                span,
+                "128-bit integer layout is supported, but value operations are not enabled",
+            )
+        } else {
+            Ok(())
+        }
+    }
+
+    fn reject_int128_boundary_type(
+        &mut self,
+        ty: TypeId,
+        span: Span,
+        boundary: &str,
+    ) -> AnalysisResult<()> {
+        if self.type_contains_int128(ty, &mut HashSet::new()) {
+            self.fail(
+                "CCC2443",
+                span,
+                format!(
+                    "{boundary} type `{}` contains a 128-bit integer with no enabled ABI transport",
+                    self.types.display(ty)
+                ),
             )
         } else {
             Ok(())
@@ -8429,6 +8548,7 @@ fn is_signed_builtin(kind: BuiltinType) -> bool {
             | BuiltinType::Int
             | BuiltinType::Long
             | BuiltinType::LongLong
+            | BuiltinType::Int128
     )
 }
 
@@ -8440,6 +8560,7 @@ fn integer_rank(kind: BuiltinType) -> u8 {
         BuiltinType::Int | BuiltinType::UnsignedInt => 3,
         BuiltinType::Long | BuiltinType::UnsignedLong => 4,
         BuiltinType::LongLong | BuiltinType::UnsignedLongLong => 5,
+        BuiltinType::Int128 | BuiltinType::UnsignedInt128 => 6,
         BuiltinType::Void | BuiltinType::Float | BuiltinType::Double | BuiltinType::LongDouble => 0,
     }
 }
@@ -8451,6 +8572,7 @@ fn unsigned_counterpart(kind: BuiltinType) -> BuiltinType {
         BuiltinType::Int => BuiltinType::UnsignedInt,
         BuiltinType::Long => BuiltinType::UnsignedLong,
         BuiltinType::LongLong => BuiltinType::UnsignedLongLong,
+        BuiltinType::Int128 => BuiltinType::UnsignedInt128,
         other => other,
     }
 }

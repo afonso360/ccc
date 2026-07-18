@@ -54,6 +54,9 @@ pub enum Keyword {
     Attribute,
     Extension,
     Typeof,
+    Int128,
+    Int128T,
+    UInt128T,
 }
 
 impl Keyword {
@@ -114,6 +117,9 @@ impl Keyword {
             "__volatile" | "__volatile__" => Some(Self::Volatile),
             "__alignof" | "__alignof__" => Some(Self::Alignof),
             "__thread" => Some(Self::GnuThreadLocal),
+            "__int128" => Some(Self::Int128),
+            "__int128_t" => Some(Self::Int128T),
+            "__uint128_t" => Some(Self::UInt128T),
             _ => None,
         }
     }

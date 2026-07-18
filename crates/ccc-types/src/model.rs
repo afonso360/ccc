@@ -22,6 +22,10 @@ impl TypeId {
     pub const FLOAT: Self = Self(13);
     pub const DOUBLE: Self = Self(14);
     pub const LONG_DOUBLE: Self = Self(15);
+    // Builtin IDs are append-only and must remain in lockstep with the
+    // TypeStore prefix interning order.
+    pub const INT128: Self = Self(16);
+    pub const UNSIGNED_INT128: Self = Self(17);
 
     pub const fn index(self) -> usize {
         self.0 as usize
@@ -45,6 +49,8 @@ impl TypeId {
             BuiltinType::Float => Self::FLOAT,
             BuiltinType::Double => Self::DOUBLE,
             BuiltinType::LongDouble => Self::LONG_DOUBLE,
+            BuiltinType::Int128 => Self::INT128,
+            BuiltinType::UnsignedInt128 => Self::UNSIGNED_INT128,
         }
     }
 }
@@ -67,10 +73,12 @@ pub enum BuiltinType {
     Float,
     Double,
     LongDouble,
+    Int128,
+    UnsignedInt128,
 }
 
 impl BuiltinType {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 18] = [
         Self::Void,
         Self::Bool,
         Self::Char,
@@ -87,6 +95,8 @@ impl BuiltinType {
         Self::Float,
         Self::Double,
         Self::LongDouble,
+        Self::Int128,
+        Self::UnsignedInt128,
     ];
 
     pub const fn is_integer(self) -> bool {
@@ -104,6 +114,8 @@ impl BuiltinType {
                 | Self::UnsignedLong
                 | Self::LongLong
                 | Self::UnsignedLongLong
+                | Self::Int128
+                | Self::UnsignedInt128
         )
     }
 
@@ -129,6 +141,8 @@ impl BuiltinType {
             Self::Float => "float",
             Self::Double => "double",
             Self::LongDouble => "long double",
+            Self::Int128 => "__int128",
+            Self::UnsignedInt128 => "unsigned __int128",
         }
     }
 }
