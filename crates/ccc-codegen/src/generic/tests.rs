@@ -301,6 +301,16 @@ fn enabled_non_x86_targets_emit_native_objects_with_fixed_aggregate_calls() {
         let object = object::File::parse(output.object.as_slice()).unwrap();
         assert_eq!(object.format(), format);
         assert_eq!(object.architecture(), architecture);
+        if architecture == object::Architecture::Riscv64 {
+            assert_eq!(
+                object.flags(),
+                object::FileFlags::Elf {
+                    os_abi: object::elf::ELFOSABI_NONE,
+                    abi_version: 0,
+                    e_flags: object::elf::EF_RISCV_RVC | object::elf::EF_RISCV_FLOAT_ABI_DOUBLE,
+                }
+            );
+        }
         let prefix = if format == object::BinaryFormat::MachO {
             "_"
         } else {

@@ -36,7 +36,7 @@ use cranelift_module::{
 use cranelift_object::{ObjectBuilder, ObjectModule};
 use object::read::{Object as _, ObjectSymbol as _};
 use object::write::SymbolSection;
-use object::{SymbolFlags, SymbolKind, SymbolScope};
+use object::{FileFlags, SymbolFlags, SymbolKind, SymbolScope};
 
 use crate::{CodegenError, Options, Output};
 
@@ -218,6 +218,19 @@ fn emit_inner(
     data::define_globals(module, config, &declarations, &mut object_module)?;
 
     let mut product = object_module.finish();
+    if config.target.abi == AbiIdentity::RiscvLp64d {
+        let FileFlags::Elf { e_flags, .. } = &mut product.object.flags else {
+            return Err(error(
+                "RISC-V LP64D code generation did not produce an ELF object",
+            ));
+        };
+        // The enabled RISC-V profile is rv64gc/lp64d. Cranelift records the
+        // floating-point ABI but does not propagate the C extension into the
+        // writable object's ELF header. Generated bridge assembly is allowed
+        // to use compressed instructions, so every constituent object must
+        // advertise the complete profile before relocatable linking.
+        *e_flags |= object::elf::EF_RISCV_RVC | object::elf::EF_RISCV_FLOAT_ABI_DOUBLE;
+    }
     if config.target.abi == AbiIdentity::DarwinArm64 {
         product
             .object
