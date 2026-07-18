@@ -27,6 +27,48 @@ fn lower_source(source: &str) -> gir::FullModule {
     lower_source_with_config(source, &EffectiveCompilationConfig::default())
 }
 
+#[test]
+fn compiler_128_bit_storage_emits_but_scalar_lowering_fails_closed() {
+    for (config, symbol_name) in [
+        (EffectiveCompilationConfig::default(), "wide_object"),
+        (
+            EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+            "wide_object",
+        ),
+        (
+            EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
+            "wide_object",
+        ),
+        (
+            EffectiveCompilationConfig::aarch64_apple_darwin(),
+            "_wide_object",
+        ),
+    ] {
+        let output = emit_source_with_config(
+            "__int128 wide_object; void *address(void) { return &wide_object; }",
+            &config,
+        );
+        let object = object::File::parse(output.object.as_slice()).unwrap();
+        let symbol = object.symbol_by_name(symbol_name).unwrap();
+        if object.format() == object::BinaryFormat::MachO {
+            let section = object
+                .section_by_index(symbol.section_index().unwrap())
+                .unwrap();
+            assert!(section.size() >= 16, "{}", config.target.triple);
+        } else {
+            assert_eq!(symbol.size(), 16, "{}", config.target.triple);
+        }
+
+        let types = TypeStore::default();
+        for ty in [TypeId::INT128, TypeId::UNSIGNED_INT128] {
+            let error =
+                super::function::scalar_type(&types, QualifiedType::unqualified(ty), &config)
+                    .unwrap_err();
+            assert_eq!(error.code, "CCC3517", "{}", config.target.triple);
+        }
+    }
+}
+
 fn emit_source(source: &str) -> Output {
     emit(
         &lower_source(source),
@@ -751,7 +793,7 @@ fn complete_abi_plan_and_aggregate_clif_have_exact_snapshots() {
     assert!(dump.contains("packaging assembly-units=2"), "{dump}");
     assert_eq!(
         sha256(&dump),
-        "2b3301ff4fc39297d5c3605d13385b2d8224fc1226ff0146b729ba70c5b6e347"
+        "d1ed2b1efc982699f3b9df7784923e1130f192d435db3f8a0842759cfe0410b9"
     );
 
     let output = emit(&module, &config, Options { emit_clif: true }).unwrap();

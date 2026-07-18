@@ -3054,6 +3054,14 @@ pub(super) fn scalar_type(
                 .to_owned(),
             span: None,
         }),
+        Some(TypeKind::Builtin(BuiltinType::Int128 | BuiltinType::UnsignedInt128)) => {
+            Err(CodegenError {
+                code: "CCC3517",
+                message: "128-bit integer values require an enabled transport capability"
+                    .to_owned(),
+                span: None,
+            })
+        }
         Some(TypeKind::Builtin(_)) => {
             let layout = object_layout(types, ty, config)?;
             integer_type_for_size(layout.size, "integer")
@@ -3112,6 +3120,14 @@ fn is_signed(
             | BuiltinType::UnsignedInt
             | BuiltinType::UnsignedLong
             | BuiltinType::UnsignedLongLong => false,
+            BuiltinType::Int128 | BuiltinType::UnsignedInt128 => {
+                return Err(CodegenError {
+                    code: "CCC3517",
+                    message: "128-bit integer values require an enabled transport capability"
+                        .to_owned(),
+                    span: None,
+                });
+            }
             BuiltinType::Void
             | BuiltinType::Float
             | BuiltinType::Double

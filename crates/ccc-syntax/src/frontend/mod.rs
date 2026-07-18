@@ -521,6 +521,23 @@ mod tests {
     }
 
     #[test]
+    fn parses_compiler_128_bit_integer_spellings_as_types() {
+        let unit = parse_source(
+            "__int128 signed_value;\n\
+             signed __int128 explicit_signed;\n\
+             unsigned __int128 unsigned_value;\n\
+             __int128_t signed_alias;\n\
+             __uint128_t unsigned_alias;\n\
+             struct Wide { __uint128_t words[4]; };",
+        )
+        .unwrap();
+        let dump = dump_ast(&unit);
+        assert_eq!(dump.matches("type __int128\n").count(), 3, "{dump}");
+        assert!(dump.contains("type __int128_t"), "{dump}");
+        assert_eq!(dump.matches("type __uint128_t").count(), 2, "{dump}");
+    }
+
+    #[test]
     fn parses_sync_synchronize_only_with_exact_zero_argument_syntax() {
         let unit = parse_source("void synchronize(void) { __sync_synchronize(); }").unwrap();
         let dump = dump_ast(&unit);

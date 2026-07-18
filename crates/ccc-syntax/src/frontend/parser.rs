@@ -352,6 +352,15 @@ impl Parser<'_> {
                 Some(TokenKind::Keyword(Keyword::Imaginary)) => {
                     self.simple_type(TypeSpecifier::Imaginary)
                 }
+                Some(TokenKind::Keyword(Keyword::Int128)) => {
+                    self.simple_type(TypeSpecifier::Int128)
+                }
+                Some(TokenKind::Keyword(Keyword::Int128T)) => {
+                    self.simple_type(TypeSpecifier::Int128T)
+                }
+                Some(TokenKind::Keyword(Keyword::UInt128T)) => {
+                    self.simple_type(TypeSpecifier::UInt128T)
+                }
                 Some(TokenKind::Keyword(Keyword::Struct)) => {
                     self.position += 1;
                     DeclarationSpecifier::Type(TypeSpecifier::Struct(Box::new(
@@ -2231,6 +2240,9 @@ impl Parser<'_> {
                     | Keyword::Attribute
                     | Keyword::Extension
                     | Keyword::Typeof
+                    | Keyword::Int128
+                    | Keyword::Int128T
+                    | Keyword::UInt128T
             ))
         )
     }
@@ -2263,6 +2275,9 @@ impl Parser<'_> {
                         | Keyword::Complex
                         | Keyword::Imaginary
                         | Keyword::Typeof
+                        | Keyword::Int128
+                        | Keyword::Int128T
+                        | Keyword::UInt128T
                 ))
             )
     }
@@ -2313,6 +2328,9 @@ impl Parser<'_> {
                     | Keyword::Imaginary
                     | Keyword::Typeof
                     | Keyword::Attribute
+                    | Keyword::Int128
+                    | Keyword::Int128T
+                    | Keyword::UInt128T
             )
         )
     }

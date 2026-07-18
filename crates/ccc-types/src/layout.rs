@@ -235,6 +235,9 @@ impl LayoutEngine<'_> {
             BuiltinType::Float => TargetScalarKind::Float,
             BuiltinType::Double => TargetScalarKind::Double,
             BuiltinType::LongDouble => TargetScalarKind::LongDouble,
+            BuiltinType::Int128 | BuiltinType::UnsignedInt128 => {
+                return Ok(TypeLayout::scalar(16, 16, builtin));
+            }
         };
         let target = self.config.target.scalar_layout(target_kind);
         self.validate_scalar(target.size, target.align)?;
