@@ -165,6 +165,9 @@ pub struct FullFunction {
     pub visibility: SymbolVisibility,
     pub properties: FunctionProperties,
     pub symbol_name: String,
+    /// Whether `symbol_name` is an explicit physical object-file spelling
+    /// rather than a C identifier subject to target mangling.
+    pub symbol_name_is_exact: bool,
     pub result_type: QualifiedType,
     pub parameters: Vec<FullParameter>,
     pub storage: Vec<FullStorage>,

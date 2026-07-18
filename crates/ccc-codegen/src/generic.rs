@@ -211,6 +211,38 @@ fn emit_inner(
         product
             .object
             .set_macho_build_version(darwin_build_version(config)?);
+
+        // `object` applies Mach-O's ordinary C leading-underscore mangling to
+        // every function and data declaration.  A declaration assembly label
+        // is different: its string is already the exact physical symbol name,
+        // as required by Apple's SDK redirects.  Relocations refer to symbol
+        // IDs, so restoring the spelling after module finalization preserves
+        // both defined and undefined references without guessing from the
+        // label's contents.
+        for function in module
+            .functions
+            .iter()
+            .filter(|function| function.symbol_name_is_exact)
+        {
+            let Some(id) = declarations.functions.get(&function.id.0).copied() else {
+                continue;
+            };
+            product.object.symbol_mut(product.function_symbol(id)).name =
+                function.symbol_name.as_bytes().to_vec();
+        }
+        for global in module
+            .globals
+            .iter()
+            .filter(|global| global.emission.symbol_name_is_exact)
+        {
+            let Some(declaration) = declarations.globals.get(&global.id.0) else {
+                continue;
+            };
+            product
+                .object
+                .symbol_mut(product.data_symbol(declaration.id))
+                .name = global.emission.symbol_name.as_bytes().to_vec();
+        }
     }
     for common in &declarations.commons {
         let symbol = product.data_symbol(common.id);
@@ -394,6 +426,7 @@ fn generated_bridge_artifacts(
         let assembly = render_target_variadic_entry(
             &VariadicEntryPlan {
                 public_symbol: public_symbol.clone(),
+                public_symbol_is_exact: artifact.public_symbol_is_exact,
                 hidden_body_symbol: hidden_body.clone(),
                 linkage,
                 fixed_gp_used: plan.gp_used,
@@ -407,7 +440,7 @@ fn generated_bridge_artifacts(
             config.target.abi,
         )
         .map_err(module_error)?;
-        let entry_symbol = match linkage {
+        let mut entry_symbol = match linkage {
             AssemblyFunctionLinkage::ExternalDefault => GeneratedSymbol::public(
                 public_symbol,
                 GeneratedSymbolKind::VariadicEntry,
@@ -434,6 +467,9 @@ fn generated_bridge_artifacts(
                 GeneratedSymbolOwner::AssemblyUnit(assembly.stem().to_owned()),
             ),
         };
+        if artifact.public_symbol_is_exact {
+            entry_symbol = entry_symbol.with_exact_object_name();
+        }
         symbols.push(entry_symbol);
         symbols.push(GeneratedSymbol::internal(
             hidden_body,

@@ -1,5 +1,6 @@
 //! Verified artifact bundles exchanged between code generation and packaging.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use object::read::{Object as _, ObjectSection as _, ObjectSymbol as _};
@@ -35,6 +36,9 @@ pub enum GeneratedSymbolVisibility {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GeneratedSymbol {
     pub name: String,
+    /// Whether `name` is already the physical object-file spelling and must
+    /// bypass the target's ordinary C symbol mangling.
+    pub object_name_is_exact: bool,
     pub kind: GeneratedSymbolKind,
     pub owner: GeneratedSymbolOwner,
     pub visibility: GeneratedSymbolVisibility,
@@ -48,6 +52,7 @@ impl GeneratedSymbol {
     ) -> Self {
         Self {
             name: name.into(),
+            object_name_is_exact: false,
             kind,
             owner,
             visibility: GeneratedSymbolVisibility::Internal,
@@ -61,6 +66,7 @@ impl GeneratedSymbol {
     ) -> Self {
         Self {
             name: name.into(),
+            object_name_is_exact: false,
             kind,
             owner,
             visibility: GeneratedSymbolVisibility::Public,
@@ -74,6 +80,7 @@ impl GeneratedSymbol {
     ) -> Self {
         Self {
             name: name.into(),
+            object_name_is_exact: false,
             kind,
             owner,
             visibility: GeneratedSymbolVisibility::SourceHidden,
@@ -87,6 +94,7 @@ impl GeneratedSymbol {
     ) -> Self {
         Self {
             name: name.into(),
+            object_name_is_exact: false,
             kind,
             owner,
             visibility: GeneratedSymbolVisibility::SourceInternal,
@@ -100,6 +108,7 @@ impl GeneratedSymbol {
     ) -> Self {
         Self {
             name: name.into(),
+            object_name_is_exact: false,
             kind,
             owner,
             visibility: GeneratedSymbolVisibility::SourceElfInternal,
@@ -113,9 +122,23 @@ impl GeneratedSymbol {
     ) -> Self {
         Self {
             name: name.into(),
+            object_name_is_exact: false,
             kind,
             owner,
             visibility: GeneratedSymbolVisibility::SourceProtected,
+        }
+    }
+
+    pub fn with_exact_object_name(mut self) -> Self {
+        self.object_name_is_exact = true;
+        self
+    }
+
+    pub(crate) fn object_name(&self, format: BinaryFormat) -> Cow<'_, str> {
+        if format == BinaryFormat::MachO && !self.object_name_is_exact {
+            Cow::Owned(format!("_{}", self.name))
+        } else {
+            Cow::Borrowed(&self.name)
         }
     }
 }
@@ -163,6 +186,22 @@ impl BridgeManifestV1 {
                 )
             })
             .map(|symbol| symbol.name.as_str())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names
+    }
+
+    pub(crate) fn localization_object_symbols(&self, format: BinaryFormat) -> Vec<Cow<'_, str>> {
+        let mut names = self
+            .symbols
+            .iter()
+            .filter(|symbol| {
+                matches!(
+                    symbol.visibility,
+                    GeneratedSymbolVisibility::Internal | GeneratedSymbolVisibility::SourceInternal
+                )
+            })
+            .map(|symbol| symbol.object_name(format))
             .collect::<Vec<_>>();
         names.sort_unstable();
         names
@@ -233,13 +272,13 @@ impl BridgeManifestV1 {
 
     fn verify_primary_object(&self, primary_object: &[u8]) -> Result<(), LinkError> {
         let object = parse_relocatable(primary_object, "primary object")?;
+        let format = object.format();
         let mut defined = BTreeMap::<String, SymbolScope>::new();
         let mut undefined = BTreeSet::<String>::new();
         for symbol in object.symbols() {
             let Ok(name) = symbol.name() else {
                 continue;
             };
-            let name = canonical_symbol_name(object.format(), name);
             if name.is_empty() {
                 continue;
             }
@@ -251,14 +290,19 @@ impl BridgeManifestV1 {
         }
 
         for symbol in &self.symbols {
+            let object_name = symbol.object_name(format);
             match &symbol.owner {
-                GeneratedSymbolOwner::PrimaryObject if !defined.contains_key(&symbol.name) => {
+                GeneratedSymbolOwner::PrimaryObject
+                    if !defined.contains_key(object_name.as_ref()) =>
+                {
                     return Err(artifact_error(format!(
                         "primary object does not define manifest symbol `{}`",
                         symbol.name
                     )));
                 }
-                GeneratedSymbolOwner::AssemblyUnit(_) if defined.contains_key(&symbol.name) => {
+                GeneratedSymbolOwner::AssemblyUnit(_)
+                    if defined.contains_key(object_name.as_ref()) =>
+                {
                     return Err(artifact_error(format!(
                         "primary object collides with assembly-owned symbol `{}`",
                         symbol.name
@@ -270,7 +314,7 @@ impl BridgeManifestV1 {
                         GeneratedSymbolKind::CallHelper
                             | GeneratedSymbolKind::CallStub
                             | GeneratedSymbolKind::TlsAccessor
-                    ) && !undefined.contains(&symbol.name) =>
+                    ) && !undefined.contains(object_name.as_ref()) =>
                 {
                     return Err(artifact_error(format!(
                         "primary object does not reference required bridge symbol `{}`",

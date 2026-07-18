@@ -888,7 +888,44 @@ impl EffectiveCompilationConfig {
     /// Selects the native host only when that host has a complete enabled
     /// profile. There is deliberately no architecture fallback.
     pub fn host() -> Result<Self, String> {
-        Self::for_target(target_lexicon::HOST)
+        Self::for_host_triple(target_lexicon::HOST)
+    }
+
+    fn for_host_triple(host: Triple) -> Result<Self, String> {
+        let profile = match (
+            &host.architecture,
+            &host.vendor,
+            &host.operating_system,
+            &host.environment,
+        ) {
+            (Architecture::X86_64, _, OperatingSystem::Linux, Environment::Gnu) => {
+                X86_64_UNKNOWN_LINUX_GNU
+            }
+            (
+                Architecture::Aarch64(Aarch64Architecture::Aarch64),
+                _,
+                OperatingSystem::Linux,
+                Environment::Gnu,
+            ) => AARCH64_UNKNOWN_LINUX_GNU,
+            (
+                Architecture::Riscv64(Riscv64Architecture::Riscv64),
+                _,
+                OperatingSystem::Linux,
+                Environment::Gnu,
+            ) => RISCV64_UNKNOWN_LINUX_GNU,
+            (
+                Architecture::Aarch64(Aarch64Architecture::Aarch64),
+                Vendor::Apple,
+                OperatingSystem::Darwin(_) | OperatingSystem::MacOSX(_),
+                Environment::Unknown,
+            ) => AARCH64_APPLE_DARWIN,
+            _ => {
+                return Err(format!(
+                    "native host target `{host}` is not an enabled CCC target profile"
+                ));
+            }
+        };
+        Ok(Self::for_spec(profile))
     }
 
     fn for_spec(target: TargetSpec) -> Self {
@@ -1317,10 +1354,34 @@ mod tests {
 
     #[test]
     fn unsupported_hosts_do_not_fall_back_to_x86_64() {
-        let error =
-            EffectiveCompilationConfig::for_target("wasm32-unknown-unknown".parse().unwrap())
-                .unwrap_err();
-        assert!(error.contains("not an enabled CCC target profile"));
+        for spelling in [
+            "wasm32-unknown-unknown",
+            "x86_64-unknown-linux-musl",
+            "aarch64-unknown-freebsd",
+        ] {
+            let error =
+                EffectiveCompilationConfig::for_host_triple(spelling.parse().unwrap()).unwrap_err();
+            assert!(
+                error.contains("native host target")
+                    && error.contains("not an enabled CCC target profile"),
+                "unexpected diagnostic for {spelling}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn enabled_host_families_select_canonical_profiles() {
+        for (host, expected) in [
+            ("x86_64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"),
+            ("aarch64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"),
+            ("riscv64-unknown-linux-gnu", "riscv64-unknown-linux-gnu"),
+            ("aarch64-apple-darwin25.5.0", "aarch64-apple-darwin"),
+            ("aarch64-apple-macosx15.0.0", "aarch64-apple-darwin"),
+        ] {
+            let config =
+                EffectiveCompilationConfig::for_host_triple(host.parse().unwrap()).unwrap();
+            assert_eq!(config.target.triple.to_string(), expected, "{host}");
+        }
     }
 
     #[test]
@@ -1582,6 +1643,25 @@ mod tests {
         assert_eq!(facts.get("__linux__"), Some("1"));
         assert_eq!(facts.get("linux"), None);
         assert_eq!(facts.get("unix"), None);
+    }
+
+    #[test]
+    fn layout_only_float16_support_does_not_advertise_value_capabilities() {
+        for config in [
+            EffectiveCompilationConfig::default(),
+            EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+            EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
+            EffectiveCompilationConfig::aarch64_apple_darwin(),
+        ] {
+            assert!(
+                config
+                    .target_macros
+                    .iter()
+                    .all(|(name, _)| !name.starts_with("__FLT16_")),
+                "{} advertises an unsupported `_Float16` value capability",
+                config.target.triple
+            );
+        }
     }
 
     #[test]

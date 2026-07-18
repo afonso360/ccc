@@ -1433,6 +1433,7 @@ impl<'a> FunctionBuilder<'a> {
                 visibility: source.visibility,
                 properties: source.properties,
                 symbol_name,
+                symbol_name_is_exact: source.asm_label.is_some(),
                 result_type: signature.result,
                 parameters,
                 storage,

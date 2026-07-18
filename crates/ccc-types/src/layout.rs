@@ -233,6 +233,7 @@ impl LayoutEngine<'_> {
             BuiltinType::Long | BuiltinType::UnsignedLong => TargetScalarKind::Long,
             BuiltinType::LongLong | BuiltinType::UnsignedLongLong => TargetScalarKind::LongLong,
             BuiltinType::Float => TargetScalarKind::Float,
+            BuiltinType::Float16 => TargetScalarKind::Float16,
             BuiltinType::Double => TargetScalarKind::Double,
             BuiltinType::LongDouble => TargetScalarKind::LongDouble,
             BuiltinType::Int128 | BuiltinType::UnsignedInt128 => {

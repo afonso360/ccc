@@ -272,6 +272,7 @@ fn plan_artifacts(
             VariadicEntryArtifactPlan {
                 function: *function,
                 public_symbol: source.symbol_name.clone(),
+                public_symbol_is_exact: source.symbol_name_is_exact,
                 source_linkage,
                 source_visibility,
                 body_symbol: generated_symbol_for(
@@ -644,9 +645,10 @@ fn dump_artifacts(output: &mut String, artifacts: &BridgeArtifactPlan) {
     for entry in artifacts.variadic_entries.values() {
         writeln!(
             output,
-            "variadic-entry function={} public={} linkage={} visibility={} body={} frame-version={} va-state-version={}",
+            "variadic-entry function={} public={} exact={} linkage={} visibility={} body={} frame-version={} va-state-version={}",
             entry.function.0,
             entry.public_symbol,
+            entry.public_symbol_is_exact,
             source_linkage_name(entry.source_linkage),
             source_visibility_name(entry.source_visibility),
             entry.body_symbol,
