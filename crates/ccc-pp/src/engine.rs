@@ -240,6 +240,8 @@ fn build_search_entries(session: &Session, options: &PreprocessOptions) -> Vec<S
             quote_only: false,
         });
     }
+    let mut seen = BTreeSet::new();
+    entries.retain(|entry| seen.insert((entry.path.clone(), entry.system, entry.quote_only)));
     entries
 }
 
@@ -2275,6 +2277,55 @@ mod tests {
         assert_eq!(
             output.dependencies.edges[1].to,
             PathBuf::from("/includes/pick.h")
+        );
+    }
+
+    #[test]
+    fn duplicate_search_entries_do_not_intercept_include_next() {
+        let mut files = MemoryFiles::default();
+        files.0.insert(
+            PathBuf::from("/wrapper/assert.h"),
+            concat!(
+                "#ifndef WRAPPER_ASSERT_H\n",
+                "#define WRAPPER_ASSERT_H\n",
+                "#include_next <assert.h>\n",
+                "#endif\n",
+            )
+            .to_owned(),
+        );
+        files.0.insert(
+            PathBuf::from("/system/assert.h"),
+            "#define ASSERT_HEADER_REACHED 42\n".to_owned(),
+        );
+
+        let (output, diagnostics) = run(
+            "#include <assert.h>\nASSERT_HEADER_REACHED\n",
+            &files,
+            &PreprocessOptions {
+                include_paths: vec![
+                    crate::options::IncludePath::new("/wrapper", IncludePathKind::User),
+                    crate::options::IncludePath::new("/unrelated", IncludePathKind::User),
+                    crate::options::IncludePath::new("/wrapper", IncludePathKind::User),
+                    crate::options::IncludePath::new("/system", IncludePathKind::User),
+                ],
+                suppress_line_markers: true,
+                ..PreprocessOptions::default()
+            },
+        );
+
+        assert!(!output.had_errors, "{:#?}", diagnostics.diagnostics);
+        assert_eq!(
+            output
+                .tokens()
+                .iter()
+                .map(|token| token.spelling.as_str())
+                .collect::<Vec<_>>(),
+            ["42"]
+        );
+        assert_eq!(output.dependencies.edges.len(), 2);
+        assert_eq!(
+            output.dependencies.edges[1].to,
+            PathBuf::from("/system/assert.h")
         );
     }
 

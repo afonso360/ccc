@@ -1464,15 +1464,27 @@ fn include_next_resumes_after_the_directory_that_found_the_current_header() {
     let first = directory.path("first");
     directory.write(
         "first/chain.h",
-        "#define FIRST_VALUE 1\n#include_next <chain.h>\n",
+        concat!(
+            "#ifndef FIRST_CHAIN_H\n",
+            "#define FIRST_CHAIN_H\n",
+            "#define FIRST_VALUE 1\n",
+            "#include_next <chain.h>\n",
+            "#endif\n",
+        ),
     );
+    let unrelated = directory.path("unrelated");
+    fs::create_dir_all(&unrelated).unwrap();
     let second = directory.path("second");
     directory.write("second/chain.h", "#define SECOND_VALUE 2\n");
 
     let mut command = directory.command();
     command
         .args(["-E", "-P", "-nostdinc", "-I"])
-        .arg(first)
+        .arg(&first)
+        .arg("-I")
+        .arg(&unrelated)
+        .arg("-I")
+        .arg(&first)
         .arg("-I")
         .arg(second)
         .arg(&source);
@@ -1487,6 +1499,10 @@ fn include_next_resumes_after_the_directory_that_found_the_current_header() {
     let mut command = directory.command();
     command
         .args(["-E", "-P", "-std=c11", "-nostdinc", "-I"])
+        .arg(directory.path("first"))
+        .arg("-I")
+        .arg(directory.path("unrelated"))
+        .arg("-I")
         .arg(directory.path("first"))
         .arg("-I")
         .arg(directory.path("second"))
