@@ -52,6 +52,17 @@ compatibility test proves scalar interleaving, register rollback,
 `StructReturn` pointer echo behavior for the exact pinned Cranelift version and
 settings.
 
+The pinned x86 backend does not satisfy that proof for native `i128`
+signatures. Under mixed GP pressure, its System V signature lowering advances
+past both registers when a two-register argument must roll back to the stack,
+so a following scalar cannot reuse the stranded register. Consequently every
+source-visible fixed signature containing a 128-bit integer, recursively
+including aggregates, uses the uniform-frame bridge. Native `i128` remains an
+internal value carrier for body operations and for runtime-helper signatures
+whose fixed shapes begin at the first GP slot and cannot encounter that
+rollback case. This split is intentional and tested against the exact backend
+pin; it does not require a backend fork.
+
 ## Supported boundary profiles
 
 The enabled SysV AMD64, AAPCS64, RISC-V LP64D, and Darwin arm64 profiles
@@ -122,6 +133,13 @@ working directory. Debuggers can unwind through generated bridges but do not
 provide source-level stepping within them. Same-compilation magic and version
 validation happens in Rust before assembly materialization; production bridge
 code does not contain an unreachable protocol trap.
+
+A fixed wide-integer definition uses the same uniform frame layout but a
+distinct public-entry renderer. Ordinary fixed calls do not define `%al`, so
+that entry saves every planned XMM input unconditionally. Only a variadic entry
+consults the incoming `%al` bound before saving XMM registers. Both entry forms
+preserve source linkage, weak binding, and ELF visibility through assembly and
+post-package verification.
 
 Prototyped variadic calls classify the fixed parameters from the prototype and
 the remaining parameters from their default-promoted actual types.
@@ -204,6 +222,10 @@ can still require cross-object resolution.
 - canonical classifier cases and exact plan/digest snapshots;
 - semantic C-to-IR aggregate snapshot goldens that do not freeze copy counts;
 - fixed aggregate cross-linking with GCC and Clang in both directions;
+- register- and memory-class aggregates containing 128-bit integers,
+  mixed SSE/wide fixed signatures, pair rollback with reuse of the stranded GP
+  register, TLS values, weak definitions, and direct/indirect calls in both
+  cross-link directions;
 - direct and indirect variadic calls with zero, one, eight, and more than eight
   floating actuals, including a disassembly assertion for `%al` saturation;
 - zero-argument, promoted scalar, direct, and function-pointer unprototyped

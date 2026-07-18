@@ -32,12 +32,19 @@ pub enum GeneratedSymbolVisibility {
     Internal,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum GeneratedSymbolBinding {
+    Strong,
+    Weak,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GeneratedSymbol {
     pub name: String,
     pub kind: GeneratedSymbolKind,
     pub owner: GeneratedSymbolOwner,
     pub visibility: GeneratedSymbolVisibility,
+    pub binding: GeneratedSymbolBinding,
 }
 
 impl GeneratedSymbol {
@@ -51,6 +58,7 @@ impl GeneratedSymbol {
             kind,
             owner,
             visibility: GeneratedSymbolVisibility::Internal,
+            binding: GeneratedSymbolBinding::Strong,
         }
     }
 
@@ -64,6 +72,7 @@ impl GeneratedSymbol {
             kind,
             owner,
             visibility: GeneratedSymbolVisibility::Public,
+            binding: GeneratedSymbolBinding::Strong,
         }
     }
 
@@ -77,6 +86,7 @@ impl GeneratedSymbol {
             kind,
             owner,
             visibility: GeneratedSymbolVisibility::SourceHidden,
+            binding: GeneratedSymbolBinding::Strong,
         }
     }
 
@@ -90,6 +100,7 @@ impl GeneratedSymbol {
             kind,
             owner,
             visibility: GeneratedSymbolVisibility::SourceInternal,
+            binding: GeneratedSymbolBinding::Strong,
         }
     }
 
@@ -103,6 +114,7 @@ impl GeneratedSymbol {
             kind,
             owner,
             visibility: GeneratedSymbolVisibility::SourceElfInternal,
+            binding: GeneratedSymbolBinding::Strong,
         }
     }
 
@@ -116,7 +128,13 @@ impl GeneratedSymbol {
             kind,
             owner,
             visibility: GeneratedSymbolVisibility::SourceProtected,
+            binding: GeneratedSymbolBinding::Strong,
         }
+    }
+
+    pub fn with_weak_binding(mut self) -> Self {
+        self.binding = GeneratedSymbolBinding::Weak;
+        self
     }
 }
 

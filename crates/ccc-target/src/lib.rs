@@ -34,6 +34,121 @@ pub enum AbiIdentity {
     DarwinArm64,
 }
 
+/// Scalar kinds used by a target runtime-helper ABI contract.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum RuntimeHelperValue {
+    SignedInt128,
+    UnsignedInt128,
+    Float32,
+    Float64,
+}
+
+/// The link-time provider selected for target runtime helpers.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum RuntimeHelperProvider {
+    /// The exact builtins archive selected by the target compiler driver.
+    /// GCC commonly reports libgcc and Clang may report compiler-rt.
+    CompilerBuiltins,
+}
+
+/// One compiler-emitted helper call with a fixed C ABI signature.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RuntimeHelperContract {
+    pub symbol: &'static str,
+    pub result: RuntimeHelperValue,
+    pub parameters: &'static [RuntimeHelperValue],
+    pub provider: RuntimeHelperProvider,
+}
+
+const I128_I128: &[RuntimeHelperValue] = &[
+    RuntimeHelperValue::SignedInt128,
+    RuntimeHelperValue::SignedInt128,
+];
+const U128_U128: &[RuntimeHelperValue] = &[
+    RuntimeHelperValue::UnsignedInt128,
+    RuntimeHelperValue::UnsignedInt128,
+];
+const I128: &[RuntimeHelperValue] = &[RuntimeHelperValue::SignedInt128];
+const U128: &[RuntimeHelperValue] = &[RuntimeHelperValue::UnsignedInt128];
+const F32: &[RuntimeHelperValue] = &[RuntimeHelperValue::Float32];
+const F64: &[RuntimeHelperValue] = &[RuntimeHelperValue::Float64];
+
+/// Complete helper manifest for the x86-64 GNU wide-integer capability.
+pub const SYSV_AMD64_INT128_RUNTIME_HELPERS: &[RuntimeHelperContract] = &[
+    RuntimeHelperContract {
+        symbol: "__divti3",
+        result: RuntimeHelperValue::SignedInt128,
+        parameters: I128_I128,
+        provider: RuntimeHelperProvider::CompilerBuiltins,
+    },
+    RuntimeHelperContract {
+        symbol: "__udivti3",
+        result: RuntimeHelperValue::UnsignedInt128,
+        parameters: U128_U128,
+        provider: RuntimeHelperProvider::CompilerBuiltins,
+    },
+    RuntimeHelperContract {
+        symbol: "__modti3",
+        result: RuntimeHelperValue::SignedInt128,
+        parameters: I128_I128,
+        provider: RuntimeHelperProvider::CompilerBuiltins,
+    },
+    RuntimeHelperContract {
+        symbol: "__umodti3",
+        result: RuntimeHelperValue::UnsignedInt128,
+        parameters: U128_U128,
+        provider: RuntimeHelperProvider::CompilerBuiltins,
+    },
+    RuntimeHelperContract {
+        symbol: "__floattisf",
+        result: RuntimeHelperValue::Float32,
+        parameters: I128,
+        provider: RuntimeHelperProvider::CompilerBuiltins,
+    },
+    RuntimeHelperContract {
+        symbol: "__floattidf",
+        result: RuntimeHelperValue::Float64,
+        parameters: I128,
+        provider: RuntimeHelperProvider::CompilerBuiltins,
+    },
+    RuntimeHelperContract {
+        symbol: "__floatuntisf",
+        result: RuntimeHelperValue::Float32,
+        parameters: U128,
+        provider: RuntimeHelperProvider::CompilerBuiltins,
+    },
+    RuntimeHelperContract {
+        symbol: "__floatuntidf",
+        result: RuntimeHelperValue::Float64,
+        parameters: U128,
+        provider: RuntimeHelperProvider::CompilerBuiltins,
+    },
+    RuntimeHelperContract {
+        symbol: "__fixsfti",
+        result: RuntimeHelperValue::SignedInt128,
+        parameters: F32,
+        provider: RuntimeHelperProvider::CompilerBuiltins,
+    },
+    RuntimeHelperContract {
+        symbol: "__fixdfti",
+        result: RuntimeHelperValue::SignedInt128,
+        parameters: F64,
+        provider: RuntimeHelperProvider::CompilerBuiltins,
+    },
+    RuntimeHelperContract {
+        symbol: "__fixunssfti",
+        result: RuntimeHelperValue::UnsignedInt128,
+        parameters: F32,
+        provider: RuntimeHelperProvider::CompilerBuiltins,
+    },
+    RuntimeHelperContract {
+        symbol: "__fixunsdfti",
+        result: RuntimeHelperValue::UnsignedInt128,
+        parameters: F64,
+        provider: RuntimeHelperProvider::CompilerBuiltins,
+    },
+];
+
 impl AbiIdentity {
     pub const fn name(self) -> &'static str {
         match self {
@@ -64,6 +179,19 @@ impl AbiIdentity {
     /// thread-local storage under this ABI profile.
     pub const fn supports_tls_codegen(self) -> bool {
         matches!(self, Self::SysvAmd64Lp64)
+    }
+
+    /// Whether this ABI profile has the complete scalar, boundary, varargs,
+    /// and runtime-helper contract required for 128-bit integer values.
+    pub const fn supports_int128_values(self) -> bool {
+        matches!(self, Self::SysvAmd64Lp64)
+    }
+
+    pub const fn runtime_helper_manifest(self) -> &'static [RuntimeHelperContract] {
+        match self {
+            Self::SysvAmd64Lp64 => SYSV_AMD64_INT128_RUNTIME_HELPERS,
+            Self::Aapcs64Lp64 | Self::RiscvLp64d | Self::DarwinArm64 => &[],
+        }
     }
 }
 
@@ -1052,6 +1180,9 @@ impl EffectiveCompilationConfig {
                 profile.version.patch.to_string(),
             );
         }
+        if self.target.abi.supports_int128_values() {
+            macros.insert("__SIZEOF_INT128__".to_owned(), "16".to_owned());
+        }
         if self.target.abi == AbiIdentity::RiscvLp64d {
             match self.relocation_model {
                 RelocationModel::Static => {
@@ -1506,7 +1637,13 @@ mod tests {
         assert_eq!(darwin.target_macros.get("__BIGGEST_ALIGNMENT__"), Some("8"));
         assert_eq!(darwin.target_macros.get("__LDBL_MANT_DIG__"), Some("53"));
         assert_eq!(darwin.target_macros.get("__LONG_DOUBLE_128__"), None);
-        for config in [x86, aarch64, riscv, darwin] {
+        assert_eq!(
+            x86.frontend_predefined_macros()
+                .get("__SIZEOF_INT128__")
+                .map(String::as_str),
+            Some("16")
+        );
+        for config in [aarch64, riscv, darwin] {
             assert_eq!(
                 config.frontend_predefined_macros().get("__SIZEOF_INT128__"),
                 None,

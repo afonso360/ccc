@@ -109,9 +109,10 @@ struct DeclarationInfo {
 
 #[derive(Default)]
 struct SwitchState {
-    cases: HashMap<i128, Span>,
+    cases: HashMap<u128, Span>,
     default: Option<Span>,
     entry_variably_modified_path: Vec<FullLocalId>,
+    controlling_type: Option<QualifiedType>,
 }
 
 struct VariablyModifiedGoto {
@@ -670,6 +671,15 @@ impl<'a> Analyzer<'a> {
         }
         let mut base = self.resolve_type_specifiers(&type_specifiers, specifiers.span)?;
         base.qualifiers |= qualifiers;
+        if base.qualifiers.contains(TypeQualifiers::ATOMIC)
+            && self.type_contains_int128(base.ty, &mut HashSet::new())
+        {
+            return self.fail(
+                "CCC2443",
+                specifiers.span,
+                "atomic 128-bit integers and aggregates containing them are not enabled",
+            );
+        }
         let mut requested_alignment = None;
         for specifier in &alignment_specifiers {
             if let Some(alignment) = self.resolve_alignment_specifier(specifier, specifiers.span)? {
@@ -2554,7 +2564,21 @@ impl<'a> Analyzer<'a> {
                     value,
                     statement: nested,
                 } => {
-                    let value = self.evaluate_integer_constant(value)?;
+                    let controlling_type = self
+                        .function
+                        .as_ref()
+                        .and_then(|function| function.switches.last())
+                        .and_then(|switch| switch.controlling_type)
+                        .ok_or_else(|| {
+                            self.diagnostics.push(
+                                Diagnostic::error(
+                                    "CCC2260",
+                                    "a `case` label must be inside a switch statement",
+                                )
+                                .with_primary(statement.span, "case outside switch"),
+                            );
+                        })?;
+                    let value = self.evaluate_switch_case(value, controlling_type)?;
                     self.reject_switch_variably_modified_ingress(statement.span)?;
                     let Some(switch) = self
                         .function
@@ -2656,6 +2680,7 @@ impl<'a> Analyzer<'a> {
                         .switches
                         .push(SwitchState {
                             entry_variably_modified_path,
+                            controlling_type: Some(expression.ty),
                             ..SwitchState::default()
                         });
                     let nested = self.analyze_statement(nested);
@@ -2930,8 +2955,13 @@ impl<'a> Analyzer<'a> {
                     FloatingConstantSuffix::Double => TypeId::DOUBLE,
                     FloatingConstantSuffix::LongDouble => TypeId::LONG_DOUBLE,
                 };
+                let value = if floating.suffix == FloatingConstantSuffix::Float {
+                    f64::from(floating.value as f32)
+                } else {
+                    floating.value
+                };
                 Ok(self.constant_expression(
-                    ConstantValue::Floating(floating.value),
+                    ConstantValue::Floating(value),
                     QualifiedType::unqualified(ty),
                     expression.span,
                 ))
@@ -3911,7 +3941,9 @@ impl<'a> Analyzer<'a> {
                 "`va_arg` does not support `long double` or an aggregate containing it",
             );
         }
-        if self.type_contains_int128(requested.ty, &mut HashSet::new()) {
+        if !self.config.target.abi.supports_int128_values()
+            && self.type_contains_int128(requested.ty, &mut HashSet::new())
+        {
             return self.fail(
                 "CCC2443",
                 type_name.span,
@@ -3923,7 +3955,7 @@ impl<'a> Analyzer<'a> {
             .layout_of(requested.ty, self.config)
             .expect("a validated, non-variably-modified object type has a layout");
         let maximum_alignment = match self.config.target.abi {
-            AbiIdentity::SysvAmd64Lp64 => 8,
+            AbiIdentity::SysvAmd64Lp64 => 16,
             AbiIdentity::Aapcs64Lp64 | AbiIdentity::RiscvLp64d | AbiIdentity::DarwinArm64 => 16,
         };
         if layout.align > maximum_alignment {
@@ -4299,7 +4331,7 @@ impl<'a> Analyzer<'a> {
             BuiltinType::UnsignedLong,
             BuiltinType::UnsignedLongLong,
         ];
-        let candidates: Vec<BuiltinType> =
+        let mut candidates: Vec<BuiltinType> =
             match (integer.suffix.unsigned, integer.suffix.long_count) {
                 (true, 0) => unsigned.to_vec(),
                 (true, 1) => unsigned[1..].to_vec(),
@@ -4323,6 +4355,15 @@ impl<'a> Analyzer<'a> {
                 ],
                 (false, _) => vec![BuiltinType::LongLong, BuiltinType::UnsignedLongLong],
             };
+        if self.config.target.abi.supports_int128_values() {
+            if integer.suffix.unsigned {
+                candidates.push(BuiltinType::UnsignedInt128);
+            } else if integer.radix == 10 {
+                candidates.push(BuiltinType::Int128);
+            } else {
+                candidates.extend([BuiltinType::Int128, BuiltinType::UnsignedInt128]);
+            }
+        }
         let Some(kind) = candidates
             .into_iter()
             .find(|candidate| self.integer_fits(*candidate, integer.value))
@@ -4565,7 +4606,8 @@ impl<'a> Analyzer<'a> {
         if matches!(operator, B::LogicalAnd | B::LogicalOr) {
             let left = self.convert_to_boolean(left)?;
             let right = self.convert_to_boolean(right)?;
-            let constant = evaluate_binary_constant(operator, left.constant, right.constant, None);
+            let constant =
+                evaluate_binary_constant(operator, left.constant, right.constant, None, false);
             let constant_expression_kind =
                 logical_constant_expression_kind(operator, &left, &right);
             return Ok(FullTypedExpression {
@@ -4667,7 +4709,8 @@ impl<'a> Analyzer<'a> {
             || self.pointer_pointee(right.ty.ty).is_some())
         {
             let (left, right) = self.convert_pointer_comparison(left, right, span)?;
-            let constant = evaluate_binary_constant(operator, left.constant, right.constant, None);
+            let constant =
+                evaluate_binary_constant(operator, left.constant, right.constant, None, false);
             let constant_expression_kind = integer_constant_expression_kind(&[&left, &right]);
             return Ok(FullTypedExpression {
                 kind: FullTypedExpressionKind::Binary {
@@ -4695,6 +4738,7 @@ impl<'a> Analyzer<'a> {
                 left.constant,
                 right.constant,
                 self.integer_constant_type(left.ty.ty),
+                false,
             );
             let constant_expression_kind = integer_constant_expression_kind(&[&left, &right]);
             return Ok(FullTypedExpression {
@@ -4734,12 +4778,16 @@ impl<'a> Analyzer<'a> {
         } else {
             common
         };
-        let constant = evaluate_binary_constant(
+        let mut constant = evaluate_binary_constant(
             operator,
             left.constant,
             right.constant,
             self.integer_constant_type(common.ty),
+            common.ty == TypeId::FLOAT,
         );
+        if result_ty.ty == TypeId::FLOAT {
+            constant = constant.and_then(|value| self.convert_constant(value, TypeId::FLOAT));
+        }
         let constant_expression_kind = integer_constant_expression_kind(&[&left, &right]);
         Ok(FullTypedExpression {
             kind: FullTypedExpressionKind::Binary {
@@ -6456,6 +6504,45 @@ impl<'a> Analyzer<'a> {
         Ok(value)
     }
 
+    fn evaluate_switch_case(
+        &mut self,
+        expression: &syntax::Expression,
+        controlling_type: QualifiedType,
+    ) -> AnalysisResult<u128> {
+        let typed = self.analyze_expression(expression)?;
+        let typed = self.value_conversion(typed)?;
+        if !self.types.is_integer(typed.ty.ty) {
+            return self.fail(
+                "CCC2339",
+                expression.span,
+                "case expression must have integer type",
+            );
+        }
+        if typed.constant_expression_kind != ConstantExpressionKind::Integer {
+            return self.fail(
+                "CCC2338",
+                expression.span,
+                "case expression cannot be evaluated as an integer constant",
+            );
+        }
+        let converted = self.arithmetic_conversion(typed, controlling_type)?;
+        let raw = match converted.constant {
+            Some(ConstantValue::Signed(value)) => value as u128,
+            Some(ConstantValue::Unsigned(value)) => value,
+            _ => {
+                return self.fail(
+                    "CCC2338",
+                    expression.span,
+                    "case expression cannot be evaluated as an integer constant",
+                );
+            }
+        };
+        let kind = self
+            .integer_representation(controlling_type.ty)
+            .unwrap_or(BuiltinType::Int);
+        Ok(truncate_to_width(raw, self.integer_width(kind)))
+    }
+
     fn try_evaluate_integer_constant(
         &mut self,
         expression: &syntax::Expression,
@@ -6691,7 +6778,10 @@ impl<'a> Analyzer<'a> {
             let raw = match value {
                 ConstantValue::Signed(value) => value as u128,
                 ConstantValue::Unsigned(value) => value,
-                ConstantValue::Floating(value) => value as i128 as u128,
+                ConstantValue::Floating(value) if self.integer_kind_is_signed(kind) => {
+                    value as i128 as u128
+                }
+                ConstantValue::Floating(value) => value as u128,
                 ConstantValue::NullPointer => 0,
                 ConstantValue::Address(_) => return None,
             };
@@ -6705,11 +6795,15 @@ impl<'a> Analyzer<'a> {
             self.types.builtin_type(target),
             Some(BuiltinType::Float | BuiltinType::Double | BuiltinType::LongDouble)
         ) {
-            let value = match value {
-                ConstantValue::Signed(value) => value as f64,
-                ConstantValue::Unsigned(value) => value as f64,
-                ConstantValue::Floating(value) => value,
-                ConstantValue::NullPointer | ConstantValue::Address(_) => return None,
+            let target = self.types.builtin_type(target)?;
+            let value = match (target, value) {
+                (BuiltinType::Float, ConstantValue::Signed(value)) => f64::from(value as f32),
+                (BuiltinType::Float, ConstantValue::Unsigned(value)) => f64::from(value as f32),
+                (BuiltinType::Float, ConstantValue::Floating(value)) => f64::from(value as f32),
+                (_, ConstantValue::Signed(value)) => value as f64,
+                (_, ConstantValue::Unsigned(value)) => value as f64,
+                (_, ConstantValue::Floating(value)) => value,
+                (_, ConstantValue::NullPointer | ConstantValue::Address(_)) => return None,
             };
             Some(ConstantValue::Floating(value))
         } else {
@@ -6799,6 +6893,11 @@ impl<'a> Analyzer<'a> {
                     return Some(self.types.builtin(candidate));
                 }
             }
+        }
+        if self.config.target.abi.supports_int128_values()
+            && self.signed_range_fits(BuiltinType::Int128, minimum, maximum)
+        {
+            return Some(TypeId::INT128);
         }
         None
     }
@@ -7182,7 +7281,9 @@ impl<'a> Analyzer<'a> {
 
     fn signed_integer_for_width(&self, width: u8) -> TypeId {
         let layout = &self.config.target.data_layout;
-        if width == layout.int_width {
+        if width == 128 && self.config.target.abi.supports_int128_values() {
+            TypeId::INT128
+        } else if width == layout.int_width {
             TypeId::INT
         } else if width == layout.long_width {
             TypeId::LONG
@@ -7197,7 +7298,9 @@ impl<'a> Analyzer<'a> {
 
     fn unsigned_integer_for_width(&self, width: u8) -> TypeId {
         let layout = &self.config.target.data_layout;
-        if width == layout.int_width {
+        if width == 128 && self.config.target.abi.supports_int128_values() {
+            TypeId::UNSIGNED_INT128
+        } else if width == layout.int_width {
             TypeId::UNSIGNED_INT
         } else if width == layout.long_width {
             TypeId::UNSIGNED_LONG
@@ -7233,9 +7336,10 @@ impl<'a> Analyzer<'a> {
         types: &[QualifiedType],
         span: Span,
     ) -> AnalysisResult<()> {
-        if types
-            .iter()
-            .any(|ty| self.type_contains_int128(ty.ty, &mut HashSet::new()))
+        if !self.config.target.abi.supports_int128_values()
+            && types
+                .iter()
+                .any(|ty| self.type_contains_int128(ty.ty, &mut HashSet::new()))
         {
             self.fail(
                 "CCC2443",
@@ -7253,7 +7357,9 @@ impl<'a> Analyzer<'a> {
         span: Span,
         boundary: &str,
     ) -> AnalysisResult<()> {
-        if self.type_contains_int128(ty, &mut HashSet::new()) {
+        if !self.config.target.abi.supports_int128_values()
+            && self.type_contains_int128(ty, &mut HashSet::new())
+        {
             self.fail(
                 "CCC2443",
                 span,
@@ -8688,6 +8794,7 @@ fn evaluate_binary_constant(
     left: Option<ConstantValue>,
     right: Option<ConstantValue>,
     integer_type: Option<IntegerConstantType>,
+    float_precision: bool,
 ) -> Option<ConstantValue> {
     use syntax::BinaryOperator as B;
     let left = left?;
@@ -8799,10 +8906,9 @@ fn evaluate_binary_constant(
             B::LogicalOr => boolean(left != 0 || right != 0),
         },
         (ConstantValue::Floating(left), ConstantValue::Floating(right)) => match operator {
-            B::Multiply => Some(ConstantValue::Floating(left * right)),
-            B::Divide => Some(ConstantValue::Floating(left / right)),
-            B::Add => Some(ConstantValue::Floating(left + right)),
-            B::Subtract => Some(ConstantValue::Floating(left - right)),
+            B::Multiply | B::Divide | B::Add | B::Subtract => {
+                Some(fold_floating_binary(operator, left, right, float_precision))
+            }
             B::Less => boolean(left < right),
             B::LessEqual => boolean(left <= right),
             B::Greater => boolean(left > right),
@@ -8830,6 +8936,33 @@ fn evaluate_binary_constant(
             _ => None,
         },
         _ => None,
+    }
+}
+
+fn fold_floating_binary(
+    operator: syntax::BinaryOperator,
+    left: f64,
+    right: f64,
+    float_precision: bool,
+) -> ConstantValue {
+    use syntax::BinaryOperator as B;
+    if float_precision {
+        let (left, right) = (left as f32, right as f32);
+        ConstantValue::Floating(f64::from(match operator {
+            B::Multiply => left * right,
+            B::Divide => left / right,
+            B::Add => left + right,
+            B::Subtract => left - right,
+            _ => unreachable!("only arithmetic operations are folded here"),
+        }))
+    } else {
+        ConstantValue::Floating(match operator {
+            B::Multiply => left * right,
+            B::Divide => left / right,
+            B::Add => left + right,
+            B::Subtract => left - right,
+            _ => unreachable!("only arithmetic operations are folded here"),
+        })
     }
 }
 

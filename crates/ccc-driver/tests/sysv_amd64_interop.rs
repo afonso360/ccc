@@ -27,6 +27,292 @@ fn test_directory(name: &str, compiler: &str, optimization: &str) -> PathBuf {
     directory
 }
 
+#[test]
+fn wide_integers_cross_link_with_gcc_and_clang_in_both_directions() {
+    const CALLEE: &str = r#"
+#include <stdarg.h>
+
+typedef __int128 i128;
+typedef unsigned __int128 u128;
+
+u128 global_max = ~(u128)0;
+i128 global_high = (i128)(((u128)1 << 127) - 1);
+_Thread_local u128 tls_wide = ((u128)0x123456789abcdef0ULL << 64) | 0x0fedcba987654321ULL;
+
+struct wide_bits {
+    u128 low : 80;
+    u128 high : 48;
+};
+
+struct wide_register { u128 value; };
+struct wide_memory { u128 value; long tail; };
+
+struct wide_bits global_bits = {
+    .low = ((u128)0xabcdULL << 64) | 0xefffffffffefdcbaULL,
+    .high = 0x123456789abcU,
+};
+
+u128 fixed_pressure(long a, long b, long c, long d, long e, u128 value, long tail) {
+    return value ^ (u128)(a + b + c + d + e + tail);
+}
+
+u128 fixed_sse(double head, u128 value, double tail) {
+    return value ^ (u128)((long)head + (long)tail);
+}
+
+u128 tls_roundtrip(u128 value) {
+    tls_wide = value;
+    return tls_wide;
+}
+
+struct wide_register register_wrapper(struct wide_register input) {
+    input.value ^= (u128)0x1357U;
+    return input;
+}
+
+struct wide_memory memory_wrapper(struct wide_memory input) {
+    input.value ^= (u128)input.tail;
+    input.tail += 9;
+    return input;
+}
+
+__attribute__((weak)) u128 weak_wide(u128 value) {
+    return value ^ (u128)0x2468U;
+}
+
+u128 native_integer_ops(u128 left, u128 right, unsigned amount) {
+    i128 signed_small = -((i128)(right & (u128)0xffffU) + 12345);
+    i128 signed_left = (i128)1234567 << amount;
+    i128 signed_right = signed_small >> amount;
+    u128 rotated = (left << amount) ^ (left >> (128U - amount));
+    u128 product = left * right;
+    unsigned comparisons = (unsigned)(left < right)
+        | ((unsigned)((i128)left < (i128)right) << 1);
+    return product ^ rotated ^ (u128)signed_left ^ (u128)signed_right
+        ^ (u128)comparisons;
+}
+
+static u128 internal_wide(u128 value) { return value ^ (u128)0x55aaU; }
+u128 internal_entry(u128 value) {
+    u128 (*call)(u128) = internal_wide;
+    return call(value);
+}
+
+i128 signed_divrem(i128 left, i128 right) {
+    return left / right + left % right;
+}
+
+u128 unsigned_divrem(u128 left, u128 right) {
+    return left / right + left % right;
+}
+
+double signed_to_double(i128 value) { return (double)value; }
+double unsigned_to_double(u128 value) { return (double)value; }
+float signed_to_float(i128 value) { return (float)value; }
+float unsigned_to_float(u128 value) { return (float)value; }
+i128 double_to_signed(double value) { return (i128)value; }
+u128 double_to_unsigned(double value) { return (u128)value; }
+i128 float_to_signed(float value) { return (i128)value; }
+u128 float_to_unsigned(float value) { return (u128)value; }
+
+u128 variadic_register(unsigned tag, ...) {
+    va_list arguments;
+    u128 value;
+    unsigned long tail;
+    va_start(arguments, tag);
+    value = va_arg(arguments, u128);
+    tail = va_arg(arguments, unsigned long);
+    va_end(arguments);
+    return value ^ (u128)(tag + tail);
+}
+
+u128 variadic_pressure(long a, long b, long c, long d, long e, ...) {
+    va_list arguments;
+    u128 value;
+    unsigned long tail;
+    va_start(arguments, e);
+    value = va_arg(arguments, u128);
+    tail = va_arg(arguments, unsigned long);
+    va_end(arguments);
+    return value ^ (u128)(a + b + c + d + e + (long)tail);
+}
+
+u128 bitfield_roundtrip(struct wide_bits *bits, u128 value) {
+    bits->low = value;
+    return bits->low;
+}
+
+int high_switch(u128 value) {
+    switch (value) {
+    case ((u128)0xfedcba9876543210ULL << 64) | 0x0123456789abcdefULL:
+        return 7;
+    case (u128)0x8000000000000000ULL << 64:
+        return 9;
+    default:
+        return 0;
+    }
+}
+"#;
+
+    const CALLER: &str = r#"
+typedef __int128 i128;
+typedef unsigned __int128 u128;
+
+extern u128 global_max;
+extern i128 global_high;
+extern _Thread_local u128 tls_wide;
+struct wide_bits { u128 low : 80; u128 high : 48; };
+struct wide_register { u128 value; };
+struct wide_memory { u128 value; long tail; };
+extern struct wide_bits global_bits;
+
+u128 fixed_pressure(long, long, long, long, long, u128, long);
+u128 fixed_sse(double, u128, double);
+u128 tls_roundtrip(u128);
+struct wide_register register_wrapper(struct wide_register);
+struct wide_memory memory_wrapper(struct wide_memory);
+u128 weak_wide(u128);
+u128 native_integer_ops(u128, u128, unsigned);
+u128 internal_entry(u128);
+i128 signed_divrem(i128, i128);
+u128 unsigned_divrem(u128, u128);
+double signed_to_double(i128);
+double unsigned_to_double(u128);
+float signed_to_float(i128);
+float unsigned_to_float(u128);
+i128 double_to_signed(double);
+u128 double_to_unsigned(double);
+i128 float_to_signed(float);
+u128 float_to_unsigned(float);
+u128 variadic_register(unsigned, ...);
+u128 variadic_pressure(long, long, long, long, long, ...);
+u128 bitfield_roundtrip(struct wide_bits *, u128);
+int high_switch(u128);
+
+static u128 wide(unsigned long long high, unsigned long long low) {
+    return ((u128)high << 64) | (u128)low;
+}
+
+static u128 expected_native_integer_ops(u128 left, u128 right, unsigned amount) {
+    i128 signed_small = -((i128)(right & (u128)0xffffU) + 12345);
+    i128 signed_left = (i128)1234567 << amount;
+    i128 signed_right = signed_small >> amount;
+    u128 rotated = (left << amount) ^ (left >> (128U - amount));
+    u128 product = left * right;
+    unsigned comparisons = (unsigned)(left < right)
+        | ((unsigned)((i128)left < (i128)right) << 1);
+    return product ^ rotated ^ (u128)signed_left ^ (u128)signed_right
+        ^ (u128)comparisons;
+}
+
+int main(void) {
+    u128 value = wide(0xfedcba9876543210ULL, 0x0123456789abcdefULL);
+    u128 alternate = wide(0x8000000000000000ULL, 0x0000000000000000ULL);
+    u128 positive = wide(0x0123456789abcdefULL, 0xfedcba9876543210ULL);
+    u128 mask80 = wide(0x000000000000ffffULL, 0xffffffffffffffffULL);
+    struct wide_bits bits = { 0, 0 };
+    struct wide_register register_value = { value };
+    struct wide_memory memory_value = { value, 37 };
+    i128 signed_value = -(((i128)1 << 100) + 12345);
+    u128 unsigned_value = ((u128)1 << 100) + 12345;
+    u128 (*pressure_call)(long, long, long, long, long, u128, long) = fixed_pressure;
+
+    if (global_max != ~(u128)0) return 1;
+    if (global_high != (i128)(((u128)1 << 127) - 1)) return 2;
+    if (global_bits.low != (wide(0x000000000000abcdULL, 0xefffffffffefdcbaULL) & mask80)) return 3;
+    if (global_bits.high != (u128)0x123456789abcULL) return 4;
+    if (pressure_call(1, 2, 3, 4, 5, value, 6) != (value ^ (u128)21)) return 5;
+    if (fixed_sse(12.0, value, 34.0) != (value ^ (u128)46)) return 18;
+    if (tls_wide != wide(0x123456789abcdef0ULL, 0x0fedcba987654321ULL)) return 19;
+    if (tls_roundtrip(value) != value || tls_wide != value) return 20;
+    register_value = register_wrapper(register_value);
+    if (register_value.value != (value ^ (u128)0x1357U)) return 21;
+    memory_value = memory_wrapper(memory_value);
+    if (memory_value.value != (value ^ (u128)37) || memory_value.tail != 46) return 22;
+    if (weak_wide(value) != (value ^ (u128)0x2468U)) return 23;
+    if (native_integer_ops(value, positive, 37) !=
+        expected_native_integer_ops(value, positive, 37)) return 24;
+    if (internal_entry(value) != (value ^ (u128)0x55aaU)) return 17;
+    if (signed_divrem(signed_value, (i128)97) != signed_value / 97 + signed_value % 97) return 6;
+    if (unsigned_divrem(unsigned_value, (u128)97) != unsigned_value / 97 + unsigned_value % 97) return 7;
+    if (double_to_signed(signed_to_double(-((i128)1 << 100))) != -((i128)1 << 100)) return 8;
+    if (double_to_unsigned(unsigned_to_double((u128)1 << 100)) != ((u128)1 << 100)) return 9;
+    if (float_to_signed(signed_to_float(-((i128)1 << 70))) != -((i128)1 << 70)) return 10;
+    if (float_to_unsigned(unsigned_to_float((u128)1 << 70)) != ((u128)1 << 70)) return 11;
+    if (variadic_register(7, value, 11UL) != (value ^ (u128)18)) return 12;
+    if (variadic_pressure(1, 2, 3, 4, 5, value, 6UL) != (value ^ (u128)21)) return 13;
+    if (bitfield_roundtrip(&bits, value) != (value & mask80)) return 14;
+    if (bits.low != (value & mask80)) return 15;
+    if (high_switch(value) != 7 || high_switch(alternate) != 9 || high_switch(1) != 0) return 16;
+    return 0;
+}
+"#;
+
+    for (compiler, optimization) in reference_configurations() {
+        let directory = test_directory("wide-integers", compiler, optimization);
+        let callee = write(&directory, "callee.c", CALLEE);
+        let caller = write(&directory, "caller.c", CALLER);
+
+        let ccc_callee = directory.join("ccc-callee.o");
+        let reference_caller = directory.join("reference-caller.o");
+        compile_ccc_optimized(compiler, optimization, &callee, &ccc_callee);
+        let ccc_bytes = fs::read(&ccc_callee).unwrap();
+        let ccc_object = object::File::parse(ccc_bytes.as_slice()).unwrap();
+        let weak = ccc_object.symbol_by_name("weak_wide").unwrap();
+        assert!(weak.is_weak(), "CCC bridge entry lost weak binding");
+        compile_reference(compiler, optimization, &caller, &reference_caller);
+        link_and_run(compiler, &directory, &[&ccc_callee, &reference_caller]);
+
+        let reference_callee = directory.join("reference-callee.o");
+        let ccc_caller = directory.join("ccc-caller.o");
+        compile_reference(compiler, optimization, &callee, &reference_callee);
+        compile_ccc_optimized(compiler, optimization, &caller, &ccc_caller);
+        link_and_run(compiler, &directory, &[&reference_callee, &ccc_caller]);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
+fn wide_integer_abi_dump_records_exact_pair_rollback_placement() {
+    let directory = test_directory("wide-abi-dump", "gcc", "-O0");
+    let source = write(
+        &directory,
+        "wide-abi.c",
+        "typedef unsigned __int128 u128;\n\
+         u128 pressure(long a, long b, long c, long d, long e, u128 value, long tail) {\n\
+             return value ^ (u128)(a + b + c + d + e + tail);\n\
+         }\n\
+         u128 invoke(u128 value) { return pressure(1, 2, 3, 4, 5, value, 6); }\n",
+    );
+    let output = run(Command::new(env!("CARGO_BIN_EXE_ccc"))
+        .arg("--target=x86_64-unknown-linux-gnu")
+        .arg("-nostdinc")
+        .arg("--dump-abi")
+        .arg(source));
+    let dump = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        dump.contains(
+            "transport=bridge abi=sysv-amd64-lp64 kind=fixed-entry stack-size=16 overflow-arg-offset=16 gp-used=6 xmm-used=0 al=0 hidden-return=false"
+        ),
+        "{dump}"
+    );
+    assert!(
+        dump.contains(
+            "transport=bridge abi=sysv-amd64-lp64 kind=fixed-call stack-size=16 overflow-arg-offset=16 gp-used=6 xmm-used=0 al=0 hidden-return=false"
+        ),
+        "{dump}"
+    );
+    for exact in [
+        "parameter-piece source=5 index=0 class=MEMORY offset=0 valid=8 extension=none indirect=false location=stack:+0",
+        "parameter-piece source=5 index=1 class=MEMORY offset=8 valid=8 extension=none indirect=false location=stack:+8",
+        "parameter-piece source=6 index=0 class=INTEGER offset=0 valid=8 extension=none indirect=false location=integer:5",
+    ] {
+        assert_eq!(dump.matches(exact).count(), 2, "{exact}\n{dump}");
+    }
+    fs::remove_dir_all(directory).unwrap();
+}
+
 fn write(directory: &Path, name: &str, contents: &str) -> PathBuf {
     let path = directory.join(name);
     fs::write(&path, contents).unwrap();
@@ -69,6 +355,24 @@ fn compile_ccc(compiler: &str, source: &Path, object: &Path) {
     let staged_object = staging_directory.join("translation-unit.o");
     run(Command::new(env!("CARGO_BIN_EXE_ccc"))
         .env("CCC_CC", compiler)
+        .arg("-c")
+        .arg(source)
+        .arg("-o")
+        .arg(&staged_object));
+    fs::rename(&staged_object, object).unwrap();
+    fs::remove_dir_all(&staging_directory).unwrap();
+}
+
+fn compile_ccc_optimized(compiler: &str, optimization: &str, source: &Path, object: &Path) {
+    let staging_directory = object.parent().unwrap().join(format!(
+        "ccc-stage-{}",
+        TEST_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir(&staging_directory).unwrap();
+    let staged_object = staging_directory.join("translation-unit.o");
+    run(Command::new(env!("CARGO_BIN_EXE_ccc"))
+        .env("CCC_CC", compiler)
+        .arg(optimization)
         .arg("-c")
         .arg(source)
         .arg("-o")

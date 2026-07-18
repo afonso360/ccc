@@ -244,7 +244,7 @@ pub enum FullTypedStatementKind {
         statement: Box<FullTypedStatement>,
     },
     Case {
-        value: i128,
+        value: u128,
         statement: Box<FullTypedStatement>,
     },
     Default(Box<FullTypedStatement>),

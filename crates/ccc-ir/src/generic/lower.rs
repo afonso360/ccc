@@ -1338,7 +1338,7 @@ fn collect_aggregate_projection<'a>(
 }
 
 struct SwitchContext {
-    cases: VecDeque<(i128, BlockId)>,
+    cases: VecDeque<(u128, BlockId)>,
     default: Option<BlockId>,
 }
 
@@ -4430,7 +4430,7 @@ fn merge_access(left: MemoryAccess, right: MemoryAccess) -> MemoryAccess {
 
 fn collect_switch_labels(
     statement: &FullTypedStatement,
-    cases: &mut Vec<i128>,
+    cases: &mut Vec<u128>,
     has_default: &mut bool,
 ) {
     use FullTypedStatementKind as S;

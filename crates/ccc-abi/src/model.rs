@@ -195,6 +195,8 @@ pub enum BridgeKind {
     UnprototypedCall,
     VariadicCall,
     VariadicEntry,
+    FixedCall,
+    FixedEntry,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -271,6 +273,12 @@ pub enum SourceVisibility {
     Internal,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum SourceBinding {
+    Strong,
+    Weak,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CallBridgeArtifactPlan {
     /// One uniform helper serves every listed call site.
@@ -280,11 +288,13 @@ pub struct CallBridgeArtifactPlan {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct VariadicEntryArtifactPlan {
+pub struct BridgeEntryArtifactPlan {
     pub function: FullFunctionId,
+    pub kind: BridgeKind,
     pub public_symbol: String,
     pub source_linkage: SourceLinkage,
     pub source_visibility: SourceVisibility,
+    pub source_binding: SourceBinding,
     pub body_symbol: String,
     pub frame_version: u16,
     pub va_state_version: u16,
@@ -317,7 +327,7 @@ pub struct PackagingPlan {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BridgeArtifactPlan {
     pub call_bridge: Option<CallBridgeArtifactPlan>,
-    pub variadic_entries: BTreeMap<FullFunctionId, VariadicEntryArtifactPlan>,
+    pub bridge_entries: BTreeMap<FullFunctionId, BridgeEntryArtifactPlan>,
     pub tls_accessors: BTreeMap<DataId, TlsAccessorArtifactPlan>,
     pub packaging: PackagingPlan,
 }

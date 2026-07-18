@@ -47,6 +47,15 @@ helpers. Cranelift's default libcall table does not contain those symbols in the
 pinned backend. Codegen therefore selects them per operation and carries their
 requirements through object emission, the link plan, and `-###` output.
 
+The final link scans the emitted object and selects only manifest entries that
+remain undefined. It asks the already resolved target driver for its exact
+compiler-builtins archive, verifies that archive's symbol index contains every
+selected helper, and passes that canonical archive path to the linker after
+the object. The historical driver query may resolve GCC's libgcc or Clang's
+compiler-rt; CCC treats the reported archive as the provider only after the
+same verification. It never verifies one archive and then uses a generic
+`-lgcc` search that could select another archive through user `-L` ordering.
+
 CCC runtime shims use a versioned symbol namespace except where an external ABI mandates a standard helper name. Runtime objects are selected by target and effective ABI options, including long-double mode, and incompatible CCC objects are diagnosed.
 
 The hosted automatic-storage provider selected by

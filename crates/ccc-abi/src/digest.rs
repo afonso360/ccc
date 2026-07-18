@@ -71,7 +71,7 @@ pub fn abi_config_key(config: &EffectiveCompilationConfig) -> Result<AbiConfigKe
     let (boundary_profile, classifier_revision, specification_revision, specification_digest) =
         match config.target.abi {
             AbiIdentity::SysvAmd64Lp64 => {
-                ("sysv-amd64-lp64-v1", 1, PSABI_COMMIT, PSABI_SOURCE_SHA256)
+                ("sysv-amd64-lp64-v2", 2, PSABI_COMMIT, PSABI_SOURCE_SHA256)
             }
             AbiIdentity::Aapcs64Lp64 => {
                 ("aapcs64-lp64-v1", 1, AAPCS64_COMMIT, AAPCS64_SOURCE_SHA256)
@@ -99,7 +99,12 @@ pub fn abi_config_key(config: &EffectiveCompilationConfig) -> Result<AbiConfigKe
         classifier_revision,
         specification_revision,
         specification_source_sha256: specification_digest,
-        backend_profile: "cranelift-0.132.0-no-llvm-extensions-no-implicit-sret",
+        backend_profile: match config.target.abi {
+            AbiIdentity::SysvAmd64Lp64 => "cranelift-0.132.0-llvm-abi-extensions-no-implicit-sret",
+            AbiIdentity::Aapcs64Lp64 | AbiIdentity::RiscvLp64d | AbiIdentity::DarwinArm64 => {
+                "cranelift-0.132.0-no-llvm-extensions-no-implicit-sret"
+            }
+        },
         normalized_target_arch: config.normalized_target_arch(),
         normalized_target_abi: config.normalized_target_abi(),
         normalized_target_cpu: config.normalized_target_cpu(),
@@ -125,6 +130,9 @@ pub fn sysv_amd64_v1_config_fingerprint(
     }
     let mut key = abi_config_key(config)?;
     key.schema = "ccc-abi-config-v1";
+    key.boundary_profile = "sysv-amd64-lp64-v1";
+    key.classifier_revision = 1;
+    key.backend_profile = "cranelift-0.132.0-no-llvm-extensions-no-implicit-sret";
     let mut encoder = Encoder { bytes: Vec::new() };
     encode_config_key_v1(&mut encoder, &key);
     Ok(Sha256::digest(encoder.finish()).into())
@@ -924,7 +932,7 @@ fn encode_terminator(encoder: &mut Encoder, terminator: &gir::FullTerminator) {
             encoder.u32(selector.0);
             encoder.len(cases.len());
             for case in cases {
-                encoder.i128(case.value);
+                encoder.u128(case.value);
                 encode_edge(encoder, &case.edge);
             }
             encode_edge(encoder, default);
@@ -1118,7 +1126,7 @@ mod tests {
             (
                 EffectiveCompilationConfig::x86_64_unknown_linux_gnu(),
                 AbiIdentity::SysvAmd64Lp64,
-                "sysv-amd64-lp64-v1",
+                "sysv-amd64-lp64-v2",
                 "x86-64",
                 "lp64",
             ),
@@ -1151,6 +1159,22 @@ mod tests {
             assert_eq!(key.normalized_target_arch, architecture);
             assert_eq!(key.normalized_target_abi, abi);
             assert_eq!(key.normalized_target_cpu, "generic");
+            assert_eq!(
+                key.backend_profile,
+                if identity == AbiIdentity::SysvAmd64Lp64 {
+                    "cranelift-0.132.0-llvm-abi-extensions-no-implicit-sret"
+                } else {
+                    "cranelift-0.132.0-no-llvm-extensions-no-implicit-sret"
+                }
+            );
+            assert_eq!(
+                key.classifier_revision,
+                if identity == AbiIdentity::SysvAmd64Lp64 {
+                    2
+                } else {
+                    1
+                }
+            );
             assert_eq!(
                 key.normalized_deployment_target,
                 if identity == AbiIdentity::DarwinArm64 {

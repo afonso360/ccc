@@ -28,7 +28,7 @@ fn lower_source(source: &str) -> gir::FullModule {
 }
 
 #[test]
-fn compiler_128_bit_storage_emits_but_scalar_lowering_fails_closed() {
+fn compiler_128_bit_storage_is_target_gated() {
     for (config, symbol_name) in [
         (EffectiveCompilationConfig::default(), "wide_object"),
         (
@@ -61,12 +61,123 @@ fn compiler_128_bit_storage_emits_but_scalar_lowering_fails_closed() {
 
         let types = TypeStore::default();
         for ty in [TypeId::INT128, TypeId::UNSIGNED_INT128] {
-            let error =
-                super::function::scalar_type(&types, QualifiedType::unqualified(ty), &config)
-                    .unwrap_err();
-            assert_eq!(error.code, "CCC3517", "{}", config.target.triple);
+            let lowered =
+                super::function::scalar_type(&types, QualifiedType::unqualified(ty), &config);
+            if config.target.abi.supports_int128_values() {
+                assert_eq!(lowered.unwrap(), ir::types::I128);
+            } else {
+                assert_eq!(lowered.unwrap_err().code, "CCC3517");
+            }
         }
     }
+}
+
+#[test]
+fn wide_operations_select_only_manifested_helpers_that_are_actually_used() {
+    let output = emit_source(
+        "typedef __int128 i128; typedef unsigned __int128 u128;\n\
+         i128 add(i128 a, i128 b) { return a + b; }\n\
+         u128 multiply(u128 a, u128 b) { return a * b; }\n\
+         i128 shift(i128 a, unsigned b) { return (a << b) ^ (a >> b); }\n\
+         int compare(u128 a, u128 b) { return a < b; }\n\
+         i128 divide(i128 a, i128 b) { return a / b; }\n\
+         u128 remainder(u128 a, u128 b) { return a % b; }\n\
+         double to_double(i128 a) { return (double)a; }\n\
+         u128 from_float(float a) { return (u128)a; }",
+    );
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    let undefined = object
+        .symbols()
+        .filter(|symbol| symbol.is_undefined())
+        .filter_map(|symbol| symbol.name().ok())
+        .filter(|symbol| symbol.starts_with("__"))
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        undefined,
+        ["__divti3", "__fixunssfti", "__floattidf", "__umodti3"]
+            .into_iter()
+            .collect()
+    );
+    for forbidden in [
+        "__multi3",
+        "__ashlti3",
+        "__ashrti3",
+        "__lshrti3",
+        "__cmpti2",
+        "__ucmpti2",
+    ] {
+        assert!(!undefined.contains(forbidden));
+    }
+}
+
+#[test]
+fn wide_static_initializers_and_bitfields_preserve_high_bytes() {
+    let output = emit_source(
+        "typedef unsigned __int128 u128;\n\
+         u128 whole = 0xffffffffffffffffffffffffffffffffU;\n\
+         struct Bits { u128 low : 80; u128 high : 48; };\n\
+         struct Bits bits = {\n\
+           .low = 0xabcdeffffffffffedcbaU,\n\
+           .high = 0x123456789abcU,\n\
+         };",
+    );
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    let whole = object.symbol_by_name("whole").unwrap();
+    let section = object
+        .section_by_index(whole.section_index().unwrap())
+        .unwrap();
+    let whole_offset = whole.address() - section.address();
+    assert_eq!(
+        &section.data().unwrap()[whole_offset as usize..whole_offset as usize + 16],
+        &[0xff; 16]
+    );
+    let bits = object.symbol_by_name("bits").unwrap();
+    let section = object
+        .section_by_index(bits.section_index().unwrap())
+        .unwrap();
+    let offset = (bits.address() - section.address()) as usize;
+    assert_eq!(
+        &section.data().unwrap()[offset..offset + 16],
+        &[
+            0xba, 0xdc, 0xfe, 0xff, 0xff, 0xff, 0xff, 0xef, 0xcd, 0xab, 0xbc, 0x9a, 0x78, 0x56,
+            0x34, 0x12,
+        ]
+    );
+}
+
+#[test]
+fn wide_integer_float_constants_round_at_float_precision() {
+    let output = emit_source(
+        "typedef __int128 i128;\n\
+         float from_wide = (float)(((i128)1 << 100) + ((i128)1 << 76) + 1);\n\
+         i128 from_literal = (i128)16777217.0f;\n\
+         i128 from_expression = (i128)(16777216.0f + 1.0f);\n\
+         float folded_division = 1.0f / 10.0f;\n\
+         unsigned __int128 unsigned_high =\n\
+             (unsigned __int128)170141183460469231731687303715884105728.0;\n\
+         unsigned __int128 unsigned_near_max =\n\
+             (unsigned __int128)0x1.fffffffffffffp127;",
+    );
+    assert_eq!(
+        symbol_bytes(&output.object, "from_wide"),
+        0x7180_0001_u32.to_le_bytes()
+    );
+    let mut expected = [0_u8; 16];
+    expected[..8].copy_from_slice(&16_777_216_u64.to_le_bytes());
+    assert_eq!(symbol_bytes(&output.object, "from_literal"), expected);
+    assert_eq!(symbol_bytes(&output.object, "from_expression"), expected);
+    assert_eq!(
+        symbol_bytes(&output.object, "folded_division"),
+        0.1_f32.to_le_bytes()
+    );
+    let mut unsigned_high = [0_u8; 16];
+    unsigned_high[15] = 0x80;
+    assert_eq!(symbol_bytes(&output.object, "unsigned_high"), unsigned_high);
+    let unsigned_near_max = (0_u128.wrapping_sub(1_u128 << 75)).to_le_bytes();
+    assert_eq!(
+        symbol_bytes(&output.object, "unsigned_near_max"),
+        unsigned_near_max
+    );
 }
 
 fn emit_source(source: &str) -> Output {
@@ -793,7 +904,7 @@ fn complete_abi_plan_and_aggregate_clif_have_exact_snapshots() {
     assert!(dump.contains("packaging assembly-units=2"), "{dump}");
     assert_eq!(
         sha256(&dump),
-        "d1ed2b1efc982699f3b9df7784923e1130f192d435db3f8a0842759cfe0410b9"
+        "04aaf96d1615fcc1cf3b74e17ef3433daf9220a3c4da648e3da036d17127e92e"
     );
 
     let output = emit(&module, &config, Options { emit_clif: true }).unwrap();
