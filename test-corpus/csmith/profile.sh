@@ -57,7 +57,8 @@ license = "BSD-3-Clause"
 upstream_license_file = "COPYING"
 fetched_not_vendored = true
 
-target = "x86_64-unknown-linux-gnu"
+enabled_targets = ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin"]
+target_selection = "native-host"
 language_mode = "c11"
 profile = "profile.sh"
 generator_options = [
@@ -71,8 +72,23 @@ target_compiler = "ccc"
 output_oracle = "reference-consensus"
 eligibility = "gcc-and-clang-strict-c11"
 inconclusive_policy = "replace-joint-reference-timeout"
-link_driver = "gcc"
+link_driver_selection = "target-profile"
+symbol_localizer_selection = "target-profile"
 link_libraries = ["m"]
+
+[target_profiles."x86_64-unknown-linux-gnu"]
+execution = "native"
+reference_compilers = ["gcc", "clang"]
+link_driver = "gcc"
+symbol_localizer = "objcopy"
+
+[target_profiles."aarch64-apple-darwin"]
+execution = "native"
+reference_compilers = ["homebrew-gcc", "apple-clang"]
+link_driver = "apple-clang"
+symbol_localizer = "nmedit"
+sdk = "xcrun --sdk macosx --show-sdk-path"
+deployment_target = "required-explicit-or-11.0-default"
 
 [defaults]
 cases = $default_cases
@@ -98,5 +114,25 @@ case = [
     "*.stdout",
     "*.stderr",
 ]
+
+[target_applicability."x86_64-unknown-linux-gnu"]
+status = "applicable"
+evidence_kind = "execution"
+runner = "run.sh"
+reason = "The runner validates an x86-64 Linux GNU host and compares CCC execution with matching native GCC and Clang reference executions."
+
+[target_applicability."aarch64-unknown-linux-gnu"]
+status = "inapplicable"
+reason = "The consensus runner has no matched AArch64 GCC and Clang cross-reference matrix or QEMU execution path."
+
+[target_applicability."riscv64-unknown-linux-gnu"]
+status = "inapplicable"
+reason = "The consensus runner has no matched RISC-V GCC and Clang cross-reference matrix or QEMU execution path."
+
+[target_applicability."aarch64-apple-darwin"]
+status = "applicable"
+evidence_kind = "execution"
+runner = "run.sh"
+reason = "The runner validates a native arm64 macOS host and compares CCC execution with matching Homebrew GCC and Apple Clang reference executions."
 EOF
 }

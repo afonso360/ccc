@@ -28,7 +28,9 @@ trap cleanup EXIT
 fake_bin="$temporary_directory/fake-bin"
 runtime_directory="$temporary_directory/csmith runtime"
 resource_directory="$temporary_directory/resource dir"
-mkdir -p "$fake_bin" "$runtime_directory" "$resource_directory"
+darwin_sdk_directory="$temporary_directory/darwin sdk"
+mkdir -p "$fake_bin" "$runtime_directory" "$resource_directory" \
+  "$darwin_sdk_directory"
 
 cat >"$runtime_directory/csmith.h" <<'EOF'
 /* fake Csmith runtime for harness tests */
@@ -39,9 +41,9 @@ cat >"$fake_bin/uname" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 case "${1:-}" in
-  -s) echo Linux ;;
-  -m) echo x86_64 ;;
-  *) echo 'Linux fake-host 1 x86_64 GNU/Linux' ;;
+  -s) echo "${FAKE_HOST_OS:-Linux}" ;;
+  -m) echo "${FAKE_HOST_ARCH:-x86_64}" ;;
+  *) echo "${FAKE_HOST_OS:-Linux} fake-host 1 ${FAKE_HOST_ARCH:-x86_64}" ;;
 esac
 EOF
 
@@ -126,7 +128,11 @@ cat >"$fake_bin/gcc" <<'EOF'
 set -euo pipefail
 case "$*" in
   -dumpmachine)
-    echo x86_64-linux-gnu
+    if [[ "${FAKE_HOST_OS:-Linux}" == Darwin ]]; then
+      echo arm64-apple-darwin25.5.0
+    else
+      echo x86_64-linux-gnu
+    fi
     exit 0
     ;;
   '-dumpfullversion -dumpversion')
@@ -140,7 +146,14 @@ case "$*" in
   '-dM -E -x c /dev/null')
     echo '#define __GNUC__ 13'
     echo '#define __GNUC_MINOR__ 2'
-    echo '#define __x86_64__ 1'
+    if [[ "${FAKE_HOST_OS:-Linux}" == Darwin ]]; then
+      echo '#define __aarch64__ 1'
+      echo '#define __arm64__ 1'
+      echo '#define __APPLE__ 1'
+      echo '#define __MACH__ 1'
+    else
+      echo '#define __x86_64__ 1'
+    fi
     echo '#define __SIZEOF_POINTER__ 8'
     echo '#define __SIZEOF_LONG__ 8'
     echo '#define __LP64__ 1'
@@ -210,7 +223,11 @@ cat >"$fake_bin/clang" <<'EOF'
 set -euo pipefail
 case "$*" in
   --print-target-triple)
-    echo x86_64-pc-linux-gnu
+    if [[ "${FAKE_HOST_OS:-Linux}" == Darwin ]]; then
+      echo arm64-apple-darwin25.5.0
+    else
+      echo x86_64-pc-linux-gnu
+    fi
     exit 0
     ;;
   --version)
@@ -220,7 +237,14 @@ case "$*" in
   '-dM -E -x c /dev/null')
     echo '#define __GNUC__ 4'
     echo '#define __clang__ 1'
-    echo '#define __x86_64__ 1'
+    if [[ "${FAKE_HOST_OS:-Linux}" == Darwin ]]; then
+      echo '#define __aarch64__ 1'
+      echo '#define __arm64__ 1'
+      echo '#define __APPLE__ 1'
+      echo '#define __MACH__ 1'
+    else
+      echo '#define __x86_64__ 1'
+    fi
     echo '#define __SIZEOF_POINTER__ 8'
     echo '#define __SIZEOF_LONG__ 8'
     echo '#define __LP64__ 1'
@@ -241,7 +265,7 @@ while (($#)); do
       syntax_only=1
       shift
       ;;
-    *.c)
+    *.c | *.o)
       input_file=$1
       shift
       ;;
@@ -272,6 +296,11 @@ if ((syntax_only)); then
   exit 0
 fi
 [[ -n "$output" ]]
+if [[ "$input_file" == *.o ]]; then
+  cp "$input_file" "$output"
+  chmod +x "$output"
+  exit 0
+fi
 {
   printf '#!/usr/bin/env bash\n'
   printf '# Seed: %s\n' "$seed"
@@ -283,7 +312,17 @@ EOF
 cat >"$fake_bin/ccc" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-expected_cc=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)/gcc
+if [[ "${FAKE_HOST_OS:-Linux}" == Darwin ]]; then
+  expected_cc=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)/clang
+  expected_nmedit=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)/nmedit
+  [[ "${CCC_NMEDIT:-}" == "$expected_nmedit" ]]
+  [[ -z "${CCC_OBJCOPY:-}" ]]
+else
+  expected_cc=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)/gcc
+  expected_objcopy=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)/objcopy
+  [[ "${CCC_OBJCOPY:-}" == "$expected_objcopy" ]]
+  [[ -z "${CCC_NMEDIT:-}" ]]
+fi
 [[ "${CCC_CC:-}" == "$expected_cc" ]]
 output=
 source_file=
@@ -327,8 +366,28 @@ fi
 exit 64
 EOF
 
+cat >"$fake_bin/nmedit" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+exit 64
+EOF
+
+cat >"$fake_bin/xcrun" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+  '--sdk macosx --show-sdk-version')
+    echo 26.5
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+EOF
+
 chmod +x "$fake_bin/uname" "$fake_bin/timeout" "$fake_bin/csmith" \
-  "$fake_bin/gcc" "$fake_bin/clang" "$fake_bin/ccc" "$fake_bin/objcopy"
+  "$fake_bin/gcc" "$fake_bin/clang" "$fake_bin/ccc" "$fake_bin/objcopy" \
+  "$fake_bin/nmedit" "$fake_bin/xcrun"
 
 export PATH="$fake_bin:$PATH"
 
@@ -340,6 +399,7 @@ common_arguments=(
   --resource-dir "$resource_directory"
   --gcc "$fake_bin/gcc"
   --clang "$fake_bin/clang"
+  --objcopy "$fake_bin/objcopy"
   --generator-timeout 1
   --compile-timeout 1
   --run-timeout 1
@@ -361,12 +421,53 @@ grep -Fq 'generator_options= --no-argc --no-float --no-packed-struct' \
   "$pass_directory/run-config.txt"
 grep -Fq 'generator_revision=unverified' "$pass_directory/run-config.txt"
 grep -Fq "ccc_native_driver=$fake_bin/gcc" "$pass_directory/run-config.txt"
-grep -Fq "ccc_object_copier=$fake_bin/objcopy" "$pass_directory/run-config.txt"
+grep -Fq 'target=x86_64-unknown-linux-gnu' "$pass_directory/run-config.txt"
+grep -Fq 'ccc_symbol_localizer=objcopy' "$pass_directory/run-config.txt"
+grep -Fq "ccc_symbol_localizer_executable=$fake_bin/objcopy" \
+  "$pass_directory/run-config.txt"
 cmp -s "$fake_bin/ccc" "$pass_directory/tool-identities/ccc-executable"
 cmp -s "$resource_directory/manifest.toml" \
   "$pass_directory/tool-identities/ccc-resource-dir/manifest.toml"
 [[ "$(find "$pass_directory/cases" -name program.c | wc -l | tr -d '[:space:]')" == 3 ]]
 ! grep -R -E -- '-fno-pie|-no-pie' "$pass_directory/cases"/*/commands.txt
+
+darwin_arguments=(
+  --csmith "$fake_bin/csmith"
+  --csmith-runtime "$runtime_directory"
+  --allow-unverified-csmith
+  --ccc "$fake_bin/ccc"
+  --resource-dir "$resource_directory"
+  --gcc "$fake_bin/gcc"
+  --clang "$fake_bin/clang"
+  --nmedit "$fake_bin/nmedit"
+  --sdk-root "$darwin_sdk_directory"
+  --deployment-target 11.0
+  --generator-timeout 1
+  --compile-timeout 1
+  --run-timeout 1
+)
+darwin_directory="$temporary_directory/darwin results"
+darwin_sdk_absolute=$(CDPATH= cd -- "$darwin_sdk_directory" && pwd -P)
+darwin_output=$(FAKE_HOST_OS=Darwin FAKE_HOST_ARCH=arm64 \
+  "$script_directory/run.sh" \
+  "${darwin_arguments[@]}" \
+  --cases 2 \
+  --start-seed 20 \
+  --work-dir "$darwin_directory")
+[[ "$darwin_output" == *"Csmith differential suite: 2/2 completed, 2 passed, 0 failures; 2 attempted"* ]]
+grep -Fq 'target=aarch64-apple-darwin' "$darwin_directory/run-config.txt"
+grep -Fq 'ccc_symbol_localizer=nmedit' "$darwin_directory/run-config.txt"
+grep -Fq "ccc_symbol_localizer_executable=$fake_bin/nmedit" \
+  "$darwin_directory/run-config.txt"
+grep -Fq "sdk_root=$darwin_sdk_absolute" "$darwin_directory/run-config.txt"
+grep -Fq 'deployment_target=11.0' "$darwin_directory/run-config.txt"
+grep -Fq 'symbol_localizer=nmedit' "$darwin_directory/tool-identities/ccc.txt"
+[[ -f "$darwin_directory/tool-identities/nmedit.txt" ]]
+[[ ! -e "$darwin_directory/tool-identities/objcopy.txt" ]]
+grep -R -Fq -- '--target=aarch64-apple-darwin' \
+  "$darwin_directory/cases"/*/commands.txt
+grep -R -Fq -- '-mmacosx-version-min=11.0' \
+  "$darwin_directory/cases"/*/commands.txt
 
 mismatch_directory="$temporary_directory/mismatch results"
 set +e

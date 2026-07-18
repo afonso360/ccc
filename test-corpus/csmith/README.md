@@ -21,13 +21,34 @@ attempt limit is reached. A one-sided rejection is an oracle failure.
 
 ## Run locally
 
-The execution oracle requires an x86-64 Linux GNU host with native GCC and
-Clang installations:
+The execution oracle supports either an x86-64 Linux GNU host or a native
+Apple-silicon macOS host. Both profiles require distinct native GCC and Clang
+installations so the reference consensus does not collapse to two names for
+the same compiler.
+
+On x86-64 Linux:
 
 ```sh
 cargo build --locked -p ccc-driver
 test-corpus/csmith/run.sh --cases 100 --start-seed 1
 ```
+
+On Apple-silicon macOS, install GNU GCC, GNU `timeout`, CMake, and OpenSSL 3.
+The runner finds Homebrew's versioned GCC executable automatically, selects
+the active macOS SDK with `xcrun`, uses Apple Clang for CCC's native driver,
+and uses `nmedit` for Mach-O symbol localization:
+
+```sh
+brew install cmake coreutils gcc m4 openssl@3
+export PATH="$(brew --prefix coreutils)/libexec/gnubin:$(brew --prefix openssl@3)/bin:$PATH"
+cargo build --locked -p ccc-driver
+test-corpus/csmith/run.sh --cases 100 --start-seed 1
+```
+
+The Darwin profile applies the selected SDK and minimum deployment version to
+GNU GCC, Apple Clang, CCC, and the final native link. Override its defaults
+with `--gcc`, `--clang`, `--nmedit`, `--sdk-root`, or
+`--deployment-target` when reproducing a run with recorded tools.
 
 The runner downloads the source archive named in
 [the manifest](manifest.toml), verifies its byte count, SHA-256, SHA3-256,
@@ -53,10 +74,11 @@ list. Defaults can also be set with `CSMITH_CASES`, `CSMITH_START_SEED`,
 `CSMITH_MAX_ATTEMPTS`, `CSMITH_BUILD_JOBS`, `CSMITH_GENERATOR_TIMEOUT`,
 `CSMITH_COMPILE_TIMEOUT`, `CSMITH_RUN_TIMEOUT`, `CSMITH_WORK_DIR`,
 `CSMITH_ARCHIVE`, `CSMITH`, `CSMITH_RUNTIME`, `CSMITH_GCC`, `CSMITH_CLANG`,
-`CSMITH_OBJCOPY`, `CSMITH_CXX`, `CCC`, and `CCC_RESOURCE_DIR`; command-line values take
-precedence. The **Csmith differential tests** workflow exposes the eligible
-case count and first attempted seed through a manual dispatch; it does not run
-for pushes or pull requests.
+`CSMITH_OBJCOPY`, `CSMITH_NMEDIT`, `CSMITH_SDKROOT`,
+`CSMITH_DEPLOYMENT_TARGET`, `CSMITH_CXX`, `CCC`, and `CCC_RESOURCE_DIR`;
+command-line values take precedence. The **Csmith differential tests**
+workflow exposes the eligible case count and first attempted seed through a
+manual Linux dispatch; it does not run for pushes or pull requests.
 
 ## Results and reproduction
 
