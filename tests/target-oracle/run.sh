@@ -470,6 +470,10 @@ else
         echo "no generated call-helper symbol in debugger fixture" >&2
         exit 1
     fi
+    # nm reports Mach-O's physical leading underscore. LLDB resolves the
+    # corresponding logical symbol spelling, just as it does for ordinary C
+    # names, so remove exactly the object-format prefix here.
+    helper_debugger_symbol=${helper_symbol#_}
     run_lldb_probe() {
         local executable=$1 symbol=$2 stem=$3
         local log=$artifact_dir/lldb-$stem.txt
@@ -499,10 +503,10 @@ else
         return "$status"
     }
     run_lldb_probe "$debugger_entry" ccc_unwind_variadic variadic-entry
-    run_lldb_probe "$debugger_helper" "$helper_symbol" call-helper
+    run_lldb_probe "$debugger_helper" "$helper_debugger_symbol" call-helper
     grep -q 'ccc_unwind_variadic' "$artifact_dir/lldb-variadic-entry.txt"
     grep -q 'main' "$artifact_dir/lldb-variadic-entry.txt"
-    grep -q "$helper_symbol" "$artifact_dir/lldb-call-helper.txt"
+    grep -q "$helper_debugger_symbol" "$artifact_dir/lldb-call-helper.txt"
     grep -q 'main' "$artifact_dir/lldb-call-helper.txt"
 fi
 pass "debugger stops in the variadic entry and generated call helper with caller frames"

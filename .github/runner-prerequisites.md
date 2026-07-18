@@ -1,8 +1,9 @@
 # Linux runner prerequisites
 
-The private Linux x86-64 runner supplies native ABI references, packaging tools,
-and hosted corpus dependencies. Provision all requirements together so a runner
-cannot pass the Rust build while silently skipping native evidence.
+The required Linux jobs use GitHub's Ubuntu 24.04 x86-64 runner. The workflow
+installs native ABI references, packaging tools, and hosted corpus dependencies
+together so a runner cannot pass the Rust build while silently skipping native
+evidence.
 
 For Ubuntu 24.04, install:
 
@@ -25,14 +26,16 @@ The manually dispatched Csmith workflow additionally requires `g++`, `cmake`,
 Csmith source pin inside the workflow artifact directory; Csmith is not
 installed globally on the runner.
 
-Provisioning is runner administration. The workflow checks and reports the
-environment but does not mutate the self-hosted machine with `apt`.
+The workflow installs this package set for each required run, then checks and
+records the resulting command, compiler, Tcl, and zlib identities. The manually
+dispatched Csmith job remains on the private runner and verifies its own larger
+prerequisite set independently.
 
 ## Cross-Linux target runners
 
-The self-hosted Linux x86-64 runner must provide Docker. Matching GNU cross
+The Ubuntu-hosted Linux x86-64 runner supplies Docker. Matching GNU cross
 compilers, sysroots, binutils, user-mode QEMU, and `gdb-multiarch` are installed
-inside the image defined by `target-oracle-linux.Dockerfile`, not on the host.
+inside the image defined by `target-oracle-linux.Dockerfile`, not on the runner.
 That image pins its base digest, dated Debian snapshot, package versions, and
 post-install identities. Its command set is:
 
