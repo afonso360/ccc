@@ -25,9 +25,8 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ccc_target::{
-    Architecture, EffectiveCompilationConfig, OperatingSystem, RelocationModel,
-    SystemIncludeEntry, SystemIncludeKind, ToolCommandSpec, ToolchainFingerprint, ToolchainSpec,
-    Triple,
+    Architecture, EffectiveCompilationConfig, OperatingSystem, RelocationModel, SystemIncludeEntry,
+    SystemIncludeKind, ToolCommandSpec, ToolchainFingerprint, ToolchainSpec, Triple,
 };
 
 #[derive(Debug)]
@@ -540,9 +539,7 @@ impl<R: ProbeRunner> ToolchainResolver<R> {
             )));
         }
         if let Some(version) = config.normalized_deployment_target() {
-            target_arguments.push(OsString::from(format!(
-                "-mmacosx-version-min={version}"
-            )));
+            target_arguments.push(OsString::from(format!("-mmacosx-version-min={version}")));
         }
         Self {
             target: config.target.triple.clone(),
@@ -635,14 +632,10 @@ impl<R: ProbeRunner> ToolchainResolver<R> {
                 },
                 || {
                     let fresh_environment = relevant_environment();
-                    let Ok(fresh_candidate) = self
-                        .driver
-                        .clone()
-                        .map_or_else(
-                            || driver_from_environment(&fresh_environment, &self.target),
-                            Ok,
-                        )
-                    else {
+                    let Ok(fresh_candidate) = self.driver.clone().map_or_else(
+                        || driver_from_environment(&fresh_environment, &self.target),
+                        Ok,
+                    ) else {
                         return false;
                     };
                     let fresh_executable =
@@ -1140,10 +1133,7 @@ pub fn link_executable_with_toolchain(
 }
 
 fn relocation_link_argument(config: &EffectiveCompilationConfig) -> &'static str {
-    match (
-        config.target.triple.binary_format,
-        config.relocation_model,
-    ) {
+    match (config.target.triple.binary_format, config.relocation_model) {
         (ccc_target::BinaryFormat::Macho, RelocationModel::Static) => "-Wl,-no_pie",
         (ccc_target::BinaryFormat::Macho, RelocationModel::Pic | RelocationModel::Pie) => {
             "-Wl,-pie"
@@ -1346,7 +1336,9 @@ fn driver_from_environment(
         .map_or_else(
             || {
                 Ok(match target.architecture {
-                    Architecture::Aarch64(_) if target.operating_system == OperatingSystem::Linux => {
+                    Architecture::Aarch64(_)
+                        if target.operating_system == OperatingSystem::Linux =>
+                    {
                         ToolCommandSpec::new("aarch64-linux-gnu-gcc")
                     }
                     Architecture::Riscv64(_) => ToolCommandSpec::new("riscv64-linux-gnu-gcc"),

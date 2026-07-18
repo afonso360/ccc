@@ -953,15 +953,10 @@ fn set_elf_symbol_visibility(symbol: &mut object::write::Symbol, visibility: Sym
     };
 }
 
-fn set_macho_symbol_visibility(
-    symbol: &mut object::write::Symbol,
-    visibility: SymbolVisibility,
-) {
+fn set_macho_symbol_visibility(symbol: &mut object::write::Symbol, visibility: SymbolVisibility) {
     symbol.scope = match visibility {
         SymbolVisibility::Default | SymbolVisibility::Protected => SymbolScope::Dynamic,
-        SymbolVisibility::Hidden | SymbolVisibility::Internal => {
-            SymbolScope::Linkage
-        }
+        SymbolVisibility::Hidden | SymbolVisibility::Internal => SymbolScope::Linkage,
     };
 }
 

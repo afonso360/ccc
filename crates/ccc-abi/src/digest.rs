@@ -1165,8 +1165,7 @@ mod tests {
         assert_eq!(
             abi_config_key(&EffectiveCompilationConfig::aarch64_apple_darwin()).unwrap(),
             abi_config_key(
-                &EffectiveCompilationConfig::aarch64_apple_darwin()
-                    .with_deployment_target("11.0")
+                &EffectiveCompilationConfig::aarch64_apple_darwin().with_deployment_target("11.0")
             )
             .unwrap()
         );

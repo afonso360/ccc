@@ -125,11 +125,33 @@ pub(crate) fn expand(
     options: &PreprocessOptions,
     location: ExpansionLocation<'_>,
 ) -> ExpansionResult {
+    expand_with_context(sources, table, tokens, options, location, false)
+}
+
+pub(crate) fn expand_condition(
+    sources: &mut SourceMap,
+    table: &mut MacroTable,
+    tokens: &[PpToken],
+    options: &PreprocessOptions,
+    location: ExpansionLocation<'_>,
+) -> ExpansionResult {
+    expand_with_context(sources, table, tokens, options, location, true)
+}
+
+fn expand_with_context(
+    sources: &mut SourceMap,
+    table: &mut MacroTable,
+    tokens: &[PpToken],
+    options: &PreprocessOptions,
+    location: ExpansionLocation<'_>,
+    preserve_defined_operands: bool,
+) -> ExpansionResult {
     let mut expander = Expander {
         sources,
         table,
         options,
         location,
+        preserve_defined_operands,
         diagnostics: Vec::new(),
         emitted_tokens: 0,
     };
@@ -151,6 +173,7 @@ struct Expander<'a, 'location> {
     table: &'a mut MacroTable,
     options: &'a PreprocessOptions,
     location: ExpansionLocation<'location>,
+    preserve_defined_operands: bool,
     diagnostics: Vec<PpDiagnostic>,
     emitted_tokens: usize,
 }
@@ -175,6 +198,33 @@ impl Expander<'_, '_> {
                 break;
             }
             let token = stream[index].clone();
+            if self.preserve_defined_operands
+                && token.kind == PpTokenKind::Identifier
+                && token.identifier_key() == "defined"
+            {
+                // Apple SDK headers, like GCC and Clang, rely on a macro
+                // replacement producing `defined(MACRO)` in a #if expression.
+                // Preserve the operand during rescan so it remains a macro name
+                // for the conditional-expression evaluator instead of expanding
+                // to the macro's replacement first.
+                output.push(token);
+                index += 1;
+                let parenthesized = stream.get(index).is_some_and(|next| next.spelling == "(");
+                if parenthesized {
+                    output.push(stream[index].clone());
+                    index += 1;
+                }
+                if let Some(operand) = stream.get(index) {
+                    output.push(operand.clone());
+                    index += 1;
+                }
+                if parenthesized && let Some(close) = stream.get(index) {
+                    output.push(close.clone());
+                    index += 1;
+                }
+                trailing_function_macro_can_continue = false;
+                continue;
+            }
             if token.kind != PpTokenKind::Identifier {
                 output.push(token);
                 trailing_function_macro_can_continue = false;

@@ -192,40 +192,15 @@ pub struct TargetSpec {
 impl TargetSpec {
     /// Selects one of the complete target profiles enabled by CCC.
     pub fn enabled(triple: Triple) -> Result<Self, String> {
-        let template = match (
-            triple.architecture,
-            triple.operating_system,
-            triple.environment,
-            triple.binary_format,
-        ) {
-            (Architecture::X86_64, OperatingSystem::Linux, Environment::Gnu, BinaryFormat::Elf) => {
-                X86_64_UNKNOWN_LINUX_GNU
-            }
-            (
-                Architecture::Aarch64(Aarch64Architecture::Aarch64),
-                OperatingSystem::Linux,
-                Environment::Gnu,
-                BinaryFormat::Elf,
-            ) => AARCH64_UNKNOWN_LINUX_GNU,
-            (
-                Architecture::Riscv64(Riscv64Architecture::Riscv64),
-                OperatingSystem::Linux,
-                Environment::Gnu,
-                BinaryFormat::Elf,
-            ) => RISCV64_UNKNOWN_LINUX_GNU,
-            (
-                Architecture::Aarch64(Aarch64Architecture::Aarch64),
-                OperatingSystem::Darwin(_) | OperatingSystem::MacOSX(_),
-                Environment::Unknown,
-                BinaryFormat::Macho,
-            ) => AARCH64_APPLE_DARWIN,
-            _ => {
-                return Err(format!(
-                    "target `{triple}` is not an enabled CCC target profile"
-                ));
-            }
-        };
-        Ok(Self { triple, ..template })
+        [
+            X86_64_UNKNOWN_LINUX_GNU,
+            AARCH64_UNKNOWN_LINUX_GNU,
+            RISCV64_UNKNOWN_LINUX_GNU,
+            AARCH64_APPLE_DARWIN,
+        ]
+        .into_iter()
+        .find(|profile| profile.triple == triple)
+        .ok_or_else(|| format!("target `{triple}` is not an enabled CCC target profile"))
     }
 
     pub fn pointer_width(&self) -> Option<u8> {
@@ -397,6 +372,7 @@ impl TargetSpec {
             OperatingSystem::Darwin(_) | OperatingSystem::MacOSX(_)
         ) {
             facts.insert("__APPLE__", "1");
+            facts.insert("__APPLE_CC__", "6000");
             facts.insert("__MACH__", "1");
             facts.insert("__arm64", "1");
             facts.insert("__arm64__", "1");
@@ -1094,7 +1070,10 @@ impl EffectiveCompilationConfig {
                 "__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__".to_owned(),
                 encoded.clone(),
             );
-            macros.insert("__ENVIRONMENT_OS_VERSION_MIN_REQUIRED__".to_owned(), encoded);
+            macros.insert(
+                "__ENVIRONMENT_OS_VERSION_MIN_REQUIRED__".to_owned(),
+                encoded,
+            );
         }
         macros
     }
@@ -1345,6 +1324,23 @@ mod tests {
     }
 
     #[test]
+    fn near_miss_target_triples_do_not_enter_enabled_profiles() {
+        for spelling in [
+            "x86_64-pc-linux-gnu",
+            "riscv64-apple-linux-gnu",
+            "aarch64-unknown-darwin",
+            "aarch64-apple-macosx14.0.0",
+        ] {
+            let error =
+                EffectiveCompilationConfig::for_target(spelling.parse().unwrap()).unwrap_err();
+            assert!(
+                error.contains("not an enabled CCC target profile"),
+                "unexpected diagnostic for {spelling}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn near_match_triples_do_not_inherit_an_incompatible_fixed_profile() {
         for triple in [
             "riscv64imac-unknown-linux-gnu",
@@ -1437,7 +1433,10 @@ mod tests {
             aarch64.target_macros.get("__ARM_ALIGN_MAX_STACK_PWR"),
             Some("16")
         );
-        assert_eq!(aarch64.target_macros.get("__BIGGEST_ALIGNMENT__"), Some("16"));
+        assert_eq!(
+            aarch64.target_macros.get("__BIGGEST_ALIGNMENT__"),
+            Some("16")
+        );
         assert_eq!(aarch64.target_macros.get("__ARM_PCS_AAPCS64"), Some("1"));
         assert_eq!(aarch64.target_macros.get("__LONG_DOUBLE_128__"), Some("1"));
         assert_eq!(aarch64.target_macros.get("__LDBL_MANT_DIG__"), Some("113"));
@@ -1460,22 +1459,24 @@ mod tests {
         );
         assert_eq!(riscv.target_macros.get("__riscv_m"), Some("2000000"));
         assert_eq!(riscv.target_macros.get("__riscv_zicsr"), Some("2000000"));
-        assert_eq!(
-            riscv.target_macros.get("__riscv_zifencei"),
-            Some("2000000")
-        );
+        assert_eq!(riscv.target_macros.get("__riscv_zifencei"), Some("2000000"));
         assert_eq!(riscv.target_macros.get("__riscv_atomic"), Some("1"));
         assert_eq!(riscv.target_macros.get("__LONG_DOUBLE_128__"), Some("1"));
         assert_eq!(riscv.target_macros.get("__LDBL_MANT_DIG__"), Some("113"));
         let pie = riscv.frontend_predefined_macros();
-        assert_eq!(pie.get("__riscv_cmodel_medany").map(String::as_str), Some("1"));
+        assert_eq!(
+            pie.get("__riscv_cmodel_medany").map(String::as_str),
+            Some("1")
+        );
         assert_eq!(pie.get("__riscv_cmodel_pic").map(String::as_str), Some("1"));
         assert_eq!(pie.get("__riscv_cmodel_medlow"), None);
         let mut static_riscv = riscv.clone();
         static_riscv.relocation_model = RelocationModel::Static;
         let static_macros = static_riscv.frontend_predefined_macros();
         assert_eq!(
-            static_macros.get("__riscv_cmodel_medlow").map(String::as_str),
+            static_macros
+                .get("__riscv_cmodel_medlow")
+                .map(String::as_str),
             Some("1")
         );
         assert_eq!(static_macros.get("__riscv_cmodel_medany"), None);
@@ -1485,6 +1486,7 @@ mod tests {
             EffectiveCompilationConfig::aarch64_apple_darwin().with_deployment_target("14.2.1");
         let macros = darwin.frontend_predefined_macros();
         assert_eq!(macros.get("__APPLE__").map(String::as_str), Some("1"));
+        assert_eq!(macros.get("__APPLE_CC__").map(String::as_str), Some("6000"));
         assert_eq!(macros.get("__arm64__").map(String::as_str), Some("1"));
         assert_eq!(
             macros

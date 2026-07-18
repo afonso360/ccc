@@ -721,14 +721,7 @@ fn allocate_bridge_argument(
     // AAPCS64 C.13-C.15 exhaust NGRN and place the complete composite at the
     // naturally aligned NSAA. AAPCS32's register/stack split does not apply.
     *gp_used = MAX_ARGUMENT_REGISTERS;
-    allocate_whole_on_stack(
-        classified,
-        source_index,
-        extension,
-        abi,
-        stack_size,
-        pieces,
-    )
+    allocate_whole_on_stack(classified, source_index, extension, abi, stack_size, pieces)
 }
 
 fn allocate_whole_on_stack(
@@ -936,7 +929,11 @@ fn homogeneous_members(
             } else {
                 *builtin
             };
-            let size = if normalized == BuiltinType::Float { 4 } else { 8 };
+            let size = if normalized == BuiltinType::Float {
+                4
+            } else {
+                8
+            };
             Some(vec![HomogeneousMember {
                 offset: base,
                 size,
@@ -1073,11 +1070,7 @@ fn homogeneous_stack_classification(
     let mut pieces = Vec::new();
     while offset < classified.size {
         let remaining = classified.size - offset;
-        let bytes = if remaining >= 8 {
-            8
-        } else {
-            4
-        };
+        let bytes = if remaining >= 8 { 8 } else { 4 };
         pieces.push(AbiPiece {
             index: pieces.len() as u8,
             offset,
@@ -1097,9 +1090,7 @@ fn homogeneous_stack_classification(
 /// Cranelift's arm64 ABI implementation gives I128 stack carriers the exact
 /// 16-byte alignment required by AAPCS C.14 and Darwin's natural stack
 /// alignment. The source object has already been rounded to 16 bytes.
-fn aligned_stack_classification(
-    classified: &ClassifiedType,
-) -> Result<ClassifiedType, AbiError> {
+fn aligned_stack_classification(classified: &ClassifiedType) -> Result<ClassifiedType, AbiError> {
     if classified.size != 16 {
         return Err(AbiError::new(
             "CCC3521",

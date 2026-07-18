@@ -1551,9 +1551,10 @@ impl FunctionState<'_> {
     ) -> Result<(), CodegenError> {
         let gr_offset_address = address_offset(builder, list, 24)?;
         let vr_offset_address = address_offset(builder, list, 28)?;
-        let mut gr_offset = builder
-            .ins()
-            .load(ir::types::I32, MemFlags::new(), gr_offset_address, 0);
+        let mut gr_offset =
+            builder
+                .ins()
+                .load(ir::types::I32, MemFlags::new(), gr_offset_address, 0);
         let vr_offset = builder
             .ins()
             .load(ir::types::I32, MemFlags::new(), vr_offset_address, 0);

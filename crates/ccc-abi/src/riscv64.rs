@@ -667,11 +667,7 @@ fn allocate_integer_slot(
     stack_size: &mut u64,
     variadic_stack_started: &mut bool,
 ) -> Result<Vec<BridgeLocation>, AbiError> {
-    if unnamed
-        && align >= 16
-        && *gp_used < ARGUMENT_REGISTERS
-        && !gp_used.is_multiple_of(2)
-    {
+    if unnamed && align >= 16 && *gp_used < ARGUMENT_REGISTERS && !gp_used.is_multiple_of(2) {
         *gp_used += 1;
     }
     let pair_must_fit = unnamed && slots == 2 && align >= 16;
@@ -1336,14 +1332,8 @@ mod tests {
                 QualifiedType::unqualified(aligned),
             ],
         ));
-        let plan = plan_variadic_call(
-            &types,
-            signature,
-            &[TypeId::INT, aligned],
-            2,
-            &config,
-        )
-        .unwrap();
+        let plan =
+            plan_variadic_call(&types, signature, &[TypeId::INT, aligned], 2, &config).unwrap();
         let locations = plan
             .parameter_pieces
             .iter()

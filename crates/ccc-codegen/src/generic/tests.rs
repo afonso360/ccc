@@ -127,7 +127,11 @@ fn darwin_symbols_tentative_data_and_libcalls_match_apple_spelling() {
         ("_protected_function", object::SymbolScope::Dynamic),
         ("_internal_function", object::SymbolScope::Linkage),
     ] {
-        assert_eq!(object.symbol_by_name(name).unwrap().scope(), scope, "{name}");
+        assert_eq!(
+            object.symbol_by_name(name).unwrap().scope(),
+            scope,
+            "{name}"
+        );
     }
     let memcpy = object.symbol_by_name("_memcpy").unwrap();
     assert!(memcpy.is_undefined());

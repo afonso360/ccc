@@ -1366,11 +1366,9 @@ mod tests {
 
     #[test]
     fn riscv_call_helper_uses_a_stable_cfa_across_dynamic_outgoing_storage() {
-        let assembly = render_target_call_helper(
-            "__ccc_call_helper_riscv_test",
-            AbiIdentity::RiscvLp64d,
-        )
-        .unwrap();
+        let assembly =
+            render_target_call_helper("__ccc_call_helper_riscv_test", AbiIdentity::RiscvLp64d)
+                .unwrap();
         let source = assembly.source();
         let establish = source.find("addi s0, sp, 32").unwrap();
         let stable_cfa = source[establish..].find(".cfi_def_cfa s0, 0").unwrap() + establish;
