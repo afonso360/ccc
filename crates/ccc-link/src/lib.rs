@@ -1253,8 +1253,11 @@ fn parse_clang_trace_arguments(line: &str) -> Option<Vec<String>> {
 }
 
 pub fn target_matches(reported: &Triple, expected: &Triple) -> bool {
+    let operating_system_matches = reported.operating_system == expected.operating_system
+        || (reported.operating_system.is_like_darwin()
+            && expected.operating_system.is_like_darwin());
     reported.architecture == expected.architecture
-        && reported.operating_system == expected.operating_system
+        && operating_system_matches
         && reported.environment == expected.environment
         && reported.binary_format == expected.binary_format
 }

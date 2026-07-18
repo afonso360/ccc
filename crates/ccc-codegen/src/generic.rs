@@ -12,7 +12,7 @@ use ccc_ir::generic as gir;
 use ccc_sema::generic::{
     Linkage as CLinkage, ObjectDefinitionPolicy, StorageDuration, SymbolBinding, SymbolVisibility,
 };
-use ccc_target::{EffectiveCompilationConfig, RelocationModel};
+use ccc_target::{AbiIdentity, BinaryFormat, EffectiveCompilationConfig, RelocationModel};
 use ccc_types::{
     BuiltinType, LayoutShape, QualifiedType, TypeId, TypeKind, TypeQualifiers, TypeStore,
 };
@@ -69,7 +69,19 @@ fn emit_inner(
     options: Options,
 ) -> Result<Output, CodegenError> {
     super::validate_target(config).map_err(error)?;
-    let isa_builder = isa::lookup(config.target.triple.clone()).map_err(module_error)?;
+    let mut isa_builder = isa::lookup(config.target.triple.clone()).map_err(module_error)?;
+    if config.target.abi == AbiIdentity::RiscvLp64d {
+        for extension in [
+            "has_m",
+            "has_a",
+            "has_f",
+            "has_d",
+            "has_zicsr",
+            "has_zifencei",
+        ] {
+            isa_builder.enable(extension).map_err(module_error)?;
+        }
+    }
     let mut flag_builder = settings::builder();
     match config.relocation_model {
         RelocationModel::Static => flag_builder.set("is_pic", "false").map_err(module_error)?,
@@ -167,6 +179,11 @@ fn emit_inner(
     }
 
     let mut product = object_module.finish();
+    if config.target.abi == AbiIdentity::DarwinArm64 {
+        product
+            .object
+            .set_macho_build_version(darwin_build_version(config)?);
+    }
     for common in &declarations.commons {
         let symbol = product.data_symbol(common.id);
         let symbol = product.object.symbol_mut(symbol);
@@ -188,7 +205,9 @@ fn emit_inner(
         let symbol = product.function_symbol(id);
         let symbol = product.object.symbol_mut(symbol);
         symbol.weak = function.binding == SymbolBinding::Weak;
-        set_elf_symbol_visibility(symbol, function.visibility);
+        if config.target.triple.binary_format == BinaryFormat::Elf {
+            set_elf_symbol_visibility(symbol, function.visibility);
+        }
     }
     for global in module
         .globals
@@ -201,7 +220,9 @@ fn emit_inner(
         let symbol = product.data_symbol(declaration.id);
         let symbol = product.object.symbol_mut(symbol);
         symbol.weak = global.emission.binding == SymbolBinding::Weak;
-        set_elf_symbol_visibility(symbol, global.emission.visibility);
+        if config.target.triple.binary_format == BinaryFormat::Elf {
+            set_elf_symbol_visibility(symbol, global.emission.visibility);
+        }
     }
     unwind.emit(&mut product).map_err(error)?;
     let object = product.emit().map_err(module_error)?;
@@ -217,6 +238,53 @@ fn emit_inner(
         assemblies,
         manifest,
     })
+}
+
+fn darwin_build_version(
+    config: &EffectiveCompilationConfig,
+) -> Result<object::write::MachOBuildVersion, CodegenError> {
+    // arm64 macOS first shipped with macOS 11.  Recording a real platform and
+    // minimum version is mandatory: Apple's linker rejects Mach-O objects
+    // whose LC_BUILD_VERSION uses PLATFORM_UNKNOWN (the value produced by a
+    // target-lexicon `darwin` triple without this override).
+    let (major, minor, patch) = match config.deployment_target.as_deref() {
+        Some(version) => parse_darwin_version(version)?,
+        None => (11, 0, 0),
+    };
+    let mut version = object::write::MachOBuildVersion::default();
+    version.platform = object::macho::PLATFORM_MACOS;
+    version.minos = (u32::from(major) << 16) | (u32::from(minor) << 8) | u32::from(patch);
+    // SDK zero is the conventional value for a relocatable object.  The
+    // linker records the selected SDK in the final image.
+    version.sdk = 0;
+    Ok(version)
+}
+
+fn parse_darwin_version(version: &str) -> Result<(u16, u8, u8), CodegenError> {
+    let mut components = version.split('.');
+    let invalid = || {
+        error(format!(
+            "invalid Darwin deployment target `{version}`; expected MAJOR[.MINOR[.PATCH]]"
+        ))
+    };
+    let major = components
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())
+        .ok_or_else(invalid)?;
+    let minor = components
+        .next()
+        .unwrap_or("0")
+        .parse::<u8>()
+        .map_err(|_| invalid())?;
+    let patch = components
+        .next()
+        .unwrap_or("0")
+        .parse::<u8>()
+        .map_err(|_| invalid())?;
+    if components.next().is_some() || major == 0 {
+        return Err(invalid());
+    }
+    Ok((major, minor, patch))
 }
 
 fn generated_bridge_artifacts(

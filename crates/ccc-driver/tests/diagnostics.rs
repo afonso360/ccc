@@ -133,7 +133,13 @@ fn rejected_translations_match_diagnostic_goldens_and_emit_no_object() {
             .current_dir(&repository)
             .env("LC_ALL", "C")
             .env("LANG", "C")
-            .args(["-nostdinc", "-c", &input, "-o"])
+            .args([
+                "--target=x86_64-unknown-linux-gnu",
+                "-nostdinc",
+                "-c",
+                &input,
+                "-o",
+            ])
             .arg(&output)
             .output()
             .unwrap();

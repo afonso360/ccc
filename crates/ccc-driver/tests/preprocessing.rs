@@ -38,6 +38,7 @@ impl TestDirectory {
         let mut command = Command::new(env!("CARGO_BIN_EXE_ccc"));
         command
             .current_dir(&self.path)
+            .arg("--target=x86_64-unknown-linux-gnu")
             .env("LC_ALL", "C")
             .env("LANG", "C")
             .env_remove("SOURCE_DATE_EPOCH");

@@ -54,6 +54,11 @@ const HELP: &str = "Usage: ccc [options] <input.c>\n\
   -isystem dir -idirafter dir Add system include search paths\n\
   -include file -imacros file Process a forced input\n\
   -M|-MM|-MD|-MMD            Generate Make dependencies\n\
+  --target triple            Select an enabled target (defaults to the native host)\n\
+  -mcpu=name -mabi=name      Select a target CPU and ABI spelling\n\
+  --sysroot dir              Select a target sysroot\n\
+  --sdk-root dir             Select a Darwin SDK root\n\
+  -mmacosx-version-min=ver   Select the minimum Darwin deployment version\n\
   --dump-pp-tokens           Dump expanded preprocessing tokens\n\
   --dump-tokens              Dump converted parser tokens\n\
   --dump-ast|--dump-typed-ast|--dump-ir|--dump-abi\n\
@@ -208,9 +213,46 @@ fn preprocess_source(options: &DriverOptions) -> Result<PreparedSource, DriverEr
 fn effective_config(
     options: &DriverOptions,
 ) -> Result<(EffectiveCompilationConfig, Option<ResourceDirectory>), DriverError> {
-    let mut config =
-        EffectiveCompilationConfig::default().with_language_mode(options.language_mode);
+    let mut config = if let Some(target) = &options.target {
+        let triple = target.parse().map_err(|error| {
+            owner_error(
+                "CCC6005",
+                format!("invalid target triple `{target}`: {error}"),
+            )
+        })?;
+        EffectiveCompilationConfig::for_target(triple)
+            .map_err(|message| owner_error("CCC6005", message))?
+    } else {
+        EffectiveCompilationConfig::host().map_err(|message| owner_error("CCC6005", message))?
+    }
+    .with_language_mode(options.language_mode);
     config.language.trigraphs = options.trigraphs;
+    if let Some(cpu) = &options.target_cpu {
+        config = config.with_target_cpu(cpu);
+    }
+    if let Some(abi) = &options.target_abi {
+        config = config.with_target_abi(abi);
+    }
+    if let Some(sdk_root) = &options.sdk_root {
+        config = config.with_sdk_root(sdk_root);
+    }
+    if let Some(version) = &options.deployment_target {
+        config = config.with_deployment_target(version);
+    }
+    if options.sdk_root.is_some() && config.target.abi != ccc_target::AbiIdentity::DarwinArm64 {
+        return Err(owner_error(
+            "CCC6005",
+            "`--sdk-root` is valid only for the Darwin arm64 target",
+        ));
+    }
+    if options.deployment_target.is_some()
+        && config.target.abi != ccc_target::AbiIdentity::DarwinArm64
+    {
+        return Err(owner_error(
+            "CCC6005",
+            "`-mmacosx-version-min` is valid only for the Darwin arm64 target",
+        ));
+    }
 
     let should_load_resources = options.resource_dir.is_some()
         || (!options.no_standard_includes && !options.no_builtin_includes);
@@ -234,10 +276,12 @@ fn effective_config(
     }
 
     let link = matches!(options.action, PrimaryAction::Compile { link: true });
-    let resolve_system_headers = !options.no_standard_includes && should_probe_native_toolchain();
-    if resolve_system_headers || link || options.sysroot.is_some() {
+    let effective_sysroot = options.sysroot.as_ref().or(options.sdk_root.as_ref());
+    let resolve_system_headers =
+        !options.no_standard_includes && should_probe_native_toolchain(&config);
+    if resolve_system_headers || link || effective_sysroot.is_some() {
         let mut resolver = ToolchainResolver::new(&config);
-        if let Some(sysroot) = &options.sysroot {
+        if let Some(sysroot) = effective_sysroot {
             resolver = resolver.sysroot(sysroot);
         }
         let requirements = ToolchainRequirements {
@@ -262,8 +306,10 @@ fn effective_config(
     Ok((config, resources))
 }
 
-fn should_probe_native_toolchain() -> bool {
-    cfg!(all(target_arch = "x86_64", target_os = "linux")) || std::env::var_os("CCC_CC").is_some()
+fn should_probe_native_toolchain(config: &EffectiveCompilationConfig) -> bool {
+    std::env::var_os("CCC_CC").is_some()
+        || ccc_target::TargetSpec::enabled(ccc_target::Triple::host())
+            .is_ok_and(|host| host.abi == config.target.abi)
 }
 
 fn unsupported_hosted_header<'a>(
@@ -1186,7 +1232,7 @@ mod tests {
         .unwrap()
         .stdout;
         assert!(abi.contains("abi-plan schema=ccc-abi-config-v2"));
-        assert!(abi.contains("target=x86_64-unknown-linux-gnu"));
+        assert!(abi.contains(&format!("target={}", ccc_target::Triple::host())));
         assert!(abi.contains("definition function=0"));
         assert!(!abi.contains(std::env::temp_dir().to_string_lossy().as_ref()));
         let clif = run(["--emit=clif".to_owned(), "-nostdinc".to_owned(), input])
@@ -1216,7 +1262,11 @@ mod tests {
         .unwrap();
         let bytes = fs::read(&output).unwrap();
         let object = object::File::parse(bytes.as_slice()).unwrap();
-        assert!(object.symbols().any(|symbol| symbol.name() == Ok("main")));
+        assert!(
+            object
+                .symbols()
+                .any(|symbol| matches!(symbol.name(), Ok("main" | "_main")))
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 

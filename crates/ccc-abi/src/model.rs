@@ -50,7 +50,11 @@ pub enum IntegerExtension {
 pub enum NativePurpose {
     Normal,
     StructArgument(u32),
+    /// An ABI-mandated pointer to a caller-owned aggregate copy.
+    IndirectArgument,
     StructReturn,
+    /// A register-position hole required by an aggregate alignment rule.
+    Padding,
 }
 
 /// One Cranelift signature carrier. This deliberately does not contain a

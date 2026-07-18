@@ -36,6 +36,65 @@ fn emit_source(source: &str) -> Output {
     .unwrap()
 }
 
+fn emit_source_with_config(source: &str, config: &EffectiveCompilationConfig) -> Output {
+    emit(
+        &lower_source_with_config(source, config),
+        config,
+        Options { emit_clif: true },
+    )
+    .unwrap()
+}
+
+#[test]
+fn enabled_non_x86_targets_emit_native_objects_with_fixed_aggregate_calls() {
+    let source = "struct Pair { long first, second; };\n\
+                  struct Floats { double first, second; };\n\
+                  struct Pair swap(struct Pair value) {\n\
+                    struct Pair result = { value.second, value.first }; return result;\n\
+                  }\n\
+                  double sum(struct Floats value) { return value.first + value.second; }";
+    for (config, format, architecture) in [
+        (
+            EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+            object::BinaryFormat::Elf,
+            object::Architecture::Aarch64,
+        ),
+        (
+            EffectiveCompilationConfig::aarch64_apple_darwin(),
+            object::BinaryFormat::MachO,
+            object::Architecture::Aarch64,
+        ),
+        (
+            EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
+            object::BinaryFormat::Elf,
+            object::Architecture::Riscv64,
+        ),
+    ] {
+        let output = emit_source_with_config(source, &config);
+        assert!(output.assemblies.is_empty());
+        let object = object::File::parse(output.object.as_slice()).unwrap();
+        assert_eq!(object.format(), format);
+        assert_eq!(object.architecture(), architecture);
+        let prefix = if format == object::BinaryFormat::MachO {
+            "_"
+        } else {
+            ""
+        };
+        let swap = format!("{prefix}swap");
+        let sum = format!("{prefix}sum");
+        assert!(
+            object
+                .symbols()
+                .any(|symbol| symbol.name() == Ok(swap.as_str()))
+        );
+        assert!(
+            object
+                .symbols()
+                .any(|symbol| symbol.name() == Ok(sum.as_str()))
+        );
+    }
+}
+
 #[test]
 fn emitted_functions_have_relocatable_system_v_call_frames() {
     use gimli::UnwindSection as _;

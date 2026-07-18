@@ -6746,7 +6746,9 @@ impl<'a> Analyzer<'a> {
         types: &[QualifiedType],
         span: Span,
     ) -> AnalysisResult<()> {
-        if types.iter().any(|ty| ty.ty == TypeId::LONG_DOUBLE) {
+        if self.config.target.data_layout.long_double_width > 64
+            && types.iter().any(|ty| ty.ty == TypeId::LONG_DOUBLE)
+        {
             self.fail(
                 "CCC2343",
                 span,

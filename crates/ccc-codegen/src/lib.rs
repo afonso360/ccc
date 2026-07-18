@@ -5,10 +5,7 @@ pub mod generic;
 use std::fmt;
 
 use ccc_session::Span;
-use ccc_target::{
-    Architecture, BinaryFormat, CallingConvention, EffectiveCompilationConfig, Environment,
-    OperatingSystem,
-};
+use ccc_target::{AbiIdentity, CallingConvention, EffectiveCompilationConfig};
 use cranelift_codegen::ir::{self, AbiParam, ArgumentPurpose, Signature};
 use cranelift_codegen::isa::CallConv;
 
@@ -56,13 +53,11 @@ impl fmt::Display for CodegenError {
 impl std::error::Error for CodegenError {}
 
 pub(crate) fn validate_target(config: &EffectiveCompilationConfig) -> Result<(), String> {
-    if config.target.triple.binary_format != BinaryFormat::Elf {
-        return Err("the configured object format is unsupported".to_owned());
-    }
-    if config.target.triple.architecture != Architecture::X86_64 {
+    let enabled = ccc_target::TargetSpec::enabled(config.target.triple.clone())?;
+    if enabled.abi != config.target.abi || enabled.data_layout != config.target.data_layout {
         return Err(format!(
-            "architecture `{}` is incompatible with the x86-64 object backend",
-            config.target.triple.architecture
+            "target `{}` does not match its enabled ABI and data-layout profile",
+            config.target.triple
         ));
     }
     let pointer_width = config
@@ -71,20 +66,38 @@ pub(crate) fn validate_target(config: &EffectiveCompilationConfig) -> Result<(),
         .ok_or_else(|| "the configured target has an unknown pointer width".to_owned())?;
     if pointer_width != 64 {
         return Err(format!(
-            "pointer width {} is incompatible with the x86-64 object backend",
+            "pointer width {} is incompatible with the enabled 64-bit object backends",
             pointer_width
         ));
     }
-    if config.target.triple.operating_system != OperatingSystem::Linux
-        || config.target.triple.environment != Environment::Gnu
-        || config.target.calling_convention() != Some(CallingConvention::SystemV)
-        || config.target.int_width() != Some(32)
+    if config.target.int_width() != Some(32)
         || config.target.data_layout.int_width != 32
         || config.target.data_layout.long_width != 64
         || config.target.data_layout.pointer_width != 64
     {
         return Err(format!(
-            "target `{}` is outside the enabled x86-64 Linux GNU LP64 profile",
+            "target `{}` is outside the enabled LP64 profiles",
+            config.target.triple
+        ));
+    }
+    if let Some(abi) = config.target_abi.as_deref() {
+        let accepted = match config.target.abi {
+            AbiIdentity::SysvAmd64Lp64 | AbiIdentity::Aapcs64Lp64 => abi == "lp64",
+            AbiIdentity::RiscvLp64d => abi == "lp64d",
+            AbiIdentity::DarwinArm64 => abi == "darwin",
+        };
+        if !accepted {
+            return Err(format!(
+                "target ABI option `{abi}` is incompatible with {}",
+                config.target.abi.name()
+            ));
+        }
+    }
+    if let Some(cpu) = config.target_cpu.as_deref()
+        && !matches!(cpu, "generic" | "native")
+    {
+        return Err(format!(
+            "target CPU `{cpu}` is not an enabled CPU profile for `{}`",
             config.target.triple
         ));
     }
@@ -94,6 +107,7 @@ pub(crate) fn validate_target(config: &EffectiveCompilationConfig) -> Result<(),
 pub(crate) fn signature(plan: &ccc_abi::NativeBoundaryPlan) -> Result<Signature, String> {
     let call_conv = match plan.calling_convention {
         CallingConvention::SystemV => CallConv::SystemV,
+        CallingConvention::AppleAarch64 => CallConv::AppleAarch64,
         convention => {
             return Err(format!(
                 "calling convention `{convention:?}` is unsupported by this backend"
@@ -122,6 +136,9 @@ fn abi_parameter(carrier: &ccc_abi::NativeCarrierPlan) -> Result<AbiParam, Strin
     let purpose = match carrier.purpose {
         ccc_abi::NativePurpose::Normal => ArgumentPurpose::Normal,
         ccc_abi::NativePurpose::StructArgument(size) => ArgumentPurpose::StructArgument(size),
+        ccc_abi::NativePurpose::IndirectArgument | ccc_abi::NativePurpose::Padding => {
+            ArgumentPurpose::Normal
+        }
         ccc_abi::NativePurpose::StructReturn => ArgumentPurpose::StructReturn,
     };
     let parameter = AbiParam::special(ty, purpose);

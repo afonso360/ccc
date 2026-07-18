@@ -27,6 +27,7 @@ fn empty_translation_unit_emits_a_valid_object() {
     let directory = test_directory("empty-object");
     let output = directory.join("empty.o");
     let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+        .arg("--target=x86_64-unknown-linux-gnu")
         .arg("-c")
         .arg(fixture("empty.c"))
         .arg("-o")
@@ -55,6 +56,7 @@ fn execution_programs_emit_x86_64_objects() {
         let directory = test_directory(name);
         let output = directory.join("program.o");
         let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+            .arg("--target=x86_64-unknown-linux-gnu")
             .arg("-c")
             .arg(fixture(name))
             .arg("-o")
@@ -85,6 +87,7 @@ fn execution_programs_produce_the_expected_exit_status() {
         let directory = test_directory(name);
         let executable = directory.join("program");
         let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+            .arg("--target=x86_64-unknown-linux-gnu")
             .arg(fixture(name))
             .arg("-o")
             .arg(&executable)

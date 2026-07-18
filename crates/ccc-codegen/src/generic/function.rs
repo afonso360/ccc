@@ -327,9 +327,15 @@ impl FunctionState<'_> {
                     .carrier_indices
                     .first()
                     .ok_or_else(|| error("scalar ABI parameter has no carrier"))?;
-                *clif_values
+                let value = *clif_values
                     .get(index as usize)
-                    .ok_or_else(|| error("scalar ABI carrier is absent from function entry"))?
+                    .ok_or_else(|| error("scalar ABI carrier is absent from function entry"))?;
+                let expected = scalar_type(
+                    &self.module.types,
+                    self.function.parameters[source].ty,
+                    self.config,
+                )?;
+                coerce_carrier_value(builder, value, expected, false)?
             } else {
                 let padded = align_up_u64(parameter.classified.size, 8)?;
                 let address = create_stack_backing(builder, padded, parameter.classified.align)?;
@@ -351,6 +357,14 @@ impl FunctionState<'_> {
                             gir::MemoryAccess::default(),
                             gir::MemoryAccess::default(),
                         )?,
+                        ccc_abi::NativePurpose::IndirectArgument => copy_memory(
+                            builder,
+                            address,
+                            incoming_value,
+                            parameter.classified.size,
+                            gir::MemoryAccess::default(),
+                            gir::MemoryAccess::default(),
+                        )?,
                         ccc_abi::NativePurpose::Normal => {
                             let destination =
                                 address_offset(builder, address, carrier.source_offset)?;
@@ -360,6 +374,9 @@ impl FunctionState<'_> {
                         }
                         ccc_abi::NativePurpose::StructReturn => {
                             return Err(error("source parameter unexpectedly uses sret purpose"));
+                        }
+                        ccc_abi::NativePurpose::Padding => {
+                            return Err(error("source parameter unexpectedly uses ABI padding"));
                         }
                     }
                 }
@@ -1708,6 +1725,14 @@ impl FunctionState<'_> {
                 lowered.push(address);
                 continue;
             }
+            if carrier.purpose == ccc_abi::NativePurpose::Padding {
+                lowered.push(
+                    builder
+                        .ins()
+                        .iconst(native_carrier_type(carrier.carrier), 0),
+                );
+                continue;
+            }
             let source_index = carrier
                 .source_index
                 .ok_or_else(|| error("call carrier has no source argument"))?;
@@ -1719,7 +1744,18 @@ impl FunctionState<'_> {
                 .get(source_index as usize)
                 .ok_or_else(|| error("call parameter plan is absent"))?;
             if parameter.classified.passing == ccc_abi::PassingMode::Scalar {
-                lowered.push(self.value(source_value)?);
+                let value = self.value(source_value)?;
+                lowered.push(coerce_carrier_value(
+                    builder,
+                    value,
+                    native_carrier_type(carrier.carrier),
+                    is_signed(
+                        &self.module.types,
+                        self.value_ty(source_value)?,
+                        self.config,
+                    )
+                    .unwrap_or(false),
+                )?);
                 continue;
             }
             let stage = if let Some(stage) = staged.get(&source_index) {
@@ -1741,6 +1777,7 @@ impl FunctionState<'_> {
             };
             match carrier.purpose {
                 ccc_abi::NativePurpose::StructArgument(_) => lowered.push(stage),
+                ccc_abi::NativePurpose::IndirectArgument => lowered.push(stage),
                 ccc_abi::NativePurpose::Normal => {
                     let address = address_offset(builder, stage, carrier.source_offset)?;
                     lowered.push(builder.ins().load(
@@ -1750,7 +1787,9 @@ impl FunctionState<'_> {
                         0,
                     ));
                 }
-                ccc_abi::NativePurpose::StructReturn => unreachable!(),
+                ccc_abi::NativePurpose::StructReturn | ccc_abi::NativePurpose::Padding => {
+                    unreachable!()
+                }
             }
         }
         Ok((lowered, result_storage))
@@ -1765,7 +1804,28 @@ impl FunctionState<'_> {
     ) -> Result<Option<ir::Value>, CodegenError> {
         match &plan.result {
             ccc_abi::NativeResultPlan::Void => call_result(builder, call, false),
-            ccc_abi::NativeResultPlan::Scalar { .. } => call_result(builder, call, true),
+            ccc_abi::NativeResultPlan::Scalar { ty, carrier_index } => {
+                let value = call_result(builder, call, true)?;
+                let Some(value) = value else {
+                    return Err(error("scalar call has no result value"));
+                };
+                let carrier = plan
+                    .clif_results
+                    .get(*carrier_index as usize)
+                    .ok_or_else(|| error("scalar result carrier index is invalid"))?;
+                let expected = scalar_type(
+                    &self.module.types,
+                    QualifiedType::unqualified(*ty),
+                    self.config,
+                )?;
+                let value = coerce_carrier_value(
+                    builder,
+                    value,
+                    expected,
+                    matches!(carrier.extension, ccc_abi::IntegerExtension::Signed),
+                )?;
+                Ok(Some(value))
+            }
             ccc_abi::NativeResultPlan::Indirect { .. } => {
                 if !builder.inst_results(call).is_empty() {
                     return Err(error(
@@ -2064,6 +2124,29 @@ fn native_carrier_type(carrier: ccc_abi::AbiCarrier) -> ir::Type {
     }
 }
 
+fn coerce_carrier_value(
+    builder: &mut FunctionBuilder<'_>,
+    value: ir::Value,
+    target: ir::Type,
+    signed: bool,
+) -> Result<ir::Value, CodegenError> {
+    let source = builder.func.dfg.value_type(value);
+    if source == target {
+        return Ok(value);
+    }
+    if source.bits() == target.bits()
+        && ((source.is_int() && target.is_float()) || (source.is_float() && target.is_int()))
+    {
+        return Ok(builder.ins().bitcast(target, MemFlags::new(), value));
+    }
+    if source.is_int() && target.is_int() {
+        return Ok(coerce_integer(builder, value, source, target, signed));
+    }
+    Err(error(format!(
+        "cannot coerce native ABI carrier from {source} to {target}"
+    )))
+}
+
 fn variadic_parameter_piece_address(
     builder: &mut FunctionBuilder<'_>,
     frame: ir::Value,
@@ -2274,9 +2357,14 @@ pub(super) fn scalar_type(
         }
         Some(TypeKind::Builtin(BuiltinType::Float)) => Ok(ir::types::F32),
         Some(TypeKind::Builtin(BuiltinType::Double)) => Ok(ir::types::F64),
+        Some(TypeKind::Builtin(BuiltinType::LongDouble))
+            if config.target.data_layout.long_double_width == 64 =>
+        {
+            Ok(ir::types::F64)
+        }
         Some(TypeKind::Builtin(BuiltinType::LongDouble)) => Err(CodegenError {
             code: "CCC3509",
-            message: "native `long double` values require the target long-double bridge capability"
+            message: "binary128 `long double` values require a target transport capability"
                 .to_owned(),
             span: None,
         }),

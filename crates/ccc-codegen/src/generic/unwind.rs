@@ -63,10 +63,6 @@ impl UnwindEmitter {
         if self.functions.is_empty() {
             return Ok(());
         }
-        if product.object.format() != BinaryFormat::Elf {
-            return Err("System V unwind emission requires an ELF object".to_owned());
-        }
-
         let mut frame_table = FrameTable::default();
         let cie = frame_table.add_cie(self.cie);
         let mut targets = Vec::with_capacity(self.functions.len());
@@ -91,9 +87,11 @@ impl UnwindEmitter {
         }) = eh_frame;
 
         let section = product.object.section_id(StandardSection::EhFrame);
-        product.object.section_mut(section).flags = object::SectionFlags::Elf {
-            sh_flags: u64::from(object::elf::SHF_ALLOC),
-        };
+        if product.object.format() == BinaryFormat::Elf {
+            product.object.section_mut(section).flags = object::SectionFlags::Elf {
+                sh_flags: u64::from(object::elf::SHF_ALLOC),
+            };
+        }
         let section_offset = product
             .object
             .append_section_data(section, &writer.into_vec(), 8);

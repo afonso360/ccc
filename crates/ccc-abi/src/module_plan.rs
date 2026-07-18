@@ -17,7 +17,7 @@ pub fn plan_module(
     module: &gir::FullModule,
     config: &EffectiveCompilationConfig,
 ) -> Result<ModuleAbiPlan, AbiError> {
-    crate::sysv_amd64::validate_target(config)?;
+    crate::validate_target(config)?;
     let config_key = abi_config_key(config)?;
     let ir_shape_digest = ir_shape_digest(module, &config_key)?;
     let translation_unit_digest = translation_unit_digest(module, &config_key, ir_shape_digest);
@@ -603,6 +603,9 @@ fn dump_boundary(output: &mut String, boundary: &BoundaryPlan, indent: &str) {
                             .find_map(|index| {
                                 match native.clif_parameters[*index as usize].purpose {
                                     NativePurpose::StructArgument(size) => Some(size),
+                                    NativePurpose::IndirectArgument => {
+                                        u32::try_from(parameter.classified.size).ok()
+                                    }
                                     _ => None,
                                 }
                             })
@@ -775,7 +778,9 @@ fn render_native_carrier(carrier: &crate::NativeCarrierPlan) -> String {
     let purpose = match carrier.purpose {
         NativePurpose::Normal => "normal".to_owned(),
         NativePurpose::StructArgument(size) => format!("sarg({size})"),
+        NativePurpose::IndirectArgument => "indirect-argument".to_owned(),
         NativePurpose::StructReturn => "sret".to_owned(),
+        NativePurpose::Padding => "padding".to_owned(),
     };
     format!(
         "abi={} source={} piece={} offset={} valid={} class={} carrier={} extension={} purpose={}",

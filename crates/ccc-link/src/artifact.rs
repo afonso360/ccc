@@ -334,7 +334,7 @@ impl ArtifactBundle {
     }
 }
 
-/// An artifact whose manifest and primary ELF object agree.
+/// An artifact whose manifest and primary relocatable object agree.
 #[derive(Clone, Debug)]
 pub struct VerifiedArtifactBundle(ArtifactBundle);
 
@@ -363,13 +363,16 @@ pub(crate) fn parse_relocatable<'data>(
     let object = object::File::parse(bytes).map_err(|error| {
         artifact_error(format!("cannot parse {description} as an object: {error}"))
     })?;
-    if object.format() != BinaryFormat::Elf
-        || object.architecture() != Architecture::X86_64
-        || object.kind() != ObjectKind::Relocatable
-        || object.entry() != 0
-    {
+    let enabled_format = matches!(
+        (object.format(), object.architecture()),
+        (
+            BinaryFormat::Elf,
+            Architecture::X86_64 | Architecture::Aarch64 | Architecture::Riscv64
+        ) | (BinaryFormat::MachO, Architecture::Aarch64)
+    );
+    if !enabled_format || object.kind() != ObjectKind::Relocatable || object.entry() != 0 {
         return Err(artifact_error(format!(
-            "{description} is not an x86-64 ELF relocatable object"
+            "{description} is not an enabled relocatable object"
         )));
     }
     for section in object.sections() {
