@@ -145,9 +145,14 @@ is adopted by an explicit compatibility decision. `_Generic` has a separate
 matrix proving controlling-expression conversions and preservation of the
 selected association's value category.
 
-Computed-goto fixtures include a positive direct `&&label` pointer table and
-exact `br_table` golden. Negative fixtures diagnose both label subtraction and
-base-label-plus-offset reconstruction before lowering erases label provenance.
+Computed-goto fixtures include direct, copied, automatic-table, and
+static-table `&&label` dispatch. Exact IR goldens prove that mutable locals in a
+function containing a computed jump remain in storage and that every
+`br_table` destination has no arguments or block parameters. Negative fixtures
+diagnose label subtraction and base-label-plus-offset reconstruction while the
+direct operands still retain label provenance. Arithmetic after a token has
+passed through object storage is outside the supported behavior and is not
+claimed as a diagnostic boundary.
 
 Wide-integer proof covers high-bit constants, signed and unsigned arithmetic,
 division and remainder traps, floating conversions, layout, varargs, mixed
@@ -199,15 +204,42 @@ calculation to Dekker's algorithm; an earlier release silently requires the f80
 runtime on the primary target. This pin is also the last canonical-source
 release before SQLite replaced the classic Autoconf configure/Makefile
 interface with Autosetup in 3.48.0; any later pin requires an adapter-interface
-review as well as a C-surface inventory. Its gate runs the `veryquick` Tcl set
-through `testfixture`, which needs Tcl and zlib development environments; the
-full suite and TH3 are out of scope. Under CCC's effective identity the build
-selects `__sync_synchronize` but no inline assembly, wide integers, VLA objects,
-computed goto, or statement expressions. Its success is integration evidence
-rather than proof of the unselected constructs; their focused fixtures remain
-required.
-Lua's default GNU-profile build exercises `setjmp`/`longjmp` and computed-goto
-dispatch. musl feeds `$CC` assembly files.
+review as well as a C-surface inventory. The default gate runs the `veryquick`
+Tcl set through `testfixture`, which needs Tcl and zlib development
+environments. Explicit `quick`, `all`, and `full` adapter modes retain the
+upstream test grouping; TH3 remains out of scope. Under CCC's effective identity
+the build selects `__sync_synchronize` but no inline assembly, wide integers,
+VLA objects, computed goto, or statement expressions. The `full` mode keeps
+SQLite's `SQLITE_ENABLE_STMT_SCANSTATUS` fuzzcheck profile. For its one
+generated `sqlite3.c` translation, the wrapper defines the upstream
+`__STRICT_ANSI__` predicate while retaining GNU C11 mode, selecting SQLite's
+zero-valued hardware timing fallback instead of the GNU x86-64 `rdtsc`
+inline-assembly path. In this release that predicate also suppresses only the
+`SQLITE_INLINE` optimization hint. The eight fuzzcheck support inputs,
+`alltest`, and `sessionfuzz` receive no override. The wrapper audits the last
+effective `-std` option and predicate state for every translation. Corpus
+success is integration evidence rather than proof of the unselected constructs;
+their focused fixtures remain required.
+Lua is pinned by its [corpus manifest](../../test-corpus/lua/manifest.toml) to
+the official 5.5.0 source and matching test archives. The adapter uses the
+upstream Linux make target in GNU11 mode and requires all 34 `.c` files in the
+source directory to appear exactly once in CCC's source-input log. GCC receives
+only CCC-produced objects and archives for the two final program links. Because
+CCC's selected relocation model is static, both links use Lua's
+`MYLDFLAGS=-no-pie` hook and the gate verifies ELF `EXEC` type plus the absence
+of dynamic text relocations.
+
+Under the pinned GNU 4.2.1 identity, Lua selects `__builtin_expect`, internal
+visibility and noreturn attributes, `__extension__`, and computed-goto VM
+dispatch; hosted `float.h` and `math.h` additionally select binary64 target facts
+and `__builtin_huge_val`. The Linux profile uses `_setjmp`/`_longjmp` for
+protected calls. The execution gate invokes the official basic profile exactly
+as `lua -e'_U=true' all.lua`, after removing ambient Lua initialization and
+module-path variables, and requires its `final OK !!!` marker. This integration
+does not replace focused computed-goto or nonlocal-control tests. The official
+complete and internal profiles remain distinct contracts because they add
+position-independent shared test modules, GNU assertion statement expressions,
+and an instrumented runtime. musl feeds `$CC` assembly files.
 
 A curated execute-only compiler torture subset may supplement focused fixtures.
 It is fetched rather than vendored, and its corpus manifest records the exact

@@ -1,0 +1,95 @@
+format_version = 2
+name = "lua"
+version = "5.5.0"
+release_date = "2025-12-22"
+distribution = "official-source"
+origin = "https://www.lua.org/ftp/lua-5.5.0.tar.gz"
+archive = "lua-5.5.0.tar.gz"
+archive_bytes = 396950
+archive_sha256 = "57ccc32bbbd005cab75bcc52444052535af691789dba2b9016d5c50640d68b3d"
+archive_sha3_256 = "5153631a215cc387b652e3bbbf6e3f82b93020a18b2f78520181bd2273c7039f"
+license = "MIT"
+upstream_license_file = "src/lua.h"
+fetched_not_vendored = true
+
+test_distribution = "official-tests"
+test_origin = "https://www.lua.org/tests/lua-5.5.0-tests.tar.gz"
+test_archive = "lua-5.5.0-tests.tar.gz"
+test_archive_bytes = 148918
+test_archive_sha256 = "5e47bbfad7db2965d69580e918ee64edeb8d8d32de404b8dae9ce5c6d76a1472"
+test_archive_sha3_256 = "dfd405aabc73d628b75b2cd4c4b84740c67091081fcf388c1f80bac20f5cf443"
+test_license = "MIT"
+
+target = "x86_64-unknown-linux-gnu"
+language_mode = "gnu11"
+gnu_compatibility_tuple = "4.2.1"
+build_interface = "upstream-make-linux"
+build_target = "linux"
+build_command = "make linux CC='<ccc-adapter> -std=gnu11' MYLDFLAGS=-no-pie"
+source_translation_units = 34
+target_compiler = "ccc"
+link_driver = "gcc"
+link_mode = "non-pie-executable"
+
+test_profile = "basic"
+test_entrypoint = "all.lua"
+test_command = "lua -e'_U=true' all.lua"
+success_marker = "final OK !!!"
+
+required_tools = [
+    "ar",
+    "awk",
+    "bash",
+    "basename",
+    "cmp",
+    "dirname",
+    "find",
+    "gcc",
+    "grep",
+    "make",
+    "mkdir",
+    "mktemp",
+    "mv",
+    "openssl",
+    "ranlib",
+    "readelf",
+    "rm",
+    "sed",
+    "sort",
+    "tar",
+    "tee",
+    "tr",
+    "uname",
+    "wc",
+]
+conditional_download_tools = ["curl"]
+
+[expected_inventory]
+selected_builtins = ["__builtin_expect", "__builtin_huge_val"]
+required_predefined_macros = ["__DBL_MANT_DIG__=53", "__DBL_MAX_10_EXP__=308"]
+gnu_attributes = ["noreturn", "visibility-internal"]
+gnu_operators = ["__extension__"]
+computed_gotos = ["luaV_execute-jump-table"]
+returns_twice_interfaces = ["_setjmp", "_longjmp"]
+inline_assembly_forms = []
+wide_integer_uses = []
+variable_length_array_objects = []
+statement_expressions = []
+
+[adapter_artifacts]
+retain = [
+    "build.log",
+    "compile-commands.txt",
+    "effective-macros.txt",
+    "elf-dynamic-tags.txt",
+    "elf-headers.txt",
+    "expected-source-inputs.txt",
+    "hosted-probe.txt",
+    "link-driver-identity.txt",
+    "link-driver-macros.txt",
+    "predicate-probe.txt",
+    "capability-inventory.txt",
+    "source-inputs.txt",
+    "version.log",
+    "test.log",
+]
