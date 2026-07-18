@@ -42,7 +42,7 @@ configure_arguments = [
     "--disable-readline",
     "--disable-load-extension",
 ]
-configure_cache = ["ac_cv_func_isnan=no"]
+configure_environment = ["LDFLAGS=-no-pie"]
 required_tools = [
     "awk",
     "bash",
@@ -80,7 +80,7 @@ requires_native_linux_filesystem = true
 pin_rationales = [
     "Release 3.47.0 removed SQLite's remaining long double use by switching that calculation to Dekker's algorithm.",
     "Release 3.47.2 is the final canonical-source release before the configure and Makefile interface migrated from Autoconf to Autosetup in 3.48.0.",
-    "The isnan configure cache decision selects SQLite's binary64 implementation because glibc's type-generic macro references the unavailable long double ABI even for double operands.",
+    "The hosted math wrapper preserves libc declarations while supplying a compiler-compatible binary64 isnan macro, allowing configure to detect the interface without a cache override.",
 ]
 
 [expected_inventory]

@@ -123,6 +123,7 @@ fn emit_inner(
             &mut object_module,
             &mut context.func,
         );
+        let frontend_config = object_module.isa().frontend_config();
         let definition_plan = abi_plan
             .plan()
             .definitions
@@ -139,6 +140,7 @@ fn emit_inner(
             abi_plan,
             definition_plan,
             &references,
+            frontend_config,
             &mut context.func,
         )
         .map_err(|error| error.with_span_if_none(function.span))?;

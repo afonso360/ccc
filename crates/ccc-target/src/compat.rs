@@ -139,11 +139,21 @@ impl CapabilityRegistry {
             "__alignof__",
             "__thread",
             "gnu-declaration-asm-labels",
+            "gnu-function-name-aliases",
+            "gnu-statement-expressions",
         ] {
             registry.insert(
                 CapabilityKind::Extension,
                 name,
                 CapabilityState::Implemented,
+            );
+        }
+        for name in ["__builtin_memcpy", "__builtin_memmove", "__builtin_memset"] {
+            registry.insert_with_rationale(
+                CapabilityKind::Builtin,
+                name,
+                CapabilityState::Implemented,
+                "the frontend enforces the libc memory-operation signature and the backend emits the matching target libcall",
             );
         }
 
@@ -287,6 +297,7 @@ impl CapabilityRegistry {
             "__builtin_clz",
             "__builtin_clzl",
             "__builtin_clzll",
+            "__builtin_ctz",
             "__builtin_ctzll",
             "__builtin_popcount",
             "__builtin_popcountll",
@@ -303,6 +314,12 @@ impl CapabilityRegistry {
             "__builtin_prefetch",
             CapabilityState::BehaviorCompatibleNoOp,
             "the address expression is evaluated exactly once and validated constant hints are discarded without introducing a faulting access",
+        );
+        registry.insert_with_rationale(
+            CapabilityKind::Pragma,
+            "GCC optimize",
+            CapabilityState::BehaviorCompatibleNoOp,
+            "the optimization hint does not alter the C abstract-machine behavior and CCC does not expose per-function optimization controls",
         );
         for name in [
             "__builtin_va_start",
@@ -422,6 +439,8 @@ mod tests {
             "__alignof__",
             "__thread",
             "gnu-declaration-asm-labels",
+            "gnu-function-name-aliases",
+            "gnu-statement-expressions",
         ] {
             assert_eq!(
                 registry.state(CapabilityKind::Extension, name),
@@ -511,9 +530,13 @@ mod tests {
             "__builtin_clz",
             "__builtin_clzl",
             "__builtin_clzll",
+            "__builtin_ctz",
             "__builtin_ctzll",
             "__builtin_popcount",
             "__builtin_popcountll",
+            "__builtin_memcpy",
+            "__builtin_memmove",
+            "__builtin_memset",
             "__builtin_va_start",
             "__builtin_va_arg",
             "__builtin_va_copy",

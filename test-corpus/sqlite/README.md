@@ -46,13 +46,12 @@ manifest even if CCC's driver default changes. The wrapper evaluates all
 the scoped hardware-timing predicate state for each translation in
 `language-modes.txt`.
 
-The adapter pins `ac_cv_func_isnan=no`. A link-only Autoconf probe finds the
-host `isnan` symbol, but glibc exposes the source interface as a type-generic
-macro whose expansion references `__isnanl` even when its operand is `double`.
-That source interface therefore requires an ABI CCC does not advertise. The
-cache decision selects SQLite's own binary64 bit test, which is the intended
-fallback when the host interface is unusable; that capability decision does not
-alter SQLite source.
+Configuration detects `isnan` without a cache override. The compiler's hosted
+`math.h` wrapper delegates declarations and constants to libc, then supplies a
+single-evaluation binary64 classification macro that does not expose an
+unselected `long double` branch. The adapter requires `HAVE_ISNAN` in the
+generated configuration, proving that the normal configure probe selected the
+usable source interface.
 
 ## Verified test-source adjustment
 

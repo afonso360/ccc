@@ -12,7 +12,6 @@ by a host-installed copy.
 | [Redis 8.8.0](redis/README.md)                    | Fetched official core source, audited server/CLI build, exact source adjustments, and focused Unix-socket smoke profile  |
 | [bzip2 1.0.8](bzip2/README.md)                    | Fetched official source and test repository, upstream checks, deterministic round trip, and 440-check extended profile  |
 | [zstd 1.5.7](zstd/README.md)                      | Fetched official source, audited portable build, bounded upstream checks, and deterministic file/stream round trips      |
-| [Csmith 2.4.0](csmith/README.md)                  | Pinned generated programs, strict C11 admission, GCC/Clang consensus, reproducible seeds, and retained failure artifacts  |
 
 [`test-adapters.sh`](test-adapters.sh) runs every shell-only adapter regression,
 including the shared native-GCC identity boundary and removal of ambient GNU

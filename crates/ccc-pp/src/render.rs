@@ -117,6 +117,13 @@ fn render_pragma(pragma: &PragmaEvent) -> String {
                 |option| format!("GCC diagnostic {action} {}", quote_c_string(option)),
             )
         }
+        PragmaEvent::GccOptimize { payload, .. } => {
+            if payload.is_empty() {
+                "GCC optimize".to_owned()
+            } else {
+                format!("GCC optimize {}", render_token_sequence(payload))
+            }
+        }
         PragmaEvent::Pack { payload, .. } => {
             if payload.is_empty() {
                 "pack".to_owned()

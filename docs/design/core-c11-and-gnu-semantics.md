@@ -305,14 +305,14 @@ does not silently discard a payload whose GNU encoding it has not implemented.
 
 The selected integer builtins have exact GNU signatures. Byte-swap takes and
 returns target `uint64_t`, represented as `unsigned long` by the x86-64 GNU
-profile. The `clz` and `popcount` forms take `unsigned
-int`, `clzl` takes `unsigned long`, and the `clzll`, `ctzll`, and `popcountll`
-forms take `unsigned long long`; every count form returns `int`. CCC applies
+profile. The `clz`, `ctz`, and `popcount` forms take `unsigned int`, `clzl`
+takes `unsigned long`, and the `clzll`, `ctzll`, and `popcountll` forms take
+`unsigned long long`; every count form returns `int`. CCC applies
 the ordinary argument conversion and lowers the operation to Cranelift's
 native `bswap`, `clz`, `ctz`, or `popcnt` instruction. A zero input to `clz` or
 `ctz` remains undefined, as in GNU C, rather than acquiring a CCC-specific
 value.
-All seven forms fold valid integer constant-expression operands. A zero
+All eight forms fold valid integer constant-expression operands. A zero
 operand to `clz` or `ctz` remains outside that fold.
 
 The prefetch form accepts one to three arguments. Its address is converted to

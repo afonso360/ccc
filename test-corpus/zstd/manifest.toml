@@ -13,24 +13,18 @@ upstream_license_files = ["LICENSE", "COPYING"]
 fetched_not_vendored = true
 
 source_adjustment_patch = "no-asm-generic-paths.patch"
-source_adjustment_sha256 = "dfbe4f3063bc40ef0a66763f5110f24c666db82ca4aa5ddfdb612788e9c66fee"
+source_adjustment_sha256 = "79f32fd5cf1224566822e2685cbcdad2ed3c92ffee292338a37e54a0303f11ae"
 source_adjustment_hashes = "no-asm-generic-paths.sha256"
-source_adjustment_hashes_sha256 = "9199e41a4c47b9a1f02fb4d117ad41fabbbdba821247e8ded6125b990c0460f4"
-source_adjustment_target_files = 7
-source_adjustment_rationale = "The upstream no-assembly configuration excludes stand-alone assembly but leaves performance-only GNU inline assembly and count-bit builtins selected by compiler identity. The adjustment extends that configuration to the existing generic C fallbacks without changing the compression format, public API, or tested behavior."
-dependency_override = "libc-memory-deps.h"
-dependency_override_sha256 = "e860784721b0c5823d62b3a37e77b73ffe046f65473fda4dc70e7a9b58cd062b"
-dependency_override_contract = "ZSTD_DEPS_COMMON"
-portable_assert_header = "compat/include/assert.h"
-portable_assert_header_sha256 = "26c844a36100d661a128ea469bbcf62f03a041506a67d3ae92638dcb615b25f0"
-portable_assert_contract = "glibc-standard-c-macro"
+source_adjustment_hashes_sha256 = "2aade5f81a82661bb3789283a45d8e7203dda08129572e44fd410ec3302f0e15"
+source_adjustment_target_files = 6
+source_adjustment_rationale = "The upstream no-assembly configuration excludes stand-alone assembly but leaves performance-only GNU inline assembly selected by compiler identity. The adjustment extends that configuration to the existing generic C fallbacks without changing the compression format, public API, or tested behavior."
 
 target = "x86_64-unknown-linux-gnu"
 language_mode = "gnu11"
 gnu_compatibility_tuple = "4.2.1"
 build_interface = "upstream-make"
 build_target = "check"
-build_command = "make check CC=<ccc-adapter> DEBUGLEVEL=2 ZSTD_NO_ASM=1 MEM_FORCE_MEMORY_ACCESS=0 XXH_FORCE_MEMORY_ACCESS=0 MOREFLAGS='-I<compat-include> -include <libc-memory-deps.h>' HAVE_PTHREAD=1 HAVE_ZLIB=0 HAVE_LZMA=0 HAVE_LZ4=0"
+build_command = "make check CC=<ccc-adapter> DEBUGLEVEL=2 ZSTD_NO_ASM=1 MEM_FORCE_MEMORY_ACCESS=0 XXH_FORCE_MEMORY_ACCESS=0 HAVE_PTHREAD=1 HAVE_ZLIB=0 HAVE_LZMA=0 HAVE_LZ4=0"
 test_profile = "upstream-quick-smoke"
 test_command = "make check"
 success_marker = "All tests completed successfully"
@@ -87,16 +81,21 @@ requires_non_root_user = true
 requires_native_linux_filesystem = true
 
 [expected_inventory]
-selected_builtins = ["__builtin_expect"]
-advertised_but_unselected_builtins = [
-    "__builtin_bswap64",
+selected_builtins = [
     "__builtin_clz",
     "__builtin_clzll",
+    "__builtin_ctz",
     "__builtin_ctzll",
+    "__builtin_expect",
+    "__builtin_memcpy",
+    "__builtin_memmove",
+    "__builtin_memset",
     "__builtin_prefetch",
 ]
-gnu_identity_selected_but_unavailable_builtins = ["__builtin_ctz"]
-generic_count_bit_operations = ["clz", "clzll", "ctz", "ctzll"]
+advertised_but_unselected_builtins = [
+    "__builtin_bswap64",
+]
+native_count_bit_operations = ["clz", "clzll", "ctz", "ctzll"]
 source_predicates_exclude_unavailable_builtins = [
     "__builtin_altivec_vmuleuw",
     "__builtin_altivec_vmulouw",
@@ -105,11 +104,6 @@ source_predicates_exclude_unavailable_builtins = [
     "__builtin_rotateleft32",
     "__builtin_rotateleft64",
     "__builtin_unreachable",
-]
-dependency_builtin_fallbacks = [
-    "__builtin_memcpy-to-memcpy",
-    "__builtin_memmove-to-memmove",
-    "__builtin_memset-to-memset",
 ]
 gnu_attributes = [
     "aligned",
@@ -140,8 +134,6 @@ retain = [
     "generated-probe-hashes.txt",
     "link-driver-identity.txt",
     "link-driver-macros.txt",
-    "dependency-override.h",
-    "portable-assert.h",
     "predicate-probe.txt",
     "roundtrip-compressed.zst",
     "roundtrip-input.txt",

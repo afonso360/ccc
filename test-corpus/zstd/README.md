@@ -26,13 +26,14 @@ links are part of the expected command multiset. The temporary probe programs
 are not part of the retained product binaries.
 
 The selected configuration enables pthread support and legacy decoding while
-disabling optional zlib, liblzma, and liblz4 format wrappers. It also sets
-zstd's `MEM_FORCE_MEMORY_ACCESS=0` and embedded xxHash's
+disabling optional zlib, liblzma, and liblz4 format wrappers. It sets zstd's
+`MEM_FORCE_MEMORY_ACCESS=0` and embedded xxHash's
 `XXH_FORCE_MEMORY_ACCESS=0`, selecting their upstream portable `memcpy`
-implementations for unaligned loads and stores. This avoids claiming support
-for GNU typedef attributes that lower scalar alignment, whose semantics cannot
-be approximated by ignoring the attribute. These controls do not change the
-source set or file format. The configuration makes the tested feature set
+implementations for unaligned loads and stores. Plain alignment-bearing scalar
+typedefs remain a tracked type-system gap: treating them as ordinary integers
+would give incorrect `_Alignof`, array stride, and object layout. These
+upstream controls avoid that approximation without changing source or format. The
+configuration makes the tested feature set
 independent of development libraries installed on the host. Ambient GNU Make
 injection, build flags, platform overrides, test binary overrides, and helper
 command overrides are cleared. The debug level, C locale, UTC timezone, and
@@ -49,58 +50,39 @@ binaries and rejects dynamic text relocations.
 
 Upstream's `ZSTD_NO_ASM=1` setting removes the stand-alone amd64 assembly
 translation unit and defines `ZSTD_DISABLE_ASM`, but zstd 1.5.7 still selects a
-small set of GNU inline-assembly performance paths and count-bit builtins from
-the compiler identity. CCC intentionally advertises GNU 4.2.1 compatibility,
-which also selects those paths, while inline assembly and the `clz`/`ctz`
-builtin family are not a single implemented surface. CCC advertises exact
-implementations of `__builtin_clz`, `__builtin_clzll`, and `__builtin_ctzll`,
-but not the `__builtin_ctz` path that zstd's GNU-version predicate also selects.
-The adjustment therefore keeps the complete count-bit group on zstd's coherent
-generic C implementation instead of mixing registry-backed and unavailable
-operations.
+small set of GNU inline-assembly performance paths from the compiler identity.
+CCC intentionally advertises GNU 4.2.1 compatibility, which also selects those
+paths. The complete selected count-bit group is implemented directly through
+`__builtin_clz`, `__builtin_clzll`, `__builtin_ctz`, and `__builtin_ctzll`, so
+the upstream builtin path remains unchanged.
 
-The checked source adjustment extends `ZSTD_DISABLE_ASM` guards to those
-performance-only paths. The existing generic C count-bit functions,
-CPU-feature fallback, conditional expression, and unaligned loops remain the
-implementation. `NO_PREFETCH`, an upstream build switch, selects the existing
-no-prefetch path. The adjustment does not undefine `__GNUC__`, remove a source
-file, alter the public API, or change the compressed format. Its patch, complete
+The checked source adjustment extends `ZSTD_DISABLE_ASM` guards only to those
+performance-only inline-assembly paths. The existing CPU-feature fallback,
+conditional expression, and unaligned loops remain the implementation. The
+upstream prefetch path uses CCC's validated nonfaulting builtin. The adjustment
+does not undefine `__GNUC__`, remove a source file, alter the public API, or
+change the compressed format. Its patch, complete
 target preimage and postimage hashes, exact application log, and rationale are
 retained with each run. Any release drift or non-exact hunk match fails before
 compilation.
 
 The capability probe requires CCC's own GNU 4.2.1 and LP64 x86-64 identity,
-the exact relevant builtin-registry profile, the generic count-bit and `memcpy`
-unaligned-access paths, and disabled assembly and prefetch paths. CCC advertises
-`__builtin_bswap64` and a behavior-compatible no-op `__builtin_prefetch`, but
-zstd's version predicates exclude the former and the pinned `NO_PREFETCH`
-switch excludes the latter. Build-command auditing requires those decisions on
-every C translation.
+the exact relevant builtin-registry profile, the native count-bit and `memcpy`
+unaligned-access paths, and disabled assembly. CCC advertises
+`__builtin_bswap64` and a behavior-compatible no-op `__builtin_prefetch`;
+zstd's version predicates exclude the former and use the latter. Build-command
+auditing requires the no-assembly decision on every C translation.
 
-Zstd's dependency header independently selects `__builtin_memcpy`,
-`__builtin_memmove`, and `__builtin_memset` from the legacy GNU version tuple.
-CCC does not advertise those builtin keys. Upstream documents
-`zstd_deps.h` as replaceable for libc integrations, so the adapter uses the
-supported `ZSTD_DEPS_COMMON` boundary: an exact-hash forced header maps the
-three operations to their declared libc functions. The header is applied to
-every CCC translation, removed before native linking, and retained as
-`dependency-override.h`. This preserves the advertised compiler identity and
-does not pretend that unavailable builtins exist.
+Zstd's dependency header selects `__builtin_memcpy`, `__builtin_memmove`, and
+`__builtin_memset` from the legacy GNU version tuple. CCC implements all three
+with their libc-compatible signatures and target libcalls, so the unmodified
+header is used without a forced dependency override.
 
 Debian glibc selects a GNU statement-expression implementation of the standard
-`assert` macro from the same legacy GNU identity, even though zstd itself does
-not use statement expressions. A single exact-hash compatibility `assert.h`
-first includes glibc's `features.h` in normal GNU mode, preserving `_GNU_SOURCE`
-and the resulting GNU, miscellaneous, and X/Open feature selections. It then
-temporarily enables strict mode only while including the next system
-`assert.h`, and immediately restores GNU mode. Its conventional wrapper guard
-preserves glibc's standard-C macro when zstd includes `assert.h` again. The
-dependency header pre-includes this wrapper, assertions remain enabled, and a
-standard `__func__` supplies the diagnostic function name in place of glibc's
-GNU `__PRETTY_FUNCTION__`. A capability probe requires the portable macro,
-retained GNU feature macros, and absence of leaked strict mode. The
-compatibility include path is required on every CCC translation, removed before
-native linking, and retained as `portable-assert.h`.
+`assert` macro from the same identity. CCC implements that expression form and
+the selected `__PRETTY_FUNCTION__` identifier directly. Assertions therefore
+remain enabled through the unmodified system header without a compatibility
+include directory or forced header.
 
 ## Bounded upstream tests
 

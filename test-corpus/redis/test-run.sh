@@ -26,7 +26,6 @@ set -e
 [[ "$unknown_option_output" == *"usage:"* ]]
 
 "$script_directory/test-ccc-cc.sh"
-"$script_directory/test-hosted-assert.sh"
 "$script_directory/test-source-adjustment.sh"
 
 echo "Redis runner tests passed"

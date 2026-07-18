@@ -32,28 +32,22 @@ bundled_data_type_modules = false
 link_time_optimization = false
 c11_atomic_make_probe = false
 ndebug = false
-assertions = "enabled-with-portable-hosted-header"
-portable_assert_header = "compat/include/assert.h"
-portable_assert_header_sha256 = "f162e79da48d69e56378d7d720d3ab94a4a426da436c8f5880115a9ac27036b3"
-portable_assert_contract = "glibc-standard-c-macro"
+assertions = "enabled-with-system-hosted-header"
 selected_atomic_backend = "legacy-sync-builtins"
 
 source_adjustment_patch = "source-adjustment.patch"
-source_adjustment_sha256 = "2d474385c7be86e4ed9722106d334d29d2b8f1b1c38d5efb134eb89a2cec22d6"
+source_adjustment_sha256 = "36e91cff18d151d6e9be236554f66aafef01b47ff5fd302e43644b176a84087e"
 source_adjustment_hashes = "source-adjustment-hashes.txt"
-source_adjustment_hashes_sha256 = "a9d2095781efabc511147d2a6b9d6919611edd5801b795193fb74d00d803f41d"
-source_adjustment_targets = 6
-source_adjustment_statement_expressions_removed = 1
+source_adjustment_hashes_sha256 = "cb0e562e336e04a62b1183e44f78ae79f729f8e19ab7136760ff4f7ab154d7a5"
+source_adjustment_targets = 2
+source_adjustment_statement_expressions_removed = 0
 source_adjustment_inline_assembly_statements_removed = 6
 source_adjustment_xxhash_ccc_noop_definitions = 1
 source_adjustment_xxhash_guard_call_sites = 9
 source_adjustment_xxhash_clang_neon_guard_call_sites = 3
 source_adjustment_xxhash_selected_guard_expansions = 1
-source_adjustment_classification_calls_rewritten = 7
-source_adjustment_hiredis_classification_calls_rewritten = 1
-source_adjustment_cjson_classification_calls_rewritten = 5
-source_adjustment_cmsgpack_classification_calls_rewritten = 1
-source_adjustment_rationale = "replace one expression-valued CAS wrapper and bundled histogram x86 assembly with equivalent sequentially consistent legacy atomic builtins, express seven hiredis and bundled Lua binary64 classification calls without glibc's long-double generic arms, and select a behavior-compatible standard-C no-op for xxHash's compiler guard under CCC instead of its GNU inline-assembly guard"
+source_adjustment_classification_calls_rewritten = 0
+source_adjustment_rationale = "replace bundled histogram x86 assembly with equivalent sequentially consistent legacy atomic builtins and select a behavior-compatible standard-C no-op for xxHash's compiler guard under CCC instead of its GNU inline-assembly guard"
 
 test_profile = "focused-server-cli-smoke"
 test_transport = "private-unix-domain-socket"
@@ -114,9 +108,9 @@ selected_builtins = [
     "__sync_val_compare_and_swap",
 ]
 gnu_attributes = ["aligned", "deprecated-declarator", "format", "noinline", "packed"]
-gnu_operators = ["compound-literal"]
-statement_expression_uses = []
-adjusted_statement_expression_uses = ["atomicCompareExchange-sync-cas"]
+gnu_operators = ["compound-literal", "statement-expression"]
+statement_expression_uses = ["atomicCompareExchange-sync-cas"]
+adjusted_statement_expression_uses = []
 inline_assembly_forms = []
 adjusted_inline_assembly_forms = ["hdr-histogram-x86-atomic-operations"]
 unselected_builtin_families = ["__atomic", "__builtin_cpu_supports"]
@@ -161,7 +155,6 @@ retain = [
     "link-driver-identity.txt",
     "link-driver-macros.txt",
     "patch-identity.txt",
-    "portable-assert.h",
     "predicate-probe.txt",
     "preprocessed-source-inputs.txt",
     "server.log",

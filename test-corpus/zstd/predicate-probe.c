@@ -1,3 +1,10 @@
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
+#include <features.h>
+#include <assert.h>
+
 #if __GNUC__ == 4 && __GNUC_MINOR__ == 2 && __GNUC_PATCHLEVEL__ == 1
 gnu_compatibility_tuple=4.2.1
 #else
@@ -17,8 +24,8 @@ selected_builtin=none
 #endif
 
 #if __has_builtin(__builtin_clz) && __has_builtin(__builtin_clzll) \
-    && !__has_builtin(__builtin_ctz) && __has_builtin(__builtin_ctzll)
-count_bit_builtin_registry=clz-clzll-ctzll-without-ctz
+    && __has_builtin(__builtin_ctz) && __has_builtin(__builtin_ctzll)
+count_bit_builtin_registry=clz-clzll-ctz-ctzll
 #else
 count_bit_builtin_registry=unexpected
 #endif
@@ -38,44 +45,39 @@ additional_builtin_registry=unexpected
 
 #if defined(ZSTD_DISABLE_ASM)
 selected_assembly=disabled
-selected_count_bits=generic-c
 #else
 selected_assembly=enabled
+#endif
 selected_count_bits=gnu-builtins
-#endif
 
-#if defined(NO_PREFETCH)
-selected_prefetch=disabled
-#else
-selected_prefetch=compiler-specific
-#endif
+selected_prefetch=compiler-builtin
 
 #if MEM_FORCE_MEMORY_ACCESS == 0
 selected_zstd_unaligned_access=memcpy
 #else
-selected_zstd_unaligned_access=compiler-specific
+selected_zstd_unaligned_access=unexpected
 #endif
 
 #if XXH_FORCE_MEMORY_ACCESS == 0
 selected_xxhash_unaligned_access=memcpy
 #else
-selected_xxhash_unaligned_access=compiler-specific
+selected_xxhash_unaligned_access=unexpected
 #endif
 
-#if CCC_ZSTD_LIBC_MEMORY_DEPS == 1
-selected_memory_dependencies=libc
+#if __has_builtin(__builtin_memcpy) && __has_builtin(__builtin_memmove) \
+    && __has_builtin(__builtin_memset)
+selected_memory_dependencies=compiler-builtins
 #else
 selected_memory_dependencies=unexpected
 #endif
 
-#if CCC_ZSTD_PORTABLE_ASSERT == 1 && !defined(__STRICT_ANSI__)
-selected_assert=standard-c-macro-gnu-mode-restored
+#if !defined(__STRICT_ANSI__) && defined(__ASSERT_FUNCTION)
+selected_assert=system-gnu-macro
 #else
 selected_assert=unexpected
 #endif
 
-#if CCC_ZSTD_GNU_FEATURES_PRIMED == 1 && defined(_GNU_SOURCE) \
-    && defined(__USE_GNU) && defined(__USE_MISC) \
+#if defined(_GNU_SOURCE) && defined(__USE_GNU) && defined(__USE_MISC) \
     && defined(__USE_XOPEN2K8) && !defined(__STRICT_ANSI__)
 selected_host_features=glibc-gnu
 #else

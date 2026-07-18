@@ -51,20 +51,12 @@ optimization profile.
 
 ## Hosted assertions
 
-Assertions remain enabled. Debian glibc normally selects a GNU
-statement-expression form of `assert` from CCC's advertised GNU identity. A
-single exact-hash compatibility `assert.h` first establishes glibc's normal
-GNU feature profile, temporarily selects the standard-C assertion macro while
-including the next system header, restores GNU mode, and supplies the standard
-C `__func__` identifier for diagnostic function names. Its include path is
-required on every CCC translation and removed from native links. The retained
-capability probe verifies the wrapper marker, restored GNU mode, and effective
-`__ASSERT_FUNCTION` definition.
-
-This hosted-header boundary does not modify the Redis source tree. The
-standard-C hosted assertion macro avoids glibc's GNU statement expression;
-Redis's separate expression-valued atomic macro is handled by the bounded
-source adjustment below because that GNU construct is not yet implemented.
+Assertions remain enabled through the target's unmodified hosted header.
+CCC implements glibc's selected GNU statement-expression macro and its
+`__PRETTY_FUNCTION__` diagnostic identifier directly, so Redis needs no
+compatibility include directory or forced assertion header. The retained
+capability probe verifies that normal GNU header mode and the system assertion
+path remain selected.
 
 ## Selected compiler surface
 
@@ -111,29 +103,17 @@ CCC.
 
 ## Bounded source adjustment
 
-One checked patch adjusts six files in the extracted disposable tree. The
+One checked patch adjusts two files in the extracted disposable tree. The
 patch and its preimage/postimage hash list are themselves pinned by SHA-256.
 Application requires GNU patch, zero fuzz, and no offset; every resulting file
 must match its recorded postimage, and a second application must fail.
 
-The six adjustments are deliberately narrow:
+The two adjustments are deliberately narrow:
 
-- Redis's one expression-valued peak-memory CAS becomes a standard-C helper
-  around `__sync_val_compare_and_swap`. Success leaves the expected value
-  unchanged; failure updates it with the observed value before the caller
-  retries, preserving the upstream strong-CAS loop behavior.
 - HDR Histogram's six x86 atomic assembly statements become the selected
   legacy sync builtins. CCC's contract gives these operations sequentially
   consistent ordering, which is at least as strong as the required load,
   store, exchange, add, and compare/exchange behavior.
-- hiredis's one `isfinite(d)` call becomes a `DBL_MAX` binary64 range check.
-  It rejects infinities and NaNs while accepting every finite `double`,
-  without instantiating glibc's unsupported long-double generic arm.
-- Redis's bundled cjson extension replaces five calls: two `isinf(num)` and
-  three `isnan(num)` invocations become binary64 helpers.
-- Redis's bundled cmsgpack extension replaces one `isinf(x)` invocation with
-  the equivalent binary64 helper while preserving its original false result
-  for NaN.
 - xxHash's compiler guard normally selects an empty GNU inline-assembly
   statement from the advertised compatibility tuple. CCC does not implement
   that source form or perform the vectorization the guard inhibits, so the
@@ -143,15 +123,15 @@ The six adjustments are deliberately narrow:
   selection remain unchanged.
 
 The runner records exact semantic occurrence counts after patching. In
-particular, it requires the upstream statement-expression CAS call to be
-absent and exactly two references to its standard-C helper to remain, all six
-HDR assembly statements to be absent, the xxHash header to retain its nine
+particular, it requires the upstream statement-expression CAS call to remain,
+all six HDR assembly statements to be absent, the xxHash header to retain its nine
 ordinary and three Clang-NEON guard call sites, exactly one ordinary guard to
 expand to the CCC no-op, no guard identifier to remain unexpanded, and exactly
-seven hosted
-math-classification calls to use the binary64 forms: one in hiredis, five in
-cjson, and one in cmsgpack. The Solaris-only fallback macro definition left in
-cjson is neither selected nor counted as a call.
+seven upstream math-classification calls to remain: one in hiredis, five in
+cjson, and one in cmsgpack. CCC's hosted `math.h` wrapper supplies
+single-evaluation binary64-compatible definitions without changing these
+sources or adding a corpus-specific include path. The Solaris-only fallback
+macro definition left in cjson is neither selected nor counted as a call.
 
 ## Execution validation
 

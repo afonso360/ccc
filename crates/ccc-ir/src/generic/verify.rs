@@ -1317,6 +1317,46 @@ impl FunctionVerifier<'_> {
                     ));
                 }
             }
+            FullInstructionKind::MemoryCopy {
+                destination,
+                source,
+                length,
+                ..
+            } => {
+                require_no_result(result, instruction, "memory copy")?;
+                let destination = pointer_pointee(types, self.value_type(*destination)?.ty)
+                    .ok_or_else(|| IrError::verify("memory copy destination is not a pointer"))?;
+                let source = pointer_pointee(types, self.value_type(*source)?.ty)
+                    .ok_or_else(|| IrError::verify("memory copy source is not a pointer"))?;
+                if destination.ty != TypeId::VOID || source.ty != TypeId::VOID {
+                    return Err(IrError::verify(
+                        "memory copy operands are not canonical void pointers",
+                    ));
+                }
+                if !types.is_integer(self.value_type(*length)?.ty) {
+                    return Err(IrError::verify("memory copy length is not an integer"));
+                }
+            }
+            FullInstructionKind::MemorySet {
+                destination,
+                value,
+                length,
+            } => {
+                require_no_result(result, instruction, "memory set")?;
+                let destination = pointer_pointee(types, self.value_type(*destination)?.ty)
+                    .ok_or_else(|| IrError::verify("memory set destination is not a pointer"))?;
+                if destination.ty != TypeId::VOID {
+                    return Err(IrError::verify(
+                        "memory set destination is not a canonical void pointer",
+                    ));
+                }
+                if self.value_type(*value)?.ty != TypeId::INT {
+                    return Err(IrError::verify("memory set value does not have type int"));
+                }
+                if !types.is_integer(self.value_type(*length)?.ty) {
+                    return Err(IrError::verify("memory set length is not an integer"));
+                }
+            }
             FullInstructionKind::DirectCall {
                 function,
                 signature,
@@ -1951,6 +1991,17 @@ fn instruction_operands(kind: &FullInstructionKind) -> Vec<ValueId> {
             source,
             ..
         } => vec![*destination, *source],
+        FullInstructionKind::MemoryCopy {
+            destination,
+            source,
+            length,
+            ..
+        } => vec![*destination, *source, *length],
+        FullInstructionKind::MemorySet {
+            destination,
+            value,
+            length,
+        } => vec![*destination, *value, *length],
         FullInstructionKind::Convert { operand, .. }
         | FullInstructionKind::Unary { operand, .. }
         | FullInstructionKind::IntegerIntrinsic { operand, .. } => vec![*operand],
@@ -2126,7 +2177,9 @@ fn integer_intrinsic_signature(operation: super::IntegerIntrinsicOperation) -> (
     use super::IntegerIntrinsicOperation as O;
     match operation {
         O::ByteSwap64 => (TypeId::UNSIGNED_LONG, TypeId::UNSIGNED_LONG),
-        O::CountLeadingZerosInt | O::PopulationCountInt => (TypeId::UNSIGNED_INT, TypeId::INT),
+        O::CountLeadingZerosInt | O::PopulationCountInt | O::CountTrailingZerosInt => {
+            (TypeId::UNSIGNED_INT, TypeId::INT)
+        }
         O::CountLeadingZerosLong => (TypeId::UNSIGNED_LONG, TypeId::INT),
         O::CountLeadingZerosLongLong
         | O::CountTrailingZerosLongLong

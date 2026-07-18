@@ -28,15 +28,7 @@ manifest_integer() {
 [[ "$(grep -Evc '^[[:space:]]*(#|$)' \
   "$script_directory/$(manifest_string source_adjustment_hashes)")" == \
   "$(manifest_integer source_adjustment_targets)" ]]
-[[ "$(redis_sha256_file "$script_directory/$(manifest_string portable_assert_header)")" == \
-  "$(manifest_string portable_assert_header_sha256)" ]]
-classification_total=$((
-  $(manifest_integer source_adjustment_hiredis_classification_calls_rewritten) +
-  $(manifest_integer source_adjustment_cjson_classification_calls_rewritten) +
-  $(manifest_integer source_adjustment_cmsgpack_classification_calls_rewritten)
-))
-[[ "$classification_total" == \
-  "$(manifest_integer source_adjustment_classification_calls_rewritten)" ]]
+[[ "$(manifest_integer source_adjustment_classification_calls_rewritten)" == 0 ]]
 
 source_directory="$temporary_directory/source"
 expected_directory="$temporary_directory/expected"

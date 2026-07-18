@@ -7,10 +7,8 @@
 
 gnu_compatibility_tuple=4.2.1
 
-#if defined(CCC_REDIS_PORTABLE_ASSERT) && \
-    !defined(__STRICT_ANSI__) && \
-    defined(__ASSERT_FUNCTION)
-selected_assert=standard-c-macro-gnu-mode-restored
+#if !defined(__STRICT_ANSI__) && defined(__ASSERT_FUNCTION)
+selected_assert=system-gnu-macro
 #else
 selected_assert=unexpected
 #endif

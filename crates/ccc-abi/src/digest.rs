@@ -739,56 +739,27 @@ fn encode_instruction(encoder: &mut Encoder, instruction: &gir::FullInstructionK
             encoder.bool(*write);
             encoder.tag(*locality);
         }
-        I::RuntimeSizedAllocate {
-            storage,
-            extents,
-            element,
-            constant_factor,
-            requested_alignment,
+        I::MemoryCopy {
+            destination,
+            source,
+            length,
+            overlap,
         } => {
-            // Append-only instruction tag: existing ABI digests retain their
-            // byte-for-byte encoding when runtime-sized storage is unused.
             encoder.tag(32);
-            encoder.u32(storage.0);
-            encoder.len(extents.len());
-            for extent in extents {
-                encoder.u32(extent.0);
-            }
-            encoder.qualified(*element);
-            encoder.u64(*constant_factor);
-            encoder.option_u64(*requested_alignment);
+            encoder.u32(destination.0);
+            encoder.u32(source.0);
+            encoder.u32(length.0);
+            encoder.bool(*overlap);
         }
-        I::RuntimePointerOffset {
-            base,
-            index,
-            element,
-            extents,
-            subtract,
+        I::MemorySet {
+            destination,
+            value,
+            length,
         } => {
             encoder.tag(33);
-            encoder.u32(base.0);
-            encoder.u32(index.0);
-            encoder.qualified(*element);
-            encoder.len(extents.len());
-            for extent in extents {
-                encoder.u32(extent.0);
-            }
-            encoder.bool(*subtract);
-        }
-        I::RuntimePointerDifference {
-            left,
-            right,
-            element,
-            extents,
-        } => {
-            encoder.tag(34);
-            encoder.u32(left.0);
-            encoder.u32(right.0);
-            encoder.qualified(*element);
-            encoder.len(extents.len());
-            for extent in extents {
-                encoder.u32(extent.0);
-            }
+            encoder.u32(destination.0);
+            encoder.u32(value.0);
+            encoder.u32(length.0);
         }
     }
 }

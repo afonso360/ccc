@@ -21,7 +21,7 @@ Headers are classified rather than all being treated as complete CCC replacement
   type; small standard spelling headers such as `stdbool.h`, `stdalign.h`, and
   `stdnoreturn.h` where no libc ABI is involved.
 - **Target-derived compiler headers:** `stddef.h`, `float.h`, and `stdatomic.h`, generated or selected from the effective configuration and backend/runtime capability table.
-- **Hosted wrappers:** `stdint.h`, `limits.h`, and any platform header for which libc owns public typedefs, feature-test integration, or ABI declarations. A wrapper supplies compiler builtins and uses `#include_next` when the resolved libc header is authoritative.
+- **Hosted wrappers:** `math.h`, `stdint.h`, `limits.h`, and any platform header for which libc owns public typedefs, feature-test integration, or ABI declarations. A wrapper supplies compiler builtins and uses `#include_next` when the resolved libc header is authoritative. The shipped `math.h` wrapper retains libc declarations and constants while replacing only the `float`/`double` classification macros that would otherwise expose unselected `long double` branches.
 
 Every wrapper is tested against each supported libc. CCC does not place a generic header ahead of the system tree if doing so changes libc typedefs or feature-test behavior. Freestanding mode uses self-contained target-derived variants and does not pretend hosted libc declarations are available.
 

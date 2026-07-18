@@ -22,6 +22,5 @@ set -e
 [[ "$unknown_output" == *"usage:"* ]]
 
 "$script_directory/test-source-adjustment.sh"
-"$script_directory/test-hosted-assert.sh"
 
 echo "zstd runner tests passed"
