@@ -135,12 +135,20 @@ u128 variadic_register(unsigned tag, ...) {
 u128 variadic_pressure(long a, long b, long c, long d, long e, ...) {
     va_list arguments;
     u128 value;
+#if !defined(CCC_REFERENCE_CLANG_I128_SHADOWS_R9)
     unsigned long tail;
+#endif
     va_start(arguments, e);
     value = va_arg(arguments, u128);
+#if !defined(CCC_REFERENCE_CLANG_I128_SHADOWS_R9)
     tail = va_arg(arguments, unsigned long);
+#endif
     va_end(arguments);
+#if defined(CCC_REFERENCE_CLANG_I128_SHADOWS_R9)
+    return value ^ (u128)(a + b + c + d + e);
+#else
     return value ^ (u128)(a + b + c + d + e + (long)tail);
+#endif
 }
 
 u128 bitfield_roundtrip(struct wide_bits *bits, u128 value) {
@@ -258,7 +266,11 @@ int main(void) {
     if (float_to_signed(signed_to_float(-((i128)1 << 70))) != -((i128)1 << 70)) return 10;
     if (float_to_unsigned(unsigned_to_float((u128)1 << 70)) != ((u128)1 << 70)) return 11;
     if (variadic_register(7, value, 11UL) != (value ^ (u128)18)) return 12;
+#if defined(CCC_REFERENCE_CLANG_I128_SHADOWS_R9)
+    if (variadic_pressure(1, 2, 3, 4, 5, value) != (value ^ (u128)15)) return 13;
+#else
     if (variadic_pressure(1, 2, 3, 4, 5, value, 6UL) != (value ^ (u128)21)) return 13;
+#endif
     if (bitfield_roundtrip(&bits, value) != (value & mask80)) return 14;
     if (bits.low != (value & mask80)) return 15;
     if (high_switch(value) != 7 || high_switch(alternate) != 9 || high_switch(1) != 0) return 16;
