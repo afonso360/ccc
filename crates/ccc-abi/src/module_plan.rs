@@ -17,7 +17,21 @@ pub fn plan_module(
     module: &gir::FullModule,
     config: &EffectiveCompilationConfig,
 ) -> Result<ModuleAbiPlan, AbiError> {
-    crate::sysv_amd64::validate_target(config)?;
+    crate::validate_target(config)?;
+    if !config.target.abi.supports_tls_codegen()
+        && module.globals.iter().any(|global| {
+            global.duration == ccc_sema::generic::StorageDuration::Thread
+                || global.emission.tls.is_some()
+        })
+    {
+        return Err(AbiError::new(
+            "CCC3522",
+            format!(
+                "thread-local storage has no enabled object and link contract for target ABI `{}`",
+                config.target.abi.name()
+            ),
+        ));
+    }
     let config_key = abi_config_key(config)?;
     let ir_shape_digest = ir_shape_digest(module, &config_key)?;
     let translation_unit_digest = translation_unit_digest(module, &config_key, ir_shape_digest);
@@ -175,7 +189,13 @@ pub fn plan_module(
             }
         }
     }
-    let artifacts = plan_artifacts(module, &definitions, &calls, translation_unit_digest)?;
+    let artifacts = plan_artifacts(
+        module,
+        &definitions,
+        &calls,
+        translation_unit_digest,
+        config.target.abi,
+    )?;
     Ok(ModuleAbiPlan {
         config_key,
         ir_shape_digest,
@@ -195,6 +215,7 @@ fn plan_artifacts(
         CallPlan,
     >,
     translation_unit_digest: crate::TranslationUnitDigest,
+    abi_identity: ccc_target::AbiIdentity,
 ) -> Result<BridgeArtifactPlan, AbiError> {
     let call_sites = calls
         .iter()
@@ -210,7 +231,11 @@ fn plan_artifacts(
             None,
         ),
         call_sites,
-        frame_version: 1,
+        frame_version: if abi_identity == ccc_target::AbiIdentity::SysvAmd64Lp64 {
+            1
+        } else {
+            2
+        },
     });
 
     let mut variadic_entries = std::collections::BTreeMap::new();
@@ -255,8 +280,16 @@ fn plan_artifacts(
                     *function,
                     None,
                 ),
-                frame_version: 1,
-                va_state_version: 1,
+                frame_version: if abi_identity == ccc_target::AbiIdentity::SysvAmd64Lp64 {
+                    1
+                } else {
+                    2
+                },
+                va_state_version: if abi_identity == ccc_target::AbiIdentity::SysvAmd64Lp64 {
+                    1
+                } else {
+                    2
+                },
             },
         );
     }
@@ -351,7 +384,8 @@ fn plan_artifacts(
             generated_assembly_units,
             requires_assembler: needs_packaging,
             requires_relocatable_link: needs_packaging,
-            requires_object_copier: needs_packaging,
+            requires_object_copier: needs_packaging
+                && abi_identity != ccc_target::AbiIdentity::DarwinArm64,
             exact_localization_symbols,
         },
     })
@@ -420,6 +454,12 @@ pub fn dump_module_plan(verified: VerifiedModuleAbiPlan<'_>) -> String {
     let mut output = String::new();
     writeln!(output, "abi-plan schema={}", plan.config_key.schema).unwrap();
     writeln!(output, "target={}", plan.config_key.target_triple).unwrap();
+    writeln!(
+        output,
+        "abi-identity={}",
+        plan.config_key.abi_identity.name()
+    )
+    .unwrap();
     writeln!(output, "data-layout={}", plan.config_key.data_layout).unwrap();
     writeln!(
         output,
@@ -439,17 +479,46 @@ pub fn dump_module_plan(verified: VerifiedModuleAbiPlan<'_>) -> String {
         plan.config_key.classifier_revision
     )
     .unwrap();
-    writeln!(output, "psabi-commit={}", plan.config_key.psabi_commit).unwrap();
     writeln!(
         output,
-        "psabi-source-sha256={}",
-        plan.config_key.psabi_source_sha256
+        "specification-revision={}",
+        plan.config_key.specification_revision
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "specification-source-sha256={}",
+        plan.config_key.specification_source_sha256
     )
     .unwrap();
     writeln!(
         output,
         "backend-profile={}",
         plan.config_key.backend_profile
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "normalized-target-arch={}",
+        plan.config_key.normalized_target_arch
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "normalized-target-abi={}",
+        plan.config_key.normalized_target_abi
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "normalized-target-cpu={}",
+        plan.config_key.normalized_target_cpu
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "normalized-deployment-target={}",
+        plan.config_key.normalized_deployment_target
     )
     .unwrap();
     writeln!(output, "ir-shape-sha256={}", plan.ir_shape_digest).unwrap();
@@ -684,6 +753,9 @@ fn dump_boundary(output: &mut String, boundary: &BoundaryPlan, indent: &str) {
                             .find_map(|index| {
                                 match native.clif_parameters[*index as usize].purpose {
                                     NativePurpose::StructArgument(size) => Some(size),
+                                    NativePurpose::IndirectArgument => {
+                                        u32::try_from(parameter.classified.size).ok()
+                                    }
                                     _ => None,
                                 }
                             })
@@ -768,7 +840,8 @@ fn dump_boundary(output: &mut String, boundary: &BoundaryPlan, indent: &str) {
         BoundaryPlan::Bridge(bridge) => {
             writeln!(
                 output,
-                "{indent}transport=bridge kind={} stack-size={} overflow-arg-offset={} gp-used={} xmm-used={} al={} hidden-return={}",
+                "{indent}transport=bridge abi={} kind={} stack-size={} overflow-arg-offset={} gp-used={} xmm-used={} al={} hidden-return={}",
+                bridge.abi_identity.name(),
                 match bridge.kind {
                     crate::BridgeKind::UnprototypedCall => "unprototyped-call",
                     crate::BridgeKind::VariadicCall => "variadic-call",
@@ -797,7 +870,7 @@ fn dump_boundary(output: &mut String, boundary: &BoundaryPlan, indent: &str) {
             for piece in &bridge.parameter_pieces {
                 writeln!(
                     output,
-                    "{indent}parameter-piece source={} index={} class={} offset={} valid={} extension={} location={}",
+                    "{indent}parameter-piece source={} index={} class={} offset={} valid={} extension={} indirect={} location={}",
                     piece
                         .source_index
                         .map_or_else(|| "result".to_owned(), |index| index.to_string()),
@@ -806,6 +879,7 @@ fn dump_boundary(output: &mut String, boundary: &BoundaryPlan, indent: &str) {
                     piece.piece.offset,
                     piece.piece.valid_bytes,
                     extension_name(piece.extension),
+                    piece.indirect,
                     render_location(piece.location)
                 )
                 .unwrap();
@@ -824,12 +898,13 @@ fn dump_boundary(output: &mut String, boundary: &BoundaryPlan, indent: &str) {
             for piece in &bridge.result_pieces {
                 writeln!(
                     output,
-                    "{indent}result-piece index={} class={} offset={} valid={} extension={} location={}",
+                    "{indent}result-piece index={} class={} offset={} valid={} extension={} indirect={} location={}",
                     piece.piece.index,
                     class_name(piece.piece.class),
                     piece.piece.offset,
                     piece.piece.valid_bytes,
                     extension_name(piece.extension),
+                    piece.indirect,
                     render_location(piece.location)
                 )
                 .unwrap();
@@ -856,7 +931,9 @@ fn render_native_carrier(carrier: &crate::NativeCarrierPlan) -> String {
     let purpose = match carrier.purpose {
         NativePurpose::Normal => "normal".to_owned(),
         NativePurpose::StructArgument(size) => format!("sarg({size})"),
+        NativePurpose::IndirectArgument => "indirect-argument".to_owned(),
         NativePurpose::StructReturn => "sret".to_owned(),
+        NativePurpose::Padding => "padding".to_owned(),
     };
     format!(
         "abi={} source={} piece={} offset={} valid={} class={} carrier={} extension={} purpose={}",
@@ -875,8 +952,11 @@ fn render_native_carrier(carrier: &crate::NativeCarrierPlan) -> String {
             AbiCarrier::I16 => "i16",
             AbiCarrier::I32 => "i32",
             AbiCarrier::I64 => "i64",
+            AbiCarrier::I128 => "i128",
             AbiCarrier::F32 => "f32",
             AbiCarrier::F64 => "f64",
+            AbiCarrier::V32 => "v32",
+            AbiCarrier::V64 => "v64",
         },
         extension_name(carrier.extension),
         purpose
@@ -923,34 +1003,15 @@ fn passing_name(passing: PassingMode) -> &'static str {
 
 fn render_location(location: BridgeLocation) -> String {
     match location {
-        BridgeLocation::Gp(register) => format!("gp:{}", gp_register_name(register)),
-        BridgeLocation::Sse(register) => format!("sse:{}", sse_register_name(register)),
+        BridgeLocation::Register(register) => format!(
+            "{}:{}",
+            match register.bank {
+                crate::RegisterBank::Integer => "integer",
+                crate::RegisterBank::Float => "float",
+            },
+            register.index
+        ),
         BridgeLocation::Stack { offset } => format!("stack:+{offset}"),
-    }
-}
-
-fn gp_register_name(register: crate::GpRegister) -> &'static str {
-    match register {
-        crate::GpRegister::Rax => "rax",
-        crate::GpRegister::Rdi => "rdi",
-        crate::GpRegister::Rsi => "rsi",
-        crate::GpRegister::Rdx => "rdx",
-        crate::GpRegister::Rcx => "rcx",
-        crate::GpRegister::R8 => "r8",
-        crate::GpRegister::R9 => "r9",
-    }
-}
-
-fn sse_register_name(register: crate::SseRegister) -> &'static str {
-    match register {
-        crate::SseRegister::Xmm0 => "xmm0",
-        crate::SseRegister::Xmm1 => "xmm1",
-        crate::SseRegister::Xmm2 => "xmm2",
-        crate::SseRegister::Xmm3 => "xmm3",
-        crate::SseRegister::Xmm4 => "xmm4",
-        crate::SseRegister::Xmm5 => "xmm5",
-        crate::SseRegister::Xmm6 => "xmm6",
-        crate::SseRegister::Xmm7 => "xmm7",
     }
 }
 
@@ -973,7 +1034,7 @@ mod tests {
         let verified = plan
             .verify_against(&module, &EffectiveCompilationConfig::default())
             .unwrap();
-        assert!(dump_module_plan(verified).contains("abi-plan schema=ccc-abi-config-v1"));
+        assert!(dump_module_plan(verified).contains("abi-plan schema=ccc-abi-config-v2"));
     }
 
     #[test]

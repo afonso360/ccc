@@ -73,3 +73,21 @@ case = [
     "*.stdout",
     "*.stderr",
 ]
+
+[target_applicability."x86_64-unknown-linux-gnu"]
+status = "applicable"
+evidence_kind = "execution"
+runner = "run.sh"
+reason = "The runner validates an x86-64 Linux GNU host and compares CCC execution with matching native GCC and Clang reference executions."
+
+[target_applicability."aarch64-unknown-linux-gnu"]
+status = "inapplicable"
+reason = "The consensus runner has no matched AArch64 GCC and Clang cross-reference matrix or QEMU execution path."
+
+[target_applicability."riscv64-unknown-linux-gnu"]
+status = "inapplicable"
+reason = "The consensus runner has no matched RISC-V GCC and Clang cross-reference matrix or QEMU execution path."
+
+[target_applicability."aarch64-apple-darwin"]
+status = "inapplicable"
+reason = "The runner requires a Linux GNU target and has no Darwin reference-consensus or native execution profile."

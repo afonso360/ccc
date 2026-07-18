@@ -43,6 +43,8 @@ mod tests {
             (BuiltinType::Float, TypeId::FLOAT, 13),
             (BuiltinType::Double, TypeId::DOUBLE, 14),
             (BuiltinType::LongDouble, TypeId::LONG_DOUBLE, 15),
+            (BuiltinType::Int128, TypeId::INT128, 16),
+            (BuiltinType::UnsignedInt128, TypeId::UNSIGNED_INT128, 17),
         ];
         assert_eq!(BuiltinType::ALL.len(), expected.len());
 
@@ -142,5 +144,44 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![0, 4, 8, 16]
         );
+    }
+
+    #[test]
+    fn target_va_list_representation_follows_each_enabled_abi() {
+        let mut aapcs_types = TypeStore::default();
+        let aapcs = EffectiveCompilationConfig::aarch64_unknown_linux_gnu();
+        let aapcs_va_list = aapcs_types
+            .target_builtin(TargetBuiltinType::VaList, &aapcs)
+            .unwrap();
+        let TypeKind::Array(array) = aapcs_types.kind(aapcs_va_list) else {
+            panic!("AAPCS64 va_list must retain array parameter adjustment")
+        };
+        assert_eq!(array.length, ArrayLength::Constant(1));
+        let layout = aapcs_types.layout_of(aapcs_va_list, &aapcs).unwrap();
+        assert_eq!((layout.size, layout.align), (32, 8));
+        let element = aapcs_types.layout_of(array.element.ty, &aapcs).unwrap();
+        let LayoutShape::Record(record) = element.shape else {
+            panic!("AAPCS64 va_list element must be a record")
+        };
+        assert_eq!(
+            record
+                .fields
+                .iter()
+                .map(|field| field.offset)
+                .collect::<Vec<_>>(),
+            vec![0, 8, 16, 24, 28]
+        );
+
+        for config in [
+            EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
+            EffectiveCompilationConfig::aarch64_apple_darwin(),
+        ] {
+            let mut types = TypeStore::default();
+            let va_list = types
+                .target_builtin(TargetBuiltinType::VaList, &config)
+                .unwrap();
+            assert!(matches!(types.kind(va_list), TypeKind::Pointer(_)));
+            assert_eq!(types.layout_of(va_list, &config).unwrap().size, 8);
+        }
     }
 }

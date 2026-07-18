@@ -12,7 +12,7 @@ use ccc_ir::generic as gir;
 use ccc_sema::generic::{
     Linkage as CLinkage, ObjectDefinitionPolicy, StorageDuration, SymbolBinding, SymbolVisibility,
 };
-use ccc_target::{EffectiveCompilationConfig, RelocationModel};
+use ccc_target::{AbiIdentity, BinaryFormat, EffectiveCompilationConfig, RelocationModel};
 use ccc_types::{
     ArrayLength, BuiltinType, LayoutShape, QualifiedType, TypeId, TypeKind, TypeQualifiers,
     TypeStore,
@@ -70,7 +70,33 @@ fn emit_inner(
     options: Options,
 ) -> Result<Output, CodegenError> {
     super::validate_target(config).map_err(error)?;
-    let isa_builder = isa::lookup(config.target.triple.clone()).map_err(module_error)?;
+    if !config.target.abi.supports_tls_codegen()
+        && module.globals.iter().any(|global| {
+            global.duration == StorageDuration::Thread || global.emission.tls.is_some()
+        })
+    {
+        return Err(CodegenError {
+            code: "CCC3522",
+            message: format!(
+                "thread-local storage has no enabled object and link contract for target ABI `{}`",
+                config.target.abi.name()
+            ),
+            span: None,
+        });
+    }
+    let mut isa_builder = isa::lookup(config.target.triple.clone()).map_err(module_error)?;
+    if config.target.abi == AbiIdentity::RiscvLp64d {
+        for extension in [
+            "has_m",
+            "has_a",
+            "has_f",
+            "has_d",
+            "has_zicsr",
+            "has_zifencei",
+        ] {
+            isa_builder.enable(extension).map_err(module_error)?;
+        }
+    }
     let mut flag_builder = settings::builder();
     match config.relocation_model {
         RelocationModel::Static => flag_builder.set("is_pic", "false").map_err(module_error)?,
@@ -102,8 +128,6 @@ fn emit_inner(
         .verify_against(module, config)
         .map_err(abi_error)?;
     let declarations = declare_module(module, config, abi_plan, &mut object_module)?;
-    data::define_strings(module, &declarations, &mut object_module)?;
-    data::define_globals(module, config, &declarations, &mut object_module)?;
 
     let mut clif = String::new();
     for function in &module.functions {
@@ -172,7 +196,22 @@ fn emit_inner(
             .map_err(error)?;
     }
 
+    // Define code before data so Mach-O's `__text` section is created first.
+    // Apple's linker derives compact-unwind records from `.eh_frame`; when a
+    // data section precedes `__text`, its relocatable-link pass can associate
+    // a section-relative FDE with data after reordering the sections.  Data
+    // references only require declarations while functions are lowered, so
+    // deferring their definitions preserves those references and gives the
+    // object the conventional text-before-data section order.
+    data::define_strings(module, &declarations, &mut object_module)?;
+    data::define_globals(module, config, &declarations, &mut object_module)?;
+
     let mut product = object_module.finish();
+    if config.target.abi == AbiIdentity::DarwinArm64 {
+        product
+            .object
+            .set_macho_build_version(darwin_build_version(config)?);
+    }
     for common in &declarations.commons {
         let symbol = product.data_symbol(common.id);
         let symbol = product.object.symbol_mut(symbol);
@@ -194,7 +233,11 @@ fn emit_inner(
         let symbol = product.function_symbol(id);
         let symbol = product.object.symbol_mut(symbol);
         symbol.weak = function.binding == SymbolBinding::Weak;
-        set_elf_symbol_visibility(symbol, function.visibility);
+        if config.target.triple.binary_format == BinaryFormat::Elf {
+            set_elf_symbol_visibility(symbol, function.visibility);
+        } else if config.target.triple.binary_format == BinaryFormat::Macho {
+            set_macho_symbol_visibility(symbol, function.visibility);
+        }
     }
     for global in module
         .globals
@@ -207,12 +250,17 @@ fn emit_inner(
         let symbol = product.data_symbol(declaration.id);
         let symbol = product.object.symbol_mut(symbol);
         symbol.weak = global.emission.binding == SymbolBinding::Weak;
-        set_elf_symbol_visibility(symbol, global.emission.visibility);
+        if config.target.triple.binary_format == BinaryFormat::Elf {
+            set_elf_symbol_visibility(symbol, global.emission.visibility);
+        } else if config.target.triple.binary_format == BinaryFormat::Macho {
+            set_macho_symbol_visibility(symbol, global.emission.visibility);
+        }
     }
     unwind.emit(&mut product).map_err(error)?;
     let object = product.emit().map_err(module_error)?;
     let (assemblies, manifest) = generated_bridge_artifacts(
         module,
+        config,
         abi_plan,
         &declarations.hidden_body_symbols,
         declarations.call_helper_symbol.as_deref(),
@@ -225,8 +273,56 @@ fn emit_inner(
     })
 }
 
+fn darwin_build_version(
+    config: &EffectiveCompilationConfig,
+) -> Result<object::write::MachOBuildVersion, CodegenError> {
+    // arm64 macOS first shipped with macOS 11.  Recording a real platform and
+    // minimum version is mandatory: Apple's linker rejects Mach-O objects
+    // whose LC_BUILD_VERSION uses PLATFORM_UNKNOWN (the value produced by a
+    // target-lexicon `darwin` triple without this override).
+    let deployment = config
+        .normalized_deployment_target()
+        .ok_or_else(|| error("Darwin build version requested for a non-Darwin target"))?;
+    let (major, minor, patch) = parse_darwin_version(deployment)?;
+    let mut version = object::write::MachOBuildVersion::default();
+    version.platform = object::macho::PLATFORM_MACOS;
+    version.minos = (u32::from(major) << 16) | (u32::from(minor) << 8) | u32::from(patch);
+    // SDK zero is the conventional value for a relocatable object.  The
+    // linker records the selected SDK in the final image.
+    version.sdk = 0;
+    Ok(version)
+}
+
+fn parse_darwin_version(version: &str) -> Result<(u16, u8, u8), CodegenError> {
+    let mut components = version.split('.');
+    let invalid = || {
+        error(format!(
+            "invalid Darwin deployment target `{version}`; expected MAJOR[.MINOR[.PATCH]]"
+        ))
+    };
+    let major = components
+        .next()
+        .and_then(|value| value.parse::<u16>().ok())
+        .ok_or_else(invalid)?;
+    let minor = components
+        .next()
+        .unwrap_or("0")
+        .parse::<u8>()
+        .map_err(|_| invalid())?;
+    let patch = components
+        .next()
+        .unwrap_or("0")
+        .parse::<u8>()
+        .map_err(|_| invalid())?;
+    if components.next().is_some() || major == 0 {
+        return Err(invalid());
+    }
+    Ok((major, minor, patch))
+}
+
 fn generated_bridge_artifacts(
     module: &gir::FullModule,
+    config: &EffectiveCompilationConfig,
     abi_plan: ccc_abi::VerifiedModuleAbiPlan<'_>,
     hidden_body_symbols: &HashMap<u32, String>,
     call_helper_symbol: Option<&str>,
@@ -240,14 +336,15 @@ fn generated_bridge_artifacts(
     use ccc_link::artifact::{BridgeManifestV1, GeneratedSymbol, GeneratedSymbolOwner};
     use ccc_link::bridge::{
         AssemblyFunctionLinkage, ElfTlsAccessModel, ElfTlsSymbolVisibility, GeneratedSymbolKind,
-        TlsAccessorPlan, VariadicEntryPlan, render_generic_call_helper, render_tls_accessor,
-        render_variadic_entry,
+        TlsAccessorPlan, VariadicEntryPlan, render_target_call_helper,
+        render_target_variadic_entry, render_tls_accessor,
     };
 
     let mut assemblies = Vec::new();
     let mut symbols = Vec::new();
     if let Some(helper) = call_helper_symbol {
-        let assembly = render_generic_call_helper(helper).map_err(module_error)?;
+        let assembly =
+            render_target_call_helper(helper, config.target.abi).map_err(module_error)?;
         symbols.push(GeneratedSymbol::internal(
             helper,
             GeneratedSymbolKind::CallHelper,
@@ -294,18 +391,21 @@ fn generated_bridge_artifacts(
             .filter(|piece| piece.piece.class == ccc_abi::AbiClass::Integer)
             .count() as u8;
         let xmm_results = plan.result_pieces.len() as u8 - gp_results;
-        let assembly = render_variadic_entry(&VariadicEntryPlan {
-            public_symbol: public_symbol.clone(),
-            hidden_body_symbol: hidden_body.clone(),
-            linkage,
-            fixed_gp_used: plan.gp_used,
-            fixed_sse_used: plan.xmm_used,
-            overflow_arg_offset: plan.overflow_arg_offset,
-            gp_results,
-            xmm_results,
-            hidden_return: plan.hidden_return,
-            logical_line: 1,
-        })
+        let assembly = render_target_variadic_entry(
+            &VariadicEntryPlan {
+                public_symbol: public_symbol.clone(),
+                hidden_body_symbol: hidden_body.clone(),
+                linkage,
+                fixed_gp_used: plan.gp_used,
+                fixed_sse_used: plan.xmm_used,
+                overflow_arg_offset: plan.overflow_arg_offset,
+                gp_results,
+                xmm_results,
+                hidden_return: plan.hidden_return,
+                logical_line: 1,
+            },
+            config.target.abi,
+        )
         .map_err(module_error)?;
         let entry_symbol = match linkage {
             AssemblyFunctionLinkage::ExternalDefault => GeneratedSymbol::public(
@@ -617,6 +717,8 @@ fn declare_module(
         let is_external_common = !tls
             && global.emission.definition == ObjectDefinitionPolicy::TentativeCommon
             && global.linkage == CLinkage::External;
+        let is_external_common =
+            is_external_common && config.target.triple.binary_format == BinaryFormat::Elf;
         let linkage = if is_external_common {
             // Cranelift has no common-symbol linkage. Keep the symbol
             // undefined through module finalization, then rewrite its ELF
@@ -856,6 +958,13 @@ fn set_elf_symbol_visibility(symbol: &mut object::write::Symbol, visibility: Sym
     symbol.flags = SymbolFlags::Elf {
         st_info: (binding << 4) | symbol_type,
         st_other,
+    };
+}
+
+fn set_macho_symbol_visibility(symbol: &mut object::write::Symbol, visibility: SymbolVisibility) {
+    symbol.scope = match visibility {
+        SymbolVisibility::Default | SymbolVisibility::Protected => SymbolScope::Dynamic,
+        SymbolVisibility::Hidden | SymbolVisibility::Internal => SymbolScope::Linkage,
     };
 }
 

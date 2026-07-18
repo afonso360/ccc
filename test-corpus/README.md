@@ -18,3 +18,29 @@ by a host-installed copy.
 including the shared native-GCC identity boundary and removal of ambient GNU
 Make injection. The fetched builds and execution profiles remain explicit
 Linux jobs invoked through each corpus's `run.sh`.
+
+## Target applicability
+
+[`target-applicability.toml`](target-applicability.toml) is the fail-closed
+catalog of enabled compiler targets and corpus manifests. Every listed manifest
+has one `target_applicability` table for every enabled target. Each table uses
+exactly one of these contracts:
+
+- `applicable` entries have a nonempty reason and identify either an executable
+  corpus `run.sh` or a target-independent parse-only entry point;
+- `inapplicable` entries have a nonempty reason that names the missing adapter,
+  platform, or execution contract. They are never inferred from the host and
+  are not reported as successful evidence.
+
+[`report-target-applicability.py`](report-target-applicability.py) validates the
+catalog and every table before printing the complete corpus-by-target matrix.
+It rejects missing or additional manifests and targets, unknown statuses or
+fields, empty reasons, absent or non-executable execution runners, absent parse
+entry points, and an enabled target with no applicable evidence. The adapter
+regression entry point runs this report on every invocation.
+
+The hosted-header fixture is parse-only evidence for all enabled targets: it
+does not claim ABI, link, or execution coverage. The fetched executable corpora
+currently have audited runners only for `x86_64-unknown-linux-gnu`; their other
+rows remain explicitly inapplicable until target-specific linking, artifact
+inspection, and native or emulated execution adapters are checked in.

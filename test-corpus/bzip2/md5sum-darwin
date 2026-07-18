@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+openssl_tool=${BZIP2_OPENSSL:-openssl}
+
+digest_stdin() {
+  "$openssl_tool" dgst -md5 | awk '{ print $NF }'
+}
+
+digest_file() {
+  "$openssl_tool" dgst -md5 "$1" | awk '{ print $NF }'
+}
+
+if [[ ${1:-} == --version ]]; then
+  echo "ccc GNU-compatible md5sum adapter 1"
+  "$openssl_tool" version
+  exit 0
+fi
+
+if [[ ${1:-} == -c || ${1:-} == --check ]]; then
+  [[ $# -eq 2 ]] || {
+    echo "usage: md5sum-darwin -c CHECKSUMS" >&2
+    exit 2
+  }
+  check_file=$2
+  status=0
+  exec 3< "$check_file"
+  while IFS= read -r line <&3 || [[ -n $line ]]; do
+    [[ -n $line ]] || continue
+    expected=${line%% *}
+    remainder=${line#"$expected"}
+    if [[ $remainder == "  "* ]]; then
+      name=${remainder:2}
+    elif [[ $remainder == " "?* ]]; then
+      name=${remainder:2}
+    else
+      echo "md5sum-darwin: malformed checksum line" >&2
+      status=1
+      continue
+    fi
+    if [[ $name == - ]]; then
+      actual=$(digest_stdin)
+    else
+      actual=$(digest_file "$name")
+    fi
+    if [[ $actual == "$expected" ]]; then
+      echo "$name: OK"
+    else
+      echo "$name: FAILED"
+      status=1
+    fi
+  done
+  exec 3<&-
+  exit "$status"
+fi
+
+if [[ $# -eq 0 ]]; then
+  printf '%s  -\n' "$(digest_stdin)"
+  exit 0
+fi
+
+for path in "$@"; do
+  if [[ $path == -* && $path != - ]]; then
+    echo "md5sum-darwin: unsupported option: $path" >&2
+    exit 2
+  fi
+  if [[ $path == - ]]; then
+    printf '%s  -\n' "$(digest_stdin)"
+  else
+    printf '%s  %s\n' "$(digest_file "$path")" "$path"
+  fi
+done

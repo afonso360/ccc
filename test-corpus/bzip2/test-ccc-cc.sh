@@ -62,6 +62,8 @@ export CCC_RESOURCE_DIR="$temporary_directory/resource-dir"
 export CCC_LINK_CC="$temporary_directory/fake-link"
 export EXPECTED_CCC_CC="$CCC_LINK_CC"
 export CCC_CC="$temporary_directory/ambient-driver-must-not-win"
+export CCC_BZIP2_TARGET=aarch64-unknown-linux-gnu
+export CCC_BZIP2_SYSROOT="$temporary_directory/resource-dir"
 export TRACE="$temporary_directory/trace"
 export CCC_BZIP2_COMMAND_LOG="$temporary_directory/commands"
 export CCC_BZIP2_SOURCE_ROOT="$source_directory"
@@ -77,6 +79,8 @@ export CCC_BZIP2_SOURCE_LOG="$temporary_directory/sources"
 ! grep -q '^link ' "$TRACE"
 [[ "$(grep -c '^ccc ' "$CCC_BZIP2_COMMAND_LOG")" == 1 ]]
 ! grep '^ccc ' "$CCC_BZIP2_COMMAND_LOG" | grep -q -- ' -std='
+grep '^ccc ' "$CCC_BZIP2_COMMAND_LOG" | grep -Fq -- ' --target=aarch64-unknown-linux-gnu'
+grep '^ccc ' "$CCC_BZIP2_COMMAND_LOG" | grep -Fq -- " --sysroot=$temporary_directory/resource-dir"
 [[ "$(wc -l <"$CCC_BZIP2_SOURCE_LOG" | tr -d '[:space:]')" == 1 ]]
 grep -Fxq "$source_directory/a.c" "$CCC_BZIP2_SOURCE_LOG"
 
@@ -93,6 +97,7 @@ grep -Fxq "$source_directory/a.c" "$CCC_BZIP2_SOURCE_LOG"
 ! grep '^link ' "$TRACE" | grep -Eq '\.(c|i)( |$)'
 ! grep '^ccc ' "$CCC_BZIP2_COMMAND_LOG" | grep -Eq -- '-std=|-fpie|-fno-PIE|-L\.|-lbz2'
 ! grep '^link ' "$CCC_BZIP2_COMMAND_LOG" | grep -Eq -- ' -std=| -fpie| -fno-PIE| -pie( |$)| -no-pie( |$)| --no-pie'
+grep '^link ' "$CCC_BZIP2_COMMAND_LOG" | grep -Fq -- " --sysroot=$temporary_directory/resource-dir"
 grep '^link ' "$CCC_BZIP2_COMMAND_LOG" | grep -Fq -- ' -Wl\,-z\,now'
 grep '^link ' "$CCC_BZIP2_COMMAND_LOG" | grep -Fq -- ' -L.'
 grep '^link ' "$CCC_BZIP2_COMMAND_LOG" | grep -q -- ' -lbz2'
@@ -140,5 +145,37 @@ if "$script_directory/ccc-cc" "@$temporary_directory/inputs.rsp"; then
   exit 1
 fi
 [[ ! -s "$TRACE" ]]
+
+: >"$TRACE"
+: >"$CCC_BZIP2_COMMAND_LOG"
+if env -u CCC_BZIP2_TARGET "$script_directory/ccc-cc" \
+  -c "$source_directory/a.c" -o "$temporary_directory/no-target.o"; then
+  echo "ccc-cc test: missing target unexpectedly succeeded" >&2
+  exit 1
+fi
+[[ ! -s "$TRACE" ]]
+[[ ! -e "$temporary_directory/no-target.o" ]]
+
+: >"$TRACE"
+: >"$CCC_BZIP2_COMMAND_LOG"
+export CCC_BZIP2_TARGET=x86_64-unknown-linux-gnu
+export CCC_BZIP2_SYSROOT=
+"$script_directory/ccc-cc" -c "$source_directory/a.c" \
+  -o "$temporary_directory/native-default.o"
+grep '^ccc ' "$CCC_BZIP2_COMMAND_LOG" | grep -Fq -- ' --target=x86_64-unknown-linux-gnu'
+! grep '^ccc ' "$CCC_BZIP2_COMMAND_LOG" | grep -q -- ' --sysroot='
+[[ -f "$temporary_directory/native-default.o" ]]
+
+: >"$TRACE"
+: >"$CCC_BZIP2_COMMAND_LOG"
+export CCC_BZIP2_TARGET=aarch64-apple-darwin
+export CCC_BZIP2_SDKROOT="$temporary_directory/resource-dir"
+export CCC_BZIP2_DEPLOYMENT_TARGET=11.0
+"$script_directory/ccc-cc" -c "$source_directory/a.c" \
+  -o "$temporary_directory/darwin.o"
+grep '^ccc ' "$CCC_BZIP2_COMMAND_LOG" | grep -Fq -- ' --target=aarch64-apple-darwin'
+grep '^ccc ' "$CCC_BZIP2_COMMAND_LOG" | grep -Fq -- " -isysroot $temporary_directory/resource-dir"
+grep '^ccc ' "$CCC_BZIP2_COMMAND_LOG" | grep -Fq -- ' -mmacosx-version-min=11.0'
+[[ -f "$temporary_directory/darwin.o" ]]
 
 echo "bzip2 ccc-cc adapter tests passed"

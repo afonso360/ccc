@@ -3345,10 +3345,14 @@ impl FunctionBuilder<'_> {
     }
 
     fn va_list_address(&mut self, expression: &FullTypedExpression) -> Result<ValueId, IrError> {
+        let va_list = self
+            .types
+            .target_builtin_id(ccc_types::TargetBuiltinType::VaList);
         if matches!(
             self.types.try_kind(expression.ty.ty),
             Some(TypeKind::Array(_))
-        ) {
+        ) || va_list == Some(expression.ty.ty)
+        {
             self.place(expression).map(|place| place.address)
         } else {
             self.expect_value(expression)

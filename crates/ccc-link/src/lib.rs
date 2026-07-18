@@ -25,8 +25,8 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ccc_target::{
-    EffectiveCompilationConfig, RelocationModel, SystemIncludeEntry, SystemIncludeKind,
-    ToolCommandSpec, ToolchainFingerprint, ToolchainSpec, Triple,
+    Architecture, EffectiveCompilationConfig, OperatingSystem, RelocationModel, SystemIncludeEntry,
+    SystemIncludeKind, ToolCommandSpec, ToolchainFingerprint, ToolchainSpec, Triple,
 };
 
 #[derive(Debug)]
@@ -119,6 +119,20 @@ impl ToolchainRequirements {
             archiver: false,
         }
     }
+
+    /// Mach-O partial linking preserves source-hidden private externs, then a
+    /// Mach-native symbol editor localizes only compiler-internal manifest
+    /// symbols while updating symbol-indexed relocations.
+    pub const fn package_generated_macho_assembly() -> Self {
+        Self {
+            system_headers: false,
+            disable_system_headers: false,
+            assembler: false,
+            linker: false,
+            object_copier: false,
+            archiver: false,
+        }
+    }
 }
 
 /// A command invocation used by an injectable toolchain probe runner.
@@ -181,6 +195,7 @@ impl ProbeRunner for ProcessProbeRunner {
 const RELEVANT_ENVIRONMENT_VARIABLES: &[&str] = &[
     "CCC_CC",
     "CCC_OBJCOPY",
+    "CCC_NMEDIT",
     "CC",
     "OBJCOPY",
     "PATH",
@@ -512,6 +527,22 @@ impl ToolchainResolver<ProcessProbeRunner> {
 
 impl<R: ProbeRunner> ToolchainResolver<R> {
     pub fn with_runner(config: &EffectiveCompilationConfig, runner: R) -> Self {
+        let mut target_arguments = vec![OsString::from(format!(
+            "-march={}",
+            config.normalized_target_arch()
+        ))];
+        if matches!(
+            config.target.abi,
+            ccc_target::AbiIdentity::Aapcs64Lp64 | ccc_target::AbiIdentity::RiscvLp64d
+        ) {
+            target_arguments.push(OsString::from(format!(
+                "-mabi={}",
+                config.normalized_target_abi()
+            )));
+        }
+        if let Some(version) = config.normalized_deployment_target() {
+            target_arguments.push(OsString::from(format!("-mmacosx-version-min={version}")));
+        }
         Self {
             target: config.target.triple.clone(),
             driver: config
@@ -522,7 +553,7 @@ impl<R: ProbeRunner> ToolchainResolver<R> {
             explicit_sysroot: config.toolchain.sysroot.clone(),
             explicit_resource_dir: config.toolchain.resource_dir.clone(),
             existing: config.toolchain.clone(),
-            target_arguments: Vec::new(),
+            target_arguments,
             cache_process_resolution: false,
             runner,
         }
@@ -569,7 +600,7 @@ impl<R: ProbeRunner> ToolchainResolver<R> {
         let candidate = self
             .driver
             .clone()
-            .map_or_else(|| driver_from_environment(&environment), Ok)?;
+            .map_or_else(|| driver_from_environment(&environment, &self.target), Ok)?;
         let executable = ExecutableIdentity::resolve(&candidate.program, &environment);
         let working_directory = current_working_directory();
         if self.cache_process_resolution {
@@ -603,11 +634,10 @@ impl<R: ProbeRunner> ToolchainResolver<R> {
                 },
                 || {
                     let fresh_environment = relevant_environment();
-                    let Ok(fresh_candidate) = self
-                        .driver
-                        .clone()
-                        .map_or_else(|| driver_from_environment(&fresh_environment), Ok)
-                    else {
+                    let Ok(fresh_candidate) = self.driver.clone().map_or_else(
+                        || driver_from_environment(&fresh_environment, &self.target),
+                        Ok,
+                    ) else {
                         return false;
                     };
                     let fresh_executable =
@@ -1063,6 +1093,12 @@ pub fn link_executable_with_toolchain(
     config: &EffectiveCompilationConfig,
     toolchain: &ToolchainSpec,
 ) -> Result<(), LinkError> {
+    config
+        .validate_target_profile_options()
+        .map_err(|message| LinkError {
+            code: "CCC5005",
+            message,
+        })?;
     let driver = toolchain
         .linker_driver
         .as_ref()
@@ -1076,14 +1112,7 @@ pub fn link_executable_with_toolchain(
         })?;
     let mut command = tool_command(driver);
     command.arg(object).arg("-o").arg(output);
-    match config.relocation_model {
-        RelocationModel::Static => {
-            command.arg("-no-pie");
-        }
-        RelocationModel::Pic | RelocationModel::Pie => {
-            command.arg("-pie");
-        }
-    }
+    command.arg(relocation_link_argument(config));
     let result = command.output().map_err(|error| LinkError {
         code: "CCC5003",
         message: format!(
@@ -1103,6 +1132,17 @@ pub fn link_executable_with_toolchain(
         });
     }
     Ok(())
+}
+
+fn relocation_link_argument(config: &EffectiveCompilationConfig) -> &'static str {
+    match (config.target.triple.binary_format, config.relocation_model) {
+        (ccc_target::BinaryFormat::Macho, RelocationModel::Static) => "-Wl,-no_pie",
+        (ccc_target::BinaryFormat::Macho, RelocationModel::Pic | RelocationModel::Pie) => {
+            "-Wl,-pie"
+        }
+        (_, RelocationModel::Static) => "-no-pie",
+        (_, RelocationModel::Pic | RelocationModel::Pie) => "-pie",
+    }
 }
 
 /// Compatibility entry point. Configurations carrying a resolved toolchain do
@@ -1256,8 +1296,16 @@ fn parse_clang_trace_arguments(line: &str) -> Option<Vec<String>> {
 }
 
 pub fn target_matches(reported: &Triple, expected: &Triple) -> bool {
+    let is_macos = |operating_system: OperatingSystem| {
+        matches!(
+            operating_system,
+            OperatingSystem::Darwin(_) | OperatingSystem::MacOSX(_)
+        )
+    };
+    let operating_system_matches = reported.operating_system == expected.operating_system
+        || (is_macos(reported.operating_system) && is_macos(expected.operating_system));
     reported.architecture == expected.architecture
-        && reported.operating_system == expected.operating_system
+        && operating_system_matches
         && reported.environment == expected.environment
         && reported.binary_format == expected.binary_format
 }
@@ -1280,11 +1328,35 @@ fn requirements_satisfied(
         && (!requirements.archiver || (spec.archiver.is_some() && spec.ranlib.is_some()))
 }
 
-fn driver_from_environment(environment: &[EnvironmentEntry]) -> Result<ToolCommandSpec, LinkError> {
+fn driver_from_environment(
+    environment: &[EnvironmentEntry],
+    target: &Triple,
+) -> Result<ToolCommandSpec, LinkError> {
     environment_value(environment, "CCC_CC")
         .or_else(|| environment_value(environment, "CC"))
         .map(OsStr::to_os_string)
-        .map_or_else(|| Ok(ToolCommandSpec::new("cc")), parse_driver_command)
+        .map_or_else(
+            || {
+                Ok(match target.architecture {
+                    Architecture::Aarch64(_)
+                        if target.operating_system == OperatingSystem::Linux =>
+                    {
+                        ToolCommandSpec::new("aarch64-linux-gnu-gcc")
+                    }
+                    Architecture::Riscv64(_) => ToolCommandSpec::new("riscv64-linux-gnu-gcc"),
+                    Architecture::Aarch64(_)
+                        if matches!(
+                            target.operating_system,
+                            OperatingSystem::Darwin(_) | OperatingSystem::MacOSX(_)
+                        ) =>
+                    {
+                        ToolCommandSpec::with_arguments("xcrun", [OsString::from("clang")])
+                    }
+                    _ => ToolCommandSpec::new("cc"),
+                })
+            },
+            parse_driver_command,
+        )
 }
 
 fn parse_driver_command(value: OsString) -> Result<ToolCommandSpec, LinkError> {
@@ -1480,6 +1552,29 @@ mod tests {
             &"x86_64-apple-darwin".parse().unwrap(),
             &expected
         ));
+        let macos: Triple = "aarch64-apple-darwin".parse().unwrap();
+        assert!(target_matches(
+            &"aarch64-apple-macosx".parse().unwrap(),
+            &macos
+        ));
+        assert!(!target_matches(
+            &"aarch64-apple-ios".parse().unwrap(),
+            &macos
+        ));
+    }
+
+    #[test]
+    fn executable_relocation_flags_follow_the_target_driver() {
+        let mut linux = EffectiveCompilationConfig::x86_64_unknown_linux_gnu();
+        assert_eq!(relocation_link_argument(&linux), "-pie");
+        linux.relocation_model = RelocationModel::Static;
+        assert_eq!(relocation_link_argument(&linux), "-no-pie");
+
+        let darwin = EffectiveCompilationConfig::aarch64_apple_darwin();
+        assert_eq!(relocation_link_argument(&darwin), "-Wl,-pie");
+        let mut unsupported = darwin;
+        unsupported.relocation_model = RelocationModel::Static;
+        assert!(unsupported.validate_target_profile_options().is_err());
     }
 
     #[test]
@@ -1919,7 +2014,7 @@ mod tests {
         assert_eq!(requests.len(), 5);
         assert_eq!(
             requests[2].arguments,
-            ["-###", "-E", "-x", "c", "-"]
+            ["-march=x86-64", "-###", "-E", "-x", "c", "-"]
                 .into_iter()
                 .map(OsString::from)
                 .collect::<Vec<_>>()
@@ -1956,7 +2051,10 @@ mod tests {
         assert_eq!(spec.sysroot.as_deref(), Some(Path::new("/sdk")));
         assert_eq!(
             spec.linker_driver,
-            Some(ToolCommandSpec::new("fixture-gcc"))
+            Some(ToolCommandSpec::with_arguments(
+                "fixture-gcc",
+                [OsString::from("-march=x86-64")]
+            ))
         );
         let requests = resolver.runner.requests.borrow();
         assert_eq!(requests.len(), 3);
@@ -2000,7 +2098,7 @@ mod tests {
         assert_eq!(requests.len(), 5);
         assert_eq!(
             requests[2].arguments,
-            ["-###", "-E", "-x", "c", "-"]
+            ["-march=x86-64", "-###", "-E", "-x", "c", "-"]
                 .into_iter()
                 .map(OsString::from)
                 .collect::<Vec<_>>()

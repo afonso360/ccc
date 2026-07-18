@@ -21,7 +21,9 @@ assembler-compatible symbol metadata.
 Render deterministic target assembly for generated ABI bridges. Assemble it
 through the resolved target compiler driver, combine it with the Cranelift
 object through a driver-mediated relocatable link, and localize only the exact
-generated-symbol allowlist with a compatible object copier.
+generated-symbol allowlist with a format-native symbol localizer. ELF uses a
+compatible `objcopy --localize-symbols`; Mach-O uses Apple's `nmedit -R`, which
+preserves symbol-indexed relocations while changing bindings.
 
 Generated assembly carries explicit `.cfi_*`, symbol type and visibility
 directives, and `.note.GNU-stack`. It intentionally omits `.file` and `.loc`:
@@ -45,7 +47,7 @@ publication.
 ## Consequences
 
 - Compilations that require generated bridges also require a matching compiler
-  driver and compatible object copier.
+  driver and compatible format-native symbol localizer.
 - Bridge-free object emission remains independent of those tools.
 - Assembly and object inspection become stable, auditable correctness gates.
 - Generated symbols use collision-resistant deterministic names and only the

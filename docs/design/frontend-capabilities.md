@@ -221,7 +221,7 @@ bytes happen to match.
 | Strings and globals    | Objects and functions carry symbol name, binding, and visibility through semantic analysis, IR, ABI planning, and ELF emission. `visibility("default")`, `visibility("hidden")`, `visibility("protected")`, and `visibility("internal")` are implemented; other layout and linkage override attributes remain outside the default supported registry. |
 | ELF proof              | Object tests inspect `.text`, `.data`, `.bss`, `.rodata`, `.tdata`, `.tbss`, local/global/undefined bindings, ordinary and TLS relocations, `R_X86_64_GOTPCREL` position-independent data accesses, and `R_X86_64_PLT32` direct external calls. Linux tests require normal links to produce executable ELF `DYN` files without runtime text relocations, execute relocated data and function pointers, cross-link CCC callers and callees with a reference compiler in both directions, and prove same-spelled internal names stay local. |
 
-Standard `_Thread_local` objects use ELF TLS sections and compiler-generated
+Standard `_Thread_local` and GNU `__thread` objects use ELF TLS sections and compiler-generated
 address accessors. Each accessor is planned from the translation-unit digest,
 assembled through the verified artifact pipeline, and localized after the
 relocatable link. The default global-dynamic model and the explicit
@@ -229,8 +229,10 @@ relocatable link. The default global-dynamic model and the explicit
 map to their canonical x86-64 relocations. Linux tests inspect those
 relocations, execute every model in a PIE, prove per-thread identity and
 initialization with pthreads, and cross-link TLS definitions and references
-with the platform compiler. GNU `__thread` has the same thread-storage
-semantics and backend path as `_Thread_local`.
+with the platform compiler. AAPCS64, RISC-V LP64D, and Darwin arm64 reject
+thread-local declarations during semantic analysis with `CCC2441`; ABI planning
+and code generation repeat the fail-closed check as `CCC3522`, so no target can
+reach the x86-specific TLS lowering accidentally.
 
 ### Statements and CFG behavior
 

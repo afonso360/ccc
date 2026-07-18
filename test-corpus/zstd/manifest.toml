@@ -148,3 +148,21 @@ retain = [
     "source-inputs.txt",
     "version.log",
 ]
+
+[target_applicability."x86_64-unknown-linux-gnu"]
+status = "applicable"
+evidence_kind = "execution"
+runner = "run.sh"
+reason = "The adapter audits the portable-C x86-64 Linux build, pinned capability inventory and adjustments, ELF PIE artifacts, and bounded upstream execution tests."
+
+[target_applicability."aarch64-unknown-linux-gnu"]
+status = "inapplicable"
+reason = "The adapter requires a native x86-64 GCC driver and its compiler predicates, capability inventory, links, and execution profile have not been recertified for AArch64."
+
+[target_applicability."riscv64-unknown-linux-gnu"]
+status = "inapplicable"
+reason = "The adapter requires a native x86-64 GCC driver and its compiler predicates, capability inventory, links, and execution profile have not been recertified for RISC-V."
+
+[target_applicability."aarch64-apple-darwin"]
+status = "inapplicable"
+reason = "The selected Make and test profile requires GNU/Linux tools, pthread behavior, GCC linking, and ELF inspection and has no Darwin adapter."

@@ -177,3 +177,21 @@ retain = [
     "test-out.txt",
     "test-run.log",
 ]
+
+[target_applicability."x86_64-unknown-linux-gnu"]
+status = "applicable"
+evidence_kind = "execution"
+runner = "run.sh"
+reason = "The adapter audits the canonical source build, native x86-64 GCC links, ELF PIE artifacts, and explicit SQLite execution suites."
+
+[target_applicability."aarch64-unknown-linux-gnu"]
+status = "inapplicable"
+reason = "The configure and suite adapter rejects non-x86-64 native GCC drivers and has no AArch64 cross-link, QEMU execution, or target-specific inventory."
+
+[target_applicability."riscv64-unknown-linux-gnu"]
+status = "inapplicable"
+reason = "The configure and suite adapter rejects non-x86-64 native GCC drivers and has no RISC-V cross-link, QEMU execution, or target-specific inventory."
+
+[target_applicability."aarch64-apple-darwin"]
+status = "inapplicable"
+reason = "The selected configuration and test contract require Linux filesystem behavior, GCC linking, and ELF inspection and have no Darwin equivalent."

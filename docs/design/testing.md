@@ -87,6 +87,18 @@ preflights every reference and packaging tool, and invokes each named native
 test binary explicitly. A missing tool or zero-test configuration is a hard
 failure, never an implicit skip.
 
+The enabled non-x86 profiles use the same fail-closed rule. AArch64 Linux and
+RISC-V Linux run two-way CCC/reference-compiler fixed and variadic calls at
+`-O0` and `-O2` under QEMU, inspect the resulting ELF objects, exercise static
+CFI through `_Unwind_Backtrace`, and attach `gdb-multiarch` to a QEMU gdbstub.
+Darwin arm64 runs the equivalent native matrix with Apple Clang, Mach-O object
+inspection, libunwind, and LLDB. Each runner records its compiler, sysroot or
+SDK, emulator/debugger, deployment target, and linker identities. Header and
+predefined-macro sentinels must agree with the selected profile. The corpus
+harness reports an explicit applicable, inapplicable-with-reason, or failed
+result for every case; an empty applicable set, absent runner, or missing tool
+fails the required job.
+
 ## Runtime-sized automatic storage
 
 Provider-independent tests first prove that nonconstant array extents are

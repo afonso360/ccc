@@ -16,7 +16,7 @@ manifest_integer() {
 }
 
 usage() {
-  echo "usage: $0 [--source-archive PATH] [--test-repository PATH] [--work-dir PATH] [--jobs COUNT]" >&2
+  echo "usage: $0 --target TRIPLE [--source-archive PATH] [--test-repository PATH] [--work-dir PATH] [--jobs COUNT]" >&2
 }
 
 die() {
@@ -58,9 +58,9 @@ verify_archive() {
   local actual_bytes actual_sha256 actual_sha3 actual_sha512
 
   actual_bytes=$(wc -c <"$path" | tr -d '[:space:]')
-  actual_sha256=$(openssl dgst -sha256 "$path" | awk '{print $NF}')
-  actual_sha3=$(openssl dgst -sha3-256 "$path" | awk '{print $NF}')
-  actual_sha512=$(openssl dgst -sha512 "$path" | awk '{print $NF}')
+  actual_sha256=$("$openssl_tool" dgst -sha256 "$path" | awk '{print $NF}')
+  actual_sha3=$("$openssl_tool" dgst -sha3-256 "$path" | awk '{print $NF}')
+  actual_sha512=$("$openssl_tool" dgst -sha512 "$path" | awk '{print $NF}')
   [[ "$actual_bytes" == "$expected_bytes" ]] ||
     die "bzip2 archive size mismatch: expected $expected_bytes, found $actual_bytes"
   [[ "$actual_sha256" == "$expected_sha256" ]] ||
@@ -113,13 +113,102 @@ prepare_test_repository() {
   absolute_directory "$cache"
 }
 
+record_gnu_target_driver() {
+  local driver=$1
+  local expected_target_prefix=$2
+  local expected_macro=$3
+  local identity_artifact=$4
+  local macro_artifact=$5
+  local reported_target version identity identity_lower
+  local -a sysroot_arguments=()
+
+  reported_target=$(LC_ALL=C "$driver" -dumpmachine) ||
+    die "bzip2 target driver did not report its target"
+  [[ "$reported_target" == "$expected_target_prefix"* ]] ||
+    die "bzip2 target driver reports $reported_target rather than $expected_target_prefix"
+  version=$(LC_ALL=C "$driver" -dumpfullversion -dumpversion) ||
+    die "bzip2 target driver did not report its version"
+  identity=$(LC_ALL=C "$driver" --version) ||
+    die "bzip2 target driver did not report its identity"
+  if [[ -n "$CCC_BZIP2_SYSROOT" ]]; then
+    sysroot_arguments+=("--sysroot=$CCC_BZIP2_SYSROOT")
+  fi
+  LC_ALL=C "$driver" "${sysroot_arguments[@]}" -dM -E -x c /dev/null \
+    >"$macro_artifact" || die "bzip2 target driver macro probe failed"
+  identity_lower=$(printf '%s\n' "$identity" | tr '[:upper:]' '[:lower:]')
+  [[ "$identity_lower" != *clang* ]] ||
+    die "bzip2 GNU/Linux target driver must be GCC rather than Clang"
+  [[ "$identity_lower" == *gcc* || "$identity_lower" == *"gnu compiler collection"* ]] ||
+    die "bzip2 GNU/Linux target driver is not GCC"
+  grep -Eq '^#define __GNUC__[[:space:]]+[0-9]+$' "$macro_artifact" ||
+    die "bzip2 target driver does not expose GCC identity macros"
+  grep -Eq "^#define $expected_macro([[:space:]]+.*)?$" "$macro_artifact" ||
+    die "bzip2 target driver does not expose $expected_macro"
+  grep -Eq '^#define __linux__([[:space:]]+.*)?$' "$macro_artifact" ||
+    die "bzip2 target driver does not expose the Linux target identity"
+  if [[ "$target" == riscv64-unknown-linux-gnu ]]; then
+    grep -Eq '^#define __riscv_xlen[[:space:]]+64$' "$macro_artifact" ||
+      die "bzip2 RISC-V driver does not target RV64"
+    grep -Eq '^#define __riscv_float_abi_double[[:space:]]+1$' "$macro_artifact" ||
+      die "bzip2 RISC-V driver does not target the LP64D floating-point ABI"
+  fi
+  {
+    printf 'executable=%s\n' "$driver"
+    printf 'target=%s\n' "$reported_target"
+    printf 'sysroot=%s\n' "${CCC_BZIP2_SYSROOT:-<driver-default>}"
+    printf 'version=%s\n' "$version"
+    printf '%s\n%s\n' '--version:' "$identity"
+  } >"$identity_artifact"
+}
+
+record_apple_target_driver() {
+  local driver=$1
+  local identity_artifact=$2
+  local macro_artifact=$3
+  local reported_target identity
+
+  reported_target=$(LC_ALL=C "$driver" -dumpmachine) ||
+    die "bzip2 Apple driver did not report its target"
+  [[ "$reported_target" == arm64-apple-darwin* ||
+    "$reported_target" == aarch64-apple-darwin* ]] ||
+    die "bzip2 Apple driver reports $reported_target rather than arm64 Apple Darwin"
+  identity=$(LC_ALL=C "$driver" --version) ||
+    die "bzip2 Apple driver did not report its identity"
+  [[ "$identity" == *"Apple clang"* ]] ||
+    die "bzip2 Darwin target driver must be Apple Clang"
+  LC_ALL=C "$driver" -isysroot "$CCC_BZIP2_SDKROOT" \
+    "-mmacosx-version-min=$CCC_BZIP2_DEPLOYMENT_TARGET" \
+    -dM -E -x c /dev/null >"$macro_artifact" ||
+    die "bzip2 Apple driver macro probe failed"
+  grep -Eq '^#define __APPLE__([[:space:]]+.*)?$' "$macro_artifact" ||
+    die "bzip2 Apple driver does not expose the Apple target identity"
+  grep -Eq '^#define (__aarch64__|__arm64__)([[:space:]]+.*)?$' "$macro_artifact" ||
+    die "bzip2 Apple driver does not expose the arm64 target identity"
+  {
+    printf 'executable=%s\n' "$driver"
+    printf 'target=%s\n' "$reported_target"
+    printf 'sdkroot=%s\n' "$CCC_BZIP2_SDKROOT"
+    printf 'deployment_target=%s\n' "$CCC_BZIP2_DEPLOYMENT_TARGET"
+    printf '%s\n%s\n' '--version:' "$identity"
+  } >"$identity_artifact"
+}
+
 source_archive=${BZIP2_SOURCE_ARCHIVE:-}
 test_repository=${BZIP2_TEST_REPOSITORY:-}
 work_directory=${BZIP2_WORK_DIR:-}
 jobs=${BZIP2_BUILD_JOBS:-2}
+target=${BZIP2_TARGET:-}
 
 while (($#)); do
   case "$1" in
+    --target)
+      (($# >= 2)) || {
+        usage
+        exit 2
+      }
+      target=$2
+      shift 2
+      ;;
     --source-archive)
       (($# >= 2)) || {
         usage
@@ -168,12 +257,136 @@ done
   exit 2
 }
 
-[[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]] ||
-  die "bzip2 execution validation requires x86-64 Linux"
+[[ -n "$target" ]] || {
+  usage
+  exit 2
+}
 
-for tool in ar awk basename cat cmp dirname find gcc git grep make md5sum mkdir mktemp mv openssl ranlib readelf rm sed sort tar tee tr uname wc; do
+for tool in awk basename cat chmod cmp cp dirname find git grep ln make mkdir mktemp mv rm sed sort tar tee tr uname wc; do
   require_tool "$tool"
 done
+
+host_os=$(uname -s)
+host_arch=$(uname -m)
+execution_kind=native
+expected_driver_prefix=
+expected_driver_macro=
+expected_elf_machine=
+expected_elf_flags=
+
+case "$target" in
+  x86_64-unknown-linux-gnu)
+    [[ "$host_os" == Linux && "$host_arch" == x86_64 ]] ||
+      die "bzip2 x86-64 execution requires an x86-64 Linux host"
+    : "${CCC_LINK_CC:=gcc}"
+    : "${BZIP2_AR:=ar}"
+    : "${BZIP2_RANLIB:=ranlib}"
+    : "${BZIP2_READELF:=readelf}"
+    expected_driver_prefix=x86_64
+    expected_driver_macro=__x86_64__
+    expected_elf_machine='Advanced Micro Devices X86-64'
+    expected_elf_flags='0x0'
+    ;;
+  aarch64-unknown-linux-gnu)
+    [[ "$host_os" == Linux ]] ||
+      die "bzip2 AArch64 GNU execution requires a Linux host"
+    : "${CCC_LINK_CC:=aarch64-linux-gnu-gcc}"
+    : "${BZIP2_AR:=aarch64-linux-gnu-ar}"
+    : "${BZIP2_RANLIB:=aarch64-linux-gnu-ranlib}"
+    : "${BZIP2_READELF:=aarch64-linux-gnu-readelf}"
+    : "${BZIP2_QEMU:=qemu-aarch64}"
+    : "${BZIP2_QEMU_ROOT:?set BZIP2_QEMU_ROOT to the AArch64 runtime root}"
+    execution_kind=qemu
+    expected_driver_prefix=aarch64-linux-gnu
+    expected_driver_macro=__aarch64__
+    expected_elf_machine=AArch64
+    expected_elf_flags='0x0'
+    ;;
+  riscv64-unknown-linux-gnu)
+    [[ "$host_os" == Linux ]] ||
+      die "bzip2 RISC-V GNU execution requires a Linux host"
+    : "${CCC_LINK_CC:=riscv64-linux-gnu-gcc}"
+    : "${BZIP2_AR:=riscv64-linux-gnu-ar}"
+    : "${BZIP2_RANLIB:=riscv64-linux-gnu-ranlib}"
+    : "${BZIP2_READELF:=riscv64-linux-gnu-readelf}"
+    : "${BZIP2_QEMU:=qemu-riscv64}"
+    : "${BZIP2_QEMU_ROOT:?set BZIP2_QEMU_ROOT to the RISC-V runtime root}"
+    execution_kind=qemu
+    expected_driver_prefix=riscv64-linux-gnu
+    expected_driver_macro=__riscv
+    expected_elf_machine=RISC-V
+    expected_elf_flags='0x5'
+    ;;
+  aarch64-apple-darwin)
+    [[ "$host_os" == Darwin &&
+      ("$host_arch" == arm64 || "$host_arch" == aarch64) ]] ||
+      die "bzip2 Darwin arm64 execution requires a native arm64 macOS host"
+    require_tool xcrun
+    : "${CCC_LINK_CC:=/usr/bin/cc}"
+    : "${BZIP2_AR:=$(xcrun --find ar)}"
+    : "${BZIP2_RANLIB:=$(xcrun --find ranlib)}"
+    : "${BZIP2_SDKROOT:=$(xcrun --sdk macosx --show-sdk-path)}"
+    : "${BZIP2_DEPLOYMENT_TARGET:=${MACOSX_DEPLOYMENT_TARGET:-11.0}}"
+    [[ "$BZIP2_DEPLOYMENT_TARGET" =~ ^[0-9]+([.][0-9]+){1,2}$ ]] ||
+      die "invalid bzip2 macOS deployment target: $BZIP2_DEPLOYMENT_TARGET"
+    CCC_BZIP2_SDKROOT=$(absolute_directory "$BZIP2_SDKROOT")
+    CCC_BZIP2_DEPLOYMENT_TARGET=$BZIP2_DEPLOYMENT_TARGET
+    ;;
+  *)
+    die "unsupported bzip2 target: $target"
+    ;;
+esac
+
+: "${CCC:=$repository/target/debug/ccc}"
+: "${CCC_RESOURCE_DIR:=$repository/resource-dir}"
+: "${BZIP2_OPENSSL:=openssl}"
+if [[ "$target" == aarch64-apple-darwin ]]; then
+  : "${BZIP2_MD5SUM:=gmd5sum}"
+else
+  : "${BZIP2_MD5SUM:=md5sum}"
+fi
+
+CCC=$(resolve_executable "$CCC")
+CCC_RESOURCE_DIR=$(absolute_directory "$CCC_RESOURCE_DIR")
+CCC_LINK_CC=$(resolve_executable "$CCC_LINK_CC")
+archiver=$(resolve_executable "$BZIP2_AR")
+archive_indexer=$(resolve_executable "$BZIP2_RANLIB")
+openssl_tool=$(resolve_executable "$BZIP2_OPENSSL")
+md5sum_tool=$(resolve_executable "$BZIP2_MD5SUM")
+
+"$openssl_tool" dgst -sha3-256 /dev/null >/dev/null 2>&1 ||
+  die "bzip2 requires an OpenSSL implementation with SHA3-256 support"
+
+if [[ "$target" == aarch64-apple-darwin ]]; then
+  file_tool=$(resolve_executable file)
+  nm_tool=$(resolve_executable nm)
+  otool_tool=$(resolve_executable otool)
+else
+  readelf_tool=$(resolve_executable "$BZIP2_READELF")
+  if [[ -n "${BZIP2_SYSROOT:-}" ]]; then
+    CCC_BZIP2_SYSROOT=$(absolute_directory "$BZIP2_SYSROOT")
+  else
+    reported_sysroot=$(LC_ALL=C "$CCC_LINK_CC" --print-sysroot) ||
+      die "bzip2 target driver did not report a compiler sysroot"
+    if [[ -n "$reported_sysroot" ]]; then
+      CCC_BZIP2_SYSROOT=$(absolute_directory "$reported_sysroot")
+    elif [[ "$execution_kind" == native ]]; then
+      CCC_BZIP2_SYSROOT=
+    else
+      die "bzip2 cross-target driver reported an empty compiler sysroot"
+    fi
+  fi
+  if [[ "$execution_kind" == qemu ]]; then
+    qemu=$(resolve_executable "$BZIP2_QEMU")
+    qemu_root=$(absolute_directory "$BZIP2_QEMU_ROOT")
+    [[ "$qemu_root" != / ]] ||
+      die "bzip2 QEMU runtime root must not be the host root"
+  fi
+fi
+
+CCC_BZIP2_TARGET=$target
+export CCC CCC_RESOURCE_DIR CCC_LINK_CC CCC_BZIP2_TARGET
+export CCC_BZIP2_SYSROOT CCC_BZIP2_SDKROOT CCC_BZIP2_DEPLOYMENT_TARGET
 
 version=$(manifest_string version)
 source_origin=$(manifest_string origin)
@@ -208,6 +421,78 @@ else
   mkdir -p "$work_directory"
 fi
 work_directory=$(absolute_directory "$work_directory")
+
+{
+  printf 'target=%s\n' "$target"
+  printf 'host=%s/%s\n' "$host_os" "$host_arch"
+  printf 'execution=%s\n' "$execution_kind"
+  printf 'compiler=%s\n' "$CCC"
+  printf 'link_driver=%s\n' "$CCC_LINK_CC"
+  printf 'archiver=%s\n' "$archiver"
+  printf 'archive_indexer=%s\n' "$archive_indexer"
+  if [[ "$target" == aarch64-apple-darwin ]]; then
+    printf 'sdkroot=%s\n' "$CCC_BZIP2_SDKROOT"
+    printf 'deployment_target=%s\n' "$CCC_BZIP2_DEPLOYMENT_TARGET"
+  else
+    printf 'compiler_sysroot=%s\n' "${CCC_BZIP2_SYSROOT:-<driver-default>}"
+    printf 'readelf=%s\n' "$readelf_tool"
+  fi
+  if [[ "$execution_kind" == qemu ]]; then
+    printf 'qemu=%s\n' "$qemu"
+    printf 'qemu_root=%s\n' "$qemu_root"
+  fi
+} >"$work_directory/target-profile.txt"
+
+if [[ "$target" == aarch64-apple-darwin ]]; then
+  record_apple_target_driver \
+    "$CCC_LINK_CC" \
+    "$work_directory/link-driver-identity.txt" \
+    "$work_directory/link-driver-macros.txt"
+else
+  record_gnu_target_driver \
+    "$CCC_LINK_CC" "$expected_driver_prefix" "$expected_driver_macro" \
+    "$work_directory/link-driver-identity.txt" \
+    "$work_directory/link-driver-macros.txt"
+fi
+
+{
+  printf 'compiler=%s\n' "$CCC"
+  "$CCC" --version 2>&1
+  printf 'archiver=%s\n' "$archiver"
+  "$openssl_tool" dgst -sha256 "$archiver"
+  printf 'archive_indexer=%s\n' "$archive_indexer"
+  "$openssl_tool" dgst -sha256 "$archive_indexer"
+  printf 'openssl=%s\n' "$openssl_tool"
+  "$openssl_tool" version
+  printf 'md5sum=%s\n' "$md5sum_tool"
+  "$md5sum_tool" --version 2>&1
+  if [[ "$target" == aarch64-apple-darwin ]]; then
+    for metadata_tool in "$file_tool" "$nm_tool" "$otool_tool"; do
+      printf 'metadata_tool=%s\n' "$metadata_tool"
+      "$openssl_tool" dgst -sha256 "$metadata_tool"
+    done
+  else
+    printf 'metadata_tool=%s\n' "$readelf_tool"
+    "$readelf_tool" --version 2>&1
+  fi
+  if [[ "$execution_kind" == qemu ]]; then
+    printf 'emulator=%s\n' "$qemu"
+    "$qemu" --version 2>&1
+  fi
+} >"$work_directory/tool-identities.txt"
+
+printf 'bzip2-md5-probe\n' >"$work_directory/md5-probe.txt"
+"$md5sum_tool" "$work_directory/md5-probe.txt" \
+  >"$work_directory/md5-probe-output.txt" ||
+  die "bzip2 MD5 tool probe failed"
+grep -Eq '^[[:xdigit:]]{32}  .*/md5-probe[.]txt$' \
+  "$work_directory/md5-probe-output.txt" ||
+  die "bzip2 requires GNU-compatible md5sum output"
+rm "$work_directory/md5-probe.txt" "$work_directory/md5-probe-output.txt"
+private_tool_directory="$work_directory/private-tools"
+mkdir "$private_tool_directory"
+ln -s "$md5sum_tool" "$private_tool_directory/md5sum"
+export PATH="$private_tool_directory:$PATH"
 
 cache_directory=${XDG_CACHE_HOME:-${HOME:?HOME must be set}/.cache}/ccc/corpus/bzip2
 if [[ -z "$source_archive" ]]; then
@@ -280,21 +565,7 @@ actual_bad_streams=$(find "$test_directory" -type f -name '*.bz2.bad' -print | w
 [[ "$actual_bad_streams" == "$expected_bad_streams" ]] ||
   die "bzip2 test tree contains $actual_bad_streams bad streams; expected $expected_bad_streams"
 
-: "${CCC:=$repository/target/debug/ccc}"
-: "${CCC_RESOURCE_DIR:=$repository/resource-dir}"
-: "${CCC_LINK_CC:=gcc}"
-CCC=$(resolve_executable "$CCC")
-CCC_RESOURCE_DIR=$(absolute_directory "$CCC_RESOURCE_DIR")
-CCC_LINK_CC=$(resolve_executable "$CCC_LINK_CC")
-archiver=$(resolve_executable ar)
-archive_indexer=$(resolve_executable ranlib)
-export CCC CCC_RESOURCE_DIR CCC_LINK_CC
 export CCC_BZIP2_COMMAND_LOG="$work_directory/compile-commands.txt"
-
-record_native_gcc_driver \
-  bzip2 "$CCC_LINK_CC" \
-  "$work_directory/link-driver-identity.txt" \
-  "$work_directory/link-driver-macros.txt"
 
 clear_ambient_make_injection
 unset CFLAGS CPPFLAGS LDFLAGS LIBS ARFLAGS
@@ -313,6 +584,27 @@ grep -Fxq '#define __GNUC_MINOR__ 2' "$work_directory/effective-macros.txt" ||
   die "CCC does not advertise the pinned __GNUC_MINOR__ value"
 grep -Fxq '#define __GNUC_PATCHLEVEL__ 1' "$work_directory/effective-macros.txt" ||
   die "CCC does not advertise the pinned __GNUC_PATCHLEVEL__ value"
+case "$target" in
+  x86_64-unknown-linux-gnu)
+    grep -Eq '^#define __x86_64__([[:space:]]+.*)?$' "$work_directory/effective-macros.txt" ||
+      die "CCC does not advertise the selected x86-64 target"
+    ;;
+  aarch64-unknown-linux-gnu)
+    grep -Eq '^#define __aarch64__([[:space:]]+.*)?$' "$work_directory/effective-macros.txt" ||
+      die "CCC does not advertise the selected AArch64 target"
+    ;;
+  riscv64-unknown-linux-gnu)
+    grep -Eq '^#define __riscv([[:space:]]+.*)?$' "$work_directory/effective-macros.txt" ||
+      die "CCC does not advertise the selected RISC-V target"
+    ;;
+  aarch64-apple-darwin)
+    grep -Eq '^#define __APPLE__([[:space:]]+.*)?$' "$work_directory/effective-macros.txt" ||
+      die "CCC does not advertise the selected Apple target"
+    grep -Eq '^#define (__aarch64__|__arm64__)([[:space:]]+.*)?$' \
+      "$work_directory/effective-macros.txt" ||
+      die "CCC does not advertise the selected Darwin arm64 target"
+    ;;
+esac
 for selection in \
   'gnu_compatibility_tuple=4.2.1' \
   'selected_attribute=noreturn' \
@@ -390,28 +682,132 @@ explicit_standard_translations=$(grep '^ccc ' "$CCC_BZIP2_COMMAND_LOG" | \
 large_file_translations=$(grep '^ccc ' "$CCC_BZIP2_COMMAND_LOG" | grep -c -- ' -D_FILE_OFFSET_BITS=64' || true)
 [[ "$large_file_translations" == "$expected_build_sources" ]] ||
   die "bzip2 C translations did not all use the pinned large-file interface"
+if grep '^ccc ' "$CCC_BZIP2_COMMAND_LOG" | grep -Eq -- ' -(march|mabi)='; then
+  die "bzip2 C translations unexpectedly selected an architecture or ABI flag"
+fi
 
-: >"$work_directory/elf-headers.txt"
-: >"$work_directory/elf-dynamic-tags.txt"
+: >"$work_directory/binary-headers.txt"
+: >"$work_directory/binary-dynamic.txt"
+: >"$work_directory/binary-load-commands.txt"
+: >"$work_directory/binary-relocations.txt"
+: >"$work_directory/binary-symbols.txt"
 for executable in bzip2 bzip2recover; do
   binary="$source_directory/$executable"
-  {
-    printf '==> %s <==\n' "$executable"
-    readelf --file-header "$binary"
-  } >>"$work_directory/elf-headers.txt"
-  {
-    printf '==> %s <==\n' "$executable"
-    readelf --dynamic "$binary"
-  } >>"$work_directory/elf-dynamic-tags.txt"
-  elf_type=$(readelf --file-header "$binary" | awk '/^[[:space:]]*Type:/{print $2; exit}')
-  [[ "$elf_type" == DYN ]] ||
-    die "bzip2 $executable is $elf_type rather than the required PIE executable type"
-  readelf --dynamic "$binary" | grep -Eq '\(FLAGS_1\).*PIE' ||
-    die "bzip2 $executable does not carry the PIE dynamic flag"
-  if readelf --dynamic "$binary" | grep -Eq '\(TEXTREL\)|FLAGS.*TEXTREL'; then
-    die "bzip2 $executable contains dynamic text relocations"
+  if [[ "$target" == aarch64-apple-darwin ]]; then
+    {
+      printf '==> %s <==\n' "$executable"
+      "$file_tool" "$binary"
+      "$otool_tool" -hv "$binary"
+    } >>"$work_directory/binary-headers.txt"
+    {
+      printf '==> %s <==\n' "$executable"
+      "$otool_tool" -l "$binary"
+    } >>"$work_directory/binary-load-commands.txt"
+    {
+      printf '==> %s <==\n' "$executable"
+      "$nm_tool" -g "$binary"
+    } >>"$work_directory/binary-symbols.txt"
+    {
+      printf '==> %s <==\n' "$executable"
+      "$otool_tool" -rv "$binary"
+    } >>"$work_directory/binary-relocations.txt"
+    "$file_tool" "$binary" | grep -Fq 'Mach-O 64-bit executable arm64' ||
+      die "bzip2 $executable is not a Mach-O arm64 executable"
+    "$otool_tool" -hv "$binary" | grep -Eq '(^|[[:space:]])PIE([[:space:]]|$)' ||
+      die "bzip2 $executable does not carry the Mach-O PIE flag"
+    "$otool_tool" -l "$binary" | grep -Fq 'cmd LC_BUILD_VERSION' ||
+      die "bzip2 $executable does not carry LC_BUILD_VERSION"
+    "$otool_tool" -l "$binary" | grep -Eq \
+      "^[[:space:]]*minos[[:space:]]+$CCC_BZIP2_DEPLOYMENT_TARGET([.]0)?$" ||
+      die "bzip2 $executable does not carry the selected deployment target"
+    "$nm_tool" -g "$binary" | grep -Eq '(^|[[:space:]])_main$' ||
+      die "bzip2 $executable does not expose the expected Darwin entry symbol"
+    segment_count=0
+    text_segment_count=0
+    while read -r segment_name maximum_protection initial_protection; do
+      [[ -n "$segment_name" ]] || continue
+      ((segment_count += 1))
+      [[ "$segment_name" != __TEXT ]] || ((text_segment_count += 1))
+      if (((maximum_protection & 6) == 6 || (initial_protection & 6) == 6)); then
+        die "bzip2 $executable has a writable and executable Mach-O segment: $segment_name"
+      fi
+    done < <("$otool_tool" -l "$binary" | awk '
+      $1 == "cmd" && $2 == "LC_SEGMENT_64" { inside=1; name=max=init=""; next }
+      inside && $1 == "segname" { name=$2; next }
+      inside && $1 == "maxprot" { max=$2; next }
+      inside && $1 == "initprot" { init=$2; print name, max, init; inside=0 }
+    ')
+    ((segment_count > 0 && text_segment_count == 1)) ||
+      die "bzip2 $executable has an unexpected Mach-O segment table"
+    relocation_lines=$("$otool_tool" -rv "$binary" | sed '1d' |
+      grep -c '[^[:space:]]' || true)
+    [[ "$relocation_lines" == 0 ]] ||
+      die "bzip2 $executable retains Mach-O relocation entries"
+  else
+    {
+      printf '==> %s <==\n' "$executable"
+      "$readelf_tool" --file-header "$binary"
+    } >>"$work_directory/binary-headers.txt"
+    {
+      printf '==> %s <==\n' "$executable"
+      "$readelf_tool" --dynamic "$binary"
+    } >>"$work_directory/binary-dynamic.txt"
+    {
+      printf '==> %s <==\n' "$executable"
+      "$readelf_tool" --program-headers "$binary"
+    } >>"$work_directory/binary-load-commands.txt"
+    {
+      printf '==> %s <==\n' "$executable"
+      "$readelf_tool" --symbols "$binary"
+    } >>"$work_directory/binary-symbols.txt"
+    {
+      printf '==> %s <==\n' "$executable"
+      "$readelf_tool" --relocs "$binary"
+    } >>"$work_directory/binary-relocations.txt"
+    elf_type=$("$readelf_tool" --file-header "$binary" |
+      awk '/^[[:space:]]*Type:/{print $2; exit}')
+    elf_machine=$("$readelf_tool" --file-header "$binary" |
+      awk '/^[[:space:]]*Machine:/{sub(/^[[:space:]]*Machine:[[:space:]]*/, ""); print; exit}')
+    elf_flags=$("$readelf_tool" --file-header "$binary" |
+      awk '/^[[:space:]]*Flags:/{for (i=1; i<=NF; i++) if ($i ~ /^0x/) {gsub(/,/, "", $i); print $i; exit}}')
+    [[ "$elf_type" == DYN ]] ||
+      die "bzip2 $executable is $elf_type rather than the required PIE executable type"
+    [[ "$elf_machine" == "$expected_elf_machine" ]] ||
+      die "bzip2 $executable has ELF machine $elf_machine rather than $expected_elf_machine"
+    [[ "$elf_flags" == "$expected_elf_flags" ]] ||
+      die "bzip2 $executable has ELF flags $elf_flags rather than $expected_elf_flags"
+    "$readelf_tool" --dynamic "$binary" | grep -Eq '\(FLAGS_1\).*PIE' ||
+      die "bzip2 $executable does not carry the PIE dynamic flag"
+    if "$readelf_tool" --dynamic "$binary" |
+      grep -Eq '\(TEXTREL\)|FLAGS.*TEXTREL'; then
+      die "bzip2 $executable contains dynamic text relocations"
+    fi
+    interpreter=$("$readelf_tool" --program-headers "$binary" |
+      sed -n 's/.*Requesting program interpreter: \([^]]*\).*/\1/p')
+    [[ "$interpreter" == /* ]] ||
+      die "bzip2 $executable has no absolute ELF program interpreter"
+    if [[ "$execution_kind" == qemu ]]; then
+      [[ -e "$qemu_root$interpreter" ]] ||
+        die "bzip2 $executable interpreter is absent from the QEMU root: $qemu_root$interpreter"
+    else
+      [[ -e "$interpreter" ]] ||
+        die "bzip2 $executable interpreter is absent from the host: $interpreter"
+    fi
   fi
 done
+
+if [[ "$execution_kind" == qemu ]]; then
+  {
+    printf 'CCC_BZIP2_QEMU=%q\n' "$qemu"
+    printf 'CCC_BZIP2_QEMU_ROOT=%q\n' "$qemu_root"
+  } >"$source_directory/.ccc-qemu-config"
+  "$qemu" --version >"$work_directory/qemu-identity.txt"
+  for executable in bzip2 bzip2recover; do
+    mv "$source_directory/$executable" "$source_directory/$executable.target"
+    cp "$script_directory/qemu-launcher" "$source_directory/$executable"
+    chmod +x "$source_directory/$executable"
+  done
+fi
 
 "$source_directory/bzip2" --version \
   </dev/null >/dev/null 2>"$work_directory/version.log"

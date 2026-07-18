@@ -27,6 +27,48 @@ fn lower_source(source: &str) -> gir::FullModule {
     lower_source_with_config(source, &EffectiveCompilationConfig::default())
 }
 
+#[test]
+fn compiler_128_bit_storage_emits_but_scalar_lowering_fails_closed() {
+    for (config, symbol_name) in [
+        (EffectiveCompilationConfig::default(), "wide_object"),
+        (
+            EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+            "wide_object",
+        ),
+        (
+            EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
+            "wide_object",
+        ),
+        (
+            EffectiveCompilationConfig::aarch64_apple_darwin(),
+            "_wide_object",
+        ),
+    ] {
+        let output = emit_source_with_config(
+            "__int128 wide_object; void *address(void) { return &wide_object; }",
+            &config,
+        );
+        let object = object::File::parse(output.object.as_slice()).unwrap();
+        let symbol = object.symbol_by_name(symbol_name).unwrap();
+        if object.format() == object::BinaryFormat::MachO {
+            let section = object
+                .section_by_index(symbol.section_index().unwrap())
+                .unwrap();
+            assert!(section.size() >= 16, "{}", config.target.triple);
+        } else {
+            assert_eq!(symbol.size(), 16, "{}", config.target.triple);
+        }
+
+        let types = TypeStore::default();
+        for ty in [TypeId::INT128, TypeId::UNSIGNED_INT128] {
+            let error =
+                super::function::scalar_type(&types, QualifiedType::unqualified(ty), &config)
+                    .unwrap_err();
+            assert_eq!(error.code, "CCC3517", "{}", config.target.triple);
+        }
+    }
+}
+
 fn emit_source(source: &str) -> Output {
     emit(
         &lower_source(source),
@@ -34,6 +76,289 @@ fn emit_source(source: &str) -> Output {
         Options { emit_clif: true },
     )
     .unwrap()
+}
+
+fn emit_source_with_config(source: &str, config: &EffectiveCompilationConfig) -> Output {
+    emit(
+        &lower_source_with_config(source, config),
+        config,
+        Options { emit_clif: true },
+    )
+    .unwrap()
+}
+
+#[test]
+fn enabled_non_x86_targets_emit_native_objects_with_fixed_aggregate_calls() {
+    let source = "struct Pair { long first, second; };\n\
+                  struct Floats { double first, second; };\n\
+                  struct Pair swap(struct Pair value) {\n\
+                    struct Pair result = { value.second, value.first }; return result;\n\
+                  }\n\
+                  double sum(struct Floats value) { return value.first + value.second; }";
+    for (config, format, architecture) in [
+        (
+            EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+            object::BinaryFormat::Elf,
+            object::Architecture::Aarch64,
+        ),
+        (
+            EffectiveCompilationConfig::aarch64_apple_darwin(),
+            object::BinaryFormat::MachO,
+            object::Architecture::Aarch64,
+        ),
+        (
+            EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
+            object::BinaryFormat::Elf,
+            object::Architecture::Riscv64,
+        ),
+    ] {
+        let output = emit_source_with_config(source, &config);
+        assert!(output.assemblies.is_empty());
+        let object = object::File::parse(output.object.as_slice()).unwrap();
+        assert_eq!(object.format(), format);
+        assert_eq!(object.architecture(), architecture);
+        let prefix = if format == object::BinaryFormat::MachO {
+            "_"
+        } else {
+            ""
+        };
+        let swap = format!("{prefix}swap");
+        let sum = format!("{prefix}sum");
+        assert!(
+            object
+                .symbols()
+                .any(|symbol| symbol.name() == Ok(swap.as_str())),
+            "{} expected {swap}; symbols={:?}",
+            config.target.triple,
+            object
+                .symbols()
+                .filter_map(|symbol| symbol.name().ok().map(str::to_owned))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            object
+                .symbols()
+                .any(|symbol| symbol.name() == Ok(sum.as_str()))
+        );
+    }
+}
+
+#[test]
+fn darwin_symbols_tentative_data_and_libcalls_match_apple_spelling() {
+    let output = emit_source_with_config(
+        "int tentative;\n\
+         int default_function(void) { return tentative; }\n\
+         int hidden_function(void) __attribute__((visibility(\"hidden\")));\n\
+         int hidden_function(void) { return 2; }\n\
+         int protected_function(void) __attribute__((visibility(\"protected\")));\n\
+         int protected_function(void) { return 3; }\n\
+         int internal_function(void) __attribute__((visibility(\"internal\")));\n\
+         int internal_function(void) { return 4; }\n\
+         void copy_bytes(void *to, const void *from, unsigned long count) {\n\
+             __builtin_memcpy(to, from, count);\n\
+         }",
+        &EffectiveCompilationConfig::aarch64_apple_darwin(),
+    );
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    let tentative = object.symbol_by_name("_tentative").unwrap();
+    assert!(!tentative.is_undefined());
+    assert_ne!(tentative.section(), object::SymbolSection::Common);
+    for (name, scope) in [
+        ("_default_function", object::SymbolScope::Dynamic),
+        ("_hidden_function", object::SymbolScope::Linkage),
+        ("_protected_function", object::SymbolScope::Dynamic),
+        ("_internal_function", object::SymbolScope::Linkage),
+    ] {
+        assert_eq!(
+            object.symbol_by_name(name).unwrap().scope(),
+            scope,
+            "{name}"
+        );
+    }
+    let memcpy = object.symbol_by_name("_memcpy").unwrap();
+    assert!(memcpy.is_undefined());
+    assert!(object.symbol_by_name("__memcpy").is_none());
+}
+
+#[test]
+fn darwin_emits_text_before_data_for_linker_unwind_conversion() {
+    let output = emit_source_with_config(
+        "int first(void) { return \"x\"[0]; }\n\
+         int main(void) { return first() == 'x' ? 0 : 1; }",
+        &EffectiveCompilationConfig::aarch64_apple_darwin(),
+    );
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    let section_names = object
+        .sections()
+        .map(|section| section.name().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    let text = section_names
+        .iter()
+        .position(|name| name == "__text")
+        .expect("Darwin text section");
+    let data = section_names
+        .iter()
+        .position(|name| name == "__const")
+        .expect("Darwin constant-data section");
+    assert!(
+        text < data,
+        "Apple's linker requires text before data when deriving compact unwind: {section_names:?}"
+    );
+}
+
+#[test]
+fn arm64_fixed_aggregate_exhaustion_emits_complete_stack_transports() {
+    const INTEGER_SOURCE: &str = "struct Pair { long first; long second; };\n\
+         long pair_after_seven(long a0, long a1, long a2, long a3, long a4, long a5, long a6, struct Pair value) {\n\
+         return a0+a1+a2+a3+a4+a5+a6+value.first+value.second; }\n\
+         long invoke(void) { struct Pair pair = {8, 9};\n\
+           return pair_after_seven(1,2,3,4,5,6,7,pair); }";
+    const HFA_SOURCE: &str = "struct Hfa { double first; double second; };\n\
+         long hfa_after_seven(double a0, double a1, double a2, double a3, double a4, double a5, double a6, struct Hfa value) {\n\
+           return (long)(a0+a1+a2+a3+a4+a5+a6+value.first+value.second); }";
+    let integer_module = lower_source(INTEGER_SOURCE);
+    let hfa_module = lower_source(HFA_SOURCE);
+    for config in [
+        EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+        EffectiveCompilationConfig::aarch64_apple_darwin(),
+    ] {
+        let plan = ccc_abi::plan_module(&integer_module, &config).unwrap();
+        assert!(plan.definitions.values().any(|definition| {
+            let ccc_abi::BoundaryPlan::Native(native) = &definition.boundary else {
+                return false;
+            };
+            native
+                .clif_parameters
+                .iter()
+                .any(|carrier| carrier.purpose == ccc_abi::NativePurpose::Padding)
+        }));
+        let output = emit(&integer_module, &config, Options::default()).unwrap();
+        let object = object::File::parse(output.object.as_slice()).unwrap();
+        assert_eq!(object.architecture(), object::Architecture::Aarch64);
+
+        let plan = ccc_abi::plan_module(&hfa_module, &config).unwrap();
+        assert!(plan.definitions.values().any(|definition| {
+            let ccc_abi::BoundaryPlan::Native(native) = &definition.boundary else {
+                return false;
+            };
+            native
+                .clif_parameters
+                .iter()
+                .any(|carrier| carrier.purpose == ccc_abi::NativePurpose::Padding)
+        }));
+        let output = emit(&hfa_module, &config, Options::default()).unwrap();
+        let object = object::File::parse(output.object.as_slice()).unwrap();
+        assert_eq!(object.architecture(), object::Architecture::Aarch64);
+    }
+}
+
+#[test]
+fn enabled_non_x86_targets_plan_target_variadics_and_emit_matching_adapters() {
+    let source = "typedef __builtin_va_list va_list;\n\
+                  struct Pair { long first, second; };\n\
+                  long collect(int count, ...) {\n\
+                    va_list list; struct Pair pair; long integer; double floating;\n\
+                    __builtin_va_start(list, count);\n\
+                    integer = __builtin_va_arg(list, long);\n\
+                    floating = __builtin_va_arg(list, double);\n\
+                    pair = __builtin_va_arg(list, struct Pair);\n\
+                    __builtin_va_end(list);\n\
+                    return integer + (long)floating + pair.first + pair.second;\n\
+                  }\n\
+                  long invoke(void) { struct Pair pair = { 3, 4 };\n\
+                    return collect(3, 1L, 2.0, pair); }";
+    for (config, expected) in [
+        (
+            EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+            "str q7, [sp, #224]",
+        ),
+        (
+            EffectiveCompilationConfig::aarch64_apple_darwin(),
+            ".subsections_via_symbols",
+        ),
+        (
+            EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
+            "sd a7, 504(sp)",
+        ),
+    ] {
+        let output = emit_source_with_config(source, &config);
+        assert_eq!(output.assemblies.len(), 2);
+        assert!(
+            output
+                .assemblies
+                .iter()
+                .any(|assembly| assembly.source().contains(expected)),
+            "{} adapter did not contain `{expected}`",
+            config.target.triple
+        );
+        assert!(
+            output
+                .manifest
+                .symbols()
+                .iter()
+                .any(|symbol| symbol.kind == ccc_link::bridge::GeneratedSymbolKind::CallHelper)
+        );
+    }
+}
+
+#[test]
+fn riscv_variadic_entry_keeps_fixed_float_arguments_separate_from_results() {
+    let config = EffectiveCompilationConfig::riscv64_unknown_linux_gnu();
+    let output = emit_source_with_config(
+        "typedef __builtin_va_list va_list;\n\
+         long collect(double first, double second, int count, ...) {\n\
+           va_list list; long tail; __builtin_va_start(list, count);\n\
+           tail = __builtin_va_arg(list, long);\n\
+           return (long)first + (long)second + tail; }",
+        &config,
+    );
+    let entry = output
+        .assemblies
+        .iter()
+        .find(|assembly| assembly.stem().starts_with("variadic-entry-"))
+        .expect("RISC-V variadic definition adapter");
+    assert!(entry.source().contains("fsd fa0, 112(sp)"));
+    assert!(entry.source().contains("fsd fa1, 128(sp)"));
+    assert!(!entry.source().contains("fsd fa0, 288(sp)"));
+    assert!(entry.source().contains("sd zero, 288(sp)"));
+}
+
+#[test]
+fn non_x86_tls_is_rejected_before_backend_lowering() {
+    let module = lower_source(
+        "_Thread_local int value;\n\
+         int read(void) { return value; }",
+    );
+    for config in [
+        EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+        EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
+        EffectiveCompilationConfig::aarch64_apple_darwin(),
+    ] {
+        let error = emit(&module, &config, Options::default()).unwrap_err();
+        assert_eq!(error.code, "CCC3522");
+        assert!(error.message.contains(config.target.abi.name()));
+    }
+}
+
+#[test]
+fn darwin_binary64_long_double_uses_the_double_transport() {
+    let config = EffectiveCompilationConfig::aarch64_apple_darwin();
+    let output = emit_source_with_config(
+        "typedef __builtin_va_list va_list;\n\
+         long double identity(long double value) { return value; }\n\
+         long double read(int count, ...) { va_list list;\n\
+           __builtin_va_start(list, count);\n\
+           return __builtin_va_arg(list, long double); }",
+        &config,
+    );
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    assert_eq!(object.format(), object::BinaryFormat::MachO);
+    assert!(
+        output
+            .assemblies
+            .iter()
+            .any(|assembly| { assembly.source().contains(".subsections_via_symbols") })
+    );
 }
 
 #[test]
@@ -494,7 +819,7 @@ fn complete_abi_plan_and_aggregate_clif_have_exact_snapshots() {
     assert!(dump.contains("packaging assembly-units=2"), "{dump}");
     assert_eq!(
         sha256(&dump),
-        "6e96880231371cdc038ca2453549b5d3a0c047b96766193efe448cd1df17c742"
+        "d1ed2b1efc982699f3b9df7784923e1130f192d435db3f8a0842759cfe0410b9"
     );
 
     let output = emit(&module, &config, Options { emit_clif: true }).unwrap();

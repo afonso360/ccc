@@ -1,0 +1,22 @@
+schema_version = 1
+source_id = "RISC-V-ELF-psABI"
+upstream = "https://github.com/riscv-non-isa/riscv-elf-psabi-doc"
+commit = "e03d44ae2f0e1144f9498c2896b5ae25b0449398"
+retrieved = "2026-07-18"
+license = "CC-BY-4.0"
+vendored = false
+classifier_revision = 1
+
+[[files]]
+path = "riscv-cc.adoc"
+url = "https://raw.githubusercontent.com/riscv-non-isa/riscv-elf-psabi-doc/e03d44ae2f0e1144f9498c2896b5ae25b0449398/riscv-cc.adoc"
+sha256 = "c87c97d518681c44398add931cc41a43235abe656eaf831b849934a3919d86e5"
+
+[implemented_profile]
+identity = "riscv-lp64d"
+isa = "rv64gc"
+abi = "lp64d"
+boundary_profile = "riscv-lp64d-v1"
+variadic_profile = "riscv-integer-unnamed-v1"
+binary128 = "layout-only; transport is rejected with CCC3509"
+tls = "rejected with CCC2441/CCC3522"

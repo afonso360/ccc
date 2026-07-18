@@ -171,3 +171,19 @@ retain = [
     "source-inputs.txt",
     "version.log",
 ]
+
+[target_applicability."x86_64-unknown-linux-gnu"]
+status = "inapplicable"
+reason = "The audited build path is retained, but execution is blocked because the selected Redis source requires native x86-64 f80 arithmetic and boundary transport that CCC does not provide."
+
+[target_applicability."aarch64-unknown-linux-gnu"]
+status = "inapplicable"
+reason = "The adapter requires a native x86-64 GCC driver and its pinned inventory and source-adjustment audit have not been recertified for AArch64 or QEMU execution."
+
+[target_applicability."riscv64-unknown-linux-gnu"]
+status = "inapplicable"
+reason = "The adapter requires a native x86-64 GCC driver and its pinned inventory and source-adjustment audit have not been recertified for RISC-V or QEMU execution."
+
+[target_applicability."aarch64-apple-darwin"]
+status = "inapplicable"
+reason = "The selected profile requires Linux process, filesystem, Unix-socket, GCC-link, and ELF semantics and has no Darwin adapter."

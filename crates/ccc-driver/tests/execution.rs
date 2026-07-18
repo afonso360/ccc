@@ -27,6 +27,7 @@ fn empty_translation_unit_emits_a_valid_object() {
     let directory = test_directory("empty-object");
     let output = directory.join("empty.o");
     let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+        .arg("--target=x86_64-unknown-linux-gnu")
         .arg("-c")
         .arg(fixture("empty.c"))
         .arg("-o")
@@ -43,6 +44,37 @@ fn empty_translation_unit_emits_a_valid_object() {
     fs::remove_dir_all(directory).unwrap();
 }
 
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[test]
+fn darwin_linker_accepts_unwind_when_functions_reference_constant_data() {
+    let directory = test_directory("darwin-text-before-data-unwind");
+    let source = directory.join("darwin-text-before-data-unwind.c");
+    let executable = directory.join("darwin-text-before-data-unwind");
+    fs::write(
+        &source,
+        "int first(void) { return \"x\"[0]; }\n\
+         int main(void) { return first() == 'x' ? 0 : 1; }\n",
+    )
+    .unwrap();
+
+    let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+        .arg("--target=aarch64-apple-darwin")
+        .arg("-nostdinc")
+        .arg(&source)
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .unwrap();
+    assert!(
+        compilation.status.success(),
+        "ccc failed: {}",
+        String::from_utf8_lossy(&compilation.stderr)
+    );
+    let execution = Command::new(&executable).output().unwrap();
+    assert_eq!(execution.status.code(), Some(0));
+    fs::remove_dir_all(directory).unwrap();
+}
+
 #[test]
 fn execution_programs_emit_x86_64_objects() {
     use object::{Architecture, Object as _, ObjectSymbol as _};
@@ -55,6 +87,7 @@ fn execution_programs_emit_x86_64_objects() {
         let directory = test_directory(name);
         let output = directory.join("program.o");
         let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+            .arg("--target=x86_64-unknown-linux-gnu")
             .arg("-c")
             .arg(fixture(name))
             .arg("-o")
@@ -85,6 +118,7 @@ fn execution_programs_produce_the_expected_exit_status() {
         let directory = test_directory(name);
         let executable = directory.join("program");
         let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+            .arg("--target=x86_64-unknown-linux-gnu")
             .arg(fixture(name))
             .arg("-o")
             .arg(&executable)

@@ -3127,6 +3127,159 @@ fn accepts_automatic_variable_length_and_thread_local_objects() {
 }
 
 #[test]
+fn target_specific_tls_and_variadic_alignment_gates_are_exact() {
+    let tls_sources = [
+        "_Thread_local int file_value;",
+        "static _Thread_local int file_static;",
+        "extern _Thread_local int file_extern;",
+        "__thread int gnu_file_value;",
+        "static __thread int gnu_file_static;",
+        "int read(void) { static _Thread_local int block_value; return block_value; }",
+        "int read(void) { extern _Thread_local int block_value; return block_value; }",
+    ];
+    for config in [
+        EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+        EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
+        EffectiveCompilationConfig::aarch64_apple_darwin(),
+    ] {
+        for source in tls_sources {
+            let diagnostics = analyze_source_with_config(source, &config).unwrap_err();
+            assert_eq!(
+                diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.code.as_str())
+                    .collect::<Vec<_>>(),
+                ["CCC2441"],
+                "{} should reject `{source}` before IR lowering",
+                config.target.triple
+            );
+        }
+    }
+    for source in tls_sources {
+        analyze_source_with_config(source, &EffectiveCompilationConfig::default()).unwrap();
+    }
+
+    let aligned_va_arg = "typedef __builtin_va_list va_list;\n\
+         struct Pair { _Alignas(16) long first; long second; };\n\
+         struct Pair read(int count, ...) { va_list list;\n\
+           __builtin_va_start(list, count);\n\
+           return __builtin_va_arg(list, struct Pair); }";
+    for config in [
+        EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+        EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
+        EffectiveCompilationConfig::aarch64_apple_darwin(),
+    ] {
+        analyze_source_with_config(aligned_va_arg, &config).unwrap_or_else(|diagnostics| {
+            panic!(
+                "{} rejected a supported 16-byte aligned va_arg: {diagnostics:#?}",
+                config.target.triple
+            )
+        });
+    }
+    let diagnostics = analyze_source(aligned_va_arg).unwrap_err();
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "CCC2406")
+    );
+}
+
+#[test]
+fn linux_binary128_operations_and_variadic_fetches_fail_explicitly() {
+    for config in [
+        EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+        EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
+    ] {
+        for source in [
+            "long double value = 1.0;",
+            "long double convert(double value) { return (long double)value; }",
+            "long double add(long double value) { return value + value; }",
+        ] {
+            let diagnostics = analyze_source_with_config(source, &config).unwrap_err();
+            assert!(
+                diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == "CCC2343"),
+                "{} did not reject `{source}` explicitly: {diagnostics:#?}",
+                config.target.triple
+            );
+        }
+        let diagnostics = analyze_source_with_config(
+            "typedef __builtin_va_list va_list;\n\
+             long double read(int count, ...) { va_list list;\n\
+               __builtin_va_start(list, count);\n\
+               return __builtin_va_arg(list, long double); }",
+            &config,
+        )
+        .unwrap_err();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "CCC2404")
+        );
+    }
+}
+
+#[test]
+fn compiler_128_bit_integers_support_layout_without_value_transport() {
+    analyze_source(
+        "static __int128 signed_file;\n\
+         static unsigned __int128 unsigned_file;\n\
+         static __int128_t signed_alias;\n\
+         static __uint128_t unsigned_alias;\n\
+         struct Wide { char tag; __uint128_t words[2]; };\n\
+         static struct Wide wide_file;\n\
+         _Static_assert(sizeof(__int128) == 16, \"signed size\");\n\
+         _Static_assert(sizeof(__uint128_t) == 16, \"unsigned size\");\n\
+         _Static_assert(_Alignof(__int128_t) == 16, \"alignment\");\n\
+         _Static_assert(sizeof(struct Wide) == 48, \"record layout\");\n\
+         void storage(void) {\n\
+             __int128 local;\n\
+             __uint128_t values[2];\n\
+             __int128 *pointer = &local;\n\
+             __uint128_t *first = values;\n\
+             _Static_assert(sizeof local == 16, \"local size\");\n\
+             _Static_assert(sizeof values == 32, \"array size\");\n\
+             (void)pointer;\n\
+             (void)first;\n\
+         }\n\
+         __int128 declaration_only(__uint128_t);",
+    )
+    .unwrap();
+
+    for source in [
+        "__int128 value = 0;",
+        "void assign(void) { __int128 left, right; left = right; }",
+        "void add(void) { __int128 left, right; (void)(left + right); }",
+        "int compare(void) { __int128 left, right; return left == right; }",
+        "struct Wide { __int128 value; }; struct Wide object = {};",
+        "int convert(void) { return (int)(__int128)1; }",
+        "__int128 defined(void) { __int128 value; return value; }",
+        "void defined(__uint128_t value) { (void)&value; }",
+        "struct Wide { __int128 value; }; void defined(struct Wide value) { (void)&value; }",
+        "__int128 declaration_only(void); void call(void) { (void)declaration_only(); }",
+        "typedef __builtin_va_list va_list; void read(int count, ...) { va_list list; __builtin_va_start(list, count); (void)__builtin_va_arg(list, __uint128_t); }",
+    ] {
+        let diagnostics = analyze_source(source).unwrap_err();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "CCC2443"),
+            "missing explicit 128-bit capability diagnostic for `{source}`: {diagnostics:#?}"
+        );
+    }
+
+    for source in [
+        "unsigned __int128_t invalid;",
+        "signed __uint128_t invalid;",
+        "__int128 int invalid;",
+        "__int128_t __uint128_t invalid;",
+    ] {
+        assert_eq!(diagnostic_codes(source), ["CCC2218"], "{source}");
+    }
+}
+
+#[test]
 fn full_typed_dump_is_independent_of_source_offsets() {
     let first = analyze_source(
         "struct { int member; } object = { .member = 1 };\n\

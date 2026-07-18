@@ -36,6 +36,12 @@ Linux GNU system-header gate by fallback; local deterministic tests use
 
 Darwin requires a compatible Apple SDK, deployment target, and Apple-capable linker. Linux GNU and musl configurations resolve distinct CRTs, dynamic loaders, libraries, and header trees. `ccc-link` invokes the resolved target compiler driver for executable/shared linking, the resolved assembler for generated bridge/assembly files, and the resolved `ar`/`ranlib` pair (or a verified in-process archive writer) for static archives.
 
+Generated-symbol localization is object-format-specific. ELF packaging probes
+the target `objcopy` for exact allowlist localization. Mach-O packaging uses
+Apple's `nmedit -R`; using a generic object copier for this step is outside the
+Darwin toolchain contract. `CCC_OBJCOPY` and `CCC_NMEDIT` select the respective
+tools explicitly when reproducible environments need to pin their paths.
+
 ## Runtime helper manifest
 
 Every compiler-emitted helper has a manifest entry containing symbol, exact C/ABI signature, provider preference, target availability, and a conformance test. Providers may be compiler-rt, libgcc, libatomic, libc, or a versioned CCC runtime shim. The link plan names the selected provider; it never assumes the target driver happens to supply a helper with the desired ABI.

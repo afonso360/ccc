@@ -4,7 +4,7 @@ use std::fmt;
 use ccc_ir::{DataId, InstructionId, ValueId};
 use ccc_sema::generic::{FullFunctionId, TlsModel};
 use ccc_session::Span;
-use ccc_target::CallingConvention;
+use ccc_target::{AbiIdentity, CallingConvention};
 use ccc_types::TypeId;
 
 /// The source-level scalar representation carried across a native boundary.
@@ -35,8 +35,11 @@ pub enum AbiCarrier {
     I16,
     I32,
     I64,
+    I128,
     F32,
     F64,
+    V32,
+    V64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -50,7 +53,11 @@ pub enum IntegerExtension {
 pub enum NativePurpose {
     Normal,
     StructArgument(u32),
+    /// An ABI-mandated pointer to a caller-owned aggregate copy.
+    IndirectArgument,
     StructReturn,
+    /// A register-position hole required by an aggregate alignment rule.
+    Padding,
 }
 
 /// One Cranelift signature carrier. This deliberately does not contain a
@@ -134,32 +141,41 @@ pub struct NativeBoundaryPlan {
 pub type FunctionPlan = NativeBoundaryPlan;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum GpRegister {
-    Rax,
-    Rdi,
-    Rsi,
-    Rdx,
-    Rcx,
-    R8,
-    R9,
+pub enum RegisterBank {
+    Integer,
+    Float,
 }
 
+/// A register slot in an ABI-defined argument or result bank.
+///
+/// Machine register spellings deliberately stay in the assembly renderer;
+/// ABI plans use only a bank and ordinal so the same model covers AMD64,
+/// arm64, and RISC-V.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub enum SseRegister {
-    Xmm0,
-    Xmm1,
-    Xmm2,
-    Xmm3,
-    Xmm4,
-    Xmm5,
-    Xmm6,
-    Xmm7,
+pub struct RegisterSlot {
+    pub bank: RegisterBank,
+    pub index: u8,
+}
+
+impl RegisterSlot {
+    pub const fn integer(index: u8) -> Self {
+        Self {
+            bank: RegisterBank::Integer,
+            index,
+        }
+    }
+
+    pub const fn float(index: u8) -> Self {
+        Self {
+            bank: RegisterBank::Float,
+            index,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum BridgeLocation {
-    Gp(GpRegister),
-    Sse(SseRegister),
+    Register(RegisterSlot),
     Stack { offset: u32 },
 }
 
@@ -168,6 +184,9 @@ pub struct BridgePiecePlan {
     pub source_index: Option<u32>,
     pub piece: AbiPiece,
     pub extension: IntegerExtension,
+    /// The physical piece carries a pointer to a caller-owned aggregate copy
+    /// rather than bytes from the aggregate itself.
+    pub indirect: bool,
     pub location: BridgeLocation,
 }
 
@@ -180,6 +199,7 @@ pub enum BridgeKind {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct BridgeBoundaryPlan {
+    pub abi_identity: AbiIdentity,
     pub calling_convention: CallingConvention,
     pub kind: BridgeKind,
     pub parameters: Vec<ClassifiedType>,
@@ -306,13 +326,18 @@ pub struct BridgeArtifactPlan {
 pub struct AbiConfigKey {
     pub schema: &'static str,
     pub target_triple: String,
+    pub abi_identity: AbiIdentity,
     pub data_layout: String,
     pub calling_convention: CallingConvention,
     pub boundary_profile: &'static str,
     pub classifier_revision: u32,
-    pub psabi_commit: &'static str,
-    pub psabi_source_sha256: &'static str,
+    pub specification_revision: &'static str,
+    pub specification_source_sha256: &'static str,
     pub backend_profile: &'static str,
+    pub normalized_target_arch: &'static str,
+    pub normalized_target_abi: &'static str,
+    pub normalized_target_cpu: &'static str,
+    pub normalized_deployment_target: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -378,6 +403,8 @@ pub struct VaArgPlan {
     pub result_align: u64,
     pub overflow_size: u64,
     pub overflow_align: u64,
+    /// The argument slot contains a pointer to the requested object.
+    pub indirect: bool,
 }
 
 pub(crate) fn hex(bytes: &[u8]) -> String {

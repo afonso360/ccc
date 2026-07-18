@@ -24,7 +24,7 @@ The default mode always preserves the selected target's C ABI, including represe
 | Target                                                   | Native representation                                     | Required lowering                                                                                                                                        |
 | -------------------------------------------------------- | --------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `x86_64-unknown-linux-gnu` / musl                        | x87 extended precision, 80 value bits in a 16-byte object | Internal memory representation plus f80 helpers; assembly ABI bridges marshal x87 arguments/returns when Cranelift cannot express them.                  |
-| `aarch64-unknown-linux-gnu`, `riscv64-unknown-linux-gnu` | IEEE binary128                                            | Verified Cranelift `f128` storage/ABI support where available; otherwise an `i128`-bits representation with compiler-runtime arithmetic and ABI bridges. |
+| `aarch64-unknown-linux-gnu`, `riscv64-unknown-linux-gnu` | IEEE binary128                                            | Exact object representation and aggregate layout; value-producing operations and ABI transport are rejected until independently proved.                 |
 | `aarch64-apple-darwin`                                   | IEEE binary64, identical to `double`                      | Native Cranelift `f64`.                                                                                                                                  |
 
 Declarations, `sizeof`, and `_Alignof` remain usable even when the selected backend lacks arithmetic or boundary support. Any literal conversion, arithmetic operation, call, return, or initializer that needs an unavailable capability is a hard, target-specific error. CCC must not substitute `double` implicitly.
@@ -32,6 +32,13 @@ Declarations, `sizeof`, and `_Alignof` remain usable even when the selected back
 `-mlong-double-64` is an explicit compatibility mode, never the default on a target whose ABI uses f80 or binary128. In that mode the [`EffectiveCompilationConfig`](targets.md#effective-compilation-configuration) changes the representation coherently: size, alignment, `__SIZEOF_LONG_DOUBLE__`, every `__LDBL_*__` macro, `<float.h>`, and ABI lowering all describe binary64. The driver emits one prominent ABI-incompatibility warning unless explicitly silenced. Objects produced in this mode carry a mode identifier in CCC metadata so the linker can diagnose incompatible CCC objects.
 
 The runtime/helper and assembly-bridge availability is a target capability checked before code generation. Soft-float arithmetic alone is not considered ABI support.
+
+The Linux binary128 profiles reject scalar and recursively containing
+aggregate boundaries with `CCC3509`, variadic fetches with `CCC2404`, and
+conversions, initialization, and arithmetic with `CCC2343`. These diagnostics
+are part of the accepted-program restriction and are tested separately from
+layout and macro evidence. Darwin's binary64 representation has native fixed
+and variadic transport.
 
 The enabled `x86_64-unknown-linux-gnu` SysV boundary profile does not yet
 provide native x87 transport or an address-backed scalar `long double` value.

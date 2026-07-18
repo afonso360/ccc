@@ -101,6 +101,12 @@ pub(crate) struct DriverOptions {
     pub no_builtin_includes: bool,
     pub sysroot: Option<PathBuf>,
     pub resource_dir: Option<PathBuf>,
+    pub target: Option<String>,
+    pub target_arch: Option<String>,
+    pub target_cpu: Option<String>,
+    pub target_abi: Option<String>,
+    pub sdk_root: Option<PathBuf>,
+    pub deployment_target: Option<String>,
     pub dependencies: DependencyOptions,
     pub suppress_warnings: bool,
     pub warnings_as_errors: bool,
@@ -111,6 +117,7 @@ pub(crate) struct DriverOptions {
 pub(crate) enum ParsedCommand {
     Run(Box<DriverOptions>),
     Help,
+    Version,
 }
 
 pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<ParsedCommand, String> {
@@ -132,6 +139,12 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
     let mut no_builtin_includes = false;
     let mut sysroot = None;
     let mut resource_dir = None;
+    let mut target = None;
+    let mut target_arch = None;
+    let mut target_cpu = None;
+    let mut target_abi = None;
+    let mut sdk_root = None;
+    let mut deployment_target = None;
     let mut dependencies = DependencyOptions::default();
     let mut suppress_warnings = false;
     let mut warnings_as_errors = false;
@@ -230,6 +243,10 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
             "-resource-dir" => {
                 resource_dir = Some(take_path(&mut arguments, "-resource-dir")?);
             }
+            "--target" | "-target" => {
+                target = Some(take_value(&mut arguments, "--target")?);
+            }
+            "--sdk-root" => sdk_root = Some(take_path(&mut arguments, "--sdk-root")?),
             "-MF" => dependencies.output = Some(take_path(&mut arguments, "-MF")?),
             "-MT" => dependencies
                 .targets
@@ -241,6 +258,7 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
                 .targets
                 .push(DependencyTarget::Quoted(take_value(&mut arguments, "-MQ")?)),
             "-h" | "--help" => return Ok(ParsedCommand::Help),
+            "--version" => return Ok(ParsedCommand::Version),
             "--" => inputs.extend(arguments.by_ref().map(PathBuf::from)),
             _ if argument == "-std=gnu11" => language_mode = LanguageMode::Gnu11,
             _ if argument == "-std=c11" => language_mode = LanguageMode::C11,
@@ -249,6 +267,33 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
             }
             _ if let Some(value) = argument.strip_prefix("--sysroot=") => {
                 sysroot = Some(PathBuf::from(value));
+            }
+            _ if let Some(value) = argument
+                .strip_prefix("--target=")
+                .or_else(|| argument.strip_prefix("-target=")) =>
+            {
+                require_joined_value(value, "--target")?;
+                target = Some(value.to_owned());
+            }
+            _ if let Some(value) = argument.strip_prefix("-march=") => {
+                require_joined_value(value, "-march")?;
+                target_arch = Some(value.to_owned());
+            }
+            _ if let Some(value) = argument.strip_prefix("-mcpu=") => {
+                require_joined_value(value, "-mcpu")?;
+                target_cpu = Some(value.to_owned());
+            }
+            _ if let Some(value) = argument.strip_prefix("-mabi=") => {
+                require_joined_value(value, "-mabi")?;
+                target_abi = Some(value.to_owned());
+            }
+            _ if let Some(value) = argument.strip_prefix("--sdk-root=") => {
+                require_joined_value(value, "--sdk-root")?;
+                sdk_root = Some(PathBuf::from(value));
+            }
+            _ if let Some(value) = argument.strip_prefix("-mmacosx-version-min=") => {
+                require_joined_value(value, "-mmacosx-version-min")?;
+                deployment_target = Some(value.to_owned());
             }
             _ if let Some(value) = argument.strip_prefix("-ferror-limit=") => {
                 error_limit = Some(parse_limit(value, "-ferror-limit")?);
@@ -355,6 +400,12 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
         no_builtin_includes,
         sysroot,
         resource_dir,
+        target,
+        target_arch,
+        target_cpu,
+        target_abi,
+        sdk_root,
+        deployment_target,
         dependencies,
         suppress_warnings,
         warnings_as_errors,
@@ -456,6 +507,14 @@ mod tests {
     }
 
     #[test]
+    fn version_is_a_no_input_driver_action() {
+        assert!(matches!(
+            parse(["--version".to_owned()]),
+            Ok(ParsedCommand::Version)
+        ));
+    }
+
+    #[test]
     fn parses_preprocessing_and_dependency_behavior() {
         let options = options(&[
             "-E",
@@ -537,6 +596,25 @@ mod tests {
                 DependencyTarget::Quoted("quoted target".to_owned()),
             ]
         );
+    }
+
+    #[test]
+    fn parses_target_toolchain_and_darwin_configuration() {
+        let options = options(&[
+            "--target=aarch64-apple-darwin",
+            "-march=armv8-a",
+            "-mcpu=generic",
+            "-mabi=darwin",
+            "--sdk-root=/SDK",
+            "-mmacosx-version-min=14.2",
+            "input.c",
+        ]);
+        assert_eq!(options.target.as_deref(), Some("aarch64-apple-darwin"));
+        assert_eq!(options.target_arch.as_deref(), Some("armv8-a"));
+        assert_eq!(options.target_cpu.as_deref(), Some("generic"));
+        assert_eq!(options.target_abi.as_deref(), Some("darwin"));
+        assert_eq!(options.sdk_root, Some(PathBuf::from("/SDK")));
+        assert_eq!(options.deployment_target.as_deref(), Some("14.2"));
     }
 
     #[test]

@@ -88,6 +88,23 @@ fn x86_64_builtin_and_pointer_layouts_are_explicit() {
 }
 
 #[test]
+fn compiler_128_bit_integer_layout_is_stable_for_every_enabled_target() {
+    for config in [
+        EffectiveCompilationConfig::default(),
+        EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+        EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
+        EffectiveCompilationConfig::aarch64_apple_darwin(),
+    ] {
+        let types = TypeStore::default();
+        for builtin in [BuiltinType::Int128, BuiltinType::UnsignedInt128] {
+            let layout = types.layout_of(types.builtin(builtin), &config).unwrap();
+            assert_eq!(layout.size, 16, "{} {builtin:?}", config.target.triple);
+            assert_eq!(layout.align, 16, "{} {builtin:?}", config.target.triple);
+        }
+    }
+}
+
+#[test]
 fn arrays_report_static_incomplete_and_runtime_shapes() {
     let mut types = TypeStore::default();
     let static_array = types.array(ArrayType {

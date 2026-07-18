@@ -94,3 +94,21 @@ retain = [
     "version.log",
     "test.log",
 ]
+
+[target_applicability."x86_64-unknown-linux-gnu"]
+status = "applicable"
+evidence_kind = "execution"
+runner = "run.sh"
+reason = "The adapter audits the upstream Linux build, native x86-64 GCC links, ELF PIE artifacts, and the official basic execution profile."
+
+[target_applicability."aarch64-unknown-linux-gnu"]
+status = "inapplicable"
+reason = "The adapter rejects non-x86-64 native GCC drivers and has no AArch64 cross-link, QEMU execution, or target-adjusted capability inventory."
+
+[target_applicability."riscv64-unknown-linux-gnu"]
+status = "inapplicable"
+reason = "The adapter rejects non-x86-64 native GCC drivers and has no RISC-V cross-link, QEMU execution, or target-adjusted capability inventory."
+
+[target_applicability."aarch64-apple-darwin"]
+status = "inapplicable"
+reason = "The selected upstream build is the Linux profile and the adapter requires GCC links and ELF inspection rather than a Darwin build and Mach-O audit."

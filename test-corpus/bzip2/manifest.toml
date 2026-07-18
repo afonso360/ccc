@@ -1,4 +1,4 @@
-format_version = 1
+format_version = 2
 name = "bzip2"
 version = "1.0.8"
 release_date = "2019-07-13"
@@ -24,7 +24,12 @@ test_pass_markers = 440
 test_runner_license = "GPL-3.0-or-later"
 test_imported_licenses = "recorded-per-source-subdirectory"
 
-target = "x86_64-unknown-linux-gnu"
+enabled_targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "riscv64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+]
 language_mode = "gnu11"
 language_mode_selection = "driver-default"
 gnu_compatibility_tuple = "4.2.1"
@@ -35,8 +40,12 @@ archive_c_translation_units = 13
 build_translation_units = 9
 native_link_commands = 2
 target_compiler = "ccc"
-link_driver = "gcc"
+link_driver_selection = "target-profile"
 link_mode = "platform-default-pie-executable"
+source_adjustments = "none"
+additional_language_flags = "none"
+additional_pie_flags = "none"
+additional_architecture_flags = "none"
 
 upstream_test_target = "check"
 upstream_test_command = "make -j1 check"
@@ -46,25 +55,22 @@ extended_success_marker = "All tests passed"
 smoke_command = "bzip2 -9 -c INPUT; bzip2 -t STREAM; bzip2 -d -c STREAM; cmp INPUT OUTPUT"
 
 required_tools = [
-    "ar",
     "awk",
     "bash",
     "basename",
     "cat",
+    "chmod",
     "cmp",
+    "cp",
     "dirname",
     "find",
-    "gcc",
     "git",
     "grep",
+    "ln",
     "make",
-    "md5sum",
     "mkdir",
     "mktemp",
     "mv",
-    "openssl",
-    "ranlib",
-    "readelf",
     "rm",
     "sed",
     "sort",
@@ -75,6 +81,44 @@ required_tools = [
     "wc",
 ]
 conditional_download_tools = ["curl"]
+
+[target_profiles."x86_64-unknown-linux-gnu"]
+execution = "native"
+link_driver = "gcc"
+archiver = "ar"
+archive_indexer = "ranlib"
+metadata_tool = "readelf"
+runtime = "host-elf-interpreter"
+
+[target_profiles."aarch64-unknown-linux-gnu"]
+execution = "qemu-user"
+link_driver = "aarch64-linux-gnu-gcc"
+archiver = "aarch64-linux-gnu-ar"
+archive_indexer = "aarch64-linux-gnu-ranlib"
+metadata_tool = "aarch64-linux-gnu-readelf"
+emulator = "qemu-aarch64"
+runtime_root = "required-explicit-non-host-root"
+runtime_interpreter = "verified-from-elf"
+
+[target_profiles."riscv64-unknown-linux-gnu"]
+execution = "qemu-user"
+link_driver = "riscv64-linux-gnu-gcc"
+archiver = "riscv64-linux-gnu-ar"
+archive_indexer = "riscv64-linux-gnu-ranlib"
+metadata_tool = "riscv64-linux-gnu-readelf"
+emulator = "qemu-riscv64"
+runtime_root = "required-explicit-non-host-root"
+runtime_interpreter = "verified-from-elf"
+
+[target_profiles."aarch64-apple-darwin"]
+execution = "native"
+link_driver = "/usr/bin/cc"
+archiver = "xcrun --find ar"
+archive_indexer = "xcrun --find ranlib"
+metadata_tools = "file otool nm"
+sdk = "xcrun --sdk macosx --show-sdk-path"
+deployment_target = "required-explicit-or-11.0-default"
+extended_test_hash_tools = "OpenSSL-with-SHA3-256 GNU-compatible-md5sum"
 
 [expected_inventory]
 gnu_attributes = ["noreturn"]
@@ -104,23 +148,53 @@ excluded_developer_utilities = ["dlltest.c", "mk251.c", "spewG.c", "unzcrash.c"]
 retain = [
     "archive-source-inputs.txt",
     "build.log",
+    "binary-dynamic.txt",
+    "binary-headers.txt",
+    "binary-load-commands.txt",
+    "binary-relocations.txt",
+    "binary-symbols.txt",
     "capability-inventory.txt",
     "compile-commands.txt",
     "effective-macros.txt",
-    "elf-dynamic-tags.txt",
-    "elf-headers.txt",
     "expected-archive-source-inputs.txt",
     "expected-source-inputs.txt",
     "extended-test.log",
     "link-driver-identity.txt",
     "link-driver-macros.txt",
     "predicate-probe.txt",
+    "qemu-identity.txt",
     "round-trip-input.txt",
     "round-trip-output.txt",
     "round-trip-stream.bz2",
     "round-trip.log",
     "source-inputs.txt",
     "test-repository-identity.txt",
+    "target-profile.txt",
+    "tool-identities.txt",
     "upstream-test.log",
     "version.log",
 ]
+
+[target_applicability."x86_64-unknown-linux-gnu"]
+status = "applicable"
+evidence_kind = "execution"
+runner = "run.sh"
+reason = "The target-explicit adapter audits the native GNU driver, compiler sysroot, x86-64 ELF PIE artifacts, upstream checks, and all 440 extended execution checks."
+
+[target_applicability."aarch64-unknown-linux-gnu"]
+status = "applicable"
+evidence_kind = "execution"
+runner = "run.sh"
+reason = "The target-explicit adapter requires matching AArch64 GNU tools, verifies the non-host QEMU root and ELF interpreter, audits AArch64 ELF PIE artifacts, and executes the upstream and 440-check suites through a tracked launcher."
+
+[target_applicability."riscv64-unknown-linux-gnu"]
+status = "applicable"
+evidence_kind = "execution"
+runner = "run.sh"
+reason = "The target-explicit adapter requires matching RISC-V GNU tools, an LP64D driver, verifies the non-host QEMU root and ELF interpreter, audits RISC-V ELF PIE artifacts including e_flags 0x5, and executes both suites through a tracked launcher."
+
+[target_applicability."aarch64-apple-darwin"]
+status = "applicable"
+evidence_kind = "execution"
+runner = "run.sh"
+reason = "The target-explicit adapter requires a native arm64 macOS host, Apple Clang, an explicit SDK and deployment target, GNU-compatible test hashes, audits Mach-O arm64 PIE artifacts, and executes both suites natively."

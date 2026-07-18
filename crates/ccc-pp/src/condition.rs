@@ -1,6 +1,6 @@
 use crate::diagnostic::PpDiagnostic;
 use crate::literal::{CharacterConstantPrefix, decode_character_constant, decode_integer_constant};
-use crate::macros::{ExpansionLocation, MacroTable, expand};
+use crate::macros::{ExpansionLocation, MacroTable, expand_condition};
 use crate::options::PreprocessOptions;
 use crate::token::{PpToken, PpTokenKind};
 use ccc_session::SourceMap;
@@ -24,11 +24,11 @@ where
     F: FnMut(&str, bool, bool) -> bool,
 {
     let direct_tokens = replace_direct_header_predicates(tokens, table, &mut has_include);
-    let (defined_tokens, mut diagnostics) = replace_defined(table, &direct_tokens);
-    let expanded = expand(sources, table, &defined_tokens, options, location);
+    let expanded = expand_condition(sources, table, &direct_tokens, options, location);
+    let (defined_tokens, mut diagnostics) = replace_defined(table, &expanded.tokens);
     diagnostics.extend(expanded.diagnostics);
     let (predicate_tokens, predicate_diagnostics) =
-        replace_predicates(expanded.tokens, table, options, &mut has_include);
+        replace_predicates(defined_tokens, table, options, &mut has_include);
     diagnostics.extend(predicate_diagnostics);
     let normalized = predicate_tokens
         .into_iter()
@@ -695,5 +695,80 @@ mod tests {
         );
         assert!(result.value);
         assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn evaluates_defined_operators_produced_by_macro_expansion() {
+        let mut sources = SourceMap::new();
+        let file = sources.add_file("test.c", "CHECK_PRESENT && !CHECK_MISSING && CHECK_BARE");
+        let tokens = lex(file, sources.source(file).unwrap()).unwrap();
+        let mut table = MacroTable::default();
+        let span = tokens[0].span;
+        for (name, replacement) in [
+            ("PRESENT", "1"),
+            ("CHECK_PRESENT", "defined(PRESENT)"),
+            ("CHECK_MISSING", "defined(MISSING)"),
+            ("CHECK_BARE", "defined PRESENT"),
+        ] {
+            let replacement_file = sources.add_file(format!("{name}.replacement"), replacement);
+            table.define(crate::macros::MacroDefinition {
+                name: name.to_owned(),
+                form: crate::macros::MacroForm::Object,
+                replacement: lex(replacement_file, sources.source(replacement_file).unwrap())
+                    .unwrap(),
+                definition_span: span,
+                predefined: false,
+            });
+        }
+        let result = evaluate(
+            &mut sources,
+            &mut table,
+            &tokens,
+            &PreprocessOptions::default(),
+            true,
+            ExpansionLocation {
+                logical_file: "test.c",
+                is_system_header: false,
+            },
+            |_, _, _| false,
+        );
+        assert!(result.value);
+        assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn generated_defined_operator_obeys_the_output_token_limit() {
+        let mut sources = SourceMap::new();
+        let file = sources.add_file("test.c", "CHECK");
+        let tokens = lex(file, sources.source(file).unwrap()).unwrap();
+        let replacement_file = sources.add_file("replacement", "defined(PRESENT)");
+        let mut table = MacroTable::default();
+        table.define(crate::macros::MacroDefinition {
+            name: "CHECK".to_owned(),
+            form: crate::macros::MacroForm::Object,
+            replacement: lex(replacement_file, sources.source(replacement_file).unwrap()).unwrap(),
+            definition_span: tokens[0].span,
+            predefined: false,
+        });
+        let mut options = PreprocessOptions::default();
+        options.limits.output_tokens = 3;
+        let result = evaluate(
+            &mut sources,
+            &mut table,
+            &tokens,
+            &options,
+            true,
+            ExpansionLocation {
+                logical_file: "test.c",
+                is_system_header: false,
+            },
+            |_, _, _| false,
+        );
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "CCC1102")
+        );
     }
 }

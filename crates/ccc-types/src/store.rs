@@ -3,8 +3,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use ccc_target::{
-    Architecture, CallingConvention, EffectiveCompilationConfig, Environment, OperatingSystem,
-    PackingPolicy, TargetBuiltinType, TargetDataLayout,
+    AbiIdentity, EffectiveCompilationConfig, PackingPolicy, TargetBuiltinType, TargetDataLayout,
 };
 
 use crate::{
@@ -101,6 +100,8 @@ impl Default for TypeStore {
             TypeKind::Builtin(BuiltinType::Float),
             TypeKind::Builtin(BuiltinType::Double),
             TypeKind::Builtin(BuiltinType::LongDouble),
+            TypeKind::Builtin(BuiltinType::Int128),
+            TypeKind::Builtin(BuiltinType::UnsignedInt128),
         ];
         let interned = kinds
             .iter()
@@ -185,28 +186,19 @@ impl TypeStore {
     }
 
     /// Returns the canonical representation of a compiler-provided target
-    /// type. The SysV AMD64 `va_list` is an array of one ABI record so normal C
-    /// parameter adjustment produces the required pointer representation.
+    /// type. Linux register-save ABIs use an array of one public record so C
+    /// parameter adjustment produces their required pointer representation;
+    /// the RISC-V and Darwin ABIs expose a pointer cursor.
     pub fn target_builtin(
         &mut self,
         kind: TargetBuiltinType,
         config: &EffectiveCompilationConfig,
     ) -> Result<TypeId, TargetBuiltinTypeError> {
-        let supported = config.target.triple.architecture == Architecture::X86_64
-            && config.target.triple.operating_system == OperatingSystem::Linux
-            && config.target.triple.environment == Environment::Gnu
-            && config.target.calling_convention() == Some(CallingConvention::SystemV);
-        if !supported {
-            return Err(TargetBuiltinTypeError {
-                kind,
-                target: config.target.triple.to_string(),
-            });
-        }
         if let Some(ty) = self.target_builtins.get(&kind) {
             return Ok(*ty);
         }
         let ty = match kind {
-            TargetBuiltinType::VaList => {
+            TargetBuiltinType::VaList if config.target.abi == AbiIdentity::SysvAmd64Lp64 => {
                 let void_pointer = self.pointer(TypeId::VOID);
                 let (record, record_ty) = self.declare_record(
                     RecordKind::Struct,
@@ -226,6 +218,40 @@ impl TypeStore {
                     element: QualifiedType::unqualified(record_ty),
                     length: ArrayLength::Constant(1),
                 })
+            }
+            TargetBuiltinType::VaList if config.target.abi == AbiIdentity::Aapcs64Lp64 => {
+                let void_pointer = self.pointer(TypeId::VOID);
+                let (record, record_ty) = self.declare_record(
+                    RecordKind::Struct,
+                    Some("__ccc_aapcs64_va_list_tag".to_owned()),
+                );
+                self.complete_record(
+                    record,
+                    vec![
+                        Field::named("__stack", void_pointer),
+                        Field::named("__gr_top", void_pointer),
+                        Field::named("__vr_top", void_pointer),
+                        Field::named("__gr_offs", TypeId::INT),
+                        Field::named("__vr_offs", TypeId::INT),
+                    ],
+                )
+                .expect("a newly declared target record is incomplete");
+                self.array(ArrayType {
+                    element: QualifiedType::unqualified(record_ty),
+                    length: ArrayLength::Constant(1),
+                })
+            }
+            TargetBuiltinType::VaList if config.target.abi == AbiIdentity::RiscvLp64d => {
+                self.pointer(TypeId::VOID)
+            }
+            TargetBuiltinType::VaList if config.target.abi == AbiIdentity::DarwinArm64 => {
+                self.pointer(TypeId::CHAR)
+            }
+            _ => {
+                return Err(TargetBuiltinTypeError {
+                    kind,
+                    target: config.target.triple.to_string(),
+                });
             }
         };
         self.target_builtins.insert(kind, ty);

@@ -30,7 +30,11 @@ fn compile_ccc(source: &Path, output: &Path) {
 
 fn compile_ccc_with_options(source: &Path, output: &Path, options: &[&str]) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ccc"));
-    command.arg("-nostdinc").arg("-c").args(options);
+    command
+        .arg("--target=x86_64-unknown-linux-gnu")
+        .arg("-nostdinc")
+        .arg("-c")
+        .args(options);
     let result = command.arg(source).arg("-o").arg(output).output().unwrap();
     assert!(
         result.status.success(),

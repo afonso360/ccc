@@ -82,7 +82,8 @@ pub(super) fn define_globals(
             || (global.emission.definition == ObjectDefinitionPolicy::TentativeCommon
                 && global.linkage == CLinkage::External
                 && global.duration != StorageDuration::Thread
-                && global.emission.tls.is_none())
+                && global.emission.tls.is_none()
+                && config.target.triple.binary_format == BinaryFormat::Elf)
         {
             continue;
         }

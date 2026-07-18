@@ -1,5 +1,5 @@
 use ccc_ir::generic as gir;
-use ccc_target::{ByteOrder, CallingConvention, EffectiveCompilationConfig};
+use ccc_target::{AbiIdentity, ByteOrder, CallingConvention, EffectiveCompilationConfig};
 use ccc_types::{ArrayLength, TypeKind, TypeQualifiers, TypeStore};
 use sha2::{Digest as _, Sha256};
 
@@ -8,6 +8,15 @@ use crate::{AbiConfigKey, AbiError, IrShapeDigest, TranslationUnitDigest};
 const PSABI_COMMIT: &str = "e1ce098331da5dbd66e1ffc74162380bcc213236";
 const PSABI_SOURCE_SHA256: &str =
     "2d42f2ab76b99a3b8456e6bc07e18314e85991119f72db90ca1175328e27b705";
+const AAPCS64_COMMIT: &str = "daa7a94ca55973736c0e434a67a6e4bbcd35d7fa";
+const AAPCS64_SOURCE_SHA256: &str =
+    "92460d0e8a1e081e0b1ed8f23dd6f9a0716ca566158a3e099a48de62cb2125a6";
+const RISCV_PSABI_COMMIT: &str = "e03d44ae2f0e1144f9498c2896b5ae25b0449398";
+const RISCV_PSABI_SOURCE_SHA256: &str =
+    "c87c97d518681c44398add931cc41a43235abe656eaf831b849934a3919d86e5";
+const APPLE_ARM64_EVIDENCE_REVISION: &str = "retrieved-2026-07-18-clt-26.6";
+const APPLE_ARM64_SOURCE_SHA256: &str =
+    "afe0badf53abe5510e610358ba81050080692af7df7715a44be55271904d3b3e";
 
 pub fn abi_config_key(config: &EffectiveCompilationConfig) -> Result<AbiConfigKey, AbiError> {
     let calling_convention = config.target.calling_convention().ok_or_else(|| {
@@ -59,17 +68,66 @@ pub fn abi_config_key(config: &EffectiveCompilationConfig) -> Result<AbiConfigKe
         layout.default_packing.maximum_field_alignment.unwrap_or(0),
         layout.default_packing.minimum_record_alignment,
     );
+    let (boundary_profile, classifier_revision, specification_revision, specification_digest) =
+        match config.target.abi {
+            AbiIdentity::SysvAmd64Lp64 => {
+                ("sysv-amd64-lp64-v1", 1, PSABI_COMMIT, PSABI_SOURCE_SHA256)
+            }
+            AbiIdentity::Aapcs64Lp64 => {
+                ("aapcs64-lp64-v1", 1, AAPCS64_COMMIT, AAPCS64_SOURCE_SHA256)
+            }
+            AbiIdentity::RiscvLp64d => (
+                "riscv-lp64d-v1",
+                1,
+                RISCV_PSABI_COMMIT,
+                RISCV_PSABI_SOURCE_SHA256,
+            ),
+            AbiIdentity::DarwinArm64 => (
+                "darwin-arm64-v1",
+                1,
+                APPLE_ARM64_EVIDENCE_REVISION,
+                APPLE_ARM64_SOURCE_SHA256,
+            ),
+        };
     Ok(AbiConfigKey {
-        schema: "ccc-abi-config-v1",
+        schema: "ccc-abi-config-v2",
         target_triple: config.target.triple.to_string(),
+        abi_identity: config.target.abi,
         data_layout,
         calling_convention,
-        boundary_profile: "sysv-amd64-lp64-v1",
-        classifier_revision: 1,
-        psabi_commit: PSABI_COMMIT,
-        psabi_source_sha256: PSABI_SOURCE_SHA256,
+        boundary_profile,
+        classifier_revision,
+        specification_revision,
+        specification_source_sha256: specification_digest,
         backend_profile: "cranelift-0.132.0-no-llvm-extensions-no-implicit-sret",
+        normalized_target_arch: config.normalized_target_arch(),
+        normalized_target_abi: config.normalized_target_abi(),
+        normalized_target_cpu: config.normalized_target_cpu(),
+        normalized_deployment_target: config
+            .normalized_deployment_target()
+            .unwrap_or("<none>")
+            .to_owned(),
     })
+}
+
+/// Fingerprints the exact configuration-key bytes used by the original
+/// x86-64 planner schema. Keeping this value stable prevents target expansion
+/// from silently invalidating cached bridge artifacts that explicitly opt in
+/// to the legacy schema.
+pub fn sysv_amd64_v1_config_fingerprint(
+    config: &EffectiveCompilationConfig,
+) -> Result<[u8; 32], AbiError> {
+    if config.target.abi != AbiIdentity::SysvAmd64Lp64 {
+        return Err(AbiError::new(
+            "CCC3504",
+            "the legacy ABI configuration schema is defined only for SysV AMD64 LP64",
+        ));
+    }
+    let mut key = abi_config_key(config)?;
+    key.schema = "ccc-abi-config-v1";
+    let mut encoder = Encoder { bytes: Vec::new() };
+    encode_config_key_v1(&mut encoder, &key);
+    Ok(Sha256::digest(encoder.finish()).into())
 }
 
 pub fn ir_shape_digest(
@@ -171,19 +229,47 @@ pub fn translation_unit_digest(
 fn encode_config_key(encoder: &mut Encoder, key: &AbiConfigKey) {
     encoder.string(key.schema);
     encoder.string(&key.target_triple);
+    encoder.tag(match key.abi_identity {
+        AbiIdentity::SysvAmd64Lp64 => 0,
+        AbiIdentity::Aapcs64Lp64 => 1,
+        AbiIdentity::RiscvLp64d => 2,
+        AbiIdentity::DarwinArm64 => 3,
+    });
     encoder.string(&key.data_layout);
-    encoder.tag(match key.calling_convention {
+    encode_calling_convention(encoder, key.calling_convention);
+    encoder.string(key.boundary_profile);
+    encoder.u32(key.classifier_revision);
+    encoder.string(key.specification_revision);
+    encoder.string(key.specification_source_sha256);
+    encoder.string(key.backend_profile);
+    // Configuration-v2 fields are append-only. Stable tag assignments and the
+    // v1 encoder below must not be renumbered when another profile is added.
+    encoder.string(key.normalized_target_arch);
+    encoder.string(key.normalized_target_abi);
+    encoder.string(key.normalized_target_cpu);
+    encoder.string(&key.normalized_deployment_target);
+}
+
+fn encode_config_key_v1(encoder: &mut Encoder, key: &AbiConfigKey) {
+    encoder.string(key.schema);
+    encoder.string(&key.target_triple);
+    encoder.string(&key.data_layout);
+    encode_calling_convention(encoder, key.calling_convention);
+    encoder.string(key.boundary_profile);
+    encoder.u32(key.classifier_revision);
+    encoder.string(key.specification_revision);
+    encoder.string(key.specification_source_sha256);
+    encoder.string(key.backend_profile);
+}
+
+fn encode_calling_convention(encoder: &mut Encoder, calling_convention: CallingConvention) {
+    encoder.tag(match calling_convention {
         CallingConvention::SystemV => 0,
         CallingConvention::WindowsFastcall => 1,
         CallingConvention::AppleAarch64 => 2,
         CallingConvention::WasmBasicCAbi => 3,
         _ => u8::MAX,
     });
-    encoder.string(key.boundary_profile);
-    encoder.u32(key.classifier_revision);
-    encoder.string(key.psabi_commit);
-    encoder.string(key.psabi_source_sha256);
-    encoder.string(key.backend_profile);
 }
 
 fn encode_types(encoder: &mut Encoder, types: &TypeStore) -> Result<(), AbiError> {
@@ -1023,6 +1109,77 @@ mod tests {
         assert_eq!(
             abi_config_key(&left).unwrap(),
             abi_config_key(&right).unwrap()
+        );
+    }
+
+    #[test]
+    fn configuration_key_uses_the_ccc_owned_abi_identity() {
+        for (config, identity, profile, architecture, abi) in [
+            (
+                EffectiveCompilationConfig::x86_64_unknown_linux_gnu(),
+                AbiIdentity::SysvAmd64Lp64,
+                "sysv-amd64-lp64-v1",
+                "x86-64",
+                "lp64",
+            ),
+            (
+                EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+                AbiIdentity::Aapcs64Lp64,
+                "aapcs64-lp64-v1",
+                "armv8-a",
+                "lp64",
+            ),
+            (
+                EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
+                AbiIdentity::RiscvLp64d,
+                "riscv-lp64d-v1",
+                "rv64gc",
+                "lp64d",
+            ),
+            (
+                EffectiveCompilationConfig::aarch64_apple_darwin(),
+                AbiIdentity::DarwinArm64,
+                "darwin-arm64-v1",
+                "armv8-a",
+                "darwin",
+            ),
+        ] {
+            let key = abi_config_key(&config).unwrap();
+            assert_eq!(key.schema, "ccc-abi-config-v2");
+            assert_eq!(key.abi_identity, identity);
+            assert_eq!(key.boundary_profile, profile);
+            assert_eq!(key.normalized_target_arch, architecture);
+            assert_eq!(key.normalized_target_abi, abi);
+            assert_eq!(key.normalized_target_cpu, "generic");
+            assert_eq!(
+                key.normalized_deployment_target,
+                if identity == AbiIdentity::DarwinArm64 {
+                    "11.0"
+                } else {
+                    "<none>"
+                }
+            );
+            assert_ne!(key.specification_source_sha256, "embedded-policy");
+            assert_eq!(key.specification_source_sha256.len(), 64);
+        }
+        assert_eq!(
+            abi_config_key(&EffectiveCompilationConfig::aarch64_apple_darwin()).unwrap(),
+            abi_config_key(
+                &EffectiveCompilationConfig::aarch64_apple_darwin().with_deployment_target("11.0")
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn sysv_amd64_v1_configuration_bytes_are_locked() {
+        let fingerprint = sysv_amd64_v1_config_fingerprint(
+            &EffectiveCompilationConfig::x86_64_unknown_linux_gnu(),
+        )
+        .unwrap();
+        assert_eq!(
+            crate::hex(&fingerprint),
+            "430708c07b263997a5f6db5759624d2c42f0f3d68396cd9fd111b2c84db6ded8"
         );
     }
 }

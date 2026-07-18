@@ -26,7 +26,7 @@ version = "0.1.0"
 unsafe_code = "forbid"
 
 [workspace.dependencies]
-cranelift-codegen = { version = "=0.132.0", default-features = false, features = ["std", "unwind", "x86"] }
+cranelift-codegen = { version = "=0.132.0", default-features = false, features = ["std", "unwind", "x86", "arm64", "riscv64"] }
 cranelift-frontend = { version = "=0.132.0", default-features = false, features = ["std"] }
 cranelift-module = { version = "=0.132.0" }
 cranelift-object = { version = "=0.132.0" }
