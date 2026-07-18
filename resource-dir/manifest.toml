@@ -5,14 +5,14 @@ compiler_version = "0.1.0"
 directory = "include"
 compiler_owned = ["stdalign.h", "stdbool.h", "stdarg.h", "stdnoreturn.h"]
 target_derived = ["stddef.h"]
-hosted_wrappers = []
+hosted_wrappers = ["math.h"]
 
 [hosted_header_profile]
 name = "gcc-4.2.1"
 version = "4.2.1"
-scope = "parsing"
+scope = "code-generation"
 selection_gate = "__GNUC_PREREQ(4, 2)"
-rationale = "This conservative version selects an established GNU declaration surface covered by preprocessing and parser tests while avoiding header gates that infer newer language features such as __VA_OPT__."
+rationale = "This conservative version selects an established GNU declaration surface covered through native object generation and execution while avoiding header gates that infer newer language features such as __VA_OPT__. CCC-specific C11 identity and predicate deviations are enumerated separately and are not attributed to historical GCC 4.2.1."
 capabilities = [
     "computed-includes",
     "function-like-macros",

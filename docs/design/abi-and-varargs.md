@@ -116,6 +116,13 @@ provide source-level stepping within them. Same-compilation magic and version
 validation happens in Rust before assembly materialization; production bridge
 code does not contain an unreachable protocol trap.
 
+Prototyped variadic calls classify the fixed parameters from the prototype and
+the remaining parameters from their default-promoted actual types.
+Unprototyped calls have a zero fixed boundary and classify every argument from
+its default-promoted actual type. Both forms set `%al` from the number of XMM
+argument registers actually occupied, as required by the SysV AMD64 variadic
+calling sequence. Direct and function-pointer calls share this transport.
+
 ## Variadic definitions and `va_list`
 
 A variadic definition has an externally visible ABI-valid assembly entry and a
@@ -185,6 +192,9 @@ can still require cross-object resolution.
 - fixed aggregate cross-linking with GCC and Clang in both directions;
 - direct and indirect variadic calls with zero, one, eight, and more than eight
   floating actuals, including a disassembly assertion for `%al` saturation;
+- zero-argument, promoted scalar, direct, and function-pointer unprototyped
+  calls cross-linked to GCC and Clang variadic callees, including `%al`-dependent
+  execution;
 - GCC/Clang-created `va_list` values consumed by CCC and CCC-created lists
   consumed by `vsnprintf` and `vfprintf`;
 - register and overflow exhaustion, mixed-class reconstruction, independent

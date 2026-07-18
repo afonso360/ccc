@@ -19,7 +19,7 @@ The `EffectiveCompilationConfig` type and per-target defaults are defined in `cc
 - `TargetSpec`: triple defaults, data layout, object format, default ABI, default CPU features, and native `long double` representation;
 - `LanguageOptions`: language/GNU profile, character set, overflow, enum, character-signedness, and diagnostic-affecting choices;
 - `AbiOptions`: calling convention, packing, long-double mode, vector ABI, TLS model, and target ABI flags;
-- `CodegenOptions`: CPU/ISA features, relocation model, code model, optimization contract, debug information, and stack policy;
+- `CodegenOptions`: CPU/ISA features, relocation model, code model, optimization contract, debug information, stack policy, and automatic-storage provider;
 - `ToolchainSpec`: resolved compiler driver, assembler, linker, archiver, sysroot/SDK, runtime libraries, system includes, deployment target, and a probe fingerprint. Components are resolved [per selected phase](toolchain.md#target-toolchain-resolution); compile-only invocations do not require a resolved linker.
 
 Target defaults remain immutable data; command-line flags produce a new effective value rather than mutating global target state. Predefined macros, builtin headers, layout, semantic analysis, ABI lowering, code generation, and linker flags are derived from this effective value. It is hashed into caches and recorded in object metadata needed for compatibility checks; each resolved tool is fingerprinted individually and hashes cover the phase-relevant subset, so compile-only outputs do not depend on linker identity.
@@ -30,6 +30,18 @@ those facts with the language and named compatibility profile once; the driver
 adds only compiler identity and capability-denial macros. Builtin headers and
 `-dM` consume that same final environment rather than maintaining parallel
 tables.
+
+An automatic-storage provider is enabled per effective target profile. Its
+versioned descriptor records the provider kind, arena and mark record layouts,
+allocator requirements, target VLA minimum alignment, failure behavior,
+returns-twice and cross-language-unwind compatibility, async-signal-safety
+stance, and committed performance budgets. Generated callers and local support
+definitions consume the same record layouts. These facts drive semantic
+diagnostics, `__STDC_NO_VLA__`, `__has_builtin`, CCC-IR lowering, helper
+selection, link planning, and provider tests together. Arena-backed ISO VLA
+support never implies native-stack builtin support. The descriptor revision and
+record layouts enter both the effective-configuration hash and object
+compatibility metadata.
 
 ## Relocation and output models
 

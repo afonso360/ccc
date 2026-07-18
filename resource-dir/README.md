@@ -34,6 +34,12 @@ the standard interface to typed compiler builtins and names the target-derived
 `__builtin_va_list` type. The target type system, ABI planner, and code
 generator own the concrete list representation.
 
+`math.h` delegates declarations and constants to the target libc, then supplies
+single-evaluation `isfinite`, `isinf`, and `isnan` macros for the supported
+`float` and `double` arithmetic surface. This avoids selecting libc generic
+macros whose unchosen branches still require unavailable native `long double`
+calls. It does not claim native `long double` classification support.
+
 The manifest also records the GNU compatibility profile used to select and
 parse hosted-header paths. Its checked capability and declined-feature sets
 keep the advertised compiler version tied to preprocessing and declaration

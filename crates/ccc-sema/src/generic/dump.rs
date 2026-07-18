@@ -71,12 +71,17 @@ fn dump_global(output: &mut String, unit: &FullTypedTranslationUnit, id: GlobalI
         output,
         0,
         format_args!(
-            "global @{} {} : {} storage={:?} linkage={:?} duration={:?} symbol={} definition={:?}",
+            "global @{} {} : {} storage={:?} linkage={:?}{} duration={:?} symbol={} definition={:?}",
             id.0,
             global.name,
             unit.types.display_qualified(global.ty),
             global.storage,
             global.linkage,
+            if global.emission.binding == SymbolBinding::Weak {
+                " binding=Weak"
+            } else {
+                ""
+            },
             global.duration,
             global.emission.symbol_name,
             global.emission.definition
@@ -93,12 +98,17 @@ fn dump_function(output: &mut String, unit: &FullTypedTranslationUnit, id: FullF
         output,
         0,
         format_args!(
-            "function @{} {} : {} storage={:?} linkage={:?} visibility={:?} inline={} noreturn={} {}",
+            "function @{} {} : {} storage={:?} linkage={:?}{} visibility={:?} inline={} noreturn={} {}",
             id.0,
             function.name,
             unit.types.display(function.signature),
             function.storage,
             function.linkage,
+            if function.binding == SymbolBinding::Weak {
+                " binding=Weak"
+            } else {
+                ""
+            },
             function.visibility,
             function.properties.inline,
             function.properties.no_return,
@@ -120,6 +130,7 @@ fn dump_function(output: &mut String, unit: &FullTypedTranslationUnit, id: FullF
                 unit.types.display_qualified(parameter.ty)
             ),
         );
+        dump_variable_length_bounds(output, unit, &parameter.variable_length_bounds, 2);
     }
     if let Some(body) = &function.body {
         dump_statement(output, unit, body, 1);
@@ -231,6 +242,10 @@ fn dump_statement(
         FullTypedStatementKind::Goto { label, name } => {
             line(output, indent, format_args!("goto ^{} {name}", label.0));
         }
+        FullTypedStatementKind::ComputedGoto(expression) => {
+            line(output, indent, format_args!("computed-goto"));
+            dump_expression(output, unit, expression, indent + 1);
+        }
         FullTypedStatementKind::Continue => line(output, indent, format_args!("continue")),
         FullTypedStatementKind::Break => line(output, indent, format_args!("break")),
         FullTypedStatementKind::Return(expression) => {
@@ -276,6 +291,12 @@ fn dump_block_item(
                     ),
                 );
             }
+            dump_variable_length_bounds(
+                output,
+                unit,
+                &declaration.variable_length_bounds,
+                indent + 1,
+            );
             if let Some(initializer) = &declaration.initializer {
                 dump_initializer(output, unit, initializer, indent + 1);
             }
@@ -313,6 +334,22 @@ fn dump_block_item(
                 format_args!("pragma {}", render_pragma(pragma)),
             );
         }
+    }
+}
+
+fn dump_variable_length_bounds(
+    output: &mut String,
+    unit: &FullTypedTranslationUnit,
+    bounds: &[FullTypedVariableLengthBound],
+    indent: usize,
+) {
+    for bound in bounds {
+        line(
+            output,
+            indent,
+            format_args!("variable-length-bound vla{}", bound.id.0),
+        );
+        dump_expression(output, unit, &bound.expression, indent + 1);
     }
 }
 
@@ -421,6 +458,7 @@ fn dump_expression(
             indirect,
             bitfield,
         } => {
+            let name = name.as_deref().unwrap_or("<anonymous>");
             let bitfield = bitfield.as_deref().map_or_else(String::new, |descriptor| {
                 format!(
                     " bitfield={}:{}:{}/{}",
@@ -436,6 +474,14 @@ fn dump_expression(
                 format_args!("member #{field_index} {name} indirect={indirect}{bitfield}{suffix}"),
             );
             dump_expression(output, unit, base, indent + 1);
+        }
+        FullTypedExpressionKind::CompoundLiteral { local, initializer } => {
+            line(
+                output,
+                indent,
+                format_args!("compound-literal l{}{suffix}", local.0),
+            );
+            dump_initializer(output, unit, initializer, indent + 1);
         }
         FullTypedExpressionKind::Assignment {
             operator,
@@ -514,6 +560,104 @@ fn dump_expression(
                 dump_expression(output, unit, expression, indent + 1);
             }
         }
+        FullTypedExpressionKind::StatementExpression { items, result } => {
+            line(output, indent, format_args!("statement-expression{suffix}"));
+            for item in items {
+                dump_block_item(output, unit, item, indent + 1);
+            }
+            if let Some(result) = result {
+                dump_named_expression(output, unit, "result", result, indent + 1);
+            }
+        }
+        FullTypedExpressionKind::BuiltinExpect { value, expected } => {
+            line(output, indent, format_args!("builtin-expect{suffix}"));
+            dump_expression(output, unit, value, indent + 1);
+            dump_expression(output, unit, expected, indent + 1);
+        }
+        FullTypedExpressionKind::IntegerIntrinsic { operation, operand } => {
+            line(
+                output,
+                indent,
+                format_args!("integer-intrinsic {operation:?}{suffix}"),
+            );
+            dump_expression(output, unit, operand, indent + 1);
+        }
+        FullTypedExpressionKind::MemoryCopy {
+            destination,
+            source,
+            length,
+            overlap,
+        } => {
+            line(
+                output,
+                indent,
+                format_args!("memory-copy overlap={overlap}{suffix}"),
+            );
+            dump_expression(output, unit, destination, indent + 1);
+            dump_expression(output, unit, source, indent + 1);
+            dump_expression(output, unit, length, indent + 1);
+        }
+        FullTypedExpressionKind::MemorySet {
+            destination,
+            value,
+            length,
+        } => {
+            line(output, indent, format_args!("memory-set{suffix}"));
+            dump_expression(output, unit, destination, indent + 1);
+            dump_expression(output, unit, value, indent + 1);
+            dump_expression(output, unit, length, indent + 1);
+        }
+        FullTypedExpressionKind::Prefetch {
+            address,
+            write,
+            locality,
+        } => {
+            line(
+                output,
+                indent,
+                format_args!("prefetch write={write} locality={locality}{suffix}"),
+            );
+            dump_expression(output, unit, address, indent + 1);
+        }
+        FullTypedExpressionKind::AtomicReadModifyWrite {
+            operation,
+            pointer,
+            operand,
+            object,
+            return_new,
+            order,
+        } => {
+            line(
+                output,
+                indent,
+                format_args!(
+                    "atomic-rmw {operation:?} object={} return-new={return_new} order={order:?}{suffix}",
+                    unit.types.display_qualified(*object)
+                ),
+            );
+            dump_expression(output, unit, pointer, indent + 1);
+            dump_expression(output, unit, operand, indent + 1);
+        }
+        FullTypedExpressionKind::AtomicCompareExchange {
+            pointer,
+            expected,
+            replacement,
+            object,
+            return_boolean,
+            order,
+        } => {
+            line(
+                output,
+                indent,
+                format_args!(
+                    "atomic-cmpxchg object={} return-boolean={return_boolean} order={order:?}{suffix}",
+                    unit.types.display_qualified(*object)
+                ),
+            );
+            dump_expression(output, unit, pointer, indent + 1);
+            dump_expression(output, unit, expected, indent + 1);
+            dump_expression(output, unit, replacement, indent + 1);
+        }
         FullTypedExpressionKind::Sizeof { operand_ty, size } => line(
             output,
             indent,
@@ -577,6 +721,13 @@ fn dump_expression(
             line(output, indent, format_args!("va-end{suffix}"));
             dump_expression(output, unit, list, indent + 1);
         }
+        FullTypedExpressionKind::MemoryFence { order } => {
+            line(
+                output,
+                indent,
+                format_args!("memory-fence {order:?}{suffix}"),
+            );
+        }
     }
 }
 
@@ -591,6 +742,14 @@ fn render_pragma(pragma: &ccc_pp::PragmaEvent) -> String {
         ccc_pp::PragmaEvent::Diagnostic { action, option, .. } => option.as_ref().map_or_else(
             || format!("diagnostic {action:?}"),
             |option| format!("diagnostic {action:?} {option}"),
+        ),
+        ccc_pp::PragmaEvent::GccOptimize { payload, .. } => format!(
+            "GCC optimize {}",
+            payload
+                .iter()
+                .map(|token| token.spelling.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
         ),
         ccc_pp::PragmaEvent::Pack { payload, .. } => format!(
             "pack {}",

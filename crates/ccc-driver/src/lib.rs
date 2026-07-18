@@ -47,6 +47,10 @@ pub use empty_object::is_empty_elf64_relocatable;
 const HELP: &str = "Usage: ccc [options] <input.c>\n\
   -c                         Compile without linking\n\
   -E [-P]                    Preprocess only; -P suppresses linemarkers\n\
+  -O|-O0|-O1|-O2|-O3|-Os|-Oz\n\
+  -g|-gN                     Accepted compatibility options; currently no code-generation effect\n\
+  -fPIC|-fPIE|-pie           Select position-independent code and PIE linking (default)\n\
+  -fno-pic|-fno-pie|-no-pie Select static-model code and non-PIE linking\n\
   -Dname[=value] -Uname      Define or undefine a macro\n\
   -I dir -iquote dir         Add user include search paths\n\
   -isystem dir -idirafter dir Add system include search paths\n\
@@ -209,6 +213,7 @@ fn effective_config(
     let mut config =
         EffectiveCompilationConfig::default().with_language_mode(options.language_mode);
     config.language.trigraphs = options.trigraphs;
+    config.relocation_model = options.relocation_model;
 
     let should_load_resources = options.resource_dir.is_some()
         || (!options.no_standard_includes && !options.no_builtin_includes);

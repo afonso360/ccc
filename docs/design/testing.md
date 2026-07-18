@@ -70,12 +70,102 @@ transport also test calls in both directions, while profiles that do not must
 reject those boundaries exactly. Explicit compatibility-mode objects must be
 rejected when mixed with incompatible CCC objects.
 
+TLS tests inspect `.tdata`/`.tbss`, symbol type and binding, and the exact
+`R_X86_64_TLSGD`, `R_X86_64_TLSLD`, `R_X86_64_DTPOFF32`,
+`R_X86_64_GOTTPOFF`, and `R_X86_64_TPOFF32` relocation families. Each model
+links and executes in a default PIE. A pthread fixture proves distinct
+addresses and initializer values per thread for external and block-local TLS,
+while two-direction reference-compiler links verify ELF TLS symbol
+interoperability. Generated accessors must retain unwind information, a
+non-executable stack note, deterministic manifest ownership, and exact local
+binding after packaging.
+
 Planner, IR, digest, renderer, fake-command, and manifest tests run on every
 host. Native `x86_64-unknown-linux-gnu` execution and object suites compile only
 on Linux x86-64. The required CI feature rejects the wrong host at compile time,
 preflights every reference and packaging tool, and invokes each named native
 test binary explicitly. A missing tool or zero-test configuration is a hard
 failure, never an implicit skip.
+
+## Runtime-sized automatic storage
+
+Provider-independent tests first prove that nonconstant array extents are
+evaluated once and retained in the typed AST, including parameter-order binding,
+and multidimensional pointer strides. Diagnostics distinguish prototype-scope
+`[*]`, legal fixed-size objects with variably modified types, nonautomatic VLA
+objects, invalid bounds, and illegal storage classes. Runtime `sizeof` and
+several variably modified typedef/type-name contexts remain explicit gates
+before the complete VLA capability can be advertised. Named-goto and switch
+tests reject ingress that bypasses a declaration, and a computed goto is
+rejected conservatively in any function that also declares a variably modified
+automatic object.
+
+CCC-IR tests pin runtime storage identities, allocation effects, retained
+extents, dynamic pointer strides, verifier type/dominance checks, and append-only
+digest tags. Execution fixtures cover bound-once evaluation, multidimensional
+access, normal return cleanup, recursion, concurrent invocations, and
+over-alignment. Aggregate returns sourced from arena storage are copied before
+the provider is released. Named/switch/computed-goto ingress diagnostics and
+runtime `sizeof` remain negative capability gates rather than silently
+approximated behavior.
+
+Provider tests inject nonpositive bounds, extent and alignment overflow,
+allocation failure, and alignments through over-aligned `_Alignas` declarations.
+On System V AMD64 every VLA allocation is checked for the target's 16-byte
+minimum as well as stronger declared alignment. An instrumented descending-size
+loop proves that one growth serves every later execution of the declaration and
+that normal return releases it once. An external GCC default-PIE link runs the
+same provider surface under AddressSanitizer and LeakSanitizer. Native x86 tests
+execute the nonpositive and overflow traps; object inspection verifies their
+`ud2` failure paths when the development host's amd64 emulator cannot deliver
+those trap signals correctly.
+
+Returns-twice and cross-language unwinding remain separate hard gates. A
+nonlocal exit may strand the abandoned invocation's cached allocations, as C
+permits for VLA storage, but cannot share or corrupt another invocation's state.
+The provider is not async-signal-safe because growth calls the hosted allocator.
+
+Object and disassembly checks prove that affected user functions keep their
+ordinary Cranelift frame and import only the declared hosted dependencies. A
+mixed-link test links a CCC-produced object with an external GCC-compatible
+driver as PIE. Negative feature-predicate tests keep `__builtin_alloca`
+unavailable for an arena-only profile.
+
+## C11 and GNU capability fixtures
+
+Statement-expression tests distinguish GNU C's three result categories rather
+than treating every closing expression alike. Transparent
+top-level-unqualified scalar and aggregate places and eligible bit-field places
+are tested as lvalues. Top-level `const` and `volatile` ordinary finals are
+tested as non-lvalues, including exactly one ordered read when materializing a
+volatile final. Aggregate forwarding is tested for preservation of nested
+member and pointed-to qualifications. Bit-fields declared with access
+qualifiers retain their descriptor and remain non-addressable; modification of
+a forwarded `const` bit-field is diagnosed, while a forwarded `volatile`
+bit-field remains assignable. Separate fixtures select an unqualified bit-field
+through `const`- and `volatile`-qualified aggregate places and require
+non-lvalue results. Arrays and functions are tested for decay;
+declaration-bearing and multi-statement bodies are tested for value capture;
+and bodies without a retained final expression are tested as `void`. GCC's
+inconsistent same-type-cast generalized-lvalue behavior is rejected unless it
+is adopted by an explicit compatibility decision. `_Generic` has a separate
+matrix proving controlling-expression conversions and preservation of the
+selected association's value category.
+
+Computed-goto fixtures include direct, copied, automatic-table, and
+static-table `&&label` dispatch. Exact IR goldens prove that mutable locals in a
+function containing a computed jump remain in storage and that every
+`br_table` destination has no arguments or block parameters. Negative fixtures
+diagnose label subtraction and base-label-plus-offset reconstruction while the
+direct operands still retain label provenance. Arithmetic after a token has
+passed through object storage is outside the supported behavior and is not
+claimed as a diagnostic boundary.
+
+Wide-integer proof covers high-bit constants, signed and unsigned arithmetic,
+division and remainder traps, floating conversions, layout, varargs, mixed
+register pressure, and GCC/Clang cross-linking in both directions. Object and
+link-plan checks require the exact `ti` helper symbols selected by each
+operation. No corpus result substitutes for this matrix.
 
 ## Differential testing and undefined behavior
 
@@ -98,19 +188,149 @@ Every enabled target has a required matrix entry. A target without an execution 
 
 ## Real-code corpus
 
-SQLite, Lua, zlib, musl, tcc, selected libc-header fixtures, c-testsuite, and GCC torture tests exercise drop-in compatibility. Each integration records the exact build command, enabled features, patches if any, expected exclusions, and whether success means preprocess, compile, link, or run. “Builds unmodified” is used only when no source or build-system patch is applied.
+SQLite, Lua, Redis, bzip2, zstd, zlib, musl, tcc, selected libc-header
+fixtures, and c-testsuite exercise drop-in compatibility. Each integration
+records the exact build command, enabled features, patches if any, expected
+exclusions, and whether success means preprocess, compile, link, or run.
+“Builds unmodified” is used
+only when no source or build-system patch is applied.
 
-Hosted-header preprocessing and parsing are separate gates. A licensed, pinned
-glibc-like fixture has both a deterministic preprocessing golden and an AST
-surface check. On x86-64 Linux, installed glibc feature, definition, integer,
-type, unistd, and string headers are also exercised by separate preprocessing
-and parsing tests. The installed-header tests record compiler, target, and libc
-identity and assert stable sentinel properties rather than snapshotting a
-mutable system header. Parsing success certifies only the advertised parsing
-ceiling; it does not imply semantic analysis or object-emission support for
-parse-only declarations.
+Hosted-header preprocessing, parsing, and code generation are separate gates.
+A licensed, pinned glibc-like fixture has both a deterministic preprocessing
+golden and an AST surface check. On x86-64 Linux, installed glibc feature,
+definition, integer, type, unistd, string, and pthread headers are exercised by
+preprocessing and parsing tests plus a compile-link-execute sentinel. The
+installed-header tests record compiler, target, and libc identity and assert
+stable sentinel properties rather than snapshotting a mutable system header.
+Parse-only declarations remain confined to the AST fixture; the execution
+sentinel independently proves the supported declaration subset.
 
-Corpus pins encode capability dependencies. SQLite is pinned to ≥ 3.45, which removed core `long double` arithmetic — an earlier pin silently requires the f80 runtime on the primary target — and its gate runs the `veryquick` TCL set through `testfixture`, which needs a TCL development environment; the full suite and TH3 are out of scope. Lua's default GNU-profile build exercises `setjmp`/`longjmp` and computed-goto dispatch. musl feeds `$CC` assembly files.
+Corpus pins encode capability dependencies. SQLite is pinned by its
+[corpus manifest](../../test-corpus/sqlite/manifest.toml) to 3.47.2. Release
+3.47.0 removed SQLite's remaining `long double` use by switching that
+calculation to Dekker's algorithm; an earlier release silently requires the f80
+runtime on the primary target. This pin is also the last canonical-source
+release before SQLite replaced the classic Autoconf configure/Makefile
+interface with Autosetup in 3.48.0; any later pin requires an adapter-interface
+review as well as a C-surface inventory. The default gate runs the `veryquick`
+Tcl set through `testfixture`, which needs Tcl and zlib development
+environments. Explicit `quick`, `all`, and `full` adapter modes retain the
+upstream test grouping; TH3 remains out of scope. Under CCC's effective identity
+the build selects `__sync_synchronize` but no inline assembly, wide integers,
+VLA objects, computed goto, or statement expressions. The `full` mode keeps
+SQLite's `SQLITE_ENABLE_STMT_SCANSTATUS` fuzzcheck profile. For its one
+generated `sqlite3.c` translation, the wrapper defines the upstream
+`__STRICT_ANSI__` predicate while retaining GNU C11 mode, selecting SQLite's
+zero-valued hardware timing fallback instead of the GNU x86-64 `rdtsc`
+inline-assembly path. In this release that predicate also suppresses only the
+`SQLITE_INLINE` optimization hint. The eight fuzzcheck support inputs,
+`alltest`, and `sessionfuzz` receive no override. Normal translations use
+CCC's GNU11 driver default, while the wrapper audits the effective language
+mode and predicate state for every translation. Corpus
+success is integration evidence rather than proof of the unselected constructs;
+their focused fixtures remain required.
+
+The `all` and `full` Make targets also build SQLite's command-line shell. Its
+`NAN` use expands through the hosted glibc `<math.h>` to
+`__builtin_nanf("")`; the same header surface exposes `INFINITY` through
+`__builtin_inff()`. Focused typed-AST, exact CCC-IR, and execution fixtures
+prove that these calls are constant expressions with canonical binary32 quiet
+NaN and positive-infinity bits. The NaN contract accepts only an empty ordinary
+or UTF-8 string literal. Nonliteral, wide, and nonempty payloads are rejected,
+so passing the corpus cannot hide unimplemented GNU payload encoding.
+
+Lua is pinned by its [corpus manifest](../../test-corpus/lua/manifest.toml) to
+the official 5.5.0 source and matching test archives. The adapter uses the
+upstream Linux make target with CCC's GNU11 driver default and requires all 34
+`.c` files in the source directory to appear exactly once in CCC's source-input
+log. GCC receives
+only CCC-produced objects and archives for the two final program links. Those
+links use the platform default without an adapter relocation flag, and the gate
+verifies PIE ELF type `DYN` plus the absence of dynamic text relocations.
+
+Under the pinned GNU 4.2.1 identity, Lua selects `__builtin_expect`, internal
+visibility and noreturn attributes, `__extension__`, and computed-goto VM
+dispatch; hosted `float.h` and `math.h` additionally select binary64 target facts
+and `__builtin_huge_val`. The Linux profile uses `_setjmp`/`_longjmp` for
+protected calls. The execution gate invokes the official basic profile exactly
+as `lua -e'_U=true' all.lua`, after removing ambient Lua initialization and
+module-path variables, and requires its `final OK !!!` marker. This integration
+does not replace focused computed-goto or nonlocal-control tests. The official
+complete and internal profiles remain distinct contracts because they add
+position-independent shared test modules, GNU assertion statement expressions,
+and an instrumented runtime. musl feeds `$CC` assembly files.
+
+Redis is pinned by its [corpus manifest](../../test-corpus/redis/manifest.toml)
+to the official 8.8.0 core archive. The selected upstream build produces
+`redis-server` and `redis-cli` with the libc allocator while disabling TLS,
+systemd, optional vector sets, bundled data-type modules, and link-time
+optimization. All 178 selected C translation units pass through CCC using its
+GNU11 default; native GCC receives only the resulting objects and archives for
+two platform-default PIE links. The wrapper filters upstream C99, GNU99, and
+GNU11 selections rather than injecting a replacement standard flag. It mirrors
+each real translation with a preprocessing
+pass under the same effective language, macro, include, warning, and
+optimization arguments. The adapter requires exactly 178 nonempty captures,
+compares their relative paths to the pinned source set, and records exact
+expanded-builtin counts. It also audits the complete compiled source multiset,
+compiler identity, link inputs, ELF executable type, and absence of dynamic
+text relocations.
+
+Redis assertions remain enabled through the unmodified system header; CCC
+implements its GNU statement expression and `__PRETTY_FUNCTION__` surface.
+The hosted `math.h` wrapper supplies single-evaluation binary64 classification
+macros without exposing unselected native-`long double` arms. Two exact-hash
+source adjustments replace the bundled HDR Histogram x86 atomic assembly with
+the selected sequentially consistent legacy builtins and select a
+behavior-compatible C no-op for xxHash's compiler guard. The adapter audits
+each remaining adjustment and its replacement count explicitly.
+
+The Redis execution profile starts the CCC-built server on a private Unix
+domain socket and drives `PING`, string, counter, list, hash, Lua `EVAL`, and
+database-size checks through the CCC-built client. It is deliberately a
+focused build-and-smoke contract: the upstream full test suite is not invoked.
+
+bzip2 is pinned by its [corpus manifest](../../test-corpus/bzip2/manifest.toml)
+to the official 1.0.8 archive and a full commit and tree from the official
+`bzip2-tests` repository. The upstream Makefile selects nine of the archive's
+13 C files to build `libbz2.a`, `bzip2`, and `bzip2recover`; CCC must compile
+each selected input exactly once, and native GCC performs only the two
+source-free platform-default PIE program links. The build inventory also proves
+that the four developer utilities were not silently substituted into the
+product set.
+
+The bzip2 execution gate combines the six byte-for-byte comparisons from
+upstream `make check`, an independent level-9 integrity/round-trip fixture,
+and the pinned extended runner over 38 valid and eight deliberately malformed
+streams. The extended profile requires exactly 440 pass records and its final
+success marker. Optional Valgrind discovery is disabled explicitly; decoder,
+corruption, small-memory, and recovery behavior remain exercised.
+
+zstd is pinned by its [corpus manifest](../../test-corpus/zstd/manifest.toml) to
+the official 1.5.7 release archive. Its selected `make check` build routes 50
+C translation occurrences through CCC, including two exact-byte pthread
+capability probes produced during recursive Make evaluation. Native GCC sees
+only objects for four source-free links. Pthread support and legacy decoding
+are enabled; optional zlib, liblzma, and liblz4 format wrappers, stand-alone
+assembly, and host-dependent unaligned scalar accesses are disabled.
+
+The zstd adapter applies an exact-hash extension of upstream's no-assembly
+guards to existing generic C fallbacks. Its unmodified dependency and system
+assertion headers use CCC's native memory builtins, GNU statement expressions,
+and function-name aliases. Every remaining source adjustment is hashed and
+audited on each run. Native links use the platform PIE default without a
+relocation flag. Upstream's bounded quick smoke target covers
+compression, decompression, streaming, dictionaries, file handling, corruption
+rejection, sparse files, and the selected threaded path; deterministic file and
+stream round trips add byte-for-byte checks. Long-running fuzz and stress
+profiles are not part of this gate.
+
+A curated execute-only compiler torture subset may supplement focused fixtures.
+It is fetched rather than vendored, and its corpus manifest records the exact
+upstream revision, selected paths, license, hashes, required language profile,
+and exclusions for undefined or implementation-specific behavior. Passing that
+subset does not replace exact typed-AST, IR, ABI, and execution regressions for
+the supported constructs.
 
 ## Licensing, pinning, and supply-chain policy
 

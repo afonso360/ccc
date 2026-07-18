@@ -90,7 +90,7 @@ impl PpToken {
 }
 
 /// Canonicalizes universal-character-name spellings in an identifier.
-pub(crate) fn canonicalize_identifier(spelling: &str) -> Option<String> {
+pub fn canonicalize_identifier(spelling: &str) -> Option<String> {
     let mut output = String::with_capacity(spelling.len());
     let mut chars = spelling.char_indices().peekable();
     while let Some((_, character)) = chars.next() {

@@ -15,6 +15,34 @@ jobs:
       CCC_REQUIRE_SYSV_ABI_TESTS: "1"
     steps:
       - uses: actions/checkout@v7
+      - name: Verify runner prerequisites
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact_dir="$RUNNER_TEMP/ccc-sysv-amd64-artifacts"
+          mkdir -p "$artifact_dir"
+          missing=()
+          for tool in curl cc gcc clang make tclsh pkg-config objdump readelf gdb objcopy timeout openssl patch; do
+            if ! command -v "$tool" >/dev/null; then
+              missing+=("$tool")
+            fi
+          done
+          if command -v pkg-config >/dev/null; then
+            for module in tcl zlib; do
+              if ! pkg-config --exists "$module"; then
+                missing+=("pkg-config:$module")
+              fi
+            done
+          fi
+          if (( ${#missing[@]} )); then
+            printf -v missing_list '%s, ' "${missing[@]}"
+            missing_list=${missing_list%, }
+            printf '::error::Missing runner prerequisites: %s\n' "$missing_list" \
+              | tee "$artifact_dir/runner-prerequisites.txt"
+            exit 1
+          fi
+          printf 'All runner prerequisites are available.\n' \
+            > "$artifact_dir/runner-prerequisites.txt"
       - name: Verify pinned x86-64 psABI source
         run: |
           mkdir -p "$RUNNER_TEMP/ccc-sysv-amd64-artifacts"
@@ -25,7 +53,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: clippy,rustfmt
-      - name: Record native ABI tool identities
+      - name: Record native ABI and corpus tool identities
         run: |
           mkdir -p "$RUNNER_TEMP/ccc-sysv-amd64-artifacts/tmp"
           {
@@ -39,8 +67,14 @@ jobs:
             readelf --version
             gdb --version
             objcopy --version
+            make --version
+            pkg-config --modversion tcl
+            pkg-config --modversion zlib
+            printf 'puts [info patchlevel]\n' | tclsh
           } 2>&1 | tee "$RUNNER_TEMP/ccc-sysv-amd64-artifacts/tool-identities.txt"
       - run: cargo fmt --check
+      - name: Test corpus adapters
+        run: ./test-corpus/test-adapters.sh
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test -p ccc-driver --test preprocessing -- --show-output
       - run: cargo test -p ccc-driver --features ci-sysv-amd64 --test sysv_amd64_environment -- --show-output

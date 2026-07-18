@@ -1,0 +1,150 @@
+format_version = 2
+name = "zstd"
+version = "1.5.7"
+release_date = "2025-02-19"
+distribution = "official-release-source"
+origin = "https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz"
+archive = "zstd-1.5.7.tar.gz"
+archive_bytes = 2434947
+archive_sha256 = "eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3"
+archive_sha3_256 = "8eaf8a9c9ed5c5ef7a3f1bc68f6e1ab254d8b5947ea9d55455f0a403fa006e6c"
+license = "BSD-3-Clause OR GPL-2.0-only"
+upstream_license_files = ["LICENSE", "COPYING"]
+fetched_not_vendored = true
+
+source_adjustment_patch = "no-asm-generic-paths.patch"
+source_adjustment_sha256 = "79f32fd5cf1224566822e2685cbcdad2ed3c92ffee292338a37e54a0303f11ae"
+source_adjustment_hashes = "no-asm-generic-paths.sha256"
+source_adjustment_hashes_sha256 = "2aade5f81a82661bb3789283a45d8e7203dda08129572e44fd410ec3302f0e15"
+source_adjustment_target_files = 6
+source_adjustment_rationale = "The upstream no-assembly configuration excludes stand-alone assembly but leaves performance-only GNU inline assembly selected by compiler identity. The adjustment extends that configuration to the existing generic C fallbacks without changing the compression format, public API, or tested behavior."
+
+target = "x86_64-unknown-linux-gnu"
+language_mode = "gnu11"
+language_mode_selection = "driver-default"
+gnu_compatibility_tuple = "4.2.1"
+build_interface = "upstream-make"
+build_target = "check"
+build_command = "make check CC=<ccc-adapter> DEBUGLEVEL=2 ZSTD_NO_ASM=1 MEM_FORCE_MEMORY_ACCESS=0 XXH_FORCE_MEMORY_ACCESS=0 HAVE_PTHREAD=1 HAVE_ZLIB=0 HAVE_LZMA=0 HAVE_LZ4=0"
+test_profile = "upstream-quick-smoke"
+test_command = "make check"
+success_marker = "All tests completed successfully"
+target_compiler = "ccc"
+link_driver = "gcc"
+link_mode = "platform-default-pie-executable"
+optional_format_libraries = "disabled"
+assembly = "disabled"
+threading = "enabled-pthread"
+unaligned_memory_access = "upstream-memcpy-fallbacks"
+source_translation_occurrences = 50
+generated_pthread_probe_translation_occurrences = 2
+generated_pthread_probe_sha256 = "ec0d733a96cf302e7a028680433e75663e240ea080c0a46e68b19b30c8cf9387"
+native_link_commands = 4
+generated_pthread_probe_link_commands = 2
+
+required_tools = [
+    "awk",
+    "bash",
+    "basename",
+    "cat",
+    "cmp",
+    "cp",
+    "dd",
+    "diff",
+    "dirname",
+    "file",
+    "find",
+    "gcc",
+    "grep",
+    "id",
+    "make",
+    "md5sum",
+    "mkdir",
+    "mkfifo",
+    "mktemp",
+    "mv",
+    "openssl",
+    "patch",
+    "readelf",
+    "rm",
+    "sed",
+    "sort",
+    "stat",
+    "tar",
+    "tee",
+    "touch",
+    "tr",
+    "uname",
+    "wc",
+]
+conditional_download_tools = ["curl"]
+requires_non_root_user = true
+requires_native_linux_filesystem = true
+
+[expected_inventory]
+selected_builtins = [
+    "__builtin_clz",
+    "__builtin_clzll",
+    "__builtin_ctz",
+    "__builtin_ctzll",
+    "__builtin_expect",
+    "__builtin_memcpy",
+    "__builtin_memmove",
+    "__builtin_memset",
+    "__builtin_prefetch",
+]
+advertised_but_unselected_builtins = [
+    "__builtin_bswap64",
+]
+native_count_bit_operations = ["clz", "clzll", "ctz", "ctzll"]
+source_predicates_exclude_unavailable_builtins = [
+    "__builtin_altivec_vmuleuw",
+    "__builtin_altivec_vmulouw",
+    "__builtin_assume",
+    "__builtin_bswap32",
+    "__builtin_rotateleft32",
+    "__builtin_rotateleft64",
+    "__builtin_unreachable",
+]
+gnu_attributes = [
+    "aligned",
+    "always_inline",
+    "const",
+    "malloc",
+    "noinline",
+    "pure",
+    "unused",
+    "visibility",
+    "weak",
+]
+inline_assembly_forms = []
+wide_integer_uses = []
+variable_length_array_objects = []
+statement_expressions = []
+computed_gotos = []
+
+[adapter_artifacts]
+retain = [
+    "build-test.log",
+    "capability-inventory.txt",
+    "compile-commands.txt",
+    "effective-macros.txt",
+    "elf-dynamic-tags.txt",
+    "elf-headers.txt",
+    "expected-source-inputs.txt",
+    "generated-probe-hashes.txt",
+    "link-driver-identity.txt",
+    "link-driver-macros.txt",
+    "predicate-probe.txt",
+    "roundtrip-compressed.zst",
+    "roundtrip-input.txt",
+    "roundtrip-output.txt",
+    "roundtrip-stream-output.txt",
+    "roundtrip.log",
+    "source-adjustment-apply.log",
+    "source-adjustment-hashes.txt",
+    "source-adjustment.patch",
+    "source-adjustment.txt",
+    "source-inputs.txt",
+    "version.log",
+]

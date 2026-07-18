@@ -6,6 +6,8 @@ pub(super) struct FunctionReferences {
     globals: HashMap<u32, DataReference>,
     strings: HashMap<u32, ir::GlobalValue>,
     call_helper: Option<ir::FuncRef>,
+    runtime_realloc: Option<ir::FuncRef>,
+    runtime_free: Option<ir::FuncRef>,
 }
 
 #[derive(Clone, Copy)]
@@ -22,8 +24,14 @@ struct FunctionReference {
 
 #[derive(Clone, Copy)]
 struct DataReference {
-    value: ir::GlobalValue,
-    tls: bool,
+    value: Option<ir::GlobalValue>,
+    tls_accessor: Option<ir::FuncRef>,
+}
+
+#[derive(Clone, Copy)]
+struct StackStorage {
+    slot: StackSlot,
+    dynamic_alignment: Option<u64>,
 }
 
 pub(super) fn declare_function_references(
@@ -57,8 +65,11 @@ pub(super) fn declare_function_references(
         globals.insert(
             *raw,
             DataReference {
-                value: object_module.declare_data_in_func(declaration.id, function),
-                tls: declaration.tls,
+                value: (!declaration.tls)
+                    .then(|| object_module.declare_data_in_func(declaration.id, function)),
+                tls_accessor: declaration
+                    .tls_accessor
+                    .map(|id| object_module.declare_func_in_func(id, function)),
             },
         );
     }
@@ -71,11 +82,19 @@ pub(super) fn declare_function_references(
     let call_helper = declarations
         .call_helper
         .map(|id| object_module.declare_func_in_func(id, function));
+    let runtime_realloc = declarations
+        .runtime_realloc
+        .map(|id| object_module.declare_func_in_func(id, function));
+    let runtime_free = declarations
+        .runtime_free
+        .map(|id| object_module.declare_func_in_func(id, function));
     FunctionReferences {
         functions,
         globals,
         strings,
         call_helper,
+        runtime_realloc,
+        runtime_free,
     }
 }
 
@@ -86,6 +105,7 @@ pub(super) fn lower_function(
     abi_plan: ccc_abi::VerifiedModuleAbiPlan<'_>,
     definition_plan: DefinitionAbi<'_>,
     references: &FunctionReferences,
+    frontend_config: isa::TargetFrontendConfig,
     clif_function: &mut ir::Function,
 ) -> Result<(), CodegenError> {
     let entry = function.entry.ok_or_else(|| {
@@ -121,25 +141,64 @@ pub(super) fn lower_function(
     }
 
     let mut storage = HashMap::new();
+    let mut runtime_storage = HashMap::new();
     for object in &function.storage {
-        if object.location != gir::StorageLocation::Automatic {
+        if object.location == gir::StorageLocation::RuntimeSized {
+            let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                16,
+                3,
+            ));
+            if runtime_storage.insert(object.id.0, slot).is_some() {
+                return Err(error(format!(
+                    "function `{}` contains duplicate runtime storage id {}",
+                    function.symbol_name, object.id.0
+                )));
+            }
+            continue;
+        } else if object.location != gir::StorageLocation::Automatic {
             continue;
         }
         let layout = object_layout(&module.types, object.ty, config)?;
-        let size = u32::try_from(layout.size).map_err(|_| {
+        let alignment = super::data::requested_alignment(object.requested_alignment, layout.align)?;
+        // Cranelift's stack slots express an alignment requirement, but the x86-64
+        // backend does not realign the frame above the ABI's 16-byte guarantee.
+        // Reserve padding and align the address within the slot for over-aligned
+        // automatic objects instead.
+        const ABI_STACK_ALIGNMENT: u64 = 16;
+        let dynamic_alignment = (alignment > ABI_STACK_ALIGNMENT).then_some(alignment);
+        let padded_size = if dynamic_alignment.is_some() {
+            layout
+                .size
+                .checked_add(alignment - 1)
+                .ok_or_else(|| error("automatic object stack allocation size overflow"))?
+        } else {
+            layout.size
+        };
+        let size = u32::try_from(padded_size).map_err(|_| {
             error(format!(
                 "automatic object `{}` is too large for a Cranelift stack slot",
                 object.name
             ))
         })?;
-        let align_shift = u8::try_from(layout.align.trailing_zeros())
+        let slot_alignment = alignment.min(ABI_STACK_ALIGNMENT);
+        let align_shift = u8::try_from(slot_alignment.trailing_zeros())
             .map_err(|_| error("stack object alignment is too large"))?;
         let slot = builder.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,
             size,
             align_shift,
         ));
-        if storage.insert(object.id.0, slot).is_some() {
+        if storage
+            .insert(
+                object.id.0,
+                StackStorage {
+                    slot,
+                    dynamic_alignment,
+                },
+            )
+            .is_some()
+        {
             return Err(error(format!(
                 "function `{}` contains duplicate storage id {}",
                 function.symbol_name, object.id.0
@@ -154,8 +213,10 @@ pub(super) fn lower_function(
         abi_plan,
         definition_plan,
         references,
+        frontend_config,
         blocks,
         storage,
+        runtime_storage,
         values: vec![None; function.value_types.len()],
         sret: None,
         variadic_state: None,
@@ -187,6 +248,7 @@ pub(super) fn lower_function(
         builder.switch_to_block(state.block(block.id.0)?);
         if block.id == entry {
             let entry_values = builder.block_params(state.block(entry.0)?).to_vec();
+            state.initialize_runtime_storage(&mut builder);
             state.bind_entry_parameters(&mut builder, &entry_values)?;
         }
         for instruction in &block.instructions {
@@ -228,8 +290,10 @@ struct FunctionState<'a> {
     abi_plan: ccc_abi::VerifiedModuleAbiPlan<'a>,
     definition_plan: DefinitionAbi<'a>,
     references: &'a FunctionReferences,
+    frontend_config: isa::TargetFrontendConfig,
     blocks: HashMap<u32, ir::Block>,
-    storage: HashMap<u32, StackSlot>,
+    storage: HashMap<u32, StackStorage>,
+    runtime_storage: HashMap<u32, StackSlot>,
     values: Vec<Option<ir::Value>>,
     sret: Option<ir::Value>,
     variadic_state: Option<ir::Value>,
@@ -237,6 +301,20 @@ struct FunctionState<'a> {
 }
 
 impl FunctionState<'_> {
+    fn initialize_runtime_storage(&self, builder: &mut FunctionBuilder<'_>) {
+        if self.runtime_storage.is_empty() {
+            return;
+        }
+        let zero = builder.ins().iconst(ir::types::I64, 0);
+        let mut slots = self.runtime_storage.iter().collect::<Vec<_>>();
+        slots.sort_unstable_by_key(|(storage, _)| **storage);
+        for (_, slot) in slots {
+            let state = builder.ins().stack_addr(ir::types::I64, *slot, 0);
+            builder.ins().store(MemFlags::new(), zero, state, 0);
+            builder.ins().store(MemFlags::new(), zero, state, 8);
+        }
+    }
+
     fn block(&self, raw: u32) -> Result<ir::Block, CodegenError> {
         block_ref(&self.blocks, raw)
     }
@@ -508,14 +586,37 @@ impl FunctionState<'_> {
                     Ok(Some(builder.ins().global_value(ir::types::I64, reference)))
                 }
                 I::AddressOfStorage { storage } => {
-                    let slot = self.storage.get(&storage.0).copied().ok_or_else(|| {
+                    let storage = self.storage.get(&storage.0).copied().ok_or_else(|| {
                     error(format!(
                         "storage {} is not an automatic stack object; static storage must use a data id",
                         storage.0
                     ))
                 })?;
-                    Ok(Some(builder.ins().stack_addr(ir::types::I64, slot, 0)))
+                    let address = builder.ins().stack_addr(ir::types::I64, storage.slot, 0);
+                    let Some(alignment) = storage.dynamic_alignment else {
+                        return Ok(Some(address));
+                    };
+                    let bias = builder.ins().iconst(ir::types::I64, (alignment - 1) as i64);
+                    let biased = builder.ins().iadd(address, bias);
+                    let mask = builder
+                        .ins()
+                        .iconst(ir::types::I64, alignment.wrapping_neg() as i64);
+                    Ok(Some(builder.ins().band(biased, mask)))
                 }
+                I::RuntimeSizedAllocate {
+                    storage,
+                    extents,
+                    element,
+                    constant_factor,
+                    requested_alignment,
+                } => Ok(Some(self.runtime_sized_allocate(
+                    builder,
+                    *storage,
+                    extents,
+                    *element,
+                    *constant_factor,
+                    *requested_alignment,
+                )?)),
                 I::ProjectField {
                     base,
                     record,
@@ -582,6 +683,31 @@ impl FunctionState<'_> {
                         builder.ins().iadd(base, displacement)
                     }))
                 }
+                I::RuntimePointerOffset {
+                    base,
+                    index,
+                    element,
+                    extents,
+                    subtract,
+                } => {
+                    let index_value = self.value(*index)?;
+                    let index_ty = builder.func.dfg.value_type(index_value);
+                    let index = coerce_integer(
+                        builder,
+                        index_value,
+                        index_ty,
+                        ir::types::I64,
+                        is_signed(&self.module.types, self.value_ty(*index)?, self.config)?,
+                    );
+                    let stride = self.runtime_element_stride(builder, *element, extents)?;
+                    let displacement = builder.ins().imul(index, stride);
+                    let base = self.value(*base)?;
+                    Ok(Some(if *subtract {
+                        builder.ins().isub(base, displacement)
+                    } else {
+                        builder.ins().iadd(base, displacement)
+                    }))
+                }
                 I::PointerDifference {
                     left,
                     right,
@@ -599,6 +725,28 @@ impl FunctionState<'_> {
                         })?,
                     );
                     let difference = builder.ins().sdiv(bytes, size);
+                    let destination = scalar_type(
+                        &self.module.types,
+                        result_ty.ok_or_else(|| error("pointer difference has no result"))?,
+                        self.config,
+                    )?;
+                    Ok(Some(coerce_integer(
+                        builder,
+                        difference,
+                        ir::types::I64,
+                        destination,
+                        true,
+                    )))
+                }
+                I::RuntimePointerDifference {
+                    left,
+                    right,
+                    element,
+                    extents,
+                } => {
+                    let bytes = builder.ins().isub(self.value(*left)?, self.value(*right)?);
+                    let stride = self.runtime_element_stride(builder, *element, extents)?;
+                    let difference = builder.ins().sdiv(bytes, stride);
                     let destination = scalar_type(
                         &self.module.types,
                         result_ty.ok_or_else(|| error("pointer difference has no result"))?,
@@ -820,6 +968,130 @@ impl FunctionState<'_> {
                         result,
                     )?))
                 }
+                I::IntegerIntrinsic { operation, operand } => {
+                    let operand = self.value(*operand)?;
+                    let value = match operation {
+                        gir::IntegerIntrinsicOperation::ByteSwap64 => builder.ins().bswap(operand),
+                        gir::IntegerIntrinsicOperation::CountLeadingZerosInt
+                        | gir::IntegerIntrinsicOperation::CountLeadingZerosLong
+                        | gir::IntegerIntrinsicOperation::CountLeadingZerosLongLong => {
+                            builder.ins().clz(operand)
+                        }
+                        gir::IntegerIntrinsicOperation::CountTrailingZerosLongLong
+                        | gir::IntegerIntrinsicOperation::CountTrailingZerosInt => {
+                            builder.ins().ctz(operand)
+                        }
+                        gir::IntegerIntrinsicOperation::PopulationCountInt
+                        | gir::IntegerIntrinsicOperation::PopulationCountLongLong => {
+                            builder.ins().popcnt(operand)
+                        }
+                    };
+                    let source = builder.func.dfg.value_type(value);
+                    let destination = scalar_type(
+                        &self.module.types,
+                        result_ty.ok_or_else(|| error("integer intrinsic has no result"))?,
+                        self.config,
+                    )?;
+                    Ok(Some(coerce_integer(
+                        builder,
+                        value,
+                        source,
+                        destination,
+                        false,
+                    )))
+                }
+                I::MemoryCopy {
+                    destination,
+                    source,
+                    length,
+                    overlap,
+                } => {
+                    let destination = self.value(*destination)?;
+                    let source = self.value(*source)?;
+                    let length = self.value(*length)?;
+                    if *overlap {
+                        builder.call_memmove(self.frontend_config, destination, source, length);
+                    } else {
+                        builder.call_memcpy(self.frontend_config, destination, source, length);
+                    }
+                    Ok(None)
+                }
+                I::MemorySet {
+                    destination,
+                    value,
+                    length,
+                } => {
+                    let value = self.value(*value)?;
+                    let value_ty = builder.func.dfg.value_type(value);
+                    let value = coerce_integer(builder, value, value_ty, ir::types::I8, true);
+                    builder.call_memset(
+                        self.frontend_config,
+                        self.value(*destination)?,
+                        value,
+                        self.value(*length)?,
+                    );
+                    Ok(None)
+                }
+                I::AtomicReadModifyWrite {
+                    operation,
+                    address,
+                    operand,
+                    object,
+                    return_new,
+                    order: gir::MemoryOrder::SequentiallyConsistent,
+                } => {
+                    let ty = atomic_scalar_type(&self.module.types, *object, self.config)?;
+                    let operation = match operation {
+                        gir::AtomicReadModifyWriteOperation::Add => ir::AtomicRmwOp::Add,
+                        gir::AtomicReadModifyWriteOperation::Subtract => ir::AtomicRmwOp::Sub,
+                        gir::AtomicReadModifyWriteOperation::Exchange => ir::AtomicRmwOp::Xchg,
+                    };
+                    let operand = self.value(*operand)?;
+                    let old = builder.ins().atomic_rmw(
+                        ty,
+                        MemFlags::new(),
+                        operation,
+                        self.value(*address)?,
+                        operand,
+                    );
+                    let result = if *return_new {
+                        match operation {
+                            ir::AtomicRmwOp::Add => builder.ins().iadd(old, operand),
+                            ir::AtomicRmwOp::Sub => builder.ins().isub(old, operand),
+                            _ => {
+                                return Err(error(
+                                    "atomic exchange cannot return a derived replacement value",
+                                ));
+                            }
+                        }
+                    } else {
+                        old
+                    };
+                    Ok(Some(result))
+                }
+                I::AtomicCompareExchange {
+                    address,
+                    expected,
+                    replacement,
+                    object,
+                    order: gir::MemoryOrder::SequentiallyConsistent,
+                } => {
+                    let _ = atomic_scalar_type(&self.module.types, *object, self.config)?;
+                    Ok(Some(builder.ins().atomic_cas(
+                        MemFlags::new(),
+                        self.value(*address)?,
+                        self.value(*expected)?,
+                        self.value(*replacement)?,
+                    )))
+                }
+                I::Prefetch {
+                    address,
+                    write: _,
+                    locality: _,
+                } => {
+                    let _ = self.value(*address)?;
+                    Ok(None)
+                }
                 I::DirectCall {
                     function,
                     signature,
@@ -848,6 +1120,12 @@ impl FunctionState<'_> {
                     arguments,
                     *variadic_boundary,
                 ),
+                I::MemoryFence {
+                    order: gir::MemoryOrder::SequentiallyConsistent,
+                } => {
+                    builder.ins().fence();
+                    Ok(None)
+                }
                 I::VaStart {
                     list,
                     last_named_parameter: _,
@@ -892,11 +1170,18 @@ impl FunctionState<'_> {
             .get(&raw)
             .copied()
             .ok_or_else(|| error(format!("reference to undeclared data object {raw}")))?;
-        Ok(if reference.tls {
-            builder.ins().tls_value(ir::types::I64, reference.value)
-        } else {
-            builder.ins().global_value(ir::types::I64, reference.value)
-        })
+        if let Some(accessor) = reference.tls_accessor {
+            let call = builder.ins().call(accessor, &[]);
+            return builder
+                .inst_results(call)
+                .first()
+                .copied()
+                .ok_or_else(|| error("TLS address accessor returned no pointer"));
+        }
+        let value = reference
+            .value
+            .ok_or_else(|| error("non-TLS data reference has no global value"))?;
+        Ok(builder.ins().global_value(ir::types::I64, value))
     }
 
     fn address_constant(
@@ -1418,10 +1703,12 @@ impl FunctionState<'_> {
             ccc_abi::BoundaryPlan::Native(plan) => plan.parameters.len(),
             ccc_abi::BoundaryPlan::Bridge(plan) => plan.parameters.len(),
         };
-        let boundary_matches = if planned_signature.variadic {
-            variadic_boundary <= arguments.len()
-        } else {
-            variadic_boundary == arguments.len()
+        let boundary_matches = match &planned_signature.parameters {
+            ccc_types::FunctionParameters::Unspecified => variadic_boundary == 0,
+            ccc_types::FunctionParameters::Prototype(_) if planned_signature.variadic => {
+                variadic_boundary <= arguments.len()
+            }
+            ccc_types::FunctionParameters::Prototype(_) => variadic_boundary == arguments.len(),
         };
         if parameter_count != arguments.len() || !boundary_matches {
             return Err(error(format!(
@@ -1706,6 +1993,188 @@ impl FunctionState<'_> {
         }
     }
 
+    fn runtime_sized_allocate(
+        &self,
+        builder: &mut FunctionBuilder<'_>,
+        storage: gir::StorageId,
+        extents: &[gir::ValueId],
+        element: QualifiedType,
+        constant_factor: u64,
+        requested_alignment: Option<u64>,
+    ) -> Result<ir::Value, CodegenError> {
+        let slot = self
+            .runtime_storage
+            .get(&storage.0)
+            .copied()
+            .ok_or_else(|| {
+                error(format!(
+                    "runtime allocation references unavailable storage {}",
+                    storage.0
+                ))
+            })?;
+        let realloc = self
+            .references
+            .runtime_realloc
+            .ok_or_else(|| error("runtime-sized storage has no realloc declaration"))?;
+        let layout = object_layout(&self.module.types, element, self.config)?;
+        let fixed_size = layout
+            .size
+            .checked_mul(constant_factor)
+            .ok_or_else(|| error("variable-length array constant size overflow"))?;
+        if fixed_size == 0 {
+            return Err(error("variable-length array has a zero-sized element"));
+        }
+        const HOSTED_VLA_MINIMUM_ALIGNMENT: u64 = 16;
+        let alignment = requested_alignment
+            .map_or(layout.align.max(HOSTED_VLA_MINIMUM_ALIGNMENT), |value| {
+                value.max(layout.align).max(HOSTED_VLA_MINIMUM_ALIGNMENT)
+            });
+        if alignment == 0 || !alignment.is_power_of_two() {
+            return Err(error("variable-length array has an invalid alignment"));
+        }
+
+        let trap = TrapCode::unwrap_user(2);
+        let mut size = builder.ins().iconst(
+            ir::types::I64,
+            i64::try_from(fixed_size)
+                .map_err(|_| error("variable-length array element size exceeds size_t"))?,
+        );
+        for extent in extents {
+            let value = self.value(*extent)?;
+            let source_ty = builder.func.dfg.value_type(value);
+            let signed = is_signed(&self.module.types, self.value_ty(*extent)?, self.config)?;
+            let value = coerce_integer(builder, value, source_ty, ir::types::I64, signed);
+            let invalid = if signed {
+                builder
+                    .ins()
+                    .icmp_imm(IntCC::SignedLessThanOrEqual, value, 0)
+            } else {
+                builder.ins().icmp_imm(IntCC::Equal, value, 0)
+            };
+            builder.ins().trapnz(invalid, trap);
+            let (product, overflow) = builder.ins().umul_overflow(size, value);
+            builder.ins().trapnz(overflow, trap);
+            size = product;
+        }
+        let padding = builder.ins().iconst(
+            ir::types::I64,
+            i64::try_from(alignment - 1)
+                .map_err(|_| error("variable-length array alignment exceeds size_t"))?,
+        );
+        let (required, overflow) = builder.ins().uadd_overflow(size, padding);
+        builder.ins().trapnz(overflow, trap);
+
+        let state = builder.ins().stack_addr(ir::types::I64, slot, 0);
+        let base = builder
+            .ins()
+            .load(ir::types::I64, MemFlags::new(), state, 0);
+        let capacity = builder
+            .ins()
+            .load(ir::types::I64, MemFlags::new(), state, 8);
+        let grow = builder.create_block();
+        let ready = builder.create_block();
+        builder.append_block_param(ready, ir::types::I64);
+        let needs_grow = builder
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThan, required, capacity);
+        builder
+            .ins()
+            .brif(needs_grow, grow, &[], ready, &[base.into()]);
+
+        builder.seal_block(grow);
+        builder.switch_to_block(grow);
+        let call = builder.ins().call(realloc, &[base, required]);
+        let allocated = *builder
+            .inst_results(call)
+            .first()
+            .ok_or_else(|| error("realloc did not return a pointer"))?;
+        builder.ins().trapz(allocated, trap);
+        builder.ins().store(MemFlags::new(), allocated, state, 0);
+        builder.ins().store(MemFlags::new(), required, state, 8);
+        builder.ins().jump(ready, &[allocated.into()]);
+
+        builder.seal_block(ready);
+        builder.switch_to_block(ready);
+        let base = builder.block_params(ready)[0];
+        let biased = builder.ins().iadd(base, padding);
+        let mask = builder
+            .ins()
+            .iconst(ir::types::I64, alignment.wrapping_neg() as i64);
+        Ok(builder.ins().band(biased, mask))
+    }
+
+    fn runtime_element_stride(
+        &self,
+        builder: &mut FunctionBuilder<'_>,
+        mut element: QualifiedType,
+        extents: &[gir::ValueId],
+    ) -> Result<ir::Value, CodegenError> {
+        let mut constant_factor = 1_u64;
+        while let Some(TypeKind::Array(array)) = self.module.types.try_kind(element.ty) {
+            if let ArrayLength::Constant(length) = array.length {
+                constant_factor = constant_factor
+                    .checked_mul(length)
+                    .ok_or_else(|| error("runtime pointer stride constant overflow"))?;
+            }
+            element = array.element;
+        }
+        let layout = object_layout(&self.module.types, element, self.config)?;
+        let fixed_size = layout
+            .size
+            .checked_mul(constant_factor)
+            .ok_or_else(|| error("runtime pointer stride constant overflow"))?;
+        if fixed_size == 0 {
+            return Err(error("runtime pointer stride is zero"));
+        }
+        let trap = TrapCode::unwrap_user(2);
+        let mut stride = builder.ins().iconst(
+            ir::types::I64,
+            i64::try_from(fixed_size)
+                .map_err(|_| error("runtime pointer stride exceeds size_t"))?,
+        );
+        for extent in extents {
+            let value = self.value(*extent)?;
+            let source_ty = builder.func.dfg.value_type(value);
+            let signed = is_signed(&self.module.types, self.value_ty(*extent)?, self.config)?;
+            let value = coerce_integer(builder, value, source_ty, ir::types::I64, signed);
+            let invalid = if signed {
+                builder
+                    .ins()
+                    .icmp_imm(IntCC::SignedLessThanOrEqual, value, 0)
+            } else {
+                builder.ins().icmp_imm(IntCC::Equal, value, 0)
+            };
+            builder.ins().trapnz(invalid, trap);
+            let (product, overflow) = builder.ins().umul_overflow(stride, value);
+            builder.ins().trapnz(overflow, trap);
+            stride = product;
+        }
+        Ok(stride)
+    }
+
+    fn release_runtime_storage(
+        &self,
+        builder: &mut FunctionBuilder<'_>,
+    ) -> Result<(), CodegenError> {
+        if self.runtime_storage.is_empty() {
+            return Ok(());
+        }
+        let free = self
+            .references
+            .runtime_free
+            .ok_or_else(|| error("runtime-sized storage has no free declaration"))?;
+        let mut slots = self.runtime_storage.iter().collect::<Vec<_>>();
+        slots.sort_unstable_by_key(|(storage, _)| **storage);
+        for (_, slot) in slots {
+            let state = builder.ins().stack_addr(ir::types::I64, *slot, 0);
+            let base = builder
+                .ins()
+                .load(ir::types::I64, MemFlags::new(), state, 0);
+            builder.ins().call(free, &[base]);
+        }
+        Ok(())
+    }
+
     fn lower_native_return(
         &self,
         builder: &mut FunctionBuilder<'_>,
@@ -1714,10 +2183,13 @@ impl FunctionState<'_> {
     ) -> Result<(), CodegenError> {
         match (&plan.result, value) {
             (ccc_abi::NativeResultPlan::Void, None) => {
+                self.release_runtime_storage(builder)?;
                 builder.ins().return_(&[]);
             }
             (ccc_abi::NativeResultPlan::Scalar { .. }, Some(value)) => {
-                builder.ins().return_(&[self.value(value)?]);
+                let value = self.value(value)?;
+                self.release_runtime_storage(builder)?;
+                builder.ins().return_(&[value]);
             }
             (ccc_abi::NativeResultPlan::RegisterAggregate { classified, .. }, Some(value)) => {
                 let padded = align_up_u64(classified.size, 8)?;
@@ -1741,6 +2213,7 @@ impl FunctionState<'_> {
                         0,
                     ));
                 }
+                self.release_runtime_storage(builder)?;
                 builder.ins().return_(&results);
             }
             (ccc_abi::NativeResultPlan::Indirect { classified, .. }, Some(value)) => {
@@ -1755,6 +2228,7 @@ impl FunctionState<'_> {
                     gir::MemoryAccess::default(),
                     gir::MemoryAccess::default(),
                 )?;
+                self.release_runtime_storage(builder)?;
                 builder.ins().return_(&[]);
             }
             _ => {
@@ -1822,6 +2296,7 @@ impl FunctionState<'_> {
                 ));
             }
         }
+        self.release_runtime_storage(builder)?;
         builder.ins().return_(&[]);
         Ok(())
     }
@@ -1872,6 +2347,46 @@ impl FunctionState<'_> {
                     builder.switch_to_block(next);
                 }
                 self.jump(builder, default)
+            }
+            gir::FullTerminator::IndirectBranch { selector, targets } => {
+                let selector = self.value(*selector)?;
+                let selector_ty = builder.func.dfg.value_type(selector);
+                if !selector_ty.is_int() {
+                    return Err(error(
+                        "computed goto selector is not represented as an integer",
+                    ));
+                }
+                let index = builder.ins().iadd_imm(selector, -1);
+                let trap = builder.create_block();
+                if selector_ty.bits() > 32 {
+                    let dispatch = builder.create_block();
+                    let out_of_range = builder.ins().icmp_imm(
+                        IntCC::UnsignedGreaterThan,
+                        index,
+                        i64::from(u32::MAX),
+                    );
+                    builder.ins().brif(out_of_range, trap, &[], dispatch, &[]);
+                    builder.seal_block(dispatch);
+                    builder.switch_to_block(dispatch);
+                }
+                let index = match selector_ty.bits() {
+                    bits if bits > 32 => builder.ins().ireduce(ir::types::I32, index),
+                    bits if bits < 32 => builder.ins().uextend(ir::types::I32, index),
+                    _ => index,
+                };
+                let default_call = builder.func.dfg.block_call(trap, &[]);
+                let mut target_calls = Vec::with_capacity(targets.len());
+                for target in targets {
+                    let block = self.block(target.target.0)?;
+                    target_calls.push(builder.func.dfg.block_call(block, &[]));
+                }
+                let table =
+                    builder.create_jump_table(ir::JumpTableData::new(default_call, &target_calls));
+                builder.ins().br_table(index, table);
+                builder.seal_block(trap);
+                builder.switch_to_block(trap);
+                builder.ins().trap(TrapCode::unwrap_user(1));
+                Ok(())
             }
             gir::FullTerminator::Return(value) => self.lower_return(builder, *value),
             gir::FullTerminator::Unreachable => {
@@ -2273,6 +2788,26 @@ fn validate_access(access: gir::MemoryAccess) -> Result<(), CodegenError> {
     Ok(())
 }
 
+fn atomic_scalar_type(
+    types: &TypeStore,
+    object: QualifiedType,
+    config: &EffectiveCompilationConfig,
+) -> Result<ir::Type, CodegenError> {
+    let ty = scalar_type(types, object, config)?;
+    if ty.is_int() && matches!(ty.bits(), 8 | 16 | 32 | 64) {
+        Ok(ty)
+    } else {
+        Err(CodegenError {
+            code: ATOMIC_ERROR,
+            message: format!(
+                "atomic operation requires a native 1, 2, 4, or 8-byte integer representation, not `{}`",
+                types.display_qualified(object)
+            ),
+            span: None,
+        })
+    }
+}
+
 fn lower_load(
     builder: &mut FunctionBuilder<'_>,
     address: ir::Value,
@@ -2410,9 +2945,16 @@ fn lower_conversion(
     let value = match kind {
         gir::ScalarConversion::ArrayToPointer
         | gir::ScalarConversion::FunctionToPointer
-        | gir::ScalarConversion::PointerConversion
         | gir::ScalarConversion::QualificationAdjustment => {
             coerce_value(builder, operand, destination, false)?
+        }
+        gir::ScalarConversion::PointerConversion => {
+            let signed = if types.is_integer(from.ty) {
+                is_signed(types, from, config)?
+            } else {
+                false
+            };
+            coerce_value(builder, operand, destination, signed)?
         }
         gir::ScalarConversion::IntegerPromotion | gir::ScalarConversion::IntegerConversion => {
             coerce_integer(

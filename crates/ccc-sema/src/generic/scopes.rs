@@ -12,6 +12,8 @@ pub(super) enum OrdinarySymbol {
     Global(GlobalId, QualifiedType),
     Function(FullFunctionId, TypeId),
     Local(FullLocalId, QualifiedType),
+    TemporaryParameter(FullLocalId, QualifiedType, bool),
+    PredefinedFunctionName,
     Typedef(TypedefId, QualifiedType),
     Enumerator(i128, QualifiedType),
 }
@@ -29,11 +31,14 @@ pub(super) struct TagSymbol {
     pub ty: TypeId,
 }
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 struct SemanticScope {
     ordinary: HashMap<String, OrdinarySymbol>,
     tags: HashMap<String, TagSymbol>,
 }
+
+#[derive(Clone, Debug)]
+pub(super) struct DetachedSemanticScope(SemanticScope);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum OrdinaryBindingConflict {
@@ -62,8 +67,16 @@ impl ScopeStack {
     }
 
     pub fn pop(&mut self) {
+        let _ = self.pop_detached();
+    }
+
+    pub fn pop_detached(&mut self) -> DetachedSemanticScope {
         assert!(self.scopes.len() > 1, "the file scope is permanent");
-        self.scopes.pop();
+        DetachedSemanticScope(self.scopes.pop().expect("a nested scope exists"))
+    }
+
+    pub fn push_detached(&mut self, scope: DetachedSemanticScope) {
+        self.scopes.push(scope.0);
     }
 
     pub fn current_ordinary(&self, name: &str) -> Option<&OrdinarySymbol> {
@@ -127,6 +140,10 @@ impl ScopeStack {
         }
         tags.insert(name, tag);
         Ok(())
+    }
+
+    pub fn current_tag(&self, name: &str) -> Option<TagSymbol> {
+        self.current().tags.get(name).copied()
     }
 
     pub fn lookup_tag(&self, name: &str) -> Option<TagSymbol> {
@@ -211,7 +228,7 @@ impl LabelScope {
     pub fn undefined_uses(&self) -> Vec<(String, Span)> {
         self.labels
             .iter()
-            .filter(|(_, label)| label.definition.is_none() && !label.uses.is_empty())
+            .filter(|(_, label)| label.id == LabelId(u32::MAX) && !label.uses.is_empty())
             .map(|(name, label)| (name.clone(), label.uses[0]))
             .collect()
     }
@@ -281,6 +298,7 @@ mod tests {
 
         labels.reserve_definition("forward");
         let forward = labels.note_use("forward", first);
+        assert!(labels.undefined_uses().is_empty());
         assert_eq!(labels.define("forward", second), Ok(forward));
         labels.note_use("missing", first);
         labels.note_use("missing", second);

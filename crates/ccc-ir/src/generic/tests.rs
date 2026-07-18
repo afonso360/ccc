@@ -1,5 +1,8 @@
 use ccc_pp::{PpItem, lex};
-use ccc_sema::generic::analyze_frontend;
+use ccc_sema::generic::{
+    ConstantValue, FullTypedBlockItem, FullTypedInitializer, FullTypedInitializerKind,
+    FullTypedStatementKind, analyze_frontend,
+};
 use ccc_session::SourceMap;
 use ccc_syntax::frontend as syntax;
 use ccc_target::EffectiveCompilationConfig;
@@ -18,6 +21,315 @@ fn typed_source(source: &str) -> ccc_sema::generic::FullTypedTranslationUnit {
 
 fn lower_source(source: &str) -> FullModule {
     lower_frontend(&typed_source(source)).unwrap()
+}
+
+#[test]
+fn lowers_variable_bound_effects() {
+    for source in [
+        "int f(int n, int (*value)[n]) { return 0; }",
+        "int f(int n) { static int (*value)[n++]; return 0; }",
+        "int f(int n) { int (*value)[(n++, 4)]; return n; }",
+        "int f(int n) { int (*(*value)(void))[n++]; return n; }",
+    ] {
+        let module = lower_source(source);
+        verify_frontend(&module).unwrap();
+    }
+}
+
+#[test]
+fn lowers_runtime_sized_objects_and_dynamic_pointer_strides_explicitly() {
+    let module = lower_source(
+        "int inspect(int rows, int columns) {
+             _Alignas(64) int matrix[rows][columns];
+             matrix[rows - 1][columns - 1] = 17;
+             return matrix[rows - 1][columns - 1];
+         }",
+    );
+    verify_frontend(&module).unwrap();
+    let function = &module.functions[0];
+    assert_eq!(function.storage.len(), 1);
+    assert_eq!(function.storage[0].location, StorageLocation::RuntimeSized);
+    assert_eq!(function.storage[0].requested_alignment, Some(64));
+    assert!(function.blocks.iter().any(|block| {
+        block.instructions.iter().any(|instruction| {
+            matches!(
+                instruction.kind,
+                FullInstructionKind::RuntimeSizedAllocate { .. }
+            )
+        })
+    }));
+    assert!(function.blocks.iter().any(|block| {
+        block.instructions.iter().any(|instruction| {
+            matches!(
+                instruction.kind,
+                FullInstructionKind::RuntimePointerOffset { .. }
+            )
+        })
+    }));
+    let dump = dump_frontend_ir(&module);
+    assert!(dump.contains("runtime.allocate"), "{dump}");
+    assert!(dump.contains("pointer.offset.runtime"), "{dump}");
+}
+
+#[test]
+fn computed_goto_has_exact_dense_table_ir_and_owned_static_tokens() {
+    let module = lower_source(
+        "int dispatch(int opcode) {\n\
+             static const void *const table[2] = {&&zero, &&one};\n\
+             goto *table[opcode];\n\
+         zero: return 10;\n\
+         one: return 20;\n\
+         }",
+    );
+    verify_frontend(&module).unwrap();
+    assert_eq!(
+        module.globals[0].source,
+        DataOrigin::BlockStatic {
+            function: ccc_sema::generic::FullFunctionId(0),
+            local: ccc_sema::generic::FullLocalId(1),
+        }
+    );
+    assert_eq!(
+        dump_frontend_ir(&module),
+        concat!(
+            "data d0 @__ccc_block_static.dispatch.0.1.table : array[2] of const pointer to const void [block-static:f0:l1 linkage=None duration=Static visibility=Internal definition=Definition]\n",
+            "  initializer root=n2 {\n",
+            "    n0: const pointer to const void = const unsigned:1\n",
+            "    n1: const pointer to const void = const unsigned:2\n",
+            "    n2: array[2] of const pointer to const void = aggregate [[0] -> n0, [1] -> n1]\n",
+            "  }\n",
+            "function f0 @dispatch(v0 %opcode: int -> m0) -> int [signature=int (int) linkage=External visibility=Default inline=false noreturn=false] {\n",
+            "  storage m0 l0 %opcode: int [Automatic; IndirectControlFlow]\n",
+            "  b0():\n",
+            "    i8: v8: int = const signed:10\n",
+            "    return v8\n",
+            "  b1():\n",
+            "    i9: v9: int = const signed:20\n",
+            "    return v9\n",
+            "  b2(v0: int):\n",
+            "    i0: v1: pointer to int = address.storage m0\n",
+            "    i1: store v0 -> v1 object=int [plain]\n",
+            "    i2: v2: pointer to array[2] of const pointer to const void = address.data d0\n",
+            "    i3: v3: pointer to const pointer to const void = convert.array-to-pointer v2 array[2] of const pointer to const void -> pointer to const pointer to const void\n",
+            "    i4: v4: pointer to int = address.storage m0\n",
+            "    i5: v5: int = load v4 object=int [plain]\n",
+            "    i6: v6: pointer to const pointer to const void = pointer.offset v3, v5 element=const pointer to const void\n",
+            "    i7: v7: pointer to const void = load v6 object=const pointer to const void [plain]\n",
+            "    br_table v7 [b0(), b1()]\n",
+            "}\n",
+        )
+    );
+}
+
+#[test]
+fn computed_goto_retains_current_local_state_in_memory() {
+    let module = lower_source(
+        "int f(int limit) {\n\
+             void *target = &&step;\n\
+             int state = 0;\n\
+             goto *target;\n\
+         again:\n\
+             state += 10;\n\
+             goto *target;\n\
+         step:\n\
+             state++;\n\
+             if (state < limit) goto again;\n\
+             return state;\n\
+         }",
+    );
+    verify_frontend(&module).unwrap();
+    assert_eq!(
+        dump_frontend_ir(&module),
+        concat!(
+            "function f0 @f(v0 %limit: int -> m0) -> int [signature=int (int) linkage=External visibility=Default inline=false noreturn=false] {\n",
+            "  storage m0 l0 %limit: int [Automatic; IndirectControlFlow]\n",
+            "  storage m1 l1 %target: pointer to void [Automatic; IndirectControlFlow]\n",
+            "  storage m2 l2 %state: int [Automatic; IndirectControlFlow]\n",
+            "  b0():\n",
+            "    i11: v9: pointer to int = address.storage m2\n",
+            "    i12: v10: int = load v9 object=int [plain]\n",
+            "    i13: v11: int = const signed:10\n",
+            "    i14: v12: int = add v10, v11\n",
+            "    i15: store v12 -> v9 object=int [plain]\n",
+            "    i16: v13: pointer to pointer to void = address.storage m1\n",
+            "    i17: v14: pointer to void = load v13 object=pointer to void [plain]\n",
+            "    br_table v14 [b0(), b1()]\n",
+            "  b1():\n",
+            "    i18: v15: pointer to int = address.storage m2\n",
+            "    i19: v16: int = load v15 object=int [plain]\n",
+            "    i20: v17: int = const signed:1\n",
+            "    i21: v18: int = add v16, v17\n",
+            "    i22: store v18 -> v15 object=int [plain]\n",
+            "    i23: v19: pointer to int = address.storage m2\n",
+            "    i24: v20: int = load v19 object=int [plain]\n",
+            "    i25: v21: pointer to int = address.storage m0\n",
+            "    i26: v22: int = load v21 object=int [plain]\n",
+            "    i27: v23: int = less v20, v22\n",
+            "    i28: v24: int = convert.to-boolean v23 int -> int\n",
+            "    conditional v24 ? b3() : b4()\n",
+            "  b2(v0: int):\n",
+            "    i0: v1: pointer to int = address.storage m0\n",
+            "    i1: store v0 -> v1 object=int [plain]\n",
+            "    i2: v2: pointer to pointer to void = address.storage m1\n",
+            "    i3: v3: pointer to void = const unsigned:2\n",
+            "    i4: v4: pointer to void = convert.pointer-conversion v3 pointer to void -> pointer to void\n",
+            "    i5: store v4 -> v2 object=pointer to void [plain]\n",
+            "    i6: v5: pointer to int = address.storage m2\n",
+            "    i7: v6: int = const signed:0\n",
+            "    i8: store v6 -> v5 object=int [plain]\n",
+            "    i9: v7: pointer to pointer to void = address.storage m1\n",
+            "    i10: v8: pointer to void = load v7 object=pointer to void [plain]\n",
+            "    br_table v8 [b0(), b1()]\n",
+            "  b3():\n",
+            "    branch b0()\n",
+            "  b4():\n",
+            "    branch b5()\n",
+            "  b5():\n",
+            "    i29: v25: pointer to int = address.storage m2\n",
+            "    i30: v26: int = load v25 object=int [plain]\n",
+            "    return v26\n",
+            "}\n",
+        )
+    );
+}
+
+#[test]
+fn label_addresses_alone_do_not_disable_scalar_promotion() {
+    let module = lower_source(
+        "int f(int value) { void *token = &&done; done: return value + (token != 0); }",
+    );
+    assert!(module.functions[0].storage.is_empty());
+    assert!(module.functions[0].blocks.iter().all(|block| !matches!(
+        block.terminator,
+        Some(FullTerminator::IndirectBranch { .. })
+    )));
+}
+
+#[test]
+fn verifier_rejects_invalid_computed_goto_target_tables() {
+    let module = lower_source("int f(void) { goto *&&done; done: return 0; }");
+
+    let mut empty = module.clone();
+    let terminator = empty.functions[0]
+        .blocks
+        .iter_mut()
+        .find_map(|block| match block.terminator.as_mut() {
+            Some(FullTerminator::IndirectBranch { targets, .. }) => Some(targets),
+            _ => None,
+        })
+        .unwrap();
+    terminator.clear();
+    assert!(
+        verify_frontend(&empty)
+            .unwrap_err()
+            .message
+            .contains("no target blocks")
+    );
+
+    let mut duplicate = module.clone();
+    let terminator = duplicate.functions[0]
+        .blocks
+        .iter_mut()
+        .find_map(|block| match block.terminator.as_mut() {
+            Some(FullTerminator::IndirectBranch { targets, .. }) => Some(targets),
+            _ => None,
+        })
+        .unwrap();
+    terminator.push(terminator[0].clone());
+    assert!(
+        verify_frontend(&duplicate)
+            .unwrap_err()
+            .message
+            .contains("duplicate target blocks")
+    );
+
+    let mut with_arguments = module.clone();
+    let terminator = with_arguments.functions[0]
+        .blocks
+        .iter_mut()
+        .find_map(|block| match block.terminator.as_mut() {
+            Some(FullTerminator::IndirectBranch { selector, targets }) => {
+                Some((*selector, targets))
+            }
+            _ => None,
+        })
+        .unwrap();
+    terminator.1[0].arguments.push(terminator.0);
+    assert!(
+        verify_frontend(&with_arguments)
+            .unwrap_err()
+            .message
+            .contains("must not carry arguments")
+    );
+
+    let mut with_parameters = module;
+    let (selector, target) = with_parameters.functions[0]
+        .blocks
+        .iter()
+        .find_map(|block| match block.terminator.as_ref() {
+            Some(FullTerminator::IndirectBranch { selector, targets }) => {
+                Some((*selector, targets[0].target))
+            }
+            _ => None,
+        })
+        .unwrap();
+    let parameter = ValueId(with_parameters.functions[0].value_types.len() as u32);
+    let parameter_type = with_parameters.functions[0].value_types[selector.0 as usize];
+    with_parameters.functions[0]
+        .value_types
+        .push(parameter_type);
+    with_parameters.functions[0].blocks[target.0 as usize]
+        .parameters
+        .push(parameter);
+    assert!(
+        verify_frontend(&with_parameters)
+            .unwrap_err()
+            .message
+            .contains("must not have parameters")
+    );
+}
+
+#[test]
+fn lowering_rejects_missing_targets_and_cross_function_static_label_tokens() {
+    let error = lower_frontend(&typed_source("int f(void *target) { goto *target; }")).unwrap_err();
+    assert_eq!(error.code, "CCC3101");
+    assert!(error.message.contains("at least one label"));
+
+    let mut unit = typed_source(
+        "int first(void) { static void *table[1] = {&&done}; goto *table[0]; done: return 0; }\n\
+         int second(void) { return 0; }",
+    );
+    let FullTypedStatementKind::Compound(items) =
+        &mut unit.functions[0].body.as_mut().unwrap().kind
+    else {
+        panic!("expected compound function body");
+    };
+    let FullTypedBlockItem::Declaration(declaration) = &mut items[0] else {
+        panic!("expected static table declaration");
+    };
+    let Some(FullTypedInitializer {
+        kind: FullTypedInitializerKind::Aggregate(entries),
+        ..
+    }) = declaration.initializer.as_mut()
+    else {
+        panic!("expected aggregate initializer");
+    };
+    let FullTypedInitializerKind::Scalar(expression) = &mut entries[0].initializer.kind else {
+        panic!("expected scalar label token");
+    };
+    expression.constant = Some(ConstantValue::Address(
+        ccc_sema::generic::RelocatableAddress {
+            base: ccc_sema::generic::RelocatableBase::Label {
+                function: ccc_sema::generic::FullFunctionId(1),
+                label: ccc_sema::generic::LabelId(0),
+            },
+            addend: 0,
+            one_past: false,
+        },
+    ));
+    let error = lower_frontend(&unit).unwrap_err();
+    assert_eq!(error.code, "CCC3101");
+    assert!(error.message.contains("cross-function"));
 }
 
 #[test]
@@ -42,6 +354,70 @@ fn dumps_explicit_places_compound_updates_and_volatile_effects_exactly() {
             "    i7: v6: pointer to volatile int = address.data d0\n",
             "    i8: v7: int = load v6 object=volatile int [volatile=true atomic=None non-elidable=true non-movable=true]\n",
             "    return v7\n",
+            "}\n",
+        )
+    );
+}
+
+#[test]
+fn pointer_difference_uses_the_unqualified_compatible_element_type() {
+    let module =
+        lower_source("long difference(const char *cursor, char *start) { return cursor - start; }");
+    verify_frontend(&module).unwrap();
+    assert_eq!(
+        dump_frontend_ir(&module),
+        concat!(
+            "function f0 @difference(v0 %cursor: pointer to const char -> ssa, v1 %start: pointer to char -> ssa) -> long int [signature=long int (pointer to const char, pointer to char) linkage=External visibility=Default inline=false noreturn=false] {\n",
+            "  b0(v0: pointer to const char, v1: pointer to char):\n",
+            "    i0: v2: long int = pointer.difference v0, v1 element=char\n",
+            "    return v2\n",
+            "}\n",
+        )
+    );
+}
+
+#[test]
+fn declaration_assembly_labels_are_exact_in_ir_symbols_and_references() {
+    let module = lower_source(
+        "extern int source_object asm(\"linked_object\");\n\
+         extern int source_function(int) asm(\"linked_function\");\n\
+         int invoke(int value) { return source_function(value) + source_object; }",
+    );
+    verify_frontend(&module).unwrap();
+    assert_eq!(
+        dump_frontend_ir(&module),
+        concat!(
+            "data d0 @linked_object : int [file:g0 linkage=External duration=Static visibility=Default definition=Declaration]\n",
+            "declare f0 @linked_function : int (int) [linkage=External visibility=Default]\n",
+            "function f1 @invoke(v0 %value: int -> ssa) -> int [signature=int (int) linkage=External visibility=Default inline=false noreturn=false] {\n",
+            "  b0(v0: int):\n",
+            "    i0: v1: int = call.direct f0 (v0) signature=int (int) variadic-boundary=1 [read=true write=true unwind=true noreturn=false]\n",
+            "    i1: v2: pointer to int = address.data d0\n",
+            "    i2: v3: int = load v2 object=int [plain]\n",
+            "    i3: v4: int = add v1, v3\n",
+            "    return v4\n",
+            "}\n",
+        )
+    );
+}
+
+#[test]
+fn unprototyped_calls_record_default_promotions_and_a_zero_fixed_boundary_exactly() {
+    let module = lower_source(
+        "int legacy();\n\
+         int invoke(float floating, signed char narrow) { return legacy(floating, narrow); }",
+    );
+    verify_frontend(&module).unwrap();
+    assert_eq!(
+        dump_frontend_ir(&module),
+        concat!(
+            "declare f0 @legacy : int () [linkage=External visibility=Default]\n",
+            "function f1 @invoke(v0 %floating: float -> ssa, v1 %narrow: signed char -> ssa) -> int [signature=int (float, signed char) linkage=External visibility=Default inline=false noreturn=false] {\n",
+            "  b0(v0: float, v1: signed char):\n",
+            "    i0: v2: double = convert.floating-conversion v0 float -> double\n",
+            "    i1: v3: int = convert.integer-promotion v1 signed char -> int\n",
+            "    i2: v4: int = call.direct f0 (v2, v3) signature=int () variadic-boundary=0 [read=true write=true unwind=true noreturn=false]\n",
+            "    return v4\n",
             "}\n",
         )
     );
@@ -84,6 +460,66 @@ fn golden_covers_data_strings_places_and_cfg() {
 }
 
 #[test]
+fn predefined_function_names_use_unique_string_storage_and_existing_relocations() {
+    let module = lower_source(
+        "const char *direct(void) { return __func__; }
+         const char *saved(void) {
+             static const char *pointer = __func__;
+             return pointer;
+         }",
+    );
+    verify_frontend(&module).unwrap();
+
+    assert_eq!(module.strings.len(), 2);
+    assert_eq!(
+        module.strings[0].code_units,
+        b"direct\0"
+            .iter()
+            .copied()
+            .map(u32::from)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        module.strings[1].code_units,
+        b"saved\0"
+            .iter()
+            .copied()
+            .map(u32::from)
+            .collect::<Vec<_>>()
+    );
+    for string in &module.strings {
+        let ccc_types::TypeKind::Array(array) = module.types.kind(string.ty.ty) else {
+            panic!("predefined function name should have array type")
+        };
+        assert_eq!(array.element.ty, TypeId::CHAR);
+        assert!(
+            array
+                .element
+                .qualifiers
+                .contains(ccc_types::TypeQualifiers::CONST)
+        );
+    }
+
+    assert!(module.functions[0].blocks.iter().any(|block| {
+        block.instructions.iter().any(|instruction| {
+            matches!(
+                instruction.kind,
+                FullInstructionKind::AddressOfString { string } if string.0 == 0
+            )
+        })
+    }));
+    let initializer = module.globals[0].initializer.as_ref().unwrap();
+    assert!(matches!(
+        initializer.nodes[initializer.root.0 as usize].kind,
+        InitializerNodeKind::Relocation {
+            target: RelocationTarget::String(string),
+            kind: RelocationKind::StringAddress,
+            ..
+        } if string.0 == 1
+    ));
+}
+
+#[test]
 fn aggregate_rvalues_are_owned_and_project_field_index_paths() {
     let module = lower_source(
         "struct Matrix { int items[2][3]; };\n\
@@ -114,6 +550,70 @@ fn aggregate_rvalues_are_owned_and_project_field_index_paths() {
             "    return v17\n",
             "}\n",
         )
+    );
+}
+
+#[test]
+fn aggregate_initializer_field_addresses_inherit_record_qualifiers() {
+    let module = lower_source(
+        "struct Item { const char *name; int value; };\n\
+         static int consume(const struct Item *items) { return items[0].value; }\n\
+         int const_init(void) {\n\
+           const struct Item items[] = {{\"none\", 1}};\n\
+           return consume(items);\n\
+         }\n\
+         int mutable_init(void) {\n\
+           struct Item items[] = {{\"full\", 2}};\n\
+           return consume(items);\n\
+         }",
+    );
+    verify_frontend(&module).unwrap();
+
+    let projections = module
+        .functions
+        .iter()
+        .filter(|function| matches!(function.name.as_str(), "const_init" | "mutable_init"))
+        .flat_map(|function| {
+            function.blocks.iter().flat_map(|block| {
+                block.instructions.iter().filter_map(|instruction| {
+                    let FullInstructionKind::ProjectField {
+                        record,
+                        field_name: Some(field_name),
+                        ..
+                    } = &instruction.kind
+                    else {
+                        return None;
+                    };
+                    if field_name != "name" {
+                        return None;
+                    }
+                    let result = instruction.result.unwrap();
+                    Some((
+                        function.name.as_str(),
+                        module
+                            .types
+                            .display(function.value_types[result.0 as usize]),
+                        module.types.display_qualified(*record),
+                    ))
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        projections,
+        vec![
+            (
+                "const_init",
+                "pointer to const pointer to const char".to_owned(),
+                "const struct Item".to_owned(),
+            ),
+            (
+                "mutable_init",
+                "pointer to pointer to const char".to_owned(),
+                "struct Item".to_owned(),
+            ),
+        ]
     );
 }
 
@@ -275,6 +775,517 @@ fn lowers_variadic_builtins_to_abi_neutral_effects() {
             "}\n",
         )
     );
+}
+
+#[test]
+fn lowers_sync_synchronize_to_a_sequentially_consistent_memory_fence() {
+    let module = lower_source("void synchronize(void) { __sync_synchronize(); }");
+    verify_frontend(&module).unwrap();
+    let function = module
+        .functions
+        .iter()
+        .find(|function| function.name == "synchronize")
+        .unwrap();
+    let fences = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.kind {
+            FullInstructionKind::MemoryFence { order } => Some(order),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(fences, [MemoryOrder::SequentiallyConsistent]);
+    let dump = dump_frontend_ir(&module);
+    assert!(
+        dump.contains("memory.fence order=SequentiallyConsistent"),
+        "{dump}"
+    );
+    assert_eq!(
+        module.functions.len(),
+        1,
+        "the builtin must not become a call"
+    );
+}
+
+#[test]
+fn lowers_legacy_sync_operations_to_explicit_sequentially_consistent_atomics() {
+    let module = lower_source(
+        "int value;\n\
+         void *pointer;\n\
+         int protected_side_effect(void);\n\
+         int update(int delta) {\n\
+             int old = __sync_fetch_and_add(&value, delta);\n\
+             int now = __sync_add_and_fetch(&value, delta, protected_side_effect());\n\
+             int after = __sync_sub_and_fetch(&value, delta, __sync_synchronize);\n\
+             int changed = __sync_bool_compare_and_swap(&value, old, now);\n\
+             int seen = __sync_val_compare_and_swap(&value, now, after);\n\
+             pointer = __sync_lock_test_and_set(&pointer, (void *)0);\n\
+             pointer = __sync_add_and_fetch(&pointer, 1);\n\
+             return old + now + after + changed + seen;\n\
+         }",
+    );
+    verify_frontend(&module).unwrap();
+    let function = module
+        .functions
+        .iter()
+        .find(|function| function.name == "update")
+        .unwrap();
+    let instructions = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .collect::<Vec<_>>();
+    let rmw = instructions
+        .iter()
+        .filter_map(|instruction| match instruction.kind {
+            FullInstructionKind::AtomicReadModifyWrite {
+                operation,
+                return_new,
+                order,
+                ..
+            } => Some((operation, return_new, order)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rmw,
+        [
+            (
+                AtomicReadModifyWriteOperation::Add,
+                false,
+                MemoryOrder::SequentiallyConsistent,
+            ),
+            (
+                AtomicReadModifyWriteOperation::Add,
+                true,
+                MemoryOrder::SequentiallyConsistent,
+            ),
+            (
+                AtomicReadModifyWriteOperation::Subtract,
+                true,
+                MemoryOrder::SequentiallyConsistent,
+            ),
+            (
+                AtomicReadModifyWriteOperation::Exchange,
+                false,
+                MemoryOrder::SequentiallyConsistent,
+            ),
+            (
+                AtomicReadModifyWriteOperation::Add,
+                true,
+                MemoryOrder::SequentiallyConsistent,
+            ),
+        ]
+    );
+    let compare_exchange = instructions
+        .iter()
+        .filter_map(|instruction| match instruction.kind {
+            FullInstructionKind::AtomicCompareExchange { order, .. } => Some(order),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        compare_exchange,
+        [
+            MemoryOrder::SequentiallyConsistent,
+            MemoryOrder::SequentiallyConsistent,
+        ]
+    );
+    assert!(instructions.iter().all(|instruction| !matches!(
+        instruction.kind,
+        FullInstructionKind::DirectCall { .. } | FullInstructionKind::IndirectCall { .. }
+    )));
+    let dump = dump_frontend_ir(&module);
+    assert_eq!(dump.matches("atomic.rmw operation=").count(), 5, "{dump}");
+    assert_eq!(dump.matches("return-new=true").count(), 3, "{dump}");
+    assert_eq!(dump.matches("atomic.cmpxchg").count(), 2, "{dump}");
+    assert_eq!(
+        dump.matches("order=SequentiallyConsistent").count(),
+        7,
+        "{dump}"
+    );
+}
+
+#[test]
+fn verifier_rejects_inconsistent_atomic_rmw_value_types() {
+    let mut module = lower_source(
+        "int value; int update(int delta) { return __sync_fetch_and_add(&value, delta); }",
+    );
+    let mut changed = false;
+    for block in &mut module.functions[0].blocks {
+        for instruction in &mut block.instructions {
+            if let FullInstructionKind::AtomicReadModifyWrite {
+                address, operand, ..
+            } = &mut instruction.kind
+            {
+                *operand = *address;
+                changed = true;
+                break;
+            }
+        }
+    }
+    assert!(changed);
+    let error = verify_frontend(&module).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("atomic RMW operand type disagrees with its object"),
+        "{error}"
+    );
+}
+
+#[test]
+fn verifier_rejects_return_new_atomic_exchange() {
+    let mut module = lower_source(
+        "void *pointer; void *exchange(void *value) {\n\
+             return __sync_lock_test_and_set(&pointer, value);\n\
+         }",
+    );
+    let changed = module.functions[0]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match &mut instruction.kind {
+            FullInstructionKind::AtomicReadModifyWrite { return_new, .. } => Some(return_new),
+            _ => None,
+        })
+        .unwrap();
+    *changed = true;
+    let error = verify_frontend(&module).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("atomic exchange cannot return a derived replacement value"),
+        "{error}"
+    );
+}
+
+#[test]
+fn lowers_integer_intrinsics_and_nonfaulting_prefetch_effects_explicitly() {
+    let module = lower_source(
+        "void *next_address(void);\n\
+         int protected_side_effect(void);\n\
+         unsigned long swap(unsigned long value) { return __builtin_bswap64(value); }\n\
+         int bits(unsigned int word, unsigned long wide, unsigned long long widest) {\n\
+             return __builtin_clz(word) + __builtin_clzl(wide) +\n\
+                 __builtin_clzll(widest) + __builtin_ctz(word) +\n\
+                 __builtin_ctzll(widest) +\n\
+                 __builtin_popcount(word) + __builtin_popcountll(widest);\n\
+         }\n\
+         void hints(void) {\n\
+             __builtin_prefetch(\n\
+                 next_address(),\n\
+                 1 ? 0 : protected_side_effect(),\n\
+                 1 ? 3 : protected_side_effect());\n\
+             __builtin_prefetch((void *)1, 1, 0);\n\
+         }",
+    );
+    verify_frontend(&module).unwrap();
+
+    let operations = module
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.kind {
+            FullInstructionKind::IntegerIntrinsic { operation, .. } => Some(operation),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        operations,
+        [
+            IntegerIntrinsicOperation::ByteSwap64,
+            IntegerIntrinsicOperation::CountLeadingZerosInt,
+            IntegerIntrinsicOperation::CountLeadingZerosLong,
+            IntegerIntrinsicOperation::CountLeadingZerosLongLong,
+            IntegerIntrinsicOperation::CountTrailingZerosInt,
+            IntegerIntrinsicOperation::CountTrailingZerosLongLong,
+            IntegerIntrinsicOperation::PopulationCountInt,
+            IntegerIntrinsicOperation::PopulationCountLongLong,
+        ]
+    );
+
+    let hints = module
+        .functions
+        .iter()
+        .find(|function| function.name == "hints")
+        .unwrap();
+    let instructions = hints
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .collect::<Vec<_>>();
+    let prefetches = instructions
+        .iter()
+        .filter_map(|instruction| match instruction.kind {
+            FullInstructionKind::Prefetch {
+                write, locality, ..
+            } => Some((write, locality)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(prefetches, [(false, 3), (true, 0)]);
+    assert_eq!(
+        instructions
+            .iter()
+            .filter(|instruction| matches!(
+                instruction.kind,
+                FullInstructionKind::DirectCall { .. }
+            ))
+            .count(),
+        1,
+        "the prefetch address expression must be evaluated exactly once"
+    );
+
+    let dump = dump_frontend_ir(&module);
+    for operation in [
+        "ByteSwap64",
+        "CountLeadingZerosInt",
+        "CountLeadingZerosLong",
+        "CountLeadingZerosLongLong",
+        "CountTrailingZerosInt",
+        "CountTrailingZerosLongLong",
+        "PopulationCountInt",
+        "PopulationCountLongLong",
+    ] {
+        assert!(
+            dump.contains(&format!("integer.intrinsic operation={operation}")),
+            "{dump}"
+        );
+    }
+    assert!(dump.contains("prefetch v"), "{dump}");
+    assert!(dump.contains("write=false locality=3"), "{dump}");
+    assert!(dump.contains("write=true locality=0"), "{dump}");
+}
+
+#[test]
+fn lowers_statement_expressions_and_memory_operations_explicitly() {
+    let module = lower_source(
+        "void *memory(char *to, char *from, unsigned long count) {\n\
+             __builtin_memcpy(to, from, count);\n\
+             __builtin_memmove(to + 1, to, count - 1);\n\
+             return __builtin_memset(to, 65, count);\n\
+         }\n\
+         int statement(int *slot) {\n\
+             ({ *slot; }) = 4;\n\
+             return ({ int captured = *slot; captured + 1; });\n\
+         }",
+    );
+    verify_frontend(&module).unwrap();
+
+    let instructions = module
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        instructions
+            .iter()
+            .filter(|instruction| matches!(
+                instruction.kind,
+                FullInstructionKind::MemoryCopy { overlap: false, .. }
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        instructions
+            .iter()
+            .filter(|instruction| matches!(
+                instruction.kind,
+                FullInstructionKind::MemoryCopy { overlap: true, .. }
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        instructions
+            .iter()
+            .filter(|instruction| matches!(instruction.kind, FullInstructionKind::MemorySet { .. }))
+            .count(),
+        1
+    );
+
+    let dump = dump_frontend_ir(&module);
+    assert!(dump.contains("memory.copy"), "{dump}");
+    assert!(dump.contains("overlap=false"), "{dump}");
+    assert!(dump.contains("overlap=true"), "{dump}");
+    assert!(dump.contains("memory.set"), "{dump}");
+}
+
+#[test]
+fn verifier_rejects_corrupt_integer_intrinsic_and_prefetch_contracts() {
+    let mut module = lower_source(
+        "int count(unsigned int word, unsigned long long wide) {\n\
+             return __builtin_clz(word) + (int)wide;\n\
+         }",
+    );
+    let wrong_operand = module.functions[0].parameters[1].incoming.unwrap();
+    let intrinsic = module.functions[0]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match &mut instruction.kind {
+            FullInstructionKind::IntegerIntrinsic { operand, .. } => Some(operand),
+            _ => None,
+        })
+        .unwrap();
+    *intrinsic = wrong_operand;
+    let error = verify_frontend(&module).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("integer intrinsic operand has the wrong exact type"),
+        "{error}"
+    );
+
+    let mut module = lower_source("void hint(void *pointer) { __builtin_prefetch(pointer); }");
+    let locality = module.functions[0]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match &mut instruction.kind {
+            FullInstructionKind::Prefetch { locality, .. } => Some(locality),
+            _ => None,
+        })
+        .unwrap();
+    *locality = 4;
+    let error = verify_frontend(&module).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("prefetch locality is outside the supported range"),
+        "{error}"
+    );
+}
+
+#[test]
+fn lowers_scalar_builtins_to_value_preserving_ir_without_calls() {
+    let module = lower_source(
+        "long choose(int value) {\n\
+             return __builtin_expect(value, 1 ? 1 : ++value);\n\
+         }\n\
+         double infinity(void) { return __builtin_huge_val(); }\n\
+         float infinityf(void) { return __builtin_inff(); }\n\
+         float not_a_number(void) { return __builtin_nanf(\"\"); }",
+    );
+    verify_frontend(&module).unwrap();
+    assert_eq!(
+        dump_frontend_ir(&module),
+        concat!(
+            "function f0 @choose(v0 %value: int -> ssa) -> long int [signature=long int (int) linkage=External visibility=Default inline=false noreturn=false] {\n",
+            "  b0(v0: int):\n",
+            "    i0: v1: long int = convert.integer-conversion v0 int -> long int\n",
+            "    return v1\n",
+            "}\n",
+            "function f1 @infinity() -> double [signature=double () linkage=External visibility=Default inline=false noreturn=false] {\n",
+            "  b0():\n",
+            "    i0: v0: double = const float:0x7ff0000000000000\n",
+            "    return v0\n",
+            "}\n",
+            "function f2 @infinityf() -> float [signature=float () linkage=External visibility=Default inline=false noreturn=false] {\n",
+            "  b0():\n",
+            "    i0: v0: float = const float:0x7ff0000000000000\n",
+            "    return v0\n",
+            "}\n",
+            "function f3 @not_a_number() -> float [signature=float () linkage=External visibility=Default inline=false noreturn=false] {\n",
+            "  b0():\n",
+            "    i0: v0: float = const float:0x7ff8000000000000\n",
+            "    return v0\n",
+            "}\n",
+        )
+    );
+}
+
+#[test]
+fn lowers_block_scope_compound_literals_at_their_evaluation_point() {
+    let module = lower_source(
+        "struct Pair { int left; int right; };
+         int read(void) {
+             struct Pair *pair = &(struct Pair){ .left = 19, .right = 23 };
+             return pair->left + pair->right;
+         }",
+    );
+    verify_frontend(&module).unwrap();
+    assert_eq!(
+        dump_frontend_ir(&module),
+        concat!(
+            "function f0 @read() -> int [signature=int () linkage=External visibility=Default inline=false noreturn=false] {\n",
+            "  storage m0 l1 %<compound-literal-1>: struct Pair [Automatic; AddressTaken,Aggregate]\n",
+            "  b0():\n",
+            "    i0: v0: pointer to struct Pair = const null\n",
+            "    i1: v1: pointer to struct Pair = address.storage m0\n",
+            "    i2: initialize.zero v1 object=struct Pair\n",
+            "    i3: v2: pointer to int = project.field v1 struct Pair .left#0\n",
+            "    i4: v3: int = const signed:19\n",
+            "    i5: store v3 -> v2 object=int [plain]\n",
+            "    i6: v4: pointer to int = project.field v1 struct Pair .right#1\n",
+            "    i7: v5: int = const signed:23\n",
+            "    i8: store v5 -> v4 object=int [plain]\n",
+            "    i9: v6: pointer to struct Pair = convert.pointer-conversion v1 pointer to struct Pair -> pointer to struct Pair\n",
+            "    i10: v7: pointer to int = project.field v6 struct Pair .left#0\n",
+            "    i11: v8: int = load v7 object=int [plain]\n",
+            "    i12: v9: pointer to int = project.field v6 struct Pair .right#1\n",
+            "    i13: v10: int = load v9 object=int [plain]\n",
+            "    i14: v11: int = add v8, v10\n",
+            "    return v11\n",
+            "}\n",
+        )
+    );
+}
+
+#[test]
+fn compound_literal_qualification_reaches_initializer_and_later_accesses() {
+    let module = lower_source(
+        "int read(void) {
+             volatile int *value = &(volatile int){ 1 };
+             *value = 2;
+             return *value;
+         }",
+    );
+    verify_frontend(&module).unwrap();
+    let accesses = module.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.kind {
+            FullInstructionKind::Load { access, .. }
+            | FullInstructionKind::Store { access, .. } => Some(access),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(accesses.len(), 3);
+    assert!(accesses.iter().all(|access| access.volatile));
+}
+
+#[test]
+fn lowers_promoted_anonymous_members_as_each_physical_projection() {
+    let module = lower_source(
+        "struct Usage {
+             int prefix;
+             union { struct { long minor; }; long alternate; };
+         };
+         long read(struct Usage *usage) { return usage->minor; }",
+    );
+    verify_frontend(&module).unwrap();
+    let read = module
+        .functions
+        .iter()
+        .find(|function| function.name == "read")
+        .unwrap();
+    let projected_names = read
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match &instruction.kind {
+            FullInstructionKind::ProjectField { field_name, .. } => Some(field_name.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(projected_names, [None, None, Some("minor".to_owned())]);
 }
 
 #[test]
@@ -497,6 +1508,93 @@ fn lowers_consecutive_equal_array_elements_to_one_repeated_fragment() {
 }
 
 #[test]
+fn lowers_static_array_addresses_decay_and_mixed_shift_constants() {
+    let module = lower_source(
+        "int values[4];\n\
+         int *selected = &values[2];\n\
+         const char text[] = \"named\";\n\
+         const char *text_pointer = text;\n\
+         unsigned long long high_bit = (unsigned long long)1 << 40;",
+    );
+    verify_frontend(&module).unwrap();
+
+    let selected = module.globals[1].initializer.as_ref().unwrap();
+    assert_eq!(
+        selected.nodes[selected.root.0 as usize].kind,
+        InitializerNodeKind::Relocation {
+            target: RelocationTarget::Object(DataId(0)),
+            addend: 8,
+            one_past: false,
+            kind: RelocationKind::ObjectAddress,
+        }
+    );
+    let text_pointer = module.globals[3].initializer.as_ref().unwrap();
+    assert_eq!(
+        text_pointer.nodes[text_pointer.root.0 as usize].kind,
+        InitializerNodeKind::Relocation {
+            target: RelocationTarget::Object(DataId(2)),
+            addend: 0,
+            one_past: false,
+            kind: RelocationKind::ObjectAddress,
+        }
+    );
+    let high_bit = module.globals[4].initializer.as_ref().unwrap();
+    assert_eq!(
+        high_bit.nodes[high_bit.root.0 as usize].kind,
+        InitializerNodeKind::Scalar(ScalarConstant::Unsigned(1_u128 << 40))
+    );
+}
+
+#[test]
+fn lowers_static_subobject_addresses_with_complete_addends() {
+    let module = lower_source(
+        "struct Pair { int first; int second; };\n\
+         struct Pair values[2];\n\
+         int *pointer = &values[1].second;",
+    );
+    verify_frontend(&module).unwrap();
+
+    let pointer = module.globals[1].initializer.as_ref().unwrap();
+    assert_eq!(
+        pointer.nodes[pointer.root.0 as usize].kind,
+        InitializerNodeKind::Relocation {
+            target: RelocationTarget::Object(DataId(0)),
+            addend: 12,
+            one_past: false,
+            kind: RelocationKind::ObjectAddress,
+        }
+    );
+}
+
+#[test]
+fn lowers_block_static_addresses_in_block_static_initializers() {
+    let module = lower_source(
+        "void *address(void) {\n\
+             static int target;\n\
+             static void *pointer = &target;\n\
+             return pointer;\n\
+         }",
+    );
+    verify_frontend(&module).unwrap();
+
+    assert_eq!(module.globals.len(), 2);
+    assert!(matches!(
+        module.globals[0].source,
+        DataOrigin::BlockStatic { .. }
+    ));
+    let pointer = module.globals[1].initializer.as_ref().unwrap();
+    assert_eq!(
+        pointer.nodes[pointer.root.0 as usize].kind,
+        InitializerNodeKind::Relocation {
+            target: RelocationTarget::Object(DataId(0)),
+            addend: 0,
+            one_past: false,
+            kind: RelocationKind::ObjectAddress,
+        }
+    );
+}
+
+#[test]
 fn retains_declaration_signatures_without_definition_parameters() {
     let module = lower_source("int abs(int); int main(void) { return abs(-1); }");
     verify_frontend(&module).unwrap();
@@ -692,6 +1790,35 @@ fn emits_static_locals_as_data_and_limits_exact_bound_string_copies() {
             matches!(
                 instruction.kind,
                 FullInstructionKind::AddressOfGlobal { global: DataId(1) }
+            )
+        })
+    }));
+}
+
+#[test]
+fn lowers_braced_string_array_initializers_as_string_copies() {
+    let module = lower_source(
+        "char output[] = { \"luac\" \".out\" };\n\
+         int f(void) { char local[2] = { (\"xy\") }; return local[0]; }",
+    );
+    verify_frontend(&module).unwrap();
+
+    let graph = module.globals[0].initializer.as_ref().unwrap();
+    assert!(matches!(
+        graph.nodes[graph.root.0 as usize].kind,
+        InitializerNodeKind::StringData {
+            copy_code_units: 9,
+            ..
+        }
+    ));
+    assert!(module.functions[0].blocks.iter().any(|block| {
+        block.instructions.iter().any(|instruction| {
+            matches!(
+                instruction.kind,
+                FullInstructionKind::StringInitialize {
+                    copy_code_units: 2,
+                    ..
+                }
             )
         })
     }));

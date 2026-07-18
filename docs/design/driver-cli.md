@@ -63,6 +63,14 @@ Unknown options are errors by default. CCC never classifies an option as harmles
 
 The target driver, sysroot/SDK, include paths, runtime helpers, CRT objects, default PIE behavior, linker flavor, and archive tools all come from `ToolchainResolver`. Link mode and code-generation relocation mode are selected together. An explicit non-PIE executable passes the resolved driver's disable-PIE option; shared/PIE output cannot consume non-PIC objects produced by the same invocation.
 
+Runtime-sized automatic storage is a named link-plan requirement, not an
+implicit libc guess. For the hosted arena provider, `-###` shows the selected
+`malloc`, `free`, and `abort` entries and that local CLIF support definitions
+are embedded in the primary object; it does not add assembler, partial-link, or
+object-copy steps. An external compatible compiler driver can link that object
+using its ordinary hosted libc because no CCC runtime archive remains to be
+supplied.
+
 Before execution, the driver validates that every input object's architecture, object format, CCC ABI metadata, and long-double mode is compatible with the link. Non-CCC objects remain allowed and are checked using available object metadata plus the selected platform ABI.
 
 ## Observability

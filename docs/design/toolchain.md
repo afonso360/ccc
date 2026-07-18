@@ -4,7 +4,7 @@
 
 The workspace uses exact, mutually compatible versions of `cranelift-codegen`, `cranelift-frontend`, `cranelift-object`, `object`, `target-lexicon`, and `gimli`. Workspace dependency declarations use exact constraints for the Cranelift family, and the committed `Cargo.lock` is the authoritative resolved-version record; documentation does not duplicate a version number that could drift.
 
-Cranelift upgrades occur in isolated changes. Each upgrade records capability changes for variadics, f16/f128, atomic operations, memory flags, dynamic stack allocation, TLS, object relocations, and debug information, then runs the ABI oracle, object inspection, CLIF verification, execution suite, and backend-specific regression corpus. A newly present API is not enabled until its emitted behavior passes those tests.
+Cranelift upgrades occur in isolated changes. Each upgrade records capability changes for variadics, f16/f128, atomic operations, memory flags, runtime-sized automatic-storage lowering, native dynamic-stack support, TLS, object relocations, and debug information, then runs the ABI oracle, object inspection, CLIF verification, execution suite, and backend-specific regression corpus. A newly present API is not enabled until its emitted behavior passes those tests.
 
 ## Target toolchain resolution
 
@@ -40,7 +40,32 @@ Darwin requires a compatible Apple SDK, deployment target, and Apple-capable lin
 
 Every compiler-emitted helper has a manifest entry containing symbol, exact C/ABI signature, provider preference, target availability, and a conformance test. Providers may be compiler-rt, libgcc, libatomic, libc, or a versioned CCC runtime shim. The link plan names the selected provider; it never assumes the target driver happens to supply a helper with the desired ABI.
 
+The System V AMD64 wide-integer contract reserves direct manifest entries for
+`__divti3`, `__udivti3`, `__modti3`, `__umodti3`, the signed and unsigned
+`ti`-to-`sf`/`df` conversion helpers, and the inverse `sf`/`df`-to-`ti`
+helpers. Cranelift's default libcall table does not contain those symbols in the
+pinned backend. Codegen therefore selects them per operation and carries their
+requirements through object emission, the link plan, and `-###` output.
+
 CCC runtime shims use a versioned symbol namespace except where an external ABI mandates a standard helper name. Runtime objects are selected by target and effective ABI options, including long-double mode, and incompatible CCC objects are diagnosed.
+
+The hosted automatic-storage provider selected by
+[ADR-0011](../adr/0011-arena-backed-runtime-sized-automatic-storage.md) uses
+deterministically named local CLIF support definitions in the primary object.
+Its logical `__ccc_auto_arena_v1_*` surface is versioned even though the emitted
+symbols have local binding. The external manifest entries are the exact hosted
+signatures for `malloc(size_t)`, `free(void *)`, and non-returning
+`abort(void)`. A compile-only object may retain those ordinary libc references,
+but enabling the provider requires a hosted link profile that resolves them.
+Runtime-sized automatic storage alone does not trigger generated assembly, a
+relocatable partial link, or object-copy tooling. A freestanding profile must
+select and test another allocator or leave the capability unavailable.
+
+The link plan and `-###` output expose these provider requirements. An external
+GCC- or Clang-compatible driver can link a CCC object directly because the
+arena support definitions are already local to that object and its remaining
+references are normal hosted-libc symbols. Mixed-link tests verify this path;
+provider availability is never inferred merely from a successful native link.
 
 ## Rust project policy
 

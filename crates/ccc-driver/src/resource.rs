@@ -7,7 +7,7 @@ use ccc_target::GnuCompatibilityProfile;
 const RESOURCE_FORMAT_VERSION: u64 = 2;
 const GNU_PROFILE_NAME: &str = "gcc-4.2.1";
 const GNU_PROFILE_VERSION: &str = "4.2.1";
-const GNU_PROFILE_SCOPE: &str = "parsing";
+const GNU_PROFILE_SCOPE: &str = "code-generation";
 const GNU_PROFILE_SELECTION_GATE: &str = "__GNUC_PREREQ(4, 2)";
 const GNU_PROFILE_CAPABILITIES: &[&str] = &[
     "computed-includes",
@@ -612,7 +612,7 @@ mod tests {
         "[hosted_header_profile]\n",
         "name = \"gcc-4.2.1\"\n",
         "version = \"4.2.1\"\n",
-        "scope = \"parsing\"\n",
+        "scope = \"code-generation\"\n",
         "selection_gate = \"__GNUC_PREREQ(4, 2)\"\n",
         "rationale = \"The conservative gate selects a tested preprocessing and declaration-parsing surface without implying newer GNU features.\"\n",
         "capabilities = [\n",
@@ -710,6 +710,27 @@ mod tests {
             assert!(
                 stddef.contains(contract),
                 "stddef.h is missing contract {contract:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ships_the_hosted_math_classification_wrapper() {
+        let resources = ResourceDirectory::discover(None).unwrap();
+        let manifest_source = fs::read_to_string(resources.root().join("manifest.toml")).unwrap();
+        let manifest = ResourceManifest::parse(&manifest_source).unwrap();
+        assert_eq!(manifest.headers.hosted_wrappers, vec!["math.h".to_owned()]);
+
+        let math = fs::read_to_string(resources.include().join("math.h")).unwrap();
+        for contract in [
+            "#include_next <math.h>",
+            "#define isfinite(value) __ccc_math_isfinite(value)",
+            "#define isinf(value) __ccc_math_isinf(value)",
+            "#define isnan(value) __ccc_math_isnan(value)",
+        ] {
+            assert!(
+                math.contains(contract),
+                "math.h is missing contract {contract:?}"
             );
         }
     }

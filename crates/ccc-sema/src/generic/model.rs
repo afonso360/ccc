@@ -2,7 +2,7 @@ use ccc_pp::{PragmaEvent, StringLiteralPrefix};
 use ccc_session::Span;
 use ccc_syntax::frontend::{AssignmentOperator, BinaryOperator, UnaryOperator};
 use ccc_target::{CapabilityState, PackingPolicy};
-use ccc_types::{QualifiedType, TypeId, TypeStore};
+use ccc_types::{QualifiedType, TypeId, TypeStore, VariableLengthId};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct GlobalId(pub u32);
@@ -60,6 +60,13 @@ pub enum Linkage {
     External,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SymbolBinding {
+    #[default]
+    Strong,
+    Weak,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StorageDuration {
     Automatic,
@@ -107,6 +114,7 @@ pub struct FullTypedGlobal {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GlobalEmission {
     pub symbol_name: String,
+    pub binding: SymbolBinding,
     pub visibility: SymbolVisibility,
     pub section: Option<String>,
     pub requested_alignment: Option<u64>,
@@ -145,6 +153,7 @@ pub struct FullTypedFunction {
     pub signature: TypeId,
     pub storage: SemanticStorageClass,
     pub linkage: Linkage,
+    pub binding: SymbolBinding,
     pub visibility: SymbolVisibility,
     pub properties: FunctionProperties,
     pub parameters: Vec<FullTypedParameter>,
@@ -154,12 +163,22 @@ pub struct FullTypedFunction {
     pub span: Span,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct FullTypedParameter {
     pub local: FullLocalId,
     pub name: String,
     pub ty: QualifiedType,
+    /// Runtime bounds evaluated for this parameter declaration. Each entry is
+    /// keyed by the ID assigned before array-parameter adjustment; bounds for
+    /// nested arrays remain embedded in the adjusted pointer type.
+    pub variable_length_bounds: Vec<FullTypedVariableLengthBound>,
     pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FullTypedVariableLengthBound {
+    pub id: VariableLengthId,
+    pub expression: FullTypedExpression,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -187,8 +206,13 @@ pub struct FullTypedLocalDeclaration {
     pub ty: QualifiedType,
     pub storage: SemanticStorageClass,
     pub duration: StorageDuration,
+    /// Runtime bounds evaluated once when this declaration is reached.
+    pub variable_length_bounds: Vec<FullTypedVariableLengthBound>,
     pub initializer: Option<FullTypedInitializer>,
     pub attributes: Vec<FullTypedAttribute>,
+    /// Strongest object-specific alignment requested by a standard alignment
+    /// specifier or an implemented GNU alignment attribute.
+    pub requested_alignment: Option<u64>,
     /// Present for static- or thread-duration block objects. These objects are
     /// emitted as data and never initialized by a runtime stack store.
     pub emission: Option<GlobalEmission>,
@@ -253,6 +277,7 @@ pub enum FullTypedStatementKind {
         label: LabelId,
         name: String,
     },
+    ComputedGoto(FullTypedExpression),
     Continue,
     Break,
     Return(Option<FullTypedExpression>),
@@ -272,7 +297,21 @@ pub struct FullTypedExpression {
     pub category: ValueCategory,
     pub place: Option<Place>,
     pub constant: Option<ConstantValue>,
+    /// How this expression may participate in a C integer constant expression.
+    /// `UnevaluatedOnly` has permitted operands but contains an operator that
+    /// C allows only inside a statically unevaluated subexpression. A floating
+    /// literal is tracked separately because C permits it only as the immediate
+    /// operand of an explicit cast to integer type.
+    pub constant_expression_kind: ConstantExpressionKind,
     pub span: Span,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConstantExpressionKind {
+    Invalid,
+    Integer,
+    UnevaluatedOnly,
+    FloatingLiteral,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -280,6 +319,30 @@ pub enum ValueCategory {
     Value,
     Lvalue,
     FunctionDesignator,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MemoryOrder {
+    SequentiallyConsistent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AtomicReadModifyWriteOperation {
+    Add,
+    Subtract,
+    Exchange,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IntegerIntrinsicOperation {
+    ByteSwap64,
+    CountLeadingZerosInt,
+    CountLeadingZerosLong,
+    CountLeadingZerosLongLong,
+    CountTrailingZerosLongLong,
+    PopulationCountInt,
+    PopulationCountLongLong,
+    CountTrailingZerosInt,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -346,8 +409,16 @@ pub struct RelocatableAddress {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RelocatableBase {
     Global(GlobalId),
+    BlockStatic {
+        function: FullFunctionId,
+        local: FullLocalId,
+    },
     Function(FullFunctionId),
     String(StringId),
+    Label {
+        function: FullFunctionId,
+        label: LabelId,
+    },
 }
 
 impl ConstantValue {
@@ -397,9 +468,13 @@ pub enum FullTypedExpressionKind {
     Member {
         base: Box<FullTypedExpression>,
         field_index: usize,
-        name: String,
+        name: Option<String>,
         indirect: bool,
         bitfield: Option<Box<BitfieldPlace>>,
+    },
+    CompoundLiteral {
+        local: FullLocalId,
+        initializer: Box<FullTypedInitializer>,
     },
     Assignment {
         operator: AssignmentOperator,
@@ -426,6 +501,14 @@ pub enum FullTypedExpressionKind {
         else_expression: Box<FullTypedExpression>,
     },
     Comma(Vec<FullTypedExpression>),
+    StatementExpression {
+        items: Vec<FullTypedBlockItem>,
+        result: Option<Box<FullTypedExpression>>,
+    },
+    BuiltinExpect {
+        value: Box<FullTypedExpression>,
+        expected: Box<FullTypedExpression>,
+    },
     Sizeof {
         operand_ty: QualifiedType,
         size: u64,
@@ -454,6 +537,45 @@ pub enum FullTypedExpressionKind {
     VaEnd {
         list: Box<FullTypedExpression>,
     },
+    IntegerIntrinsic {
+        operation: IntegerIntrinsicOperation,
+        operand: Box<FullTypedExpression>,
+    },
+    MemoryCopy {
+        destination: Box<FullTypedExpression>,
+        source: Box<FullTypedExpression>,
+        length: Box<FullTypedExpression>,
+        overlap: bool,
+    },
+    MemorySet {
+        destination: Box<FullTypedExpression>,
+        value: Box<FullTypedExpression>,
+        length: Box<FullTypedExpression>,
+    },
+    Prefetch {
+        address: Box<FullTypedExpression>,
+        write: bool,
+        locality: u8,
+    },
+    AtomicReadModifyWrite {
+        operation: AtomicReadModifyWriteOperation,
+        pointer: Box<FullTypedExpression>,
+        operand: Box<FullTypedExpression>,
+        object: QualifiedType,
+        return_new: bool,
+        order: MemoryOrder,
+    },
+    AtomicCompareExchange {
+        pointer: Box<FullTypedExpression>,
+        expected: Box<FullTypedExpression>,
+        replacement: Box<FullTypedExpression>,
+        object: QualifiedType,
+        return_boolean: bool,
+        order: MemoryOrder,
+    },
+    MemoryFence {
+        order: MemoryOrder,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -461,6 +583,7 @@ pub enum SymbolReference {
     Global(GlobalId),
     Function(FullFunctionId),
     Local(FullLocalId),
+    PredefinedFunctionName(StringId),
     Enumerator { value: i128 },
 }
 

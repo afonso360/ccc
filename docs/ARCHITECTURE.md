@@ -6,7 +6,7 @@ CCC targets **pragmatic C11 plus a GNU compatibility subset** — a deliberate c
 
 This document is the high-level introduction. Each design area is detailed in its own document under [`docs/design/`](design/); each significant decision is an ADR under [`docs/adr/`](adr/).
 
-Status: design. Last updated 2026-07-13.
+Status: design. Last updated 2026-07-15.
 
 ---
 
@@ -50,20 +50,21 @@ The fully annotated pipeline — which crate owns each stage, the component brea
 
 ## Design documents
 
-| Document                                                 | Covers                                                                                         |
-| -------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| [Targets & non-goals](design/targets.md)                 | Exact target triples, object formats, ABIs, and what's explicitly out of scope                 |
-| [Conformance policy](design/conformance.md)              | `long double`, `_Complex`, effective implementation-defined behavior, GNU capability registry  |
-| [Frontend capabilities](design/frontend-capabilities.md) | Syntax recognition, GNU declarations, capability states, and hosted-header phase certification |
-| [ABI & variadic functions](design/abi-and-varargs.md)    | ABI plans, aggregate boundaries, variadic call bridges, `va_list`, and target shims            |
-| [Pipeline & crates](design/pipeline-and-crates.md)       | Annotated pipeline, per-component design, workspace/crate layout                               |
-| [CCC-IR invariants](design/ccc-ir.md)                    | Places vs values, aggregates, bitfields, volatile, atomics; sema guarantees                    |
-| [Resource directory](design/resource-dir.md)             | Shipped builtin headers, include search, runtime helper strategy                               |
-| [Driver & CLI](design/driver-cli.md)                     | Flag surface, unknown-flag policy, observability dumps                                         |
-| [Diagnostics](design/diagnostics.md)                     | Spans, macro/include backtraces, parser recovery, warning control                              |
-| [Cranelift risk register](design/cranelift-risks.md)     | The hard backend problems (ABI, varargs, `long double`, inline asm, TLS, …)                    |
-| [Testing strategy](design/testing.md)                    | Snapshot/execution/differential tiers, the ABI oracle, corpus licensing                        |
-| [Toolchain & policy](design/toolchain.md)                | Dependencies, Cranelift pinning, MSRV, lint/dep policy                                         |
+| Document                                                      | Covers                                                                                                  |
+| ------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| [Targets & non-goals](design/targets.md)                      | Exact target triples, object formats, ABIs, and what's explicitly out of scope                          |
+| [Conformance policy](design/conformance.md)                   | `long double`, `_Complex`, effective implementation-defined behavior, GNU capability registry           |
+| [Frontend capabilities](design/frontend-capabilities.md)      | Syntax recognition, GNU declarations, capability states, and hosted-header phase certification          |
+| [C11 and GNU semantics](design/core-c11-and-gnu-semantics.md) | Activation contract for selected C11 constructs, GNU expressions, wide integers, builtins, and assembly |
+| [ABI & variadic functions](design/abi-and-varargs.md)         | ABI plans, aggregate boundaries, variadic call bridges, `va_list`, and target shims                     |
+| [Pipeline & crates](design/pipeline-and-crates.md)            | Annotated pipeline, per-component design, workspace/crate layout                                        |
+| [CCC-IR invariants](design/ccc-ir.md)                         | Places vs values, aggregates, bitfields, volatile, atomics; sema guarantees                             |
+| [Resource directory](design/resource-dir.md)                  | Shipped builtin headers, include search, runtime helper strategy                                        |
+| [Driver & CLI](design/driver-cli.md)                          | Flag surface, unknown-flag policy, observability dumps                                                  |
+| [Diagnostics](design/diagnostics.md)                          | Spans, macro/include backtraces, parser recovery, warning control                                       |
+| [Cranelift risk register](design/cranelift-risks.md)          | The hard backend problems (ABI, varargs, `long double`, inline asm, TLS, …)                             |
+| [Testing strategy](design/testing.md)                         | Snapshot/execution/differential tiers, the ABI oracle, corpus licensing                                 |
+| [Toolchain & policy](design/toolchain.md)                     | Dependencies, Cranelift pinning, MSRV, lint/dep policy                                                  |
 
 Project planning is documented separately in [ROADMAP.md]; it is not part of
 the feature design.
@@ -72,14 +73,16 @@ the feature design.
 
 The significant, cross-cutting decisions live as ADRs in [`docs/adr/`](adr/):
 
-| ADR                                                     | Decision                                                                                          |
-| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| [0001](adr/0001-ccc-ir-middle-layer.md)                 | Adopt a CCC-IR middle layer (don't lower AST→CLIF directly)                                       |
-| [0002](adr/0002-syntax-owned-typedef-classification.md) | Syntax owns a shared typedef-classification event model                                           |
-| [0003](adr/0003-first-target-triple.md)                 | First target triple: `x86_64-unknown-linux-gnu`                                                   |
-| [0004](adr/0004-recursive-descent-parser.md)            | Hand-written recursive-descent parser                                                             |
-| [0005](adr/0005-preprocessor-owns-pp-token-lexing.md)   | Preprocessor owns pp-token lexing                                                                 |
-| [0006](adr/0006-link-via-target-driver.md)              | Link via a resolved target compiler driver                                                        |
-| [0007](adr/0007-long-double-and-complex.md)             | Preserve target `long double` ABI; reject unsupported operations, explicit f64 compatibility mode |
-| [0008](adr/0008-pin-cranelift.md)                       | Pin Cranelift; upgrade deliberately                                                               |
-| [0009](adr/0009-shared-type-and-layout-crate.md)        | Shared `ccc-types` crate: one canonical type representation and layout engine                     |
+| ADR                                                              | Decision                                                                                          |
+| ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| [0001](adr/0001-ccc-ir-middle-layer.md)                          | Adopt a CCC-IR middle layer (don't lower AST→CLIF directly)                                       |
+| [0002](adr/0002-syntax-owned-typedef-classification.md)          | Syntax owns a shared typedef-classification event model                                           |
+| [0003](adr/0003-first-target-triple.md)                          | First target triple: `x86_64-unknown-linux-gnu`                                                   |
+| [0004](adr/0004-recursive-descent-parser.md)                     | Hand-written recursive-descent parser                                                             |
+| [0005](adr/0005-preprocessor-owns-pp-token-lexing.md)            | Preprocessor owns pp-token lexing                                                                 |
+| [0006](adr/0006-link-via-target-driver.md)                       | Link via a resolved target compiler driver                                                        |
+| [0007](adr/0007-long-double-and-complex.md)                      | Preserve target `long double` ABI; reject unsupported operations, explicit f64 compatibility mode |
+| [0008](adr/0008-pin-cranelift.md)                                | Pin Cranelift; upgrade deliberately                                                               |
+| [0009](adr/0009-shared-type-and-layout-crate.md)                 | Shared `ccc-types` crate: one canonical type representation and layout engine                     |
+| [0010](adr/0010-generate-abi-bridges-as-assembly.md)             | Generate ABI bridges as auditable target assembly                                                 |
+| [0011](adr/0011-arena-backed-runtime-sized-automatic-storage.md) | Back runtime-sized automatic objects with a scoped arena; keep native-stack builtins gated        |

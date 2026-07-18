@@ -7,8 +7,17 @@ separate immutable [module ABI plan](abi-and-varargs.md#module-abi-plan).
 
 ## Core invariants
 
-- **Places vs values.** A place is an address expression plus type, qualifiers, and an optional bitfield descriptor. Every read is an explicit load and every write an explicit store; lvalue-to-rvalue conversion is never implicit.
+- **Places vs values.** A place is an address expression plus type, qualifiers, and an optional bitfield descriptor. Every read is an explicit load and every write an explicit store; lvalue-to-rvalue conversion is never implicit. A transparent GNU statement expression may forward an eligible top-level-unqualified ordinary place or an eligible bit-field place whose ordinary expression type is top-level-unqualified. A forwarded aggregate retains nested member qualifications; a forwarded bit-field retains qualification declared on the field as descriptor access metadata and remains non-addressable. Top-level qualification on an ordinary final, including qualification inherited by a bit-field through its containing aggregate, instead causes an explicit value conversion and any required volatile read. A body that requires sequencing or scoped declarations likewise captures its result as a value before cleanup. `_Generic` independently forwards the selected association's place or value and does not use that materialization rule.
 - **Object identity and address-taking.** Address-taken, volatile, aggregate, atomic, and variably modified objects are materialized in memory. A pre-lowering scan classifies locals before any SSA value is emitted, so later `&local` cannot require retroactive materialization.
+- **Runtime-sized automatic storage.** Runtime extents are explicit values, and
+  `AutomaticStorageBegin`/`AutomaticStorageEnd`-class effects delimit each
+  dynamic object's lifetime without naming a physical provider. Begin carries
+  checked byte size and required alignment; address formation is valid only
+  while the storage is active. The verifier propagates a LIFO active-region
+  stack, requires equal stacks at CFG merges, and rejects an ordinary return
+  with active storage. Provider-specific arena marks or native stack-save tokens
+  exist only below CCC-IR, as required by
+  [ADR-0011](../adr/0011-arena-backed-runtime-sized-automatic-storage.md).
 - **Pointer operations.** Scaled pointer arithmetic, pointer difference, array/member offsets, null values, and integer/pointer conversions are explicit operations with the source C rules attached. Codegen does not infer pointee size or signedness.
 - **Aggregate value semantics.** Every aggregate rvalue is an immutable owned
   snapshot with compiler-managed backing storage. `AggregateSnapshot` observes

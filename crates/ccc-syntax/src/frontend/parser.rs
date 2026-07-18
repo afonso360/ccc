@@ -74,6 +74,11 @@ impl Parser<'_> {
                 items.push(ExternalItem::Pragma(pragma));
                 continue;
             }
+            if self.language_mode == LanguageMode::Gnu11
+                && self.consume_punctuator(Punctuator::Semicolon).is_some()
+            {
+                continue;
+            }
             if self.check_keyword(Keyword::StaticAssert) {
                 let assertion = self.static_assert()?;
                 items.push(ExternalItem::StaticAssert(Box::new(assertion)));
@@ -139,6 +144,11 @@ impl Parser<'_> {
             while !self.check_punctuator(Punctuator::LeftBrace) {
                 declarations.push(self.declaration()?);
             }
+            let body_start = self
+                .current_token()
+                .expect("a function definition has an opening brace")
+                .span;
+            self.names.bind("__func__", NameClass::Ordinary, body_start);
             let function_start = start;
             let body = self.compound_statement(false)?;
             self.names.leave_scope(body.span);
@@ -156,7 +166,8 @@ impl Parser<'_> {
         let first = self.finish_init_declarator(declarator)?;
         let mut declarators = vec![first];
         while self.consume_punctuator(Punctuator::Comma).is_some() {
-            let declarator = self.declarator(false)?;
+            let leading_attributes = self.attributes()?;
+            let declarator = self.declarator_with_leading_attributes(leading_attributes)?;
             self.bind_declarator(&declarator, class);
             declarators.push(self.finish_init_declarator(declarator)?);
         }
@@ -195,7 +206,8 @@ impl Parser<'_> {
         let mut declarators = Vec::new();
         if !self.check_punctuator(Punctuator::Semicolon) {
             loop {
-                let declarator = self.declarator(false)?;
+                let leading_attributes = self.attributes()?;
+                let declarator = self.declarator_with_leading_attributes(leading_attributes)?;
                 self.bind_declarator(&declarator, class);
                 declarators.push(self.finish_init_declarator(declarator)?);
                 if self.consume_punctuator(Punctuator::Comma).is_none() {
@@ -210,6 +222,19 @@ impl Parser<'_> {
             specifiers,
             declarators,
         })
+    }
+
+    fn declarator_with_leading_attributes(
+        &mut self,
+        mut leading_attributes: Vec<Attribute>,
+    ) -> Result<Declarator, ParseError> {
+        let mut declarator = self.declarator(false)?;
+        if let Some(first) = leading_attributes.first() {
+            declarator.span = span_through(first.span, declarator.span);
+            leading_attributes.append(&mut declarator.attributes);
+            declarator.attributes = leading_attributes;
+        }
+        Ok(declarator)
     }
 
     fn finish_init_declarator(
@@ -543,19 +568,24 @@ impl Parser<'_> {
             let mut result = Vec::new();
             if !self.check_punctuator(Punctuator::RightBrace) {
                 loop {
+                    let leading_attributes = self.attributes()?;
                     let name = self.identifier()?;
+                    let mut item_attributes = leading_attributes;
+                    item_attributes.extend(self.attributes()?);
                     let value = if self.consume_punctuator(Punctuator::Assign).is_some() {
                         Some(self.conditional_expression()?)
                     } else {
                         None
                     };
-                    let item_attributes = self.attributes()?;
-                    let end = item_attributes
-                        .last()
-                        .map(|attribute| attribute.span)
-                        .or_else(|| value.as_ref().map(|value| value.span))
+                    let start = item_attributes
+                        .first()
+                        .map_or(name.span, |attribute| attribute.span);
+                    let end = value
+                        .as_ref()
+                        .map(|value| value.span)
+                        .or_else(|| item_attributes.last().map(|attribute| attribute.span))
                         .unwrap_or(name.span);
-                    let span = span_through(name.span, end);
+                    let span = span_through(start, end);
                     self.names
                         .bind(name.name.clone(), NameClass::Ordinary, name.span);
                     result.push(Enumerator {
@@ -736,7 +766,7 @@ impl Parser<'_> {
             }
             let specifiers = self.declaration_specifiers()?;
             let start = specifiers.span;
-            let declarator = if self.starts_declarator() {
+            let declarator = if self.starts_declarator() || self.starts_abstract_declarator() {
                 Some(self.declarator(true)?)
             } else {
                 None
@@ -1110,6 +1140,19 @@ impl Parser<'_> {
             return self.for_statement(keyword.span);
         }
         if let Some(keyword) = self.consume_keyword(Keyword::Goto) {
+            if self.language_mode == LanguageMode::Gnu11
+                && self.consume_punctuator(Punctuator::Star).is_some()
+            {
+                let expression = self.expression()?;
+                let semicolon = self.expect_punctuator(
+                    Punctuator::Semicolon,
+                    "expected `;` after computed goto expression",
+                )?;
+                return Ok(Statement {
+                    span: span_through(keyword.span, semicolon.span),
+                    kind: StatementKind::ComputedGoto(Box::new(expression)),
+                });
+            }
             let label = self.identifier()?;
             let semicolon =
                 self.expect_punctuator(Punctuator::Semicolon, "expected `;` after goto label")?;
@@ -1295,13 +1338,14 @@ impl Parser<'_> {
             if self.check_punctuator(Punctuator::LeftBrace) {
                 let initializer = self.initializer()?;
                 let span = span_through(left.span, initializer.span());
-                return Ok(Expression {
+                let expression = Expression {
                     kind: ExpressionKind::CompoundLiteral {
                         ty,
                         initializer: Box::new(initializer),
                     },
                     span,
-                });
+                };
+                return self.postfix_expression_suffix(expression);
             }
             let expression = self.nested(Self::cast_expression)?;
             let span = span_through(left.span, expression.span);
@@ -1317,6 +1361,15 @@ impl Parser<'_> {
     }
 
     fn unary_expression(&mut self) -> Result<Expression, ParseError> {
+        if self.language_mode == LanguageMode::Gnu11
+            && let Some(operator) = self.consume_punctuator(Punctuator::AmpAmp)
+        {
+            let label = self.identifier()?;
+            return Ok(Expression {
+                span: span_through(operator.span, label.span),
+                kind: ExpressionKind::LabelAddress(label),
+            });
+        }
         if let Some(extension) = self.consume_keyword(Keyword::Extension) {
             let expression = self.nested(Self::cast_expression)?;
             return Ok(Expression {
@@ -1377,7 +1430,14 @@ impl Parser<'_> {
     }
 
     fn postfix_expression(&mut self) -> Result<Expression, ParseError> {
-        let mut expression = self.primary_expression()?;
+        let expression = self.primary_expression()?;
+        self.postfix_expression_suffix(expression)
+    }
+
+    fn postfix_expression_suffix(
+        &mut self,
+        mut expression: Expression,
+    ) -> Result<Expression, ParseError> {
         loop {
             if self.consume_punctuator(Punctuator::LeftBracket).is_some() {
                 let index = self.expression()?;
@@ -1467,6 +1527,59 @@ impl Parser<'_> {
         if token.spelling == "__builtin_va_end" {
             return self.builtin_va_end();
         }
+        if token.spelling == "__builtin_expect" {
+            return self.builtin_expect();
+        }
+        if token.spelling == "__builtin_huge_val" {
+            return self.builtin_huge_val();
+        }
+        if token.spelling == "__builtin_inff" {
+            return self.builtin_inff();
+        }
+        if token.spelling == "__builtin_nanf" {
+            return self.builtin_nanf();
+        }
+        let integer_intrinsic = match token.spelling.as_str() {
+            "__builtin_bswap64" => Some(IntegerBuiltinOperation::ByteSwap64),
+            "__builtin_clz" => Some(IntegerBuiltinOperation::CountLeadingZerosInt),
+            "__builtin_clzl" => Some(IntegerBuiltinOperation::CountLeadingZerosLong),
+            "__builtin_clzll" => Some(IntegerBuiltinOperation::CountLeadingZerosLongLong),
+            "__builtin_ctzll" => Some(IntegerBuiltinOperation::CountTrailingZerosLongLong),
+            "__builtin_ctz" => Some(IntegerBuiltinOperation::CountTrailingZerosInt),
+            "__builtin_popcount" => Some(IntegerBuiltinOperation::PopulationCountInt),
+            "__builtin_popcountll" => Some(IntegerBuiltinOperation::PopulationCountLongLong),
+            _ => None,
+        };
+        if let Some(operation) = integer_intrinsic {
+            return self.builtin_integer_intrinsic(operation);
+        }
+        let memory_operation = match token.spelling.as_str() {
+            "__builtin_memcpy" => Some(MemoryBuiltinOperation::Copy),
+            "__builtin_memmove" => Some(MemoryBuiltinOperation::Move),
+            "__builtin_memset" => Some(MemoryBuiltinOperation::Set),
+            _ => None,
+        };
+        if let Some(operation) = memory_operation {
+            return self.builtin_memory_operation(operation);
+        }
+        if token.spelling == "__builtin_prefetch" {
+            return self.builtin_prefetch();
+        }
+        let sync_operation = match token.spelling.as_str() {
+            "__sync_add_and_fetch" => Some(SyncBuiltinOperation::AddAndFetch),
+            "__sync_fetch_and_add" => Some(SyncBuiltinOperation::FetchAndAdd),
+            "__sync_sub_and_fetch" => Some(SyncBuiltinOperation::SubAndFetch),
+            "__sync_bool_compare_and_swap" => Some(SyncBuiltinOperation::BoolCompareAndSwap),
+            "__sync_val_compare_and_swap" => Some(SyncBuiltinOperation::ValCompareAndSwap),
+            "__sync_lock_test_and_set" => Some(SyncBuiltinOperation::LockTestAndSet),
+            _ => None,
+        };
+        if let Some(operation) = sync_operation {
+            return self.builtin_sync_operation(operation);
+        }
+        if token.spelling == "__sync_synchronize" {
+            return self.builtin_sync_synchronize();
+        }
         match token.kind {
             TokenKind::Identifier => {
                 self.position += 1;
@@ -1509,6 +1622,22 @@ impl Parser<'_> {
             TokenKind::Keyword(Keyword::Generic) => self.generic_selection(),
             TokenKind::Punctuator(Punctuator::LeftParen) => {
                 self.position += 1;
+                if self.language_mode == LanguageMode::Gnu11
+                    && self.check_punctuator(Punctuator::LeftBrace)
+                {
+                    let compound = self.compound_statement(true)?;
+                    let right = self.expect_punctuator(
+                        Punctuator::RightParen,
+                        "expected `)` after statement expression",
+                    )?;
+                    let StatementKind::Compound(items) = compound.kind else {
+                        unreachable!("compound-statement parser returned another statement kind")
+                    };
+                    return Ok(Expression {
+                        kind: ExpressionKind::StatementExpression(items),
+                        span: span_through(token.span, right.span),
+                    });
+                }
                 let expression = self.expression()?;
                 let right = self
                     .expect_punctuator(Punctuator::RightParen, "expected `)` after expression")?;
@@ -1702,6 +1831,286 @@ impl Parser<'_> {
             },
             span: span_through(builtin.span, right.span),
         })
+    }
+
+    fn builtin_expect(&mut self) -> Result<Expression, ParseError> {
+        let builtin = self
+            .current_token()
+            .expect("caller checked builtin")
+            .clone();
+        self.position += 1;
+        self.expect_punctuator(
+            Punctuator::LeftParen,
+            "expected `(` after `__builtin_expect`",
+        )?;
+        let value = self.assignment_expression()?;
+        self.expect_punctuator(Punctuator::Comma, "expected `,` after predicted value")?;
+        let expected = self.assignment_expression()?;
+        let right = self.expect_punctuator(
+            Punctuator::RightParen,
+            "expected `)` after `__builtin_expect` arguments",
+        )?;
+        Ok(Expression {
+            kind: ExpressionKind::BuiltinExpect {
+                value: Box::new(value),
+                expected: Box::new(expected),
+            },
+            span: span_through(builtin.span, right.span),
+        })
+    }
+
+    fn builtin_huge_val(&mut self) -> Result<Expression, ParseError> {
+        let builtin = self
+            .current_token()
+            .expect("caller checked builtin")
+            .clone();
+        self.position += 1;
+        self.expect_punctuator(
+            Punctuator::LeftParen,
+            "expected `(` after `__builtin_huge_val`",
+        )?;
+        let right = self.expect_punctuator(
+            Punctuator::RightParen,
+            "`__builtin_huge_val` requires exactly zero arguments",
+        )?;
+        Ok(Expression {
+            kind: ExpressionKind::BuiltinHugeVal,
+            span: span_through(builtin.span, right.span),
+        })
+    }
+
+    fn builtin_inff(&mut self) -> Result<Expression, ParseError> {
+        let builtin = self
+            .current_token()
+            .expect("caller checked builtin")
+            .clone();
+        self.position += 1;
+        self.expect_punctuator(Punctuator::LeftParen, "expected `(` after `__builtin_inff`")?;
+        let right = self.expect_punctuator(
+            Punctuator::RightParen,
+            "`__builtin_inff` requires exactly zero arguments",
+        )?;
+        Ok(Expression {
+            kind: ExpressionKind::BuiltinInfF,
+            span: span_through(builtin.span, right.span),
+        })
+    }
+
+    fn builtin_nanf(&mut self) -> Result<Expression, ParseError> {
+        let builtin = self
+            .current_token()
+            .expect("caller checked builtin")
+            .clone();
+        self.position += 1;
+        self.expect_punctuator(Punctuator::LeftParen, "expected `(` after `__builtin_nanf`")?;
+        let payload = self.assignment_expression()?;
+        let right = self.expect_punctuator(
+            Punctuator::RightParen,
+            "`__builtin_nanf` requires exactly one argument",
+        )?;
+        Ok(Expression {
+            kind: ExpressionKind::BuiltinNanF {
+                payload: Box::new(payload),
+            },
+            span: span_through(builtin.span, right.span),
+        })
+    }
+
+    fn builtin_sync_synchronize(&mut self) -> Result<Expression, ParseError> {
+        let builtin = self
+            .current_token()
+            .expect("caller checked builtin")
+            .clone();
+        self.position += 1;
+        self.expect_punctuator(
+            Punctuator::LeftParen,
+            "expected `(` after `__sync_synchronize`",
+        )?;
+        let right = self.expect_punctuator(
+            Punctuator::RightParen,
+            "`__sync_synchronize` requires exactly zero arguments",
+        )?;
+        Ok(Expression {
+            kind: ExpressionKind::BuiltinSyncSynchronize,
+            span: span_through(builtin.span, right.span),
+        })
+    }
+
+    fn builtin_integer_intrinsic(
+        &mut self,
+        operation: IntegerBuiltinOperation,
+    ) -> Result<Expression, ParseError> {
+        let builtin = self
+            .current_token()
+            .expect("caller checked builtin")
+            .clone();
+        self.position += 1;
+        self.expect_punctuator(
+            Punctuator::LeftParen,
+            &format!("expected `(` after `{}`", operation.spelling()),
+        )?;
+        if self.check_punctuator(Punctuator::RightParen) {
+            return Err(self.error_current(&format!(
+                "`{}` requires exactly one argument",
+                operation.spelling()
+            )));
+        }
+        let operand = self.assignment_expression()?;
+        let right = self.expect_punctuator(
+            Punctuator::RightParen,
+            &format!("`{}` requires exactly one argument", operation.spelling()),
+        )?;
+        Ok(Expression {
+            kind: ExpressionKind::BuiltinIntegerIntrinsic {
+                operation,
+                operand: Box::new(operand),
+            },
+            span: span_through(builtin.span, right.span),
+        })
+    }
+
+    fn builtin_prefetch(&mut self) -> Result<Expression, ParseError> {
+        let builtin = self
+            .current_token()
+            .expect("caller checked builtin")
+            .clone();
+        self.position += 1;
+        self.expect_punctuator(
+            Punctuator::LeftParen,
+            "expected `(` after `__builtin_prefetch`",
+        )?;
+        let mut arguments = Vec::new();
+        while !self.check_punctuator(Punctuator::RightParen) {
+            arguments.push(self.assignment_expression()?);
+            if self.consume_punctuator(Punctuator::Comma).is_none() {
+                break;
+            }
+            if self.check_punctuator(Punctuator::RightParen) {
+                return Err(self.error_current(
+                    "trailing `,` is not allowed in `__builtin_prefetch` arguments",
+                ));
+            }
+        }
+        if !(1..=3).contains(&arguments.len()) {
+            return Err(
+                self.error_current("`__builtin_prefetch` requires between one and three arguments")
+            );
+        }
+        let right = self.expect_punctuator(
+            Punctuator::RightParen,
+            "expected `)` after `__builtin_prefetch` arguments",
+        )?;
+        Ok(Expression {
+            kind: ExpressionKind::BuiltinPrefetch { arguments },
+            span: span_through(builtin.span, right.span),
+        })
+    }
+
+    fn builtin_memory_operation(
+        &mut self,
+        operation: MemoryBuiltinOperation,
+    ) -> Result<Expression, ParseError> {
+        let builtin = self
+            .current_token()
+            .expect("caller checked builtin")
+            .clone();
+        self.position += 1;
+        self.expect_punctuator(
+            Punctuator::LeftParen,
+            &format!("expected `(` after `{}`", operation.spelling()),
+        )?;
+        let mut arguments = Vec::new();
+        while !self.check_punctuator(Punctuator::RightParen) {
+            arguments.push(self.assignment_expression()?);
+            if self.consume_punctuator(Punctuator::Comma).is_none() {
+                break;
+            }
+        }
+        if arguments.len() != 3 {
+            return Err(self.error_current(&format!(
+                "`{}` requires exactly three arguments",
+                operation.spelling()
+            )));
+        }
+        let right = self.expect_punctuator(
+            Punctuator::RightParen,
+            &format!("expected `)` after `{}` arguments", operation.spelling()),
+        )?;
+        Ok(Expression {
+            kind: ExpressionKind::BuiltinMemoryOperation {
+                operation,
+                arguments,
+            },
+            span: span_through(builtin.span, right.span),
+        })
+    }
+
+    fn builtin_sync_operation(
+        &mut self,
+        operation: SyncBuiltinOperation,
+    ) -> Result<Expression, ParseError> {
+        let builtin = self
+            .current_token()
+            .expect("caller checked builtin")
+            .clone();
+        self.position += 1;
+        self.expect_punctuator(
+            Punctuator::LeftParen,
+            &format!("expected `(` after `{}`", operation.spelling()),
+        )?;
+        let mut arguments = Vec::new();
+        while !self.check_punctuator(Punctuator::RightParen) {
+            let protected = arguments.len() >= operation.fixed_arity();
+            arguments.push(self.sync_builtin_argument(protected)?);
+            if self.consume_punctuator(Punctuator::Comma).is_none() {
+                break;
+            }
+            if self.check_punctuator(Punctuator::RightParen) {
+                return Err(self.error_current(&format!(
+                    "trailing `,` is not allowed in `{}` arguments",
+                    operation.spelling()
+                )));
+            }
+        }
+        if arguments.len() < operation.fixed_arity() {
+            return Err(self.error_current(&format!(
+                "`{}` requires at least {} arguments",
+                operation.spelling(),
+                operation.fixed_arity()
+            )));
+        }
+        let right = self.expect_punctuator(
+            Punctuator::RightParen,
+            &format!("expected `)` after `{}` arguments", operation.spelling()),
+        )?;
+        Ok(Expression {
+            kind: ExpressionKind::BuiltinSyncOperation {
+                operation,
+                arguments,
+            },
+            span: span_through(builtin.span, right.span),
+        })
+    }
+
+    fn sync_builtin_argument(&mut self, protected: bool) -> Result<Expression, ParseError> {
+        if protected
+            && self
+                .current_token()
+                .is_some_and(|token| token.spelling == "__sync_synchronize")
+            && (self.peek_punctuator(1, Punctuator::Comma)
+                || self.peek_punctuator(1, Punctuator::RightParen))
+        {
+            let token = self.current_token().expect("checked above").clone();
+            self.position += 1;
+            return Ok(Expression {
+                kind: ExpressionKind::Identifier(Identifier {
+                    name: token.spelling,
+                    span: token.span,
+                }),
+                span: token.span,
+            });
+        }
+        self.assignment_expression()
     }
 
     fn current_binary_operator(&self) -> Option<(u8, BinaryOperator)> {
@@ -2108,6 +2517,7 @@ fn pragma_span(pragma: &PragmaEvent) -> Span {
         PragmaEvent::Once { span }
         | PragmaEvent::SystemHeader { span }
         | PragmaEvent::Diagnostic { span, .. }
+        | PragmaEvent::GccOptimize { span, .. }
         | PragmaEvent::Pack { span, .. }
         | PragmaEvent::Unknown { span, .. } => *span,
     }

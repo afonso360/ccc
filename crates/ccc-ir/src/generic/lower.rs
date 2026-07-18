@@ -2,12 +2,14 @@ use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 use ccc_pp::StringLiteralPrefix;
 use ccc_sema::generic::{
-    AccessSemantics, BitfieldPlace, CompoundAssignmentPlan, ConstantValue, ConversionKind,
-    FullFunctionId, FullLocalId, FullTypedBlockItem, FullTypedExpression, FullTypedExpressionKind,
+    AccessSemantics, AtomicReadModifyWriteOperation as TypedAtomicReadModifyWriteOperation,
+    BitfieldPlace, CompoundAssignmentPlan, ConstantValue, ConversionKind, FullFunctionId,
+    FullLocalId, FullTypedBlockItem, FullTypedExpression, FullTypedExpressionKind,
     FullTypedForInitializer, FullTypedFunction, FullTypedInitializer, FullTypedInitializerKind,
     FullTypedLocalDeclaration, FullTypedStatement, FullTypedStatementKind,
-    FullTypedTranslationUnit, GlobalId, InitializerPathElement, LabelId, Linkage, Place, PlaceBase,
-    StorageDuration, StringId, SymbolReference,
+    FullTypedTranslationUnit, GlobalId, InitializerPathElement,
+    IntegerIntrinsicOperation as TypedIntegerIntrinsicOperation, LabelId, Linkage,
+    MemoryOrder as TypedMemoryOrder, Place, PlaceBase, StorageDuration, StringId, SymbolReference,
 };
 use ccc_session::Span;
 use ccc_syntax::frontend::{
@@ -15,17 +17,18 @@ use ccc_syntax::frontend::{
 };
 use ccc_types::{
     ArrayLength, BuiltinType, FunctionParameters, QualifiedType, TypeId, TypeKind, TypeQualifiers,
-    TypeStore,
+    TypeStore, VariableLengthId,
 };
 
 use super::{
-    AggregateOverlap, AggregateProjection, BinaryOperation, BitfieldDescriptor, BlockId,
-    CallEffects, DataId, DataOrigin, FullBlock, FullEdge, FullFunction, FullGlobal,
-    FullInstruction, FullInstructionKind, FullModule, FullParameter, FullStorage, FullString,
-    FullTerminator, InitializerEdge, InitializerGraph, InitializerNode, InitializerNodeId,
-    InitializerNodeKind, InitializerPath, InstructionId, IrError, MemoryAccess, MemoryOrder,
-    MemoryResidencyReason, RelocationKind, RelocationTarget, ScalarConstant, ScalarConversion,
-    StorageId, StorageLocation, StringEncoding, SwitchEdge, UnaryOperation, ValueId,
+    AggregateOverlap, AggregateProjection, AtomicReadModifyWriteOperation, BinaryOperation,
+    BitfieldDescriptor, BlockId, CallEffects, DataId, DataOrigin, FullBlock, FullEdge,
+    FullFunction, FullGlobal, FullInstruction, FullInstructionKind, FullModule, FullParameter,
+    FullStorage, FullString, FullTerminator, InitializerEdge, InitializerGraph, InitializerNode,
+    InitializerNodeId, InitializerNodeKind, InitializerPath, InstructionId,
+    IntegerIntrinsicOperation, IrError, MemoryAccess, MemoryOrder, MemoryResidencyReason,
+    RelocationKind, RelocationTarget, ScalarConstant, ScalarConversion, StorageId, StorageLocation,
+    StringEncoding, SwitchEdge, UnaryOperation, ValueId,
 };
 
 const LOWERING_ERROR: &str = "CCC3101";
@@ -46,7 +49,10 @@ pub fn lower_frontend(unit: &FullTypedTranslationUnit) -> Result<FullModule, IrE
         .map(|(index, (function, declaration))| {
             (
                 (*function, declaration.local),
-                DataId((unit.globals.len() + index) as u32),
+                (
+                    DataId((unit.globals.len() + index) as u32),
+                    declaration.duration,
+                ),
             )
         })
         .collect::<BTreeMap<_, _>>();
@@ -64,7 +70,9 @@ pub fn lower_frontend(unit: &FullTypedTranslationUnit) -> Result<FullModule, IrE
             initializer: global
                 .initializer
                 .as_ref()
-                .map(|initializer| lower_initializer_graph(initializer, &file_data, unit))
+                .map(|initializer| {
+                    lower_initializer_graph(initializer, &file_data, &static_data, unit, None)
+                })
                 .transpose()?,
             tentative: global.tentative,
             emission: global.emission.clone(),
@@ -83,7 +91,7 @@ pub fn lower_frontend(unit: &FullTypedTranslationUnit) -> Result<FullModule, IrE
             ));
         };
         globals.push(FullGlobal {
-            id: static_data[&(function, declaration.local)],
+            id: static_data[&(function, declaration.local)].0,
             source: DataOrigin::BlockStatic {
                 function,
                 local: declaration.local,
@@ -96,7 +104,15 @@ pub fn lower_frontend(unit: &FullTypedTranslationUnit) -> Result<FullModule, IrE
             initializer: declaration
                 .initializer
                 .as_ref()
-                .map(|initializer| lower_initializer_graph(initializer, &file_data, unit))
+                .map(|initializer| {
+                    lower_initializer_graph(
+                        initializer,
+                        &file_data,
+                        &static_data,
+                        unit,
+                        Some(function),
+                    )
+                })
                 .transpose()?,
             tentative: false,
             emission,
@@ -211,25 +227,36 @@ fn collect_static_declarations_in_statement<'a>(
         S::Switch { statement, .. } | S::While { statement, .. } | S::DoWhile { statement, .. } => {
             collect_static_declarations_in_statement(function, statement, declarations);
         }
-        S::Expression(_) | S::Goto { .. } | S::Continue | S::Break | S::Return(_) => {}
+        S::Expression(_)
+        | S::Goto { .. }
+        | S::ComputedGoto(_)
+        | S::Continue
+        | S::Break
+        | S::Return(_) => {}
     }
 }
 
 struct InitializerBuilder<'a> {
     nodes: Vec<InitializerNode>,
     file_data: &'a BTreeMap<GlobalId, DataId>,
+    static_data: &'a BTreeMap<(FullFunctionId, FullLocalId), (DataId, StorageDuration)>,
     unit: &'a FullTypedTranslationUnit,
+    function: Option<FullFunctionId>,
 }
 
 fn lower_initializer_graph(
     initializer: &FullTypedInitializer,
     file_data: &BTreeMap<GlobalId, DataId>,
+    static_data: &BTreeMap<(FullFunctionId, FullLocalId), (DataId, StorageDuration)>,
     unit: &FullTypedTranslationUnit,
+    function: Option<FullFunctionId>,
 ) -> Result<InitializerGraph, IrError> {
     let mut builder = InitializerBuilder {
         nodes: Vec::new(),
         file_data,
+        static_data,
         unit,
+        function,
     };
     let root = builder.initializer(initializer)?;
     Ok(InitializerGraph {
@@ -263,7 +290,14 @@ impl InitializerBuilder<'_> {
                         "static initializer did not retain a constant value",
                     ));
                 };
-                constant_initializer(constant, self.file_data, self.unit, expression.span)?
+                constant_initializer(
+                    constant,
+                    self.file_data,
+                    self.static_data,
+                    self.unit,
+                    self.function,
+                    expression.span,
+                )?
             }
             FullTypedInitializerKind::Aggregate(entries) => {
                 if let Some((element, count)) = repeated_array_element(entries) {
@@ -354,7 +388,9 @@ fn same_constant_value(left: Option<ConstantValue>, right: Option<ConstantValue>
 fn constant_initializer(
     constant: ConstantValue,
     file_data: &BTreeMap<GlobalId, DataId>,
+    static_data: &BTreeMap<(FullFunctionId, FullLocalId), (DataId, StorageDuration)>,
     unit: &FullTypedTranslationUnit,
+    initializer_function: Option<FullFunctionId>,
     span: Span,
 ) -> Result<InitializerNodeKind, IrError> {
     Ok(match constant {
@@ -386,6 +422,29 @@ fn constant_initializer(
                         RelocationKind::ObjectAddress
                     },
                 ),
+                ccc_sema::generic::RelocatableBase::BlockStatic { function, local } => {
+                    let (data, duration) = static_data
+                        .get(&(function, local))
+                        .copied()
+                        .ok_or_else(|| {
+                            IrError::lower(
+                                LOWERING_ERROR,
+                                span,
+                                format!(
+                                    "initializer references unknown block-static object {}:{}",
+                                    function.0, local.0
+                                ),
+                            )
+                        })?;
+                    (
+                        RelocationTarget::Object(data),
+                        if duration == StorageDuration::Thread {
+                            RelocationKind::ThreadLocalAddress
+                        } else {
+                            RelocationKind::ObjectAddress
+                        },
+                    )
+                }
                 ccc_sema::generic::RelocatableBase::Function(function) => (
                     RelocationTarget::Function(function),
                     RelocationKind::FunctionAddress,
@@ -394,6 +453,22 @@ fn constant_initializer(
                     RelocationTarget::String(string),
                     RelocationKind::StringAddress,
                 ),
+                ccc_sema::generic::RelocatableBase::Label { function, label } => {
+                    if initializer_function != Some(function)
+                        || address.addend != 0
+                        || address.one_past
+                        || label.0 == u32::MAX
+                    {
+                        return Err(IrError::lower(
+                            LOWERING_ERROR,
+                            span,
+                            "invalid cross-function or adjusted label address in static initializer",
+                        ));
+                    }
+                    return Ok(InitializerNodeKind::Scalar(ScalarConstant::Unsigned(
+                        u128::from(label.0) + 1,
+                    )));
+                }
             };
             InitializerNodeKind::Relocation {
                 target,
@@ -426,6 +501,7 @@ struct LocalFact {
     name: String,
     ty: QualifiedType,
     duration: StorageDuration,
+    requested_alignment: Option<u64>,
     span: Span,
     reasons: BTreeSet<MemoryResidencyReason>,
 }
@@ -443,6 +519,7 @@ fn local_facts(
                 parameter.name.clone(),
                 parameter.ty,
                 StorageDuration::Automatic,
+                None,
                 parameter.span,
                 types,
             ),
@@ -450,9 +527,46 @@ fn local_facts(
     }
     if let Some(body) = &function.body {
         collect_automatic_local_facts(body, types, &mut facts);
-        scan_statement_for_address_taken(body, &mut facts);
+        scan_statement_for_address_taken(body, types, &mut facts);
+        if contains_computed_goto(body) {
+            for fact in facts.values_mut() {
+                fact.reasons
+                    .insert(MemoryResidencyReason::IndirectControlFlow);
+            }
+        }
     }
     facts
+}
+
+fn contains_computed_goto(statement: &FullTypedStatement) -> bool {
+    use FullTypedStatementKind as S;
+    match &statement.kind {
+        S::ComputedGoto(_) => true,
+        S::Label { statement, .. }
+        | S::Case { statement, .. }
+        | S::Default(statement)
+        | S::Switch { statement, .. }
+        | S::While { statement, .. }
+        | S::DoWhile { statement, .. }
+        | S::For { statement, .. } => contains_computed_goto(statement),
+        S::Compound(items) => items.iter().any(|item| {
+            matches!(
+                item,
+                FullTypedBlockItem::Statement(statement) if contains_computed_goto(statement)
+            )
+        }),
+        S::If {
+            then_statement,
+            else_statement,
+            ..
+        } => {
+            contains_computed_goto(then_statement)
+                || else_statement
+                    .as_deref()
+                    .is_some_and(contains_computed_goto)
+        }
+        S::Expression(_) | S::Goto { .. } | S::Continue | S::Break | S::Return(_) => false,
+    }
 }
 
 fn make_local_fact(
@@ -460,6 +574,7 @@ fn make_local_fact(
     name: String,
     ty: QualifiedType,
     duration: StorageDuration,
+    requested_alignment: Option<u64>,
     span: Span,
     types: &TypeStore,
 ) -> LocalFact {
@@ -481,6 +596,7 @@ fn make_local_fact(
         name,
         ty,
         duration,
+        requested_alignment,
         span,
         reasons,
     }
@@ -510,10 +626,14 @@ fn collect_automatic_local_facts(
                                 declaration.name.clone(),
                                 declaration.ty,
                                 declaration.duration,
+                                declaration.requested_alignment,
                                 declaration.span,
                                 types,
                             ),
                         );
+                        if let Some(initializer) = &declaration.initializer {
+                            collect_automatic_local_facts_in_initializer(initializer, types, facts);
+                        }
                     }
                     FullTypedBlockItem::Statement(statement) => {
                         collect_automatic_local_facts(statement, types, facts);
@@ -522,11 +642,17 @@ fn collect_automatic_local_facts(
                 }
             }
         }
+        S::Expression(expression) => {
+            if let Some(expression) = expression {
+                collect_automatic_local_facts_in_expression(expression, types, facts);
+            }
+        }
         S::If {
+            condition,
             then_statement,
             else_statement,
-            ..
         } => {
+            collect_automatic_local_facts_in_expression(condition, types, facts);
             collect_automatic_local_facts(then_statement, types, facts);
             if let Some(statement) = else_statement {
                 collect_automatic_local_facts(statement, types, facts);
@@ -534,34 +660,249 @@ fn collect_automatic_local_facts(
         }
         S::For {
             initializer,
+            condition,
+            step,
             statement,
-            ..
         } => {
-            if let FullTypedForInitializer::Declarations(items) = initializer {
-                for item in items {
-                    if let FullTypedBlockItem::Declaration(declaration) = item
-                        && declaration.duration == StorageDuration::Automatic
-                    {
-                        facts.insert(
-                            declaration.local,
-                            make_local_fact(
-                                declaration.local,
-                                declaration.name.clone(),
-                                declaration.ty,
-                                declaration.duration,
-                                declaration.span,
-                                types,
-                            ),
-                        );
+            match initializer {
+                FullTypedForInitializer::Empty => {}
+                FullTypedForInitializer::Expression(expression) => {
+                    collect_automatic_local_facts_in_expression(expression, types, facts);
+                }
+                FullTypedForInitializer::Declarations(items) => {
+                    for item in items {
+                        if let FullTypedBlockItem::Declaration(declaration) = item {
+                            if declaration.duration == StorageDuration::Automatic {
+                                facts.insert(
+                                    declaration.local,
+                                    make_local_fact(
+                                        declaration.local,
+                                        declaration.name.clone(),
+                                        declaration.ty,
+                                        declaration.duration,
+                                        declaration.requested_alignment,
+                                        declaration.span,
+                                        types,
+                                    ),
+                                );
+                            }
+                            if let Some(initializer) = &declaration.initializer {
+                                collect_automatic_local_facts_in_initializer(
+                                    initializer,
+                                    types,
+                                    facts,
+                                );
+                            }
+                        }
                     }
                 }
             }
+            if let Some(condition) = condition {
+                collect_automatic_local_facts_in_expression(condition, types, facts);
+            }
+            if let Some(step) = step {
+                collect_automatic_local_facts_in_expression(step, types, facts);
+            }
             collect_automatic_local_facts(statement, types, facts);
         }
-        S::Switch { statement, .. } | S::While { statement, .. } | S::DoWhile { statement, .. } => {
+        S::Switch {
+            expression,
+            statement,
+        }
+        | S::While {
+            condition: expression,
+            statement,
+        } => {
+            collect_automatic_local_facts_in_expression(expression, types, facts);
             collect_automatic_local_facts(statement, types, facts);
         }
-        S::Expression(_) | S::Goto { .. } | S::Continue | S::Break | S::Return(_) => {}
+        S::DoWhile {
+            statement,
+            condition,
+        } => {
+            collect_automatic_local_facts(statement, types, facts);
+            collect_automatic_local_facts_in_expression(condition, types, facts);
+        }
+        S::ComputedGoto(expression) => {
+            collect_automatic_local_facts_in_expression(expression, types, facts);
+        }
+        S::Return(expression) => {
+            if let Some(expression) = expression {
+                collect_automatic_local_facts_in_expression(expression, types, facts);
+            }
+        }
+        S::Goto { .. } | S::Continue | S::Break => {}
+    }
+}
+
+fn collect_automatic_local_facts_in_initializer(
+    initializer: &FullTypedInitializer,
+    types: &TypeStore,
+    facts: &mut BTreeMap<FullLocalId, LocalFact>,
+) {
+    match &initializer.kind {
+        FullTypedInitializerKind::Scalar(expression) => {
+            collect_automatic_local_facts_in_expression(expression, types, facts);
+        }
+        FullTypedInitializerKind::Aggregate(entries) => {
+            for entry in entries {
+                collect_automatic_local_facts_in_initializer(&entry.initializer, types, facts);
+            }
+        }
+        FullTypedInitializerKind::String(_) | FullTypedInitializerKind::Zero => {}
+    }
+}
+
+fn collect_automatic_local_facts_in_expression(
+    expression: &FullTypedExpression,
+    types: &TypeStore,
+    facts: &mut BTreeMap<FullLocalId, LocalFact>,
+) {
+    use FullTypedExpressionKind as E;
+    match &expression.kind {
+        E::Conversion {
+            expression: operand,
+            ..
+        }
+        | E::Unary { operand, .. }
+        | E::AddressOf(operand)
+        | E::Dereference(operand) => {
+            collect_automatic_local_facts_in_expression(operand, types, facts);
+        }
+        E::Binary { left, right, .. }
+        | E::Subscript {
+            base: left,
+            index: right,
+        } => {
+            collect_automatic_local_facts_in_expression(left, types, facts);
+            collect_automatic_local_facts_in_expression(right, types, facts);
+        }
+        E::Member { base, .. } => {
+            collect_automatic_local_facts_in_expression(base, types, facts);
+        }
+        E::CompoundLiteral { initializer, .. } => {
+            collect_automatic_local_facts_in_initializer(initializer, types, facts);
+        }
+        E::Assignment { target, value, .. } => {
+            collect_automatic_local_facts_in_expression(target, types, facts);
+            collect_automatic_local_facts_in_expression(value, types, facts);
+        }
+        E::Increment { operand, .. } | E::IntegerIntrinsic { operand, .. } => {
+            collect_automatic_local_facts_in_expression(operand, types, facts);
+        }
+        E::Call {
+            callee, arguments, ..
+        } => {
+            collect_automatic_local_facts_in_expression(callee, types, facts);
+            for argument in arguments {
+                collect_automatic_local_facts_in_expression(argument, types, facts);
+            }
+        }
+        E::Conditional {
+            condition,
+            then_expression,
+            else_expression,
+        } => {
+            collect_automatic_local_facts_in_expression(condition, types, facts);
+            collect_automatic_local_facts_in_expression(then_expression, types, facts);
+            collect_automatic_local_facts_in_expression(else_expression, types, facts);
+        }
+        E::Comma(expressions) => {
+            for expression in expressions {
+                collect_automatic_local_facts_in_expression(expression, types, facts);
+            }
+        }
+        E::StatementExpression { items, result } => {
+            for item in items {
+                match item {
+                    FullTypedBlockItem::Declaration(declaration) => {
+                        if declaration.duration == StorageDuration::Automatic {
+                            facts.insert(
+                                declaration.local,
+                                make_local_fact(
+                                    declaration.local,
+                                    declaration.name.clone(),
+                                    declaration.ty,
+                                    declaration.duration,
+                                    declaration.requested_alignment,
+                                    declaration.span,
+                                    types,
+                                ),
+                            );
+                        }
+                        if let Some(initializer) = &declaration.initializer {
+                            collect_automatic_local_facts_in_initializer(initializer, types, facts);
+                        }
+                    }
+                    FullTypedBlockItem::Statement(statement) => {
+                        collect_automatic_local_facts(statement, types, facts);
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(result) = result {
+                collect_automatic_local_facts_in_expression(result, types, facts);
+            }
+        }
+        E::BuiltinExpect { value, expected } => {
+            collect_automatic_local_facts_in_expression(value, types, facts);
+            collect_automatic_local_facts_in_expression(expected, types, facts);
+        }
+        E::MemoryCopy {
+            destination,
+            source,
+            length,
+            ..
+        } => {
+            collect_automatic_local_facts_in_expression(destination, types, facts);
+            collect_automatic_local_facts_in_expression(source, types, facts);
+            collect_automatic_local_facts_in_expression(length, types, facts);
+        }
+        E::MemorySet {
+            destination,
+            value,
+            length,
+        } => {
+            collect_automatic_local_facts_in_expression(destination, types, facts);
+            collect_automatic_local_facts_in_expression(value, types, facts);
+            collect_automatic_local_facts_in_expression(length, types, facts);
+        }
+        E::Prefetch { address, .. } => {
+            collect_automatic_local_facts_in_expression(address, types, facts);
+        }
+        E::AtomicReadModifyWrite {
+            pointer, operand, ..
+        } => {
+            collect_automatic_local_facts_in_expression(pointer, types, facts);
+            collect_automatic_local_facts_in_expression(operand, types, facts);
+        }
+        E::AtomicCompareExchange {
+            pointer,
+            expected,
+            replacement,
+            ..
+        } => {
+            collect_automatic_local_facts_in_expression(pointer, types, facts);
+            collect_automatic_local_facts_in_expression(expected, types, facts);
+            collect_automatic_local_facts_in_expression(replacement, types, facts);
+        }
+        E::VaStart { list, .. } | E::VaArg { list, .. } | E::VaEnd { list } => {
+            collect_automatic_local_facts_in_expression(list, types, facts);
+        }
+        E::VaCopy {
+            destination,
+            source,
+        } => {
+            collect_automatic_local_facts_in_expression(destination, types, facts);
+            collect_automatic_local_facts_in_expression(source, types, facts);
+        }
+        E::Constant(_)
+        | E::StringLiteral(_)
+        | E::DeclRef(_)
+        | E::Sizeof { .. }
+        | E::Alignof { .. }
+        | E::Offsetof { .. }
+        | E::MemoryFence { .. } => {}
     }
 }
 
@@ -571,8 +912,10 @@ fn variably_modified(types: &TypeStore, ty: TypeId, active: &mut HashSet<TypeId>
     }
     let result = match types.try_kind(ty) {
         Some(TypeKind::Array(array)) => {
-            matches!(array.length, ArrayLength::Variable(_))
-                || variably_modified(types, array.element.ty, active)
+            matches!(
+                array.length,
+                ArrayLength::Variable(_) | ArrayLength::UnspecifiedVariable(_)
+            ) || variably_modified(types, array.element.ty, active)
         }
         Some(TypeKind::Pointer(pointer)) => variably_modified(types, pointer.pointee.ty, active),
         Some(TypeKind::Function(signature)) => {
@@ -590,26 +933,86 @@ fn variably_modified(types: &TypeStore, ty: TypeId, active: &mut HashSet<TypeId>
     result
 }
 
+fn runtime_sized_object(types: &TypeStore, ty: TypeId) -> bool {
+    match types.try_kind(ty) {
+        Some(TypeKind::Array(array)) => {
+            matches!(array.length, ArrayLength::Variable(_))
+                || runtime_sized_object(types, array.element.ty)
+        }
+        _ => false,
+    }
+}
+
+fn runtime_storage_layout(
+    types: &TypeStore,
+    ty: QualifiedType,
+    bounds: &[(VariableLengthId, ValueId)],
+    span: Span,
+) -> Result<(Vec<ValueId>, QualifiedType, u64), IrError> {
+    let mut current = ty;
+    let mut extents = Vec::new();
+    let mut constant_factor = 1_u64;
+    loop {
+        let Some(TypeKind::Array(array)) = types.try_kind(current.ty) else {
+            return Ok((extents, current, constant_factor));
+        };
+        match array.length {
+            ArrayLength::Constant(length) => {
+                constant_factor = constant_factor.checked_mul(length).ok_or_else(|| {
+                    IrError::lower(
+                        LOWERING_ERROR,
+                        span,
+                        "constant dimensions of a variable-length array overflow size_t",
+                    )
+                })?;
+            }
+            ArrayLength::Variable(id) => {
+                extents.push(
+                    bounds
+                        .iter()
+                        .find_map(|(candidate, value)| (*candidate == id).then_some(*value))
+                        .ok_or_else(|| {
+                            IrError::lower(
+                                LOWERING_ERROR,
+                                span,
+                                format!("variable-length array is missing runtime bound {}", id.0),
+                            )
+                        })?,
+                );
+            }
+            ArrayLength::Incomplete | ArrayLength::UnspecifiedVariable(_) => {
+                return Err(IrError::lower(
+                    LOWERING_ERROR,
+                    span,
+                    "runtime-sized object has an incomplete or unspecified array bound",
+                ));
+            }
+        }
+        current = array.element;
+    }
+}
+
 fn scan_statement_for_address_taken(
     statement: &FullTypedStatement,
+    types: &TypeStore,
     facts: &mut BTreeMap<FullLocalId, LocalFact>,
 ) {
     use FullTypedStatementKind as S;
     match &statement.kind {
         S::Label { statement, .. } | S::Case { statement, .. } => {
-            scan_statement_for_address_taken(statement, facts);
+            scan_statement_for_address_taken(statement, types, facts);
         }
-        S::Default(statement) => scan_statement_for_address_taken(statement, facts),
+        S::Default(statement) => scan_statement_for_address_taken(statement, types, facts),
         S::Compound(items) => {
             for item in items {
                 match item {
                     FullTypedBlockItem::Declaration(declaration) => {
                         if let Some(initializer) = &declaration.initializer {
-                            scan_initializer_for_address_taken(initializer, facts);
+                            scan_initializer_for_address_taken(initializer, types, facts);
                         }
                     }
                     FullTypedBlockItem::Statement(statement) => {
-                        scan_statement_for_address_taken(statement, facts);
+                        scan_statement_for_address_taken(statement, types, facts);
                     }
                     _ => {}
                 }
@@ -617,7 +1020,7 @@ fn scan_statement_for_address_taken(
         }
         S::Expression(expression) => {
             if let Some(expression) = expression {
-                scan_expression_for_address_taken(expression, facts);
+                scan_expression_for_address_taken(expression, types, facts);
             }
         }
         S::If {
@@ -625,32 +1028,32 @@ fn scan_statement_for_address_taken(
             then_statement,
             else_statement,
         } => {
-            scan_expression_for_address_taken(condition, facts);
-            scan_statement_for_address_taken(then_statement, facts);
+            scan_expression_for_address_taken(condition, types, facts);
+            scan_statement_for_address_taken(then_statement, types, facts);
             if let Some(statement) = else_statement {
-                scan_statement_for_address_taken(statement, facts);
+                scan_statement_for_address_taken(statement, types, facts);
             }
         }
         S::Switch {
             expression,
             statement,
         } => {
-            scan_expression_for_address_taken(expression, facts);
-            scan_statement_for_address_taken(statement, facts);
+            scan_expression_for_address_taken(expression, types, facts);
+            scan_statement_for_address_taken(statement, types, facts);
         }
         S::While {
             condition,
             statement,
         } => {
-            scan_expression_for_address_taken(condition, facts);
-            scan_statement_for_address_taken(statement, facts);
+            scan_expression_for_address_taken(condition, types, facts);
+            scan_statement_for_address_taken(statement, types, facts);
         }
         S::DoWhile {
             statement,
             condition,
         } => {
-            scan_statement_for_address_taken(statement, facts);
-            scan_expression_for_address_taken(condition, facts);
+            scan_statement_for_address_taken(statement, types, facts);
+            scan_expression_for_address_taken(condition, types, facts);
         }
         S::For {
             initializer,
@@ -661,46 +1064,48 @@ fn scan_statement_for_address_taken(
             match initializer {
                 FullTypedForInitializer::Empty => {}
                 FullTypedForInitializer::Expression(expression) => {
-                    scan_expression_for_address_taken(expression, facts);
+                    scan_expression_for_address_taken(expression, types, facts);
                 }
                 FullTypedForInitializer::Declarations(items) => {
                     for item in items {
                         if let FullTypedBlockItem::Declaration(declaration) = item
                             && let Some(initializer) = &declaration.initializer
                         {
-                            scan_initializer_for_address_taken(initializer, facts);
+                            scan_initializer_for_address_taken(initializer, types, facts);
                         }
                     }
                 }
             }
             if let Some(condition) = condition {
-                scan_expression_for_address_taken(condition, facts);
+                scan_expression_for_address_taken(condition, types, facts);
             }
             if let Some(step) = step {
-                scan_expression_for_address_taken(step, facts);
+                scan_expression_for_address_taken(step, types, facts);
             }
-            scan_statement_for_address_taken(statement, facts);
+            scan_statement_for_address_taken(statement, types, facts);
         }
         S::Return(expression) => {
             if let Some(expression) = expression {
-                scan_expression_for_address_taken(expression, facts);
+                scan_expression_for_address_taken(expression, types, facts);
             }
         }
+        S::ComputedGoto(expression) => scan_expression_for_address_taken(expression, types, facts),
         S::Goto { .. } | S::Continue | S::Break => {}
     }
 }
 
 fn scan_initializer_for_address_taken(
     initializer: &FullTypedInitializer,
+    types: &TypeStore,
     facts: &mut BTreeMap<FullLocalId, LocalFact>,
 ) {
     match &initializer.kind {
         FullTypedInitializerKind::Scalar(expression) => {
-            scan_expression_for_address_taken(expression, facts);
+            scan_expression_for_address_taken(expression, types, facts);
         }
         FullTypedInitializerKind::Aggregate(entries) => {
             for entry in entries {
-                scan_initializer_for_address_taken(&entry.initializer, facts);
+                scan_initializer_for_address_taken(&entry.initializer, types, facts);
             }
         }
         FullTypedInitializerKind::String(_) | FullTypedInitializerKind::Zero => {}
@@ -709,6 +1114,7 @@ fn scan_initializer_for_address_taken(
 
 fn scan_expression_for_address_taken(
     expression: &FullTypedExpression,
+    types: &TypeStore,
     facts: &mut BTreeMap<FullLocalId, LocalFact>,
 ) {
     use FullTypedExpressionKind as E;
@@ -717,7 +1123,7 @@ fn scan_expression_for_address_taken(
             if let Some(place) = &operand.place {
                 mark_place_address_taken(place, facts);
             }
-            scan_expression_for_address_taken(operand, facts);
+            scan_expression_for_address_taken(operand, types, facts);
         }
         E::Conversion { expression, .. }
         | E::Unary {
@@ -725,28 +1131,42 @@ fn scan_expression_for_address_taken(
             ..
         }
         | E::Dereference(expression) => {
-            scan_expression_for_address_taken(expression, facts);
+            scan_expression_for_address_taken(expression, types, facts);
         }
         E::Binary { left, right, .. }
         | E::Subscript {
             base: left,
             index: right,
         } => {
-            scan_expression_for_address_taken(left, facts);
-            scan_expression_for_address_taken(right, facts);
+            scan_expression_for_address_taken(left, types, facts);
+            scan_expression_for_address_taken(right, types, facts);
         }
-        E::Member { base, .. } => scan_expression_for_address_taken(base, facts),
+        E::Member { base, .. } => scan_expression_for_address_taken(base, types, facts),
+        E::CompoundLiteral { local, initializer } => {
+            let mut fact = make_local_fact(
+                *local,
+                format!("<compound-literal-{}>", local.0),
+                expression.ty,
+                StorageDuration::Automatic,
+                None,
+                expression.span,
+                types,
+            );
+            fact.reasons.insert(MemoryResidencyReason::AddressTaken);
+            facts.insert(*local, fact);
+            scan_initializer_for_address_taken(initializer, types, facts);
+        }
         E::Assignment { target, value, .. } => {
-            scan_expression_for_address_taken(target, facts);
-            scan_expression_for_address_taken(value, facts);
+            scan_expression_for_address_taken(target, types, facts);
+            scan_expression_for_address_taken(value, types, facts);
         }
-        E::Increment { operand, .. } => scan_expression_for_address_taken(operand, facts),
+        E::Increment { operand, .. } => scan_expression_for_address_taken(operand, types, facts),
         E::Call {
             callee, arguments, ..
         } => {
-            scan_expression_for_address_taken(callee, facts);
+            scan_expression_for_address_taken(callee, types, facts);
             for argument in arguments {
-                scan_expression_for_address_taken(argument, facts);
+                scan_expression_for_address_taken(argument, types, facts);
             }
         }
         E::Conditional {
@@ -754,17 +1174,79 @@ fn scan_expression_for_address_taken(
             then_expression,
             else_expression,
         } => {
-            scan_expression_for_address_taken(condition, facts);
-            scan_expression_for_address_taken(then_expression, facts);
-            scan_expression_for_address_taken(else_expression, facts);
+            scan_expression_for_address_taken(condition, types, facts);
+            scan_expression_for_address_taken(then_expression, types, facts);
+            scan_expression_for_address_taken(else_expression, types, facts);
         }
         E::Comma(expressions) => {
             for expression in expressions {
-                scan_expression_for_address_taken(expression, facts);
+                scan_expression_for_address_taken(expression, types, facts);
             }
         }
+        E::StatementExpression { items, result } => {
+            for item in items {
+                match item {
+                    FullTypedBlockItem::Declaration(declaration) => {
+                        if let Some(initializer) = &declaration.initializer {
+                            scan_initializer_for_address_taken(initializer, types, facts);
+                        }
+                    }
+                    FullTypedBlockItem::Statement(statement) => {
+                        scan_statement_for_address_taken(statement, types, facts);
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(result) = result {
+                scan_expression_for_address_taken(result, types, facts);
+            }
+        }
+        E::BuiltinExpect { value, expected: _ } => {
+            scan_expression_for_address_taken(value, types, facts);
+        }
+        E::IntegerIntrinsic { operand, .. } => {
+            scan_expression_for_address_taken(operand, types, facts);
+        }
+        E::MemoryCopy {
+            destination,
+            source,
+            length,
+            ..
+        } => {
+            scan_expression_for_address_taken(destination, types, facts);
+            scan_expression_for_address_taken(source, types, facts);
+            scan_expression_for_address_taken(length, types, facts);
+        }
+        E::MemorySet {
+            destination,
+            value,
+            length,
+        } => {
+            scan_expression_for_address_taken(destination, types, facts);
+            scan_expression_for_address_taken(value, types, facts);
+            scan_expression_for_address_taken(length, types, facts);
+        }
+        E::Prefetch { address, .. } => {
+            scan_expression_for_address_taken(address, types, facts);
+        }
+        E::AtomicReadModifyWrite {
+            pointer, operand, ..
+        } => {
+            scan_expression_for_address_taken(pointer, types, facts);
+            scan_expression_for_address_taken(operand, types, facts);
+        }
+        E::AtomicCompareExchange {
+            pointer,
+            expected,
+            replacement,
+            ..
+        } => {
+            scan_expression_for_address_taken(pointer, types, facts);
+            scan_expression_for_address_taken(expected, types, facts);
+            scan_expression_for_address_taken(replacement, types, facts);
+        }
         E::VaStart { list, .. } | E::VaArg { list, .. } | E::VaEnd { list } => {
-            scan_expression_for_address_taken(list, facts);
+            scan_expression_for_address_taken(list, types, facts);
             if let Some(place) = &list.place {
                 mark_place_address_taken(place, facts);
             }
@@ -773,8 +1255,8 @@ fn scan_expression_for_address_taken(
             destination,
             source,
         } => {
-            scan_expression_for_address_taken(destination, facts);
-            scan_expression_for_address_taken(source, facts);
+            scan_expression_for_address_taken(destination, types, facts);
+            scan_expression_for_address_taken(source, types, facts);
             if let Some(place) = &destination.place {
                 mark_place_address_taken(place, facts);
             }
@@ -787,7 +1269,8 @@ fn scan_expression_for_address_taken(
         | E::DeclRef(_)
         | E::Sizeof { .. }
         | E::Alignof { .. }
-        | E::Offsetof { .. } => {}
+        | E::Offsetof { .. }
+        | E::MemoryFence { .. } => {}
     }
 }
 
@@ -810,7 +1293,7 @@ struct LoweredPlace {
 enum PendingAggregateProjection<'a> {
     Field {
         index: usize,
-        name: &'a str,
+        name: Option<&'a str>,
         bitfield: Option<BitfieldDescriptor>,
     },
     Index {
@@ -833,7 +1316,7 @@ fn collect_aggregate_projection<'a>(
             let root = collect_aggregate_projection(base, projections).unwrap_or(base);
             projections.push(PendingAggregateProjection::Field {
                 index: *field_index,
-                name,
+                name: name.as_deref(),
                 bitfield: bitfield.as_deref().map(bitfield_descriptor),
             });
             Some(root)
@@ -862,11 +1345,13 @@ struct SwitchContext {
 struct FunctionBuilder<'a> {
     unit: &'a FullTypedTranslationUnit,
     file_data: &'a BTreeMap<GlobalId, DataId>,
-    static_data: &'a BTreeMap<(FullFunctionId, FullLocalId), DataId>,
+    static_data: &'a BTreeMap<(FullFunctionId, FullLocalId), (DataId, StorageDuration)>,
     types: &'a mut TypeStore,
     function: FullFunction,
     current: Option<BlockId>,
     storage_by_local: BTreeMap<FullLocalId, StorageId>,
+    runtime_storage_addresses: BTreeMap<FullLocalId, ValueId>,
+    runtime_bounds: Vec<(VariableLengthId, ValueId)>,
     label_blocks: BTreeMap<LabelId, BlockId>,
     break_targets: Vec<BlockId>,
     continue_targets: Vec<BlockId>,
@@ -878,7 +1363,7 @@ impl<'a> FunctionBuilder<'a> {
         source: &FullTypedFunction,
         unit: &'a FullTypedTranslationUnit,
         file_data: &'a BTreeMap<GlobalId, DataId>,
-        static_data: &'a BTreeMap<(FullFunctionId, FullLocalId), DataId>,
+        static_data: &'a BTreeMap<(FullFunctionId, FullLocalId), (DataId, StorageDuration)>,
         types: &'a mut TypeStore,
     ) -> Result<FullFunction, IrError> {
         let signature = types.function_signature(source.signature).ok_or_else(|| {
@@ -905,10 +1390,14 @@ impl<'a> FunctionBuilder<'a> {
                 ty: fact.ty,
                 duration: fact.duration,
                 location: match fact.duration {
+                    StorageDuration::Automatic if runtime_sized_object(types, fact.ty.ty) => {
+                        StorageLocation::RuntimeSized
+                    }
                     StorageDuration::Automatic => StorageLocation::Automatic,
                     StorageDuration::Static => StorageLocation::Static,
                     StorageDuration::Thread => StorageLocation::ThreadLocal,
                 },
+                requested_alignment: fact.requested_alignment,
                 required_by: fact.reasons.iter().copied().collect(),
                 span: fact.span,
             });
@@ -940,6 +1429,7 @@ impl<'a> FunctionBuilder<'a> {
                 signature: source.signature,
                 storage_class: source.storage,
                 linkage: source.linkage,
+                binding: source.binding,
                 visibility: source.visibility,
                 properties: source.properties,
                 symbol_name,
@@ -954,6 +1444,8 @@ impl<'a> FunctionBuilder<'a> {
             },
             current: None,
             storage_by_local,
+            runtime_storage_addresses: BTreeMap::new(),
+            runtime_bounds: Vec::new(),
             label_blocks: BTreeMap::new(),
             break_targets: Vec::new(),
             continue_targets: Vec::new(),
@@ -1004,6 +1496,12 @@ impl<'a> FunctionBuilder<'a> {
                         span,
                     )?;
                 }
+            }
+        }
+        for parameter in &source.parameters {
+            for bound in &parameter.variable_length_bounds {
+                let value = builder.expect_value(&bound.expression)?;
+                builder.runtime_bounds.push((bound.id, value));
             }
         }
 
@@ -1155,6 +1653,88 @@ impl<'a> FunctionBuilder<'a> {
             QualifiedType::unqualified(pointer),
             span,
         )
+    }
+
+    fn runtime_extents(
+        &self,
+        mut element: QualifiedType,
+        span: Span,
+    ) -> Result<Vec<ValueId>, IrError> {
+        let mut extents = Vec::new();
+        while let Some(TypeKind::Array(array)) = self.types.try_kind(element.ty) {
+            if let ArrayLength::Variable(id) = array.length {
+                extents.push(
+                    self.runtime_bounds
+                        .iter()
+                        .rev()
+                        .find_map(|(candidate, value)| (*candidate == id).then_some(*value))
+                        .ok_or_else(|| {
+                            IrError::lower(
+                                LOWERING_ERROR,
+                                span,
+                                format!("pointer stride is missing runtime bound {}", id.0),
+                            )
+                        })?,
+                );
+            }
+            element = array.element;
+        }
+        Ok(extents)
+    }
+
+    fn pointer_offset(
+        &mut self,
+        base: ValueId,
+        index: ValueId,
+        element: QualifiedType,
+        subtract: bool,
+        result_ty: QualifiedType,
+        span: Span,
+    ) -> Result<ValueId, IrError> {
+        let extents = self.runtime_extents(element, span)?;
+        let kind = if extents.is_empty() {
+            FullInstructionKind::PointerOffset {
+                base,
+                index,
+                element,
+                subtract,
+            }
+        } else {
+            FullInstructionKind::RuntimePointerOffset {
+                base,
+                index,
+                element,
+                extents,
+                subtract,
+            }
+        };
+        self.emit_result(kind, result_ty, span)
+    }
+
+    fn pointer_difference(
+        &mut self,
+        left: ValueId,
+        right: ValueId,
+        element: QualifiedType,
+        result_ty: QualifiedType,
+        span: Span,
+    ) -> Result<ValueId, IrError> {
+        let extents = self.runtime_extents(element, span)?;
+        let kind = if extents.is_empty() {
+            FullInstructionKind::PointerDifference {
+                left,
+                right,
+                element,
+            }
+        } else {
+            FullInstructionKind::RuntimePointerDifference {
+                left,
+                right,
+                element,
+                extents,
+            }
+        };
+        self.emit_result(kind, result_ty, span)
     }
 }
 
@@ -1345,10 +1925,14 @@ fn promote_scalar_locals(function: &mut FullFunction, types: &TypeStore) -> Resu
     }
     for block in &mut function.blocks {
         for instruction in &mut block.instructions {
-            if let FullInstructionKind::AddressOfStorage { storage } = &mut instruction.kind {
-                *storage = *storage_remap.get(storage).ok_or_else(|| {
-                    IrError::verify("a promoted storage address escaped SSA construction")
-                })?;
+            match &mut instruction.kind {
+                FullInstructionKind::AddressOfStorage { storage }
+                | FullInstructionKind::RuntimeSizedAllocate { storage, .. } => {
+                    *storage = *storage_remap.get(storage).ok_or_else(|| {
+                        IrError::verify("a promoted storage address escaped SSA construction")
+                    })?;
+                }
+                _ => {}
             }
         }
     }
@@ -1492,16 +2076,46 @@ fn remap_instruction_values(
         | FullInstructionKind::AddressOfGlobal { .. }
         | FullInstructionKind::AddressOfFunction { .. }
         | FullInstructionKind::AddressOfString { .. }
-        | FullInstructionKind::AddressOfStorage { .. } => {}
+        | FullInstructionKind::AddressOfStorage { .. }
+        | FullInstructionKind::MemoryFence { .. } => {}
+        FullInstructionKind::RuntimeSizedAllocate { extents, .. } => {
+            for extent in extents {
+                map(extent)?;
+            }
+        }
         FullInstructionKind::ProjectField { base, .. } => map(base)?,
         FullInstructionKind::PointerOffset { base, index, .. } => {
             map(base)?;
             map(index)?;
         }
+        FullInstructionKind::RuntimePointerOffset {
+            base,
+            index,
+            extents,
+            ..
+        } => {
+            map(base)?;
+            map(index)?;
+            for extent in extents {
+                map(extent)?;
+            }
+        }
         FullInstructionKind::PointerDifference { left, right, .. }
         | FullInstructionKind::Binary { left, right, .. } => {
             map(left)?;
             map(right)?;
+        }
+        FullInstructionKind::RuntimePointerDifference {
+            left,
+            right,
+            extents,
+            ..
+        } => {
+            map(left)?;
+            map(right)?;
+            for extent in extents {
+                map(extent)?;
+            }
         }
         FullInstructionKind::Load { address, .. }
         | FullInstructionKind::BitfieldLoad { address, .. }
@@ -1523,6 +2137,23 @@ fn remap_instruction_values(
             map(address)?;
             map(value)?;
         }
+        FullInstructionKind::AtomicReadModifyWrite {
+            address, operand, ..
+        } => {
+            map(address)?;
+            map(operand)?;
+        }
+        FullInstructionKind::AtomicCompareExchange {
+            address,
+            expected,
+            replacement,
+            ..
+        } => {
+            map(address)?;
+            map(expected)?;
+            map(replacement)?;
+        }
+        FullInstructionKind::Prefetch { address, .. } => map(address)?,
         FullInstructionKind::ZeroInitialize { destination, .. }
         | FullInstructionKind::StringInitialize { destination, .. } => map(destination)?,
         FullInstructionKind::AggregateCopy {
@@ -1533,8 +2164,28 @@ fn remap_instruction_values(
             map(destination)?;
             map(source)?;
         }
+        FullInstructionKind::MemoryCopy {
+            destination,
+            source,
+            length,
+            ..
+        } => {
+            map(destination)?;
+            map(source)?;
+            map(length)?;
+        }
+        FullInstructionKind::MemorySet {
+            destination,
+            value,
+            length,
+        } => {
+            map(destination)?;
+            map(value)?;
+            map(length)?;
+        }
         FullInstructionKind::Convert { operand, .. }
-        | FullInstructionKind::Unary { operand, .. } => map(operand)?,
+        | FullInstructionKind::Unary { operand, .. }
+        | FullInstructionKind::IntegerIntrinsic { operand, .. } => map(operand)?,
         FullInstructionKind::DirectCall { arguments, .. } => {
             for argument in arguments {
                 map(argument)?;
@@ -1589,6 +2240,12 @@ fn remap_terminator_values(
             }
             remap_edge_values(default, aliases, remap)?;
         }
+        FullTerminator::IndirectBranch { selector, targets } => {
+            remap_value(selector, aliases, remap)?;
+            for target in targets {
+                remap_edge_values(target, aliases, remap)?;
+            }
+        }
         FullTerminator::Return(value) => {
             if let Some(value) = value {
                 remap_value(value, aliases, remap)?;
@@ -1612,6 +2269,7 @@ fn terminator_edges_mut(terminator: &mut FullTerminator) -> Vec<&mut FullEdge> {
             .map(|case| &mut case.edge)
             .chain(std::iter::once(default))
             .collect(),
+        FullTerminator::IndirectBranch { targets, .. } => targets.iter_mut().collect(),
         FullTerminator::Return(_) | FullTerminator::Unreachable => Vec::new(),
     }
 }
@@ -1732,6 +2390,28 @@ impl FunctionBuilder<'_> {
                     self.branch(target)?;
                 }
             }
+            S::ComputedGoto(expression) => {
+                if self.current.is_some() {
+                    if self.label_blocks.is_empty() {
+                        return Err(IrError::lower(
+                            LOWERING_ERROR,
+                            statement.span,
+                            "a computed goto requires at least one label in its function",
+                        ));
+                    }
+                    let selector = self.expect_value(expression)?;
+                    let targets = self
+                        .label_blocks
+                        .values()
+                        .copied()
+                        .map(|target| FullEdge {
+                            target,
+                            arguments: Vec::new(),
+                        })
+                        .collect();
+                    self.terminate(FullTerminator::IndirectBranch { selector, targets })?;
+                }
+            }
             S::Continue => {
                 if self.current.is_some() {
                     let target = self.continue_targets.last().copied().ok_or_else(|| {
@@ -1769,7 +2449,17 @@ impl FunctionBuilder<'_> {
         &mut self,
         declaration: &FullTypedLocalDeclaration,
     ) -> Result<(), IrError> {
-        if declaration.duration != StorageDuration::Automatic || self.current.is_none() {
+        if self.current.is_none() {
+            return Ok(());
+        }
+        let mut bounds = Vec::new();
+        for bound in &declaration.variable_length_bounds {
+            let value = self.expect_value(&bound.expression)?;
+            bounds.push((bound.id, value));
+            self.runtime_bounds.push((bound.id, value));
+        }
+
+        if declaration.duration != StorageDuration::Automatic {
             return Ok(());
         }
         let storage = *self
@@ -1782,6 +2472,33 @@ impl FunctionBuilder<'_> {
                     format!("local `{}` has no preallocated storage", declaration.name),
                 )
             })?;
+        if runtime_sized_object(self.types, declaration.ty.ty) {
+            if declaration.initializer.is_some() {
+                return Err(IrError::lower(
+                    LOWERING_ERROR,
+                    declaration.span,
+                    "a variable-length array cannot have an initializer",
+                ));
+            }
+            let (extents, element, constant_factor) =
+                runtime_storage_layout(self.types, declaration.ty, &bounds, declaration.span)?;
+            let pointer = self.types.pointer(declaration.ty);
+            let address = self.emit_result(
+                FullInstructionKind::RuntimeSizedAllocate {
+                    storage,
+                    extents,
+                    element,
+                    constant_factor,
+                    requested_alignment: declaration.requested_alignment,
+                },
+                QualifiedType::unqualified(pointer),
+                declaration.span,
+            )?;
+            self.runtime_storage_addresses
+                .insert(declaration.local, address);
+            return Ok(());
+        }
+
         if let Some(initializer) = &declaration.initializer {
             let address = self.address_of_storage(storage, declaration.span)?;
             let place = LoweredPlace {
@@ -1891,13 +2608,11 @@ impl FunctionBuilder<'_> {
                         pointer_ty,
                         span,
                     )?;
-                    let address = self.emit_result(
-                        FullInstructionKind::PointerOffset {
-                            base,
-                            index: index_value,
-                            element: array.element,
-                            subtract: false,
-                        },
+                    let address = self.pointer_offset(
+                        base,
+                        index_value,
+                        array.element,
+                        false,
                         pointer_ty,
                         span,
                     )?;
@@ -1927,7 +2642,12 @@ impl FunctionBuilder<'_> {
                         .record(record)
                         .and_then(|record| record.fields.as_ref())
                         .and_then(|fields| fields.get(*index))
-                        .map(|field| field.ty)
+                        .map(|field| {
+                            QualifiedType::new(
+                                field.ty.ty,
+                                field.ty.qualifiers | record_ty.qualifiers,
+                            )
+                        })
                         .ok_or_else(|| {
                             IrError::lower(
                                 LOWERING_ERROR,
@@ -2185,7 +2905,7 @@ impl FunctionBuilder<'_> {
             E::DeclRef(SymbolReference::Function(function)) => self
                 .address_of_function(*function, expression.span)
                 .map(Some),
-            E::DeclRef(_) => {
+            E::DeclRef(_) | E::CompoundLiteral { .. } => {
                 if expression.place.is_some() {
                     Err(IrError::lower(
                         LOWERING_ERROR,
@@ -2340,6 +3060,203 @@ impl FunctionBuilder<'_> {
                 }
                 Ok(result)
             }
+            E::StatementExpression { items, result } => {
+                for item in items {
+                    match item {
+                        FullTypedBlockItem::Declaration(declaration) => {
+                            self.local_declaration(declaration)?;
+                        }
+                        FullTypedBlockItem::Statement(statement) => self.statement(statement)?,
+                        FullTypedBlockItem::Typedef(_)
+                        | FullTypedBlockItem::ExternalObject(_)
+                        | FullTypedBlockItem::FunctionDeclaration(_)
+                        | FullTypedBlockItem::StaticAssert { .. }
+                        | FullTypedBlockItem::Pragma(_) => {}
+                    }
+                }
+                if self.current.is_none() {
+                    Ok(None)
+                } else if let Some(result) = result {
+                    self.expression(result)
+                } else {
+                    Ok(None)
+                }
+            }
+            E::BuiltinExpect { value, expected: _ } => self.expression(value),
+            E::IntegerIntrinsic { operation, operand } => {
+                let operand = self.expect_value(operand)?;
+                let operation = match operation {
+                    TypedIntegerIntrinsicOperation::ByteSwap64 => {
+                        IntegerIntrinsicOperation::ByteSwap64
+                    }
+                    TypedIntegerIntrinsicOperation::CountLeadingZerosInt => {
+                        IntegerIntrinsicOperation::CountLeadingZerosInt
+                    }
+                    TypedIntegerIntrinsicOperation::CountLeadingZerosLong => {
+                        IntegerIntrinsicOperation::CountLeadingZerosLong
+                    }
+                    TypedIntegerIntrinsicOperation::CountLeadingZerosLongLong => {
+                        IntegerIntrinsicOperation::CountLeadingZerosLongLong
+                    }
+                    TypedIntegerIntrinsicOperation::CountTrailingZerosLongLong => {
+                        IntegerIntrinsicOperation::CountTrailingZerosLongLong
+                    }
+                    TypedIntegerIntrinsicOperation::PopulationCountInt => {
+                        IntegerIntrinsicOperation::PopulationCountInt
+                    }
+                    TypedIntegerIntrinsicOperation::PopulationCountLongLong => {
+                        IntegerIntrinsicOperation::PopulationCountLongLong
+                    }
+                    TypedIntegerIntrinsicOperation::CountTrailingZerosInt => {
+                        IntegerIntrinsicOperation::CountTrailingZerosInt
+                    }
+                };
+                self.emit_result(
+                    FullInstructionKind::IntegerIntrinsic { operation, operand },
+                    expression.ty,
+                    expression.span,
+                )
+                .map(Some)
+            }
+            E::MemoryCopy {
+                destination,
+                source,
+                length,
+                overlap,
+            } => {
+                let destination = self.expect_value(destination)?;
+                let source = self.expect_value(source)?;
+                let length = self.expect_value(length)?;
+                self.emit_effect(
+                    FullInstructionKind::MemoryCopy {
+                        destination,
+                        source,
+                        length,
+                        overlap: *overlap,
+                    },
+                    expression.span,
+                )?;
+                Ok(Some(destination))
+            }
+            E::MemorySet {
+                destination,
+                value,
+                length,
+            } => {
+                let destination = self.expect_value(destination)?;
+                let value = self.expect_value(value)?;
+                let length = self.expect_value(length)?;
+                self.emit_effect(
+                    FullInstructionKind::MemorySet {
+                        destination,
+                        value,
+                        length,
+                    },
+                    expression.span,
+                )?;
+                Ok(Some(destination))
+            }
+            E::Prefetch {
+                address,
+                write,
+                locality,
+            } => {
+                let address = self.expect_value(address)?;
+                self.emit_effect(
+                    FullInstructionKind::Prefetch {
+                        address,
+                        write: *write,
+                        locality: *locality,
+                    },
+                    expression.span,
+                )?;
+                Ok(None)
+            }
+            E::AtomicReadModifyWrite {
+                operation,
+                pointer,
+                operand,
+                object,
+                return_new,
+                order,
+            } => {
+                let address = self.expect_value(pointer)?;
+                let operand = self.expect_value(operand)?;
+                let operation = match operation {
+                    TypedAtomicReadModifyWriteOperation::Add => AtomicReadModifyWriteOperation::Add,
+                    TypedAtomicReadModifyWriteOperation::Subtract => {
+                        AtomicReadModifyWriteOperation::Subtract
+                    }
+                    TypedAtomicReadModifyWriteOperation::Exchange => {
+                        AtomicReadModifyWriteOperation::Exchange
+                    }
+                };
+                let order = match order {
+                    TypedMemoryOrder::SequentiallyConsistent => MemoryOrder::SequentiallyConsistent,
+                };
+                if *return_new && operation == AtomicReadModifyWriteOperation::Exchange {
+                    return Err(IrError::lower(
+                        LOWERING_ERROR,
+                        expression.span,
+                        "atomic exchange cannot request the replacement value",
+                    ));
+                }
+                let value_ty = QualifiedType::unqualified(object.ty);
+                self.emit_result(
+                    FullInstructionKind::AtomicReadModifyWrite {
+                        operation,
+                        address,
+                        operand,
+                        object: *object,
+                        return_new: *return_new,
+                        order,
+                    },
+                    value_ty,
+                    expression.span,
+                )
+                .map(Some)
+            }
+            E::AtomicCompareExchange {
+                pointer,
+                expected,
+                replacement,
+                object,
+                return_boolean,
+                order,
+            } => {
+                let address = self.expect_value(pointer)?;
+                let expected = self.expect_value(expected)?;
+                let replacement = self.expect_value(replacement)?;
+                let order = match order {
+                    TypedMemoryOrder::SequentiallyConsistent => MemoryOrder::SequentiallyConsistent,
+                };
+                let value_ty = QualifiedType::unqualified(object.ty);
+                let old = self.emit_result(
+                    FullInstructionKind::AtomicCompareExchange {
+                        address,
+                        expected,
+                        replacement,
+                        object: *object,
+                        order,
+                    },
+                    value_ty,
+                    expression.span,
+                )?;
+                if *return_boolean {
+                    self.emit_result(
+                        FullInstructionKind::Binary {
+                            operator: BinaryOperation::Equal,
+                            left: old,
+                            right: expected,
+                        },
+                        QualifiedType::unqualified(TypeId::BOOL),
+                        expression.span,
+                    )
+                    .map(Some)
+                } else {
+                    Ok(Some(old))
+                }
+            }
             E::Sizeof { size, .. } => self
                 .emit_result(
                     FullInstructionKind::Constant(ScalarConstant::Unsigned(*size as u128)),
@@ -2361,6 +3278,13 @@ impl FunctionBuilder<'_> {
                     expression.span,
                 )
                 .map(Some),
+            E::MemoryFence { order } => {
+                let order = match order {
+                    TypedMemoryOrder::SequentiallyConsistent => MemoryOrder::SequentiallyConsistent,
+                };
+                self.emit_effect(FullInstructionKind::MemoryFence { order }, expression.span)?;
+                Ok(None)
+            }
             E::VaStart {
                 list,
                 last_named_parameter,
@@ -2469,11 +3393,48 @@ impl FunctionBuilder<'_> {
                             )
                         })?)
                     }
+                    ccc_sema::generic::RelocatableBase::BlockStatic { function, local } => {
+                        RelocationTarget::Object(
+                            self.static_data
+                                .get(&(function, local))
+                                .map(|(data, _)| *data)
+                                .ok_or_else(|| {
+                                    IrError::lower(
+                                        LOWERING_ERROR,
+                                        span,
+                                        format!(
+                                            "constant references unknown block-static object {}:{}",
+                                            function.0, local.0
+                                        ),
+                                    )
+                                })?,
+                        )
+                    }
                     ccc_sema::generic::RelocatableBase::Function(function) => {
                         RelocationTarget::Function(function)
                     }
                     ccc_sema::generic::RelocatableBase::String(string) => {
                         RelocationTarget::String(string)
+                    }
+                    ccc_sema::generic::RelocatableBase::Label { function, label } => {
+                        if function != self.function.id
+                            || address.addend != 0
+                            || address.one_past
+                            || label.0 == u32::MAX
+                        {
+                            return Err(IrError::lower(
+                                LOWERING_ERROR,
+                                span,
+                                "invalid cross-function or adjusted label address",
+                            ));
+                        }
+                        return self.emit_result(
+                            FullInstructionKind::Constant(ScalarConstant::Unsigned(
+                                u128::from(label.0) + 1,
+                            )),
+                            ty,
+                            span,
+                        );
                     }
                 };
                 self.emit_result(
@@ -2586,6 +3547,27 @@ impl FunctionBuilder<'_> {
     }
 
     fn place(&mut self, expression: &FullTypedExpression) -> Result<LoweredPlace, IrError> {
+        if let FullTypedExpressionKind::StatementExpression {
+            items,
+            result: Some(result),
+        } = &expression.kind
+        {
+            for item in items {
+                match item {
+                    FullTypedBlockItem::Declaration(declaration) => {
+                        self.local_declaration(declaration)?;
+                    }
+                    FullTypedBlockItem::Statement(statement) => self.statement(statement)?,
+                    FullTypedBlockItem::Typedef(_)
+                    | FullTypedBlockItem::ExternalObject(_)
+                    | FullTypedBlockItem::FunctionDeclaration(_)
+                    | FullTypedBlockItem::StaticAssert { .. }
+                    | FullTypedBlockItem::Pragma(_) => {}
+                }
+            }
+            return self.place(result);
+        }
+
         let mut pending = Vec::new();
         if let Some(root) = collect_aggregate_projection(expression, &mut pending) {
             if !is_aggregate(self.types, root.ty.ty) {
@@ -2616,7 +3598,7 @@ impl FunctionBuilder<'_> {
                         projected_bitfield = bitfield;
                         AggregateProjection::Field {
                             index,
-                            name: Some(name.to_owned()),
+                            name: name.map(str::to_owned),
                             bitfield,
                         }
                     }
@@ -2669,8 +3651,14 @@ impl FunctionBuilder<'_> {
                 self.address_of_data(data, expression.ty, expression.span)?
             }
             FullTypedExpressionKind::DeclRef(SymbolReference::Local(local)) => {
-                if let Some(data) = self.static_data.get(&(self.function.id, *local)).copied() {
+                if let Some(data) = self
+                    .static_data
+                    .get(&(self.function.id, *local))
+                    .map(|(data, _)| *data)
+                {
                     self.address_of_data(data, expression.ty, expression.span)?
+                } else if let Some(address) = self.runtime_storage_addresses.get(local).copied() {
+                    address
                 } else {
                     let storage = *self.storage_by_local.get(local).ok_or_else(|| {
                         IrError::lower(
@@ -2682,6 +3670,27 @@ impl FunctionBuilder<'_> {
                     self.address_of_storage(storage, expression.span)?
                 }
             }
+            FullTypedExpressionKind::DeclRef(SymbolReference::PredefinedFunctionName(string)) => {
+                self.address_of_string(*string, expression.ty, expression.span)?
+            }
+            FullTypedExpressionKind::CompoundLiteral { local, initializer } => {
+                let storage = *self.storage_by_local.get(local).ok_or_else(|| {
+                    IrError::lower(
+                        LOWERING_ERROR,
+                        expression.span,
+                        format!("reference to unknown compound literal {}", local.0),
+                    )
+                })?;
+                let address = self.address_of_storage(storage, expression.span)?;
+                let destination = LoweredPlace {
+                    address,
+                    object: expression.ty,
+                    access: access_from_qualified(expression.ty),
+                    bitfield: None,
+                };
+                self.runtime_initializer(destination, initializer)?;
+                address
+            }
             FullTypedExpressionKind::StringLiteral(string) => {
                 self.address_of_string(*string, expression.ty, expression.span)?
             }
@@ -2690,13 +3699,11 @@ impl FunctionBuilder<'_> {
                 let base = self.expect_value(base)?;
                 let index = self.expect_value(index)?;
                 let pointer = self.types.pointer(expression.ty);
-                self.emit_result(
-                    FullInstructionKind::PointerOffset {
-                        base,
-                        index,
-                        element: expression.ty,
-                        subtract: false,
-                    },
+                self.pointer_offset(
+                    base,
+                    index,
+                    expression.ty,
+                    false,
                     QualifiedType::unqualified(pointer),
                     expression.span,
                 )?
@@ -2728,7 +3735,7 @@ impl FunctionBuilder<'_> {
                         base: base_address,
                         record,
                         field_index: *field_index,
-                        field_name: Some(name.clone()),
+                        field_name: name.clone(),
                     },
                     QualifiedType::unqualified(pointer),
                     expression.span,
@@ -3065,16 +4072,7 @@ impl FunctionBuilder<'_> {
         };
         let one = self.emit_result(FullInstructionKind::Constant(one), one_ty, span)?;
         let updated = if let Some(element) = pointer {
-            self.emit_result(
-                FullInstructionKind::PointerOffset {
-                    base: old,
-                    index: one,
-                    element,
-                    subtract: decrement,
-                },
-                result_ty,
-                span,
-            )?
+            self.pointer_offset(old, one, element, decrement, result_ty, span)?
         } else {
             self.emit_result(
                 FullInstructionKind::Binary {
@@ -3110,13 +4108,11 @@ impl FunctionBuilder<'_> {
             if let Some(element) = left_pointee
                 && self.types.is_integer(right_ty)
             {
-                return self.emit_result(
-                    FullInstructionKind::PointerOffset {
-                        base: left,
-                        index: right,
-                        element,
-                        subtract: operator == AstBinary::Subtract,
-                    },
+                return self.pointer_offset(
+                    left,
+                    right,
+                    element,
+                    operator == AstBinary::Subtract,
                     result_ty,
                     span,
                 );
@@ -3125,26 +4121,18 @@ impl FunctionBuilder<'_> {
                 && let Some(element) = right_pointee
                 && self.types.is_integer(left_ty)
             {
-                return self.emit_result(
-                    FullInstructionKind::PointerOffset {
-                        base: right,
-                        index: left,
-                        element,
-                        subtract: false,
-                    },
-                    result_ty,
-                    span,
-                );
+                return self.pointer_offset(right, left, element, false, result_ty, span);
             }
             if operator == AstBinary::Subtract
                 && let (Some(element), Some(_)) = (left_pointee, right_pointee)
             {
-                return self.emit_result(
-                    FullInstructionKind::PointerDifference {
-                        left,
-                        right,
-                        element,
-                    },
+                return self.pointer_difference(
+                    left,
+                    right,
+                    // Pointer subtraction permits qualified and unqualified
+                    // versions of compatible object types. Qualifiers do not
+                    // affect the element stride carried by the IR.
+                    QualifiedType::unqualified(element.ty),
                     result_ty,
                     span,
                 );
@@ -3476,6 +4464,7 @@ fn collect_switch_labels(
         S::Switch { .. }
         | S::Expression(_)
         | S::Goto { .. }
+        | S::ComputedGoto(_)
         | S::Continue
         | S::Break
         | S::Return(_) => {}
@@ -3520,7 +4509,12 @@ fn collect_labels(statement: &FullTypedStatement, labels: &mut Vec<LabelId>) {
         | S::While { statement, .. }
         | S::DoWhile { statement, .. }
         | S::For { statement, .. } => collect_labels(statement, labels),
-        S::Expression(_) | S::Goto { .. } | S::Continue | S::Break | S::Return(_) => {}
+        S::Expression(_)
+        | S::Goto { .. }
+        | S::ComputedGoto(_)
+        | S::Continue
+        | S::Break
+        | S::Return(_) => {}
     }
 }
 
@@ -3593,7 +4587,9 @@ fn string_copy_code_units(
     let bound = match types.try_kind(object.ty) {
         Some(TypeKind::Array(array)) => match array.length {
             ArrayLength::Constant(bound) => bound,
-            ArrayLength::Incomplete | ArrayLength::Variable(_) => {
+            ArrayLength::Incomplete
+            | ArrayLength::Variable(_)
+            | ArrayLength::UnspecifiedVariable(_) => {
                 return Err(IrError::lower(
                     LOWERING_ERROR,
                     span,

@@ -95,7 +95,6 @@ fn compile_reference(compiler: &str, optimization: &str, source: &Path, object: 
 fn link_and_run(compiler: &str, directory: &Path, objects: &[&Path]) -> Output {
     let executable = directory.join("program");
     let mut command = Command::new(compiler);
-    command.arg("-no-pie");
     command.args(objects.iter().map(|path| path.as_os_str()));
     command.arg("-o").arg(&executable);
     run(&mut command);
@@ -1076,6 +1075,69 @@ int main(void) {
 }
 
 #[test]
+fn unprototyped_direct_and_indirect_calls_use_promotions_and_the_sse_count() {
+    const CCC_SOURCE: &str = r#"
+int reference_zero();
+int reference_unprototyped();
+
+int ccc_calls_unprototyped(void) {
+    float floating = 1.25f;
+    signed char narrow = -7;
+    int (*indirect)() = reference_unprototyped;
+    if (reference_zero() != 17)
+        return 1;
+    if (reference_unprototyped(11, floating, narrow, 2.5) != 11)
+        return 2;
+    if (indirect(12, floating, narrow, 2.5) != 12)
+        return 3;
+    return 0;
+}
+"#;
+    const REFERENCE_SOURCE: &str = r#"
+#include <stdarg.h>
+
+int ccc_calls_unprototyped(void);
+
+int reference_zero(void) {
+    return 17;
+}
+
+int reference_unprototyped(int marker, ...) {
+    va_list ap;
+    double floating;
+    int narrow;
+    double trailing;
+    va_start(ap, marker);
+    floating = va_arg(ap, double);
+    narrow = va_arg(ap, int);
+    trailing = va_arg(ap, double);
+    va_end(ap);
+    if (floating != 1.25 || narrow != -7 || trailing != 2.5)
+        return 99;
+    return marker;
+}
+
+int main(void) {
+    return ccc_calls_unprototyped();
+}
+"#;
+
+    for (compiler, optimization) in reference_configurations() {
+        let directory = test_directory("unprototyped-calls", compiler, optimization);
+        let ccc_source = write(&directory, "ccc-source.c", CCC_SOURCE);
+        let reference_source = write(&directory, "reference-source.c", REFERENCE_SOURCE);
+        let ccc_object = directory.join("ccc-source.o");
+        let reference_object = directory.join("reference-source.o");
+        compile_ccc(compiler, &ccc_source, &ccc_object);
+        compile_reference(compiler, optimization, &reference_source, &reference_object);
+        let output = link_and_run(compiler, &directory, &[&ccc_object, &reference_object]);
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
 fn variadic_call_bridge_sets_the_vector_register_count() {
     const CCC_SOURCE: &str = r#"
 int reference_al(int marker, ...);
@@ -1775,10 +1837,11 @@ static _Unwind_Ptr parse_region(const char *text) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 3)
+    if (argc != 4)
         return 130;
-    entry_bridge_region = parse_region(argv[1]);
-    call_helper_region = parse_region(argv[2]);
+    _Unwind_Ptr load_bias = (_Unwind_Ptr)main - parse_region(argv[3]);
+    entry_bridge_region = load_bias + parse_region(argv[1]);
+    call_helper_region = load_bias + parse_region(argv[2]);
     if (entry_bridge_region == 0 || call_helper_region == 0)
         return 130;
     int entry_depth = ccc_variadic_unwind_depth(0, 1);
@@ -1803,7 +1866,6 @@ int main(int argc, char **argv) {
         compile_reference(compiler, optimization, &reference_source, &reference_object);
         let executable = directory.join("program");
         run(Command::new(compiler)
-            .arg("-no-pie")
             .arg(&ccc_object)
             .arg(&reference_object)
             .arg("-o")
@@ -1826,6 +1888,11 @@ int main(int argc, char **argv) {
                     .map(|_| symbol.address())
             })
             .collect::<Vec<_>>();
+        let main_address = object
+            .symbols()
+            .find(|symbol| symbol.name() == Ok("main"))
+            .map(|symbol| symbol.address())
+            .expect("main symbol is present");
         assert_eq!(
             helper_addresses.len(),
             1,
@@ -1834,7 +1901,8 @@ int main(int argc, char **argv) {
         let output = run(Command::new(&executable)
             .env("LC_ALL", "C")
             .arg(format!("{entry_address:x}"))
-            .arg(format!("{:x}", helper_addresses[0])));
+            .arg(format!("{:x}", helper_addresses[0]))
+            .arg(format!("{main_address:x}")));
         assert!(output.stdout.is_empty());
         assert!(output.stderr.is_empty());
         fs::remove_dir_all(directory).unwrap();

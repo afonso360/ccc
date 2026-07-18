@@ -202,6 +202,10 @@ pub enum ArrayLength {
     Incomplete,
     Constant(u64),
     Variable(VariableLengthId),
+    /// A `[*]` bound from function prototype scope. Unlike an incomplete
+    /// array bound, this denotes a variable-length array whose bound is
+    /// intentionally unspecified by the declaration.
+    UnspecifiedVariable(VariableLengthId),
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -288,6 +292,10 @@ pub struct Field {
     pub name: Option<String>,
     pub ty: QualifiedType,
     pub bitfield: Option<Bitfield>,
+    /// Object-specific alignment requested for this member. This is distinct
+    /// from the natural alignment of `ty` and participates in the containing
+    /// record's layout.
+    pub requested_alignment: Option<u64>,
 }
 
 impl Field {
@@ -296,6 +304,7 @@ impl Field {
             name,
             ty: ty.into(),
             bitfield: None,
+            requested_alignment: None,
         }
     }
 
@@ -312,7 +321,13 @@ impl Field {
             name,
             ty: ty.into(),
             bitfield: Some(Bitfield { width }),
+            requested_alignment: None,
         }
+    }
+
+    pub const fn with_requested_alignment(mut self, alignment: Option<u64>) -> Self {
+        self.requested_alignment = alignment;
+        self
     }
 }
 
@@ -323,6 +338,9 @@ pub struct RecordDefinition {
     pub tag: Option<String>,
     pub fields: Option<Vec<Field>>,
     pub packing: PackingPolicy,
+    /// This narrow GNU contract permits compatible member expressions at
+    /// function-call boundaries; it does not alter ordinary union layout.
+    pub transparent_union: bool,
 }
 
 impl RecordDefinition {

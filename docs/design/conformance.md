@@ -69,7 +69,33 @@ A conforming complex implementation represents values as typed real/imaginary pa
 
 ## Variable-length arrays
 
-C11 makes VLAs optional. While a target lacks the [dynamic-stack capability](cranelift-risks.md#dynamic-stack-capability-contract), its configuration defines `__STDC_NO_VLA__` to `1`, and a declaration whose storage requires runtime stack allocation is a hard capability diagnostic — documented conformance, not a deferred bug. Variably modified types remain representable in semantic analysis (runtime `sizeof`, pointers to VLA), matching the general parse-don't-claim policy. When the capability lands for a target, the macro is removed and the execution tests take over.
+C11 makes runtime-sized automatic VLA objects optional and does not require
+their physical storage to reside on the machine stack. Variably modified types
+remain representable independently of that storage capability. Semantic
+analysis distinguishes an expression-bound array from prototype-scope `[*]`,
+retains supported parameter and local-declaration extents, permits fixed-size
+objects such as pointers to VLA where C permits them, and diagnoses illegal
+storage classes. Variably modified typedef and type-name bounds remain explicit
+frontend boundaries until their effects can be represented without loss.
+
+The hosted profile implements automatic VLA object allocation through the
+[runtime-sized automatic storage contract](cranelift-risks.md#runtime-sized-automatic-storage-contract),
+including checked extents, multidimensional strides, alignment, bounded reuse,
+and normal-return cleanup. It still defines `__STDC_NO_VLA__` to `1` until the
+remaining runtime-layout and variably modified type contexts have complete
+semantic, CCC-IR, provider, failure, and execution evidence. The macro describes
+the complete optional C11 capability; it does not prevent a documented subset
+from being accepted as an extension and does not promise native-stack storage.
+
+The selected hosted provider is the scoped arena in
+[ADR-0011](../adr/0011-arena-backed-runtime-sized-automatic-storage.md). It
+does not enable `__builtin_alloca` or related native-stack builtins;
+`__has_builtin` reports them as unavailable until the separate
+[native dynamic-stack contract](cranelift-risks.md#native-dynamic-stack-capability-contract)
+is proved. The arena provider documents possible storage loss across nonlocal
+exit and does not claim POSIX async-signal-safe allocation. A GNU statement
+expression does not extend a VLA's lifetime beyond its closing brace, even when
+its result contains a pointer to that storage.
 
 ## Effective implementation-defined behavior
 
@@ -100,6 +126,13 @@ The exact alternative-keyword, attribute, declaration, and phase-certification
 rules are the [frontend capability contract](frontend-capabilities.md). Syntax
 recognition alone does not advance a hosted-header profile beyond its recorded
 phase.
+
+The activation semantics and proof obligations for the selected C11 and GNU
+constructs are defined separately in the
+[C11 and GNU semantics contract](core-c11-and-gnu-semantics.md). In particular,
+the advertised GCC version is only one component of CCC's effective identity;
+CCC-provided predicates and later language facts are enumerated there as
+intentional deviations rather than being attributed to historical GCC 4.2.1.
 
 Layout, calling-convention, visibility, aliasing, section, TLS, cleanup, control-flow, vector, and code-generation attributes can never be classified as no-ops. Unknown attributes are preserved for diagnostics and rejected unless the standard explicitly permits them to be ignored and doing so is behavior-safe.
 

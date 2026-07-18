@@ -20,10 +20,15 @@ pub use target_lexicon::{
     Triple, Vendor,
 };
 
-/// The relocation contract used by generated objects.
+/// The relocation and executable-output contract used by code generation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RelocationModel {
+    /// Generate code that may only be linked at a fixed address.
     Static,
+    /// Generate position-independent code suitable for PIE and shared objects.
+    Pic,
+    /// Generate position-independent code and advertise a PIE compilation.
+    Pie,
 }
 
 /// Compiler-provided C types whose representation is selected by the target
@@ -191,6 +196,18 @@ impl TargetSpec {
             "__SIZEOF_LONG_DOUBLE__",
             (self.data_layout.long_double_width / 8).to_string(),
         );
+        // A 32-bit float in the enabled target data-layout contract uses the
+        // IEEE 754 binary32 representation.  Hosted GCC headers spell their
+        // <float.h> limits in terms of this predefined-macro family.
+        if self.data_layout.float_width == 32 {
+            insert_binary32_compatibility_facts(&mut facts);
+        }
+        // A 64-bit double in the enabled target data-layout contract uses the
+        // IEEE 754 binary64 representation. Keep the hosted `float.h` family
+        // together so its precision, ranges, and exact boundary values agree.
+        if self.data_layout.double_width == 64 {
+            insert_binary64_compatibility_facts(&mut facts);
+        }
         facts.insert(
             "__SIZEOF_SIZE_T__",
             (self.data_layout.pointer_width / 8).to_string(),
@@ -226,11 +243,63 @@ impl TargetSpec {
         if self.triple.binary_format == BinaryFormat::Elf {
             facts.insert("__ELF__", "1");
         }
+        if self.triple.architecture == Architecture::X86_64
+            && self.triple.binary_format == BinaryFormat::Elf
+            && self.calling_convention() == Some(CallingConvention::SystemV)
+        {
+            facts.insert("__USER_LABEL_PREFIX__", "");
+        }
         if self.data_layout.pointer_width == 64 && self.data_layout.long_width == 64 {
             facts.insert("__LP64__", "1");
             facts.insert("_LP64", "1");
         }
         facts
+    }
+}
+
+fn insert_binary32_compatibility_facts(facts: &mut PredefinedMacroFacts) {
+    for (suffix, replacement) in [
+        ("MANT_DIG", "24"),
+        ("DIG", "6"),
+        ("MIN_EXP", "(-125)"),
+        ("MIN_10_EXP", "(-37)"),
+        ("MAX_EXP", "128"),
+        ("MAX_10_EXP", "38"),
+        ("DECIMAL_DIG", "9"),
+        ("HAS_DENORM", "1"),
+        ("HAS_INFINITY", "1"),
+        ("HAS_QUIET_NAN", "1"),
+        ("MAX", "0x1.fffffep+127F"),
+        ("NORM_MAX", "0x1.fffffep+127F"),
+        ("EPSILON", "0x1p-23F"),
+        ("MIN", "0x1p-126F"),
+        ("DENORM_MIN", "0x1p-149F"),
+    ] {
+        facts.insert(format!("__FLT_{suffix}__"), replacement);
+    }
+}
+
+fn insert_binary64_compatibility_facts(facts: &mut PredefinedMacroFacts) {
+    facts.insert("__FLT_RADIX__", "2");
+    facts.insert("__FLT_EVAL_METHOD__", "0");
+    for (suffix, replacement) in [
+        ("MANT_DIG", "53"),
+        ("DIG", "15"),
+        ("MIN_EXP", "(-1021)"),
+        ("MIN_10_EXP", "(-307)"),
+        ("MAX_EXP", "1024"),
+        ("MAX_10_EXP", "308"),
+        ("DECIMAL_DIG", "17"),
+        ("HAS_DENORM", "1"),
+        ("HAS_INFINITY", "1"),
+        ("HAS_QUIET_NAN", "1"),
+        ("MAX", "0x1.fffffffffffffp+1023"),
+        ("NORM_MAX", "0x1.fffffffffffffp+1023"),
+        ("EPSILON", "0x1p-52"),
+        ("MIN", "0x1p-1022"),
+        ("DENORM_MIN", "0x1p-1074"),
+    ] {
+        facts.insert(format!("__DBL_{suffix}__"), replacement);
     }
 }
 
@@ -590,7 +659,7 @@ impl EffectiveCompilationConfig {
             target_macros,
             resource_dir: None,
             toolchain: ToolchainSpec::default(),
-            relocation_model: RelocationModel::Static,
+            relocation_model: RelocationModel::Pie,
         }
     }
 
@@ -727,13 +796,14 @@ mod tests {
         );
         assert_eq!(config.language.mode, LanguageMode::Gnu11);
         assert!(!config.language.trigraphs_enabled());
+        assert_eq!(config.relocation_model, RelocationModel::Pie);
         assert_eq!(
             config.gnu_profile.as_ref().map(|profile| profile.version),
             Some(CompatibilityVersion::new(4, 2, 1))
         );
         assert_eq!(
             config.gnu_profile.as_ref().map(|profile| profile.scope),
-            Some(CompatibilityScope::Parsing)
+            Some(CompatibilityScope::CodeGeneration)
         );
     }
 
@@ -752,6 +822,42 @@ mod tests {
         let facts = &EffectiveCompilationConfig::default().target_macros;
         assert_eq!(facts.get("__SIZEOF_POINTER__"), Some("8"));
         assert_eq!(facts.get("__SIZEOF_LONG_DOUBLE__"), Some("16"));
+        for (name, expected) in [
+            ("__FLT_RADIX__", "2"),
+            ("__FLT_EVAL_METHOD__", "0"),
+            ("__FLT_MANT_DIG__", "24"),
+            ("__FLT_DIG__", "6"),
+            ("__FLT_MIN_EXP__", "(-125)"),
+            ("__FLT_MIN_10_EXP__", "(-37)"),
+            ("__FLT_MAX_EXP__", "128"),
+            ("__FLT_MAX_10_EXP__", "38"),
+            ("__FLT_DECIMAL_DIG__", "9"),
+            ("__FLT_HAS_DENORM__", "1"),
+            ("__FLT_HAS_INFINITY__", "1"),
+            ("__FLT_HAS_QUIET_NAN__", "1"),
+            ("__FLT_MAX__", "0x1.fffffep+127F"),
+            ("__FLT_NORM_MAX__", "0x1.fffffep+127F"),
+            ("__FLT_EPSILON__", "0x1p-23F"),
+            ("__FLT_MIN__", "0x1p-126F"),
+            ("__FLT_DENORM_MIN__", "0x1p-149F"),
+            ("__DBL_MANT_DIG__", "53"),
+            ("__DBL_DIG__", "15"),
+            ("__DBL_MIN_EXP__", "(-1021)"),
+            ("__DBL_MIN_10_EXP__", "(-307)"),
+            ("__DBL_MAX_EXP__", "1024"),
+            ("__DBL_MAX_10_EXP__", "308"),
+            ("__DBL_DECIMAL_DIG__", "17"),
+            ("__DBL_HAS_DENORM__", "1"),
+            ("__DBL_HAS_INFINITY__", "1"),
+            ("__DBL_HAS_QUIET_NAN__", "1"),
+            ("__DBL_MAX__", "0x1.fffffffffffffp+1023"),
+            ("__DBL_NORM_MAX__", "0x1.fffffffffffffp+1023"),
+            ("__DBL_EPSILON__", "0x1p-52"),
+            ("__DBL_MIN__", "0x1p-1022"),
+            ("__DBL_DENORM_MIN__", "0x1p-1074"),
+        ] {
+            assert_eq!(facts.get(name), Some(expected), "unexpected {name}");
+        }
         assert_eq!(facts.get("__SIZEOF_SIZE_T__"), Some("8"));
         assert_eq!(facts.get("__SIZE_TYPE__"), Some("long unsigned int"));
         assert_eq!(facts.get("__PTRDIFF_TYPE__"), Some("long int"));
@@ -762,6 +868,7 @@ mod tests {
         assert_eq!(facts.get("__UINT64_MAX__"), Some("18446744073709551615UL"));
         assert_eq!(facts.get("__INT_FAST16_TYPE__"), Some("long int"));
         assert_eq!(facts.get("__BYTE_ORDER__"), Some("__ORDER_LITTLE_ENDIAN__"));
+        assert_eq!(facts.get("__USER_LABEL_PREFIX__"), Some(""));
         assert_eq!(facts.get("__x86_64__"), Some("1"));
         assert_eq!(facts.get("__linux__"), Some("1"));
         assert_eq!(facts.get("linux"), None);

@@ -39,4 +39,4 @@ pub use options::{
 pub use render::{
     DependencyRenderOptions, render_dependencies, render_macro_definitions, render_preprocessed,
 };
-pub use token::{PpToken, PpTokenKind};
+pub use token::{PpToken, PpTokenKind, canonicalize_identifier};

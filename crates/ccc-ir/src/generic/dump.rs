@@ -19,12 +19,17 @@ pub fn dump_frontend_ir(module: &FullModule) -> String {
         };
         let _ = writeln!(
             output,
-            "data d{} @{} : {} [{} linkage={:?} duration={:?} visibility={:?} definition={:?}{}{}{}]",
+            "data d{} @{} : {} [{} linkage={:?}{} duration={:?} visibility={:?} definition={:?}{}{}{}]",
             global.id.0,
             global.emission.symbol_name,
             module.types.display_qualified(global.ty),
             origin,
             global.linkage,
+            if global.emission.binding == ccc_sema::generic::SymbolBinding::Weak {
+                " binding=Weak"
+            } else {
+                ""
+            },
             global.duration,
             global.emission.visibility,
             global.emission.definition,
@@ -66,11 +71,16 @@ pub fn dump_frontend_ir(module: &FullModule) -> String {
         if function.entry.is_none() {
             let _ = writeln!(
                 output,
-                "declare f{} @{} : {} [linkage={:?} visibility={:?}]",
+                "declare f{} @{} : {} [linkage={:?}{} visibility={:?}]",
                 function.id.0,
                 function.symbol_name,
                 module.types.display(function.signature),
                 function.linkage,
+                if function.binding == ccc_sema::generic::SymbolBinding::Weak {
+                    " binding=Weak"
+                } else {
+                    ""
+                },
                 function.visibility,
             );
             continue;
@@ -94,13 +104,18 @@ pub fn dump_frontend_ir(module: &FullModule) -> String {
             .join(", ");
         let _ = writeln!(
             output,
-            "function f{} @{}({}) -> {} [signature={} linkage={:?} visibility={:?} inline={} noreturn={}] {{",
+            "function f{} @{}({}) -> {} [signature={} linkage={:?}{} visibility={:?} inline={} noreturn={}] {{",
             function.id.0,
             function.symbol_name,
             parameters,
             module.types.display_qualified(function.result_type),
             module.types.display(function.signature),
             function.linkage,
+            if function.binding == ccc_sema::generic::SymbolBinding::Weak {
+                " binding=Weak"
+            } else {
+                ""
+            },
             function.visibility,
             function.properties.inline,
             function.properties.no_return,
@@ -114,12 +129,15 @@ pub fn dump_frontend_ir(module: &FullModule) -> String {
                 .join(",");
             let _ = writeln!(
                 output,
-                "  storage m{} l{} %{}: {} [{:?}; {}]",
+                "  storage m{} l{} %{}: {} [{:?}{}; {}]",
                 storage.id.0,
                 storage.local.0,
                 storage.name,
                 module.types.display_qualified(storage.ty),
                 storage.location,
+                storage
+                    .requested_alignment
+                    .map_or_else(String::new, |alignment| format!("; align={alignment}")),
                 reasons,
             );
         }
@@ -269,6 +287,58 @@ fn display_instruction(module: &FullModule, kind: &FullInstructionKind) -> Strin
         FullInstructionKind::AddressOfStorage { storage } => {
             format!("address.storage m{}", storage.0)
         }
+        FullInstructionKind::RuntimeSizedAllocate {
+            storage,
+            extents,
+            element,
+            constant_factor,
+            requested_alignment,
+        } => format!(
+            "runtime.allocate m{} extents=[{}] element={} constant-factor={} requested-align={}",
+            storage.0,
+            extents
+                .iter()
+                .map(|value| format!("v{}", value.0))
+                .collect::<Vec<_>>()
+                .join(", "),
+            module.types.display_qualified(*element),
+            constant_factor,
+            requested_alignment.map_or_else(|| "natural".to_owned(), |value| value.to_string())
+        ),
+        FullInstructionKind::RuntimePointerOffset {
+            base,
+            index,
+            element,
+            extents,
+            subtract,
+        } => format!(
+            "pointer.offset.runtime v{}, {}v{} element={} extents=[{}]",
+            base.0,
+            if *subtract { "-" } else { "" },
+            index.0,
+            module.types.display_qualified(*element),
+            extents
+                .iter()
+                .map(|value| format!("v{}", value.0))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        FullInstructionKind::RuntimePointerDifference {
+            left,
+            right,
+            element,
+            extents,
+        } => format!(
+            "pointer.difference.runtime v{}, v{} element={} extents=[{}]",
+            left.0,
+            right.0,
+            module.types.display_qualified(*element),
+            extents
+                .iter()
+                .map(|value| format!("v{}", value.0))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         FullInstructionKind::ProjectField {
             base,
             record,
@@ -457,6 +527,26 @@ fn display_instruction(module: &FullModule, kind: &FullInstructionKind) -> Strin
             left,
             right,
         } => format!("{} v{}, v{}", binary_name(*operator), left.0, right.0),
+        FullInstructionKind::IntegerIntrinsic { operation, operand } => {
+            format!("integer.intrinsic operation={operation:?} v{}", operand.0)
+        }
+        FullInstructionKind::MemoryCopy {
+            destination,
+            source,
+            length,
+            overlap,
+        } => format!(
+            "memory.copy v{} -> v{} length=v{} overlap={overlap}",
+            source.0, destination.0, length.0
+        ),
+        FullInstructionKind::MemorySet {
+            destination,
+            value,
+            length,
+        } => format!(
+            "memory.set v{} value=v{} length=v{}",
+            destination.0, value.0, length.0
+        ),
         FullInstructionKind::DirectCall {
             function,
             signature,
@@ -485,6 +575,40 @@ fn display_instruction(module: &FullModule, kind: &FullInstructionKind) -> Strin
             variadic_boundary,
             display_call_effects(*effects)
         ),
+        FullInstructionKind::AtomicReadModifyWrite {
+            operation,
+            address,
+            operand,
+            object,
+            return_new,
+            order,
+        } => format!(
+            "atomic.rmw operation={operation:?} v{}, v{} object={} return-new={return_new} order={order:?}",
+            address.0,
+            operand.0,
+            module.types.display_qualified(*object)
+        ),
+        FullInstructionKind::AtomicCompareExchange {
+            address,
+            expected,
+            replacement,
+            object,
+            order,
+        } => format!(
+            "atomic.cmpxchg v{}, expected=v{}, replacement=v{} object={} order={order:?}",
+            address.0,
+            expected.0,
+            replacement.0,
+            module.types.display_qualified(*object)
+        ),
+        FullInstructionKind::Prefetch {
+            address,
+            write,
+            locality,
+        } => format!("prefetch v{} write={write} locality={locality}", address.0),
+        FullInstructionKind::MemoryFence { order } => {
+            format!("memory.fence order={order:?}")
+        }
         FullInstructionKind::VaStart {
             list,
             last_named_parameter,
@@ -528,6 +652,15 @@ fn display_terminator(terminator: &FullTerminator) -> String {
                 .collect::<Vec<_>>()
                 .join(", "),
             display_edge(default)
+        ),
+        FullTerminator::IndirectBranch { selector, targets } => format!(
+            "br_table v{} [{}]",
+            selector.0,
+            targets
+                .iter()
+                .map(display_edge)
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
         FullTerminator::Return(Some(value)) => format!("return v{}", value.0),
         FullTerminator::Return(None) => "return".to_owned(),

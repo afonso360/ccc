@@ -164,6 +164,9 @@ impl AstDumper {
         if let Some(enumerators) = &enumeration.enumerators {
             for enumerator in enumerators {
                 self.line(indent + 1, &format!("enumerator {}", enumerator.name.name));
+                for attribute in &enumerator.attributes {
+                    self.attribute(attribute, indent + 2);
+                }
                 if let Some(value) = &enumerator.value {
                     self.expression(value, indent + 2);
                 }
@@ -204,6 +207,7 @@ impl AstDumper {
             StatementKind::DoWhile { .. } => "do-while",
             StatementKind::For { .. } => "for",
             StatementKind::Goto(_) => "goto",
+            StatementKind::ComputedGoto(_) => "computed-goto",
             StatementKind::Continue => "continue",
             StatementKind::Break => "break",
             StatementKind::Return(_) => "return",
@@ -226,7 +230,8 @@ impl AstDumper {
                 }
             }
             StatementKind::Expression(Some(expression))
-            | StatementKind::Return(Some(expression)) => self.expression(expression, indent + 1),
+            | StatementKind::Return(Some(expression))
+            | StatementKind::ComputedGoto(expression) => self.expression(expression, indent + 1),
             StatementKind::If {
                 condition,
                 then_statement,
@@ -288,6 +293,9 @@ impl AstDumper {
         match &expression.kind {
             ExpressionKind::Identifier(identifier) => {
                 self.line(indent, &format!("name {}", identifier.name))
+            }
+            ExpressionKind::LabelAddress(label) => {
+                self.line(indent, &format!("label-address {}", label.name))
             }
             ExpressionKind::Integer(value) => {
                 self.line(indent, &format!("integer {}", value.value))
@@ -363,6 +371,52 @@ impl AstDumper {
                 self.line(indent, "builtin-va-end");
                 self.expression(list, indent + 1);
             }
+            ExpressionKind::BuiltinExpect { value, expected } => {
+                self.line(indent, "builtin-expect");
+                self.expression(value, indent + 1);
+                self.expression(expected, indent + 1);
+            }
+            ExpressionKind::BuiltinHugeVal => {
+                self.line(indent, "builtin-huge-val");
+            }
+            ExpressionKind::BuiltinInfF => {
+                self.line(indent, "builtin-inff");
+            }
+            ExpressionKind::BuiltinNanF { payload } => {
+                self.line(indent, "builtin-nanf");
+                self.expression(payload, indent + 1);
+            }
+            ExpressionKind::BuiltinIntegerIntrinsic { operation, operand } => {
+                self.line(indent, operation.spelling());
+                self.expression(operand, indent + 1);
+            }
+            ExpressionKind::BuiltinMemoryOperation {
+                operation,
+                arguments,
+            } => {
+                self.line(indent, operation.spelling());
+                for argument in arguments {
+                    self.expression(argument, indent + 1);
+                }
+            }
+            ExpressionKind::BuiltinPrefetch { arguments } => {
+                self.line(indent, "builtin-prefetch");
+                for argument in arguments {
+                    self.expression(argument, indent + 1);
+                }
+            }
+            ExpressionKind::BuiltinSyncOperation {
+                operation,
+                arguments,
+            } => {
+                self.line(indent, operation.spelling());
+                for argument in arguments {
+                    self.expression(argument, indent + 1);
+                }
+            }
+            ExpressionKind::BuiltinSyncSynchronize => {
+                self.line(indent, "builtin-sync-synchronize");
+            }
             ExpressionKind::Comma(expressions) => {
                 self.line(indent, "comma");
                 for expression in expressions {
@@ -376,6 +430,22 @@ impl AstDumper {
             | ExpressionKind::Extension(inner) => {
                 self.line(indent, "expression");
                 self.expression(inner, indent + 1);
+            }
+            ExpressionKind::StatementExpression(items) => {
+                self.line(indent, "statement-expression");
+                for item in items {
+                    match item {
+                        BlockItem::Declaration(declaration) => {
+                            self.declaration(declaration, indent + 1)
+                        }
+                        BlockItem::StaticAssert(assertion) => {
+                            self.line(indent + 1, "static-assert");
+                            self.expression(&assertion.condition, indent + 2);
+                        }
+                        BlockItem::Statement(statement) => self.statement(statement, indent + 1),
+                        BlockItem::Pragma(pragma) => self.pragma(pragma, indent + 1),
+                    }
+                }
             }
             ExpressionKind::Subscript { base, index } => {
                 self.line(indent, "subscript");
@@ -405,6 +475,14 @@ impl AstDumper {
             PragmaEvent::Once { .. } => "once".to_owned(),
             PragmaEvent::SystemHeader { .. } => "GCC system_header".to_owned(),
             PragmaEvent::Diagnostic { .. } => "GCC diagnostic".to_owned(),
+            PragmaEvent::GccOptimize { payload, .. } => format!(
+                "GCC optimize {}",
+                payload
+                    .iter()
+                    .map(|token| token.spelling.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
             PragmaEvent::Pack { payload, .. } => format!(
                 "pack {}",
                 payload

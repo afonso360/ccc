@@ -644,7 +644,10 @@ fn inspect_combined_object(
         let intentionally_localized = bundle.manifest().symbols().iter().any(|generated| {
             generated.name == name
                 && generated.owner == GeneratedSymbolOwner::PrimaryObject
-                && generated.visibility == GeneratedSymbolVisibility::Internal
+                && matches!(
+                    generated.visibility,
+                    GeneratedSymbolVisibility::Internal | GeneratedSymbolVisibility::SourceInternal
+                )
         });
         if !intentionally_localized && packaged.scope != symbol.scope() {
             return Err(artifact_error(format!(

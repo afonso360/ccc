@@ -1,5 +1,5 @@
-ccc: error[CCC2258]: variably modified object storage is not supported
- --> tests/diagnostics/cases/variable-length-object.c:2:9
+ccc: error[CCC2258]: a variable-length array object must have automatic storage duration
+ --> tests/diagnostics/cases/variable-length-object.c:2:16
    |
- 2 |     int values[count];
-   |         ^^^^^^^^^^^^^
+ 2 |     static int values[count];
+   |                ^^^^^^^^^^^^^

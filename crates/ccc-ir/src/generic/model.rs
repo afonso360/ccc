@@ -2,7 +2,7 @@ use std::fmt;
 
 use ccc_sema::generic::{
     FullFunctionId, FullLocalId, FunctionProperties, GlobalEmission, GlobalId, Linkage,
-    SemanticStorageClass, StorageDuration, StringId, SymbolVisibility,
+    SemanticStorageClass, StorageDuration, StringId, SymbolBinding, SymbolVisibility,
 };
 use ccc_session::Span;
 use ccc_types::{QualifiedType, TypeId, TypeStore};
@@ -161,6 +161,7 @@ pub struct FullFunction {
     pub signature: TypeId,
     pub storage_class: SemanticStorageClass,
     pub linkage: Linkage,
+    pub binding: SymbolBinding,
     pub visibility: SymbolVisibility,
     pub properties: FunctionProperties,
     pub symbol_name: String,
@@ -195,6 +196,7 @@ pub struct FullStorage {
     pub ty: QualifiedType,
     pub duration: StorageDuration,
     pub location: StorageLocation,
+    pub requested_alignment: Option<u64>,
     pub required_by: Vec<MemoryResidencyReason>,
     pub span: Span,
 }
@@ -204,6 +206,8 @@ pub enum StorageLocation {
     Automatic,
     Static,
     ThreadLocal,
+    /// Runtime-sized automatic storage backed by a per-invocation arena.
+    RuntimeSized,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -213,6 +217,7 @@ pub enum MemoryResidencyReason {
     Aggregate,
     Atomic,
     VariablyModified,
+    IndirectControlFlow,
 }
 
 #[derive(Clone, Debug)]
@@ -340,6 +345,21 @@ pub enum FullInstructionKind {
         left: ValueId,
         right: ValueId,
     },
+    IntegerIntrinsic {
+        operation: IntegerIntrinsicOperation,
+        operand: ValueId,
+    },
+    MemoryCopy {
+        destination: ValueId,
+        source: ValueId,
+        length: ValueId,
+        overlap: bool,
+    },
+    MemorySet {
+        destination: ValueId,
+        value: ValueId,
+        length: ValueId,
+    },
     DirectCall {
         function: FullFunctionId,
         signature: TypeId,
@@ -353,6 +373,29 @@ pub enum FullInstructionKind {
         arguments: Vec<ValueId>,
         variadic_boundary: usize,
         effects: CallEffects,
+    },
+    AtomicReadModifyWrite {
+        operation: AtomicReadModifyWriteOperation,
+        address: ValueId,
+        operand: ValueId,
+        object: QualifiedType,
+        return_new: bool,
+        order: MemoryOrder,
+    },
+    AtomicCompareExchange {
+        address: ValueId,
+        expected: ValueId,
+        replacement: ValueId,
+        object: QualifiedType,
+        order: MemoryOrder,
+    },
+    Prefetch {
+        address: ValueId,
+        write: bool,
+        locality: u8,
+    },
+    MemoryFence {
+        order: MemoryOrder,
     },
     VaStart {
         list: ValueId,
@@ -368,6 +411,31 @@ pub enum FullInstructionKind {
     },
     VaEnd {
         list: ValueId,
+    },
+    /// Allocates or reuses storage for one runtime-sized automatic object.
+    /// Each extent is checked for positivity and the complete byte-size
+    /// calculation is checked for overflow by the backend.
+    RuntimeSizedAllocate {
+        storage: StorageId,
+        extents: Vec<ValueId>,
+        element: QualifiedType,
+        constant_factor: u64,
+        requested_alignment: Option<u64>,
+    },
+    /// Pointer arithmetic whose element stride contains runtime VLA extents.
+    RuntimePointerOffset {
+        base: ValueId,
+        index: ValueId,
+        element: QualifiedType,
+        extents: Vec<ValueId>,
+        subtract: bool,
+    },
+    /// Pointer subtraction whose element stride contains runtime VLA extents.
+    RuntimePointerDifference {
+        left: ValueId,
+        right: ValueId,
+        element: QualifiedType,
+        extents: Vec<ValueId>,
     },
 }
 
@@ -397,6 +465,25 @@ pub struct MemoryAccess {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MemoryOrder {
     SequentiallyConsistent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AtomicReadModifyWriteOperation {
+    Add,
+    Subtract,
+    Exchange,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IntegerIntrinsicOperation {
+    ByteSwap64,
+    CountLeadingZerosInt,
+    CountLeadingZerosLong,
+    CountLeadingZerosLongLong,
+    CountTrailingZerosLongLong,
+    PopulationCountInt,
+    PopulationCountLongLong,
+    CountTrailingZerosInt,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -490,6 +577,10 @@ pub enum FullTerminator {
         selector: ValueId,
         cases: Vec<SwitchEdge>,
         default: FullEdge,
+    },
+    IndirectBranch {
+        selector: ValueId,
+        targets: Vec<FullEdge>,
     },
     Return(Option<ValueId>),
     Unreachable,

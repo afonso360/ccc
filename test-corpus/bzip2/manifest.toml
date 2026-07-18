@@ -1,0 +1,126 @@
+format_version = 1
+name = "bzip2"
+version = "1.0.8"
+release_date = "2019-07-13"
+distribution = "official-source"
+origin = "https://sourceware.org/pub/bzip2/bzip2-1.0.8.tar.gz"
+archive = "bzip2-1.0.8.tar.gz"
+archive_bytes = 810029
+archive_sha256 = "ab5a03176ee106d3f0fa90e381da478ddae405918153cca248e682cd0c4a2269"
+archive_sha3_256 = "34400e535a9018e93fc04f509811df340e8f9b48b06467b9c025400ac0a4898d"
+archive_sha512 = "083f5e675d73f3233c7930ebe20425a533feedeaaa9d8cc86831312a6581cefbe6ed0d08d2fa89be81082f2a5abdabca8b3c080bf97218a1bd59dc118a30b9f3"
+archive_sha512_origin = "https://sourceware.org/pub/bzip2/sha512.sum"
+license = "bzip2-1.0.8"
+upstream_license_file = "LICENSE"
+fetched_not_vendored = true
+
+test_distribution = "official-bzip2-tests-git"
+test_origin = "https://sourceware.org/git/bzip2-tests.git"
+test_commit = "5f31d0d2ef548f5232e1806796817f8e342ff63f"
+test_tree = "bed2468efb282b39ab325341a9dda1ca4b6248d1"
+test_good_streams = 38
+test_bad_streams = 8
+test_pass_markers = 440
+test_runner_license = "GPL-3.0-or-later"
+test_imported_licenses = "recorded-per-source-subdirectory"
+
+target = "x86_64-unknown-linux-gnu"
+language_mode = "gnu11"
+language_mode_selection = "driver-default"
+gnu_compatibility_tuple = "4.2.1"
+build_interface = "upstream-make"
+build_targets = "libbz2.a bzip2 bzip2recover"
+build_command = "make -j<JOBS> libbz2.a bzip2 bzip2recover CC=<ccc-adapter> CFLAGS='-Wall -Winline -O2 -g -D_FILE_OFFSET_BITS=64'"
+archive_c_translation_units = 13
+build_translation_units = 9
+native_link_commands = 2
+target_compiler = "ccc"
+link_driver = "gcc"
+link_mode = "platform-default-pie-executable"
+
+upstream_test_target = "check"
+upstream_test_command = "make -j1 check"
+upstream_reference_comparisons = 6
+extended_test_command = "run-tests.sh --bzip2=<built-bzip2> --without-valgrind"
+extended_success_marker = "All tests passed"
+smoke_command = "bzip2 -9 -c INPUT; bzip2 -t STREAM; bzip2 -d -c STREAM; cmp INPUT OUTPUT"
+
+required_tools = [
+    "ar",
+    "awk",
+    "bash",
+    "basename",
+    "cat",
+    "cmp",
+    "dirname",
+    "find",
+    "gcc",
+    "git",
+    "grep",
+    "make",
+    "md5sum",
+    "mkdir",
+    "mktemp",
+    "mv",
+    "openssl",
+    "ranlib",
+    "readelf",
+    "rm",
+    "sed",
+    "sort",
+    "tar",
+    "tee",
+    "tr",
+    "uname",
+    "wc",
+]
+conditional_download_tools = ["curl"]
+
+[expected_inventory]
+gnu_attributes = ["noreturn"]
+gnu_keywords = ["__inline__"]
+selected_integer_types = ["unsigned-long-long"]
+builtins = []
+computed_gotos = []
+inline_assembly_forms = []
+int128_uses = []
+variable_length_array_objects = []
+statement_expressions = []
+
+[selected_sources]
+library = [
+    "blocksort.c",
+    "huffman.c",
+    "crctable.c",
+    "randtable.c",
+    "compress.c",
+    "decompress.c",
+    "bzlib.c",
+]
+programs = ["bzip2.c", "bzip2recover.c"]
+excluded_developer_utilities = ["dlltest.c", "mk251.c", "spewG.c", "unzcrash.c"]
+
+[adapter_artifacts]
+retain = [
+    "archive-source-inputs.txt",
+    "build.log",
+    "capability-inventory.txt",
+    "compile-commands.txt",
+    "effective-macros.txt",
+    "elf-dynamic-tags.txt",
+    "elf-headers.txt",
+    "expected-archive-source-inputs.txt",
+    "expected-source-inputs.txt",
+    "extended-test.log",
+    "link-driver-identity.txt",
+    "link-driver-macros.txt",
+    "predicate-probe.txt",
+    "round-trip-input.txt",
+    "round-trip-output.txt",
+    "round-trip-stream.bz2",
+    "round-trip.log",
+    "source-inputs.txt",
+    "test-repository-identity.txt",
+    "upstream-test.log",
+    "version.log",
+]

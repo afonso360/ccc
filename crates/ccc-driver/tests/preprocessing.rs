@@ -513,7 +513,18 @@ fn emits_predefined_dynamic_and_reproducible_macros() {
             "const char *translation_time = __TIME__;\n",
             "const char *translation_file = __FILE__;\n",
             "int translation_line = __LINE__;\n",
+            "int double_mantissa_bits = __DBL_MANT_DIG__;\n",
+            "int float_mantissa_bits = __FLT_MANT_DIG__;\n",
+            "float float_maximum = __FLT_MAX__;\n",
+            "float float_epsilon = __FLT_EPSILON__;\n",
+            "int double_decimal_digits = __DBL_DIG__;\n",
+            "int double_max_decimal_exponent = __DBL_MAX_10_EXP__;\n",
+            "double double_maximum = __DBL_MAX__;\n",
+            "double double_epsilon = __DBL_EPSILON__;\n",
             "int counters[] = { __COUNTER__, __COUNTER__ };\n",
+            "#define CCC_STRINGIFY_INNER(value) #value\n",
+            "#define CCC_STRINGIFY(value) CCC_STRINGIFY_INNER(value)\n",
+            "const char *user_label_prefix = CCC_STRINGIFY(__USER_LABEL_PREFIX__);\n",
             "__SIZE_TYPE__ size_value;\n",
             "__PTRDIFF_TYPE__ difference_value;\n",
             "__WCHAR_TYPE__ wide_value;\n",
@@ -536,6 +547,27 @@ fn emits_predefined_dynamic_and_reproducible_macros() {
     assert!(output.contains("longstandard_version=201112L;"), "{output}");
     assert!(output.contains("intcompatibility=4*100+2;"), "{output}");
     assert!(output.contains("intpointer_size=8;"), "{output}");
+    assert!(output.contains("intdouble_mantissa_bits=53;"), "{output}");
+    assert!(output.contains("intfloat_mantissa_bits=24;"), "{output}");
+    assert!(
+        output.contains("floatfloat_maximum=0x1.fffffep+127F;"),
+        "{output}"
+    );
+    assert!(output.contains("floatfloat_epsilon=0x1p-23F;"), "{output}");
+    assert!(output.contains("intdouble_decimal_digits=15;"), "{output}");
+    assert!(
+        output.contains("intdouble_max_decimal_exponent=308;"),
+        "{output}"
+    );
+    assert!(
+        output.contains("doubledouble_maximum=0x1.fffffffffffffp+1023;"),
+        "{output}"
+    );
+    assert!(output.contains("doubledouble_epsilon=0x1p-52;"), "{output}");
+    assert!(
+        output.contains("constchar*user_label_prefix=\"\";"),
+        "{output}"
+    );
     assert!(result.stdout.contains("\"Feb 29 2000\""));
     assert!(result.stdout.contains("\"12:34:56\""));
     assert!(result.stdout.contains(&format!("\"{}\"", source.display())));
@@ -552,6 +584,38 @@ fn emits_predefined_dynamic_and_reproducible_macros() {
     macros.assert_success();
     for definition in [
         "#define __CCC__ 1",
+        "#define __DBL_DECIMAL_DIG__ 17",
+        "#define __DBL_DENORM_MIN__ 0x1p-1074",
+        "#define __DBL_DIG__ 15",
+        "#define __DBL_EPSILON__ 0x1p-52",
+        "#define __DBL_HAS_DENORM__ 1",
+        "#define __DBL_HAS_INFINITY__ 1",
+        "#define __DBL_HAS_QUIET_NAN__ 1",
+        "#define __DBL_MANT_DIG__ 53",
+        "#define __DBL_MAX_10_EXP__ 308",
+        "#define __DBL_MAX_EXP__ 1024",
+        "#define __DBL_MAX__ 0x1.fffffffffffffp+1023",
+        "#define __DBL_MIN_10_EXP__ (-307)",
+        "#define __DBL_MIN_EXP__ (-1021)",
+        "#define __DBL_MIN__ 0x1p-1022",
+        "#define __DBL_NORM_MAX__ 0x1.fffffffffffffp+1023",
+        "#define __FLT_EVAL_METHOD__ 0",
+        "#define __FLT_DECIMAL_DIG__ 9",
+        "#define __FLT_DENORM_MIN__ 0x1p-149F",
+        "#define __FLT_DIG__ 6",
+        "#define __FLT_EPSILON__ 0x1p-23F",
+        "#define __FLT_HAS_DENORM__ 1",
+        "#define __FLT_HAS_INFINITY__ 1",
+        "#define __FLT_HAS_QUIET_NAN__ 1",
+        "#define __FLT_MANT_DIG__ 24",
+        "#define __FLT_MAX_10_EXP__ 38",
+        "#define __FLT_MAX_EXP__ 128",
+        "#define __FLT_MAX__ 0x1.fffffep+127F",
+        "#define __FLT_MIN_10_EXP__ (-37)",
+        "#define __FLT_MIN_EXP__ (-125)",
+        "#define __FLT_MIN__ 0x1p-126F",
+        "#define __FLT_NORM_MAX__ 0x1.fffffep+127F",
+        "#define __FLT_RADIX__ 2",
         "#define __GNUC__ 4",
         "#define __INTMAX_TYPE__ long int",
         "#define __PTRDIFF_TYPE__ long int",
@@ -560,6 +624,7 @@ fn emits_predefined_dynamic_and_reproducible_macros() {
         "#define __SIZE_TYPE__ long unsigned int",
         "#define __STDC__ 1",
         "#define __STDC_VERSION__ 201112L",
+        "#define __USER_LABEL_PREFIX__",
         "#define __WCHAR_TYPE__ int",
     ] {
         assert!(
@@ -1423,15 +1488,27 @@ fn include_next_resumes_after_the_directory_that_found_the_current_header() {
     let first = directory.path("first");
     directory.write(
         "first/chain.h",
-        "#define FIRST_VALUE 1\n#include_next <chain.h>\n",
+        concat!(
+            "#ifndef FIRST_CHAIN_H\n",
+            "#define FIRST_CHAIN_H\n",
+            "#define FIRST_VALUE 1\n",
+            "#include_next <chain.h>\n",
+            "#endif\n",
+        ),
     );
+    let unrelated = directory.path("unrelated");
+    fs::create_dir_all(&unrelated).unwrap();
     let second = directory.path("second");
     directory.write("second/chain.h", "#define SECOND_VALUE 2\n");
 
     let mut command = directory.command();
     command
         .args(["-E", "-P", "-nostdinc", "-I"])
-        .arg(first)
+        .arg(&first)
+        .arg("-I")
+        .arg(&unrelated)
+        .arg("-I")
+        .arg(&first)
         .arg("-I")
         .arg(second)
         .arg(&source);
@@ -1446,6 +1523,10 @@ fn include_next_resumes_after_the_directory_that_found_the_current_header() {
     let mut command = directory.command();
     command
         .args(["-E", "-P", "-std=c11", "-nostdinc", "-I"])
+        .arg(directory.path("first"))
+        .arg("-I")
+        .arg(directory.path("unrelated"))
+        .arg("-I")
         .arg(directory.path("first"))
         .arg("-I")
         .arg(directory.path("second"))

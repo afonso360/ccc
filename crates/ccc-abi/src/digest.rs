@@ -100,6 +100,7 @@ pub fn ir_shape_digest(
         encoder.tag(global.duration as u8);
         encoder.bool(global.tentative);
         encoder.string(&global.emission.symbol_name);
+        encoder.tag(global.emission.binding as u8);
         encoder.tag(global.emission.visibility as u8);
         encoder.option_string(global.emission.section.as_deref());
         encoder.option_u64(global.emission.requested_alignment);
@@ -140,6 +141,7 @@ pub fn translation_unit_digest(
             (
                 function.symbol_name.as_str(),
                 function.linkage as u8,
+                function.binding as u8,
                 function.visibility as u8,
                 u8::from(function.entry.is_some()),
             )
@@ -148,6 +150,7 @@ pub fn translation_unit_digest(
             (
                 global.emission.symbol_name.as_str(),
                 global.linkage as u8,
+                global.emission.binding as u8,
                 global.emission.visibility as u8,
                 global.emission.definition as u8,
             )
@@ -155,9 +158,10 @@ pub fn translation_unit_digest(
         .collect::<Vec<_>>();
     symbols.sort_unstable();
     encoder.len(symbols.len());
-    for (name, linkage, visibility, policy) in symbols {
+    for (name, linkage, binding, visibility, policy) in symbols {
         encoder.string(name);
         encoder.tag(linkage);
+        encoder.tag(binding);
         encoder.tag(visibility);
         encoder.tag(policy);
     }
@@ -208,6 +212,10 @@ fn encode_types(encoder: &mut Encoder, types: &TypeStore) -> Result<(), AbiError
                         encoder.tag(2);
                         encoder.u32(id.0);
                     }
+                    ArrayLength::UnspecifiedVariable(id) => {
+                        encoder.tag(3);
+                        encoder.u32(id.0);
+                    }
                 }
             }
             TypeKind::Function(signature) => {
@@ -252,6 +260,7 @@ fn encode_types(encoder: &mut Encoder, types: &TypeStore) -> Result<(), AbiError
                 encoder.option_string(definition.tag.as_deref());
                 encoder.option_u64(definition.packing.maximum_field_alignment);
                 encoder.u64(definition.packing.minimum_record_alignment);
+                encoder.bool(definition.transparent_union);
                 encoder.bool(definition.fields.is_some());
                 if let Some(fields) = &definition.fields {
                     encoder.len(fields.len());
@@ -260,6 +269,7 @@ fn encode_types(encoder: &mut Encoder, types: &TypeStore) -> Result<(), AbiError
                         encoder.qualified(field.ty);
                         encoder
                             .option_u64(field.bitfield.map(|bitfield| u64::from(bitfield.width)));
+                        encoder.option_u64(field.requested_alignment);
                     }
                 }
             }
@@ -348,6 +358,7 @@ fn encode_function(encoder: &mut Encoder, function: &gir::FullFunction) {
     encoder.type_id(function.signature);
     encoder.tag(function.storage_class as u8);
     encoder.tag(function.linkage as u8);
+    encoder.tag(function.binding as u8);
     encoder.tag(function.visibility as u8);
     encoder.bool(function.properties.inline);
     encoder.bool(function.properties.no_return);
@@ -370,6 +381,7 @@ fn encode_function(encoder: &mut Encoder, function: &gir::FullFunction) {
         encoder.qualified(storage.ty);
         encoder.tag(storage.duration as u8);
         encoder.tag(storage.location as u8);
+        encoder.option_u64(storage.requested_alignment);
         encoder.len(storage.required_by.len());
         for reason in &storage.required_by {
             encoder.tag(*reason as u8);
@@ -678,6 +690,126 @@ fn encode_instruction(encoder: &mut Encoder, instruction: &gir::FullInstructionK
             encoder.tag(26);
             encoder.u32(list.0);
         }
+        I::MemoryFence { order } => {
+            encoder.tag(27);
+            encoder.tag(*order as u8);
+        }
+        I::AtomicReadModifyWrite {
+            operation,
+            address,
+            operand,
+            object,
+            return_new,
+            order,
+        } => {
+            encoder.tag(28);
+            encoder.tag(*operation as u8);
+            encoder.u32(address.0);
+            encoder.u32(operand.0);
+            encoder.qualified(*object);
+            encoder.bool(*return_new);
+            encoder.tag(*order as u8);
+        }
+        I::AtomicCompareExchange {
+            address,
+            expected,
+            replacement,
+            object,
+            order,
+        } => {
+            encoder.tag(29);
+            encoder.u32(address.0);
+            encoder.u32(expected.0);
+            encoder.u32(replacement.0);
+            encoder.qualified(*object);
+            encoder.tag(*order as u8);
+        }
+        I::IntegerIntrinsic { operation, operand } => {
+            encoder.tag(30);
+            encoder.tag(*operation as u8);
+            encoder.u32(operand.0);
+        }
+        I::Prefetch {
+            address,
+            write,
+            locality,
+        } => {
+            encoder.tag(31);
+            encoder.u32(address.0);
+            encoder.bool(*write);
+            encoder.tag(*locality);
+        }
+        I::RuntimeSizedAllocate {
+            storage,
+            extents,
+            element,
+            constant_factor,
+            requested_alignment,
+        } => {
+            encoder.tag(32);
+            encoder.u32(storage.0);
+            encoder.len(extents.len());
+            for extent in extents {
+                encoder.u32(extent.0);
+            }
+            encoder.qualified(*element);
+            encoder.u64(*constant_factor);
+            encoder.option_u64(*requested_alignment);
+        }
+        I::RuntimePointerOffset {
+            base,
+            index,
+            element,
+            extents,
+            subtract,
+        } => {
+            encoder.tag(33);
+            encoder.u32(base.0);
+            encoder.u32(index.0);
+            encoder.qualified(*element);
+            encoder.len(extents.len());
+            for extent in extents {
+                encoder.u32(extent.0);
+            }
+            encoder.bool(*subtract);
+        }
+        I::RuntimePointerDifference {
+            left,
+            right,
+            element,
+            extents,
+        } => {
+            encoder.tag(34);
+            encoder.u32(left.0);
+            encoder.u32(right.0);
+            encoder.qualified(*element);
+            encoder.len(extents.len());
+            for extent in extents {
+                encoder.u32(extent.0);
+            }
+        }
+        I::MemoryCopy {
+            destination,
+            source,
+            length,
+            overlap,
+        } => {
+            encoder.tag(35);
+            encoder.u32(destination.0);
+            encoder.u32(source.0);
+            encoder.u32(length.0);
+            encoder.bool(*overlap);
+        }
+        I::MemorySet {
+            destination,
+            value,
+            length,
+        } => {
+            encoder.tag(36);
+            encoder.u32(destination.0);
+            encoder.u32(value.0);
+            encoder.u32(length.0);
+        }
     }
 }
 
@@ -716,6 +848,14 @@ fn encode_terminator(encoder: &mut Encoder, terminator: &gir::FullTerminator) {
             encoder.option_u64(value.map(|value| u64::from(value.0)));
         }
         gir::FullTerminator::Unreachable => encoder.tag(4),
+        gir::FullTerminator::IndirectBranch { selector, targets } => {
+            encoder.tag(5);
+            encoder.u32(selector.0);
+            encoder.len(targets.len());
+            for target in targets {
+                encode_edge(encoder, target);
+            }
+        }
     }
 }
 

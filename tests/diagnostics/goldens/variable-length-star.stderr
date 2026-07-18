@@ -1,0 +1,5 @@
+ccc: error[CCC2223]: `[*]` is only permitted in function prototype scope
+ --> tests/diagnostics/cases/variable-length-star.c:2:18
+   |
+ 2 |     int (*matrix)[*];
+   |                  ^^^

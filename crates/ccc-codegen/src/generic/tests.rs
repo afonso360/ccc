@@ -214,6 +214,182 @@ fn function_visibility_reaches_native_objects_and_variadic_assembly() {
     }
 }
 
+#[test]
+fn weak_binding_reaches_defined_and_undefined_elf_symbols() {
+    const SOURCE: &str = "extern int weak_import(void) __attribute__((__weak__));\n\
+         extern int weak_data_import __attribute__((weak));\n\
+         int weak_function(void) __attribute__((weak));\n\
+         int weak_function(void) { return 7; }\n\
+         int weak_data __attribute__((weak)) = 11;\n\
+         int weak_zero __attribute__((weak));\n\
+         int strong_function(void) { return 13; }\n\
+         int retain_imports(void) { return weak_import() + weak_data_import; }";
+    let module = lower_source(SOURCE);
+    assert_eq!(
+        module
+            .functions
+            .iter()
+            .find(|function| function.name == "weak_function")
+            .unwrap()
+            .binding,
+        SymbolBinding::Weak
+    );
+    assert_eq!(
+        module
+            .globals
+            .iter()
+            .find(|global| global.name == "weak_data")
+            .unwrap()
+            .emission
+            .binding,
+        SymbolBinding::Weak
+    );
+    let output = emit(
+        &module,
+        &EffectiveCompilationConfig::default(),
+        Options { emit_clif: true },
+    )
+    .unwrap();
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    for (name, undefined) in [
+        ("weak_import", true),
+        ("weak_data_import", true),
+        ("weak_function", false),
+        ("weak_data", false),
+        ("weak_zero", false),
+    ] {
+        let symbol = object
+            .symbols()
+            .find(|symbol| symbol.name() == Ok(name))
+            .unwrap_or_else(|| panic!("missing `{name}`"));
+        assert!(symbol.is_weak(), "{name}");
+        assert_eq!(symbol.is_undefined(), undefined, "{name}");
+    }
+    assert!(
+        object
+            .symbol_by_name("strong_function")
+            .unwrap()
+            .is_global()
+    );
+    assert!(!object.symbol_by_name("strong_function").unwrap().is_weak());
+    let weak_zero = object.symbol_by_name("weak_zero").unwrap();
+    let section = object
+        .section_by_index(weak_zero.section_index().expect("weak definition section"))
+        .unwrap();
+    assert_eq!(section.kind(), object::SectionKind::UninitializedData);
+}
+
+#[test]
+fn thread_local_accesses_use_manifested_generated_accessors() {
+    const SOURCE: &str = "_Thread_local int external_value = 7;\n\
+         int read_values(void) {\n\
+             static _Thread_local int block_value = 5;\n\
+             ++external_value;\n\
+             return external_value + block_value;\n\
+         }";
+    let module = lower_source(SOURCE);
+    let config = EffectiveCompilationConfig::default();
+    let plan = ccc_abi::plan_module(&module, &config).unwrap();
+    assert_eq!(plan.artifacts.tls_accessors.len(), 2);
+    assert_eq!(
+        plan.artifacts.packaging.generated_assembly_units, 2,
+        "one deterministic assembly unit is planned per TLS object"
+    );
+    let first_dump = ccc_abi::dump_module_plan(plan.verify_against(&module, &config).unwrap());
+    let second = ccc_abi::plan_module(&module, &config).unwrap();
+    assert_eq!(
+        first_dump,
+        ccc_abi::dump_module_plan(second.verify_against(&module, &config).unwrap())
+    );
+
+    let output = emit(&module, &config, Options { emit_clif: true }).unwrap();
+    assert!(!output.clif.contains("tls_value"), "{}", output.clif);
+    assert_eq!(output.assemblies.len(), 2);
+    assert_eq!(
+        output
+            .manifest
+            .symbols()
+            .iter()
+            .filter(|symbol| symbol.kind == ccc_link::bridge::GeneratedSymbolKind::TlsAccessor)
+            .count(),
+        2
+    );
+    let block = module
+        .globals
+        .iter()
+        .find(|global| global.name == "block_value")
+        .unwrap();
+    let block_manifest = output
+        .manifest
+        .symbols()
+        .iter()
+        .find(|symbol| symbol.name == block.emission.symbol_name)
+        .unwrap();
+    assert_eq!(
+        block_manifest.kind,
+        ccc_link::bridge::GeneratedSymbolKind::TlsObject
+    );
+    assert_eq!(
+        block_manifest.visibility,
+        ccc_link::artifact::GeneratedSymbolVisibility::SourceInternal
+    );
+    let block_accessor = output
+        .assemblies
+        .iter()
+        .find(|assembly| assembly.source().contains(&block.emission.symbol_name))
+        .unwrap();
+    assert!(
+        block_accessor
+            .source()
+            .contains(&format!(".hidden {}", block.emission.symbol_name))
+    );
+
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    for global in &module.globals {
+        let symbol = object
+            .symbol_by_name(&global.emission.symbol_name)
+            .unwrap_or_else(|| panic!("missing TLS symbol `{}`", global.emission.symbol_name));
+        assert_eq!(symbol.kind(), object::SymbolKind::Tls);
+    }
+    output.into_artifact_bundle().verify().unwrap();
+}
+
+#[test]
+fn incomplete_extern_arrays_remain_layout_free_undefined_data() {
+    const SOURCE: &str = "extern const char bytes[];\n\
+         extern int values[];\n\
+         int read_imports(void) { return bytes[0] + values[0]; }";
+    let module = lower_source(SOURCE);
+    for name in ["bytes", "values"] {
+        let global = module
+            .globals
+            .iter()
+            .find(|global| global.name == name)
+            .unwrap();
+        assert_eq!(
+            global.emission.definition,
+            ObjectDefinitionPolicy::Declaration
+        );
+        let ccc_types::TypeKind::Array(array) = module.types.kind(global.ty.ty) else {
+            panic!("{name} should have array type")
+        };
+        assert_eq!(array.length, ccc_types::ArrayLength::Incomplete);
+    }
+
+    let config = EffectiveCompilationConfig::default();
+    ccc_abi::plan_module(&module, &config).unwrap();
+    let output = emit(&module, &config, Options { emit_clif: true }).unwrap();
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    for name in ["bytes", "values"] {
+        let symbol = object
+            .symbol_by_name(name)
+            .unwrap_or_else(|| panic!("missing `{name}`"));
+        assert!(symbol.is_undefined(), "{name}");
+        assert!(symbol.is_global(), "{name}");
+        assert_eq!(symbol.kind(), object::SymbolKind::Data, "{name}");
+    }
+}
+
 fn symbol_bytes(object_bytes: &[u8], name: &str) -> Vec<u8> {
     let file = object::File::parse(object_bytes).unwrap();
     let symbol = file
@@ -237,6 +413,45 @@ fn function_clif<'a>(clif: &'a str, name: &str) -> &'a str {
     let body = &clif[start + marker.len()..];
     let end = body.find("; function ").unwrap_or(body.len());
     &body[..end]
+}
+
+#[test]
+fn computed_goto_uses_a_dense_br_table_and_nonrelocatable_label_tokens() {
+    let output = emit_source(
+        "int dispatch(int which) {\n\
+             static void *table[2] = {&&left, &&right};\n\
+             goto *table[which];\n\
+         left: return 11;\n\
+         right: return 22;\n\
+         }\n\
+         int invalid(void) { goto *(void *)0; unused: return 0; }",
+    );
+    let dispatch = function_clif(&output.clif, "dispatch");
+    assert_eq!(dispatch.matches("br_table").count(), 1, "{dispatch}");
+    assert!(dispatch.contains("[block0, block1]"), "{dispatch}");
+    assert!(dispatch.contains("trap user1"), "{dispatch}");
+
+    let invalid = function_clif(&output.clif, "invalid");
+    assert!(invalid.contains("iconst.i32 0"), "{invalid}");
+    assert!(
+        invalid.contains("iadd_imm") && invalid.contains("-1"),
+        "{invalid}"
+    );
+    assert!(invalid.contains("icmp_imm ugt"), "{invalid}");
+    assert!(invalid.contains("br_table"), "{invalid}");
+    assert!(invalid.contains("trap user1"), "{invalid}");
+
+    let table_name = "__ccc_block_static.dispatch.0.1.table";
+    assert_eq!(
+        symbol_bytes(&output.object, table_name),
+        [1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0]
+    );
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    let table = object.symbol_by_name(table_name).unwrap();
+    let section = object
+        .section_by_index(table.section_index().unwrap())
+        .unwrap();
+    assert_eq!(section.relocations().count(), 0);
 }
 
 fn sha256(text: &str) -> String {
@@ -279,7 +494,7 @@ fn complete_abi_plan_and_aggregate_clif_have_exact_snapshots() {
     assert!(dump.contains("packaging assembly-units=2"), "{dump}");
     assert_eq!(
         sha256(&dump),
-        "03f37e9d0f6df3a5ebdba7f091a4f77f1d4fbb39dc8242ab39e0e0b384c702a3"
+        "6e96880231371cdc038ca2453549b5d3a0c047b96766193efe448cd1df17c742"
     );
 
     let output = emit(&module, &config, Options { emit_clif: true }).unwrap();
@@ -441,6 +656,21 @@ fn runtime_bool_conversion_normalizes_nonzero_values() {
 }
 
 #[test]
+fn integer_to_pointer_widening_preserves_source_signedness() {
+    let output = emit_source(
+        "void *from_signed(int value) { return (void *)value; }\n\
+         void *from_unsigned(unsigned int value) { return (void *)value; }",
+    );
+    let signed = function_clif(&output.clif, "from_signed");
+    assert!(signed.contains("sextend.i64"), "{signed}");
+    assert!(!signed.contains("uextend.i64"), "{signed}");
+
+    let unsigned = function_clif(&output.clif, "from_unsigned");
+    assert!(unsigned.contains("uextend.i64"), "{unsigned}");
+    assert!(!unsigned.contains("sextend.i64"), "{unsigned}");
+}
+
+#[test]
 fn static_bool_initializers_normalize_and_tentative_data_uses_elf_common() {
     let output = emit_source(
         "static _Bool normalized = 7;\n\
@@ -532,6 +762,35 @@ fn long_double_definitions_are_rejected_while_variadic_calls_use_a_bridge() {
 }
 
 #[test]
+fn unprototyped_calls_use_the_generic_bridge_with_the_promoted_actual_plan() {
+    let module = lower_source(
+        "int legacy();\n\
+         int invoke(float floating, signed char narrow) { return legacy(floating, narrow); }",
+    );
+    let config = EffectiveCompilationConfig::default();
+    let plan = ccc_abi::plan_module(&module, &config).unwrap();
+    let call = plan.calls.values().next().unwrap();
+    assert_eq!(call.promoted_actual_types, [TypeId::DOUBLE, TypeId::INT]);
+    assert_eq!(call.fixed_boundary, 0);
+    let ccc_abi::BoundaryPlan::Bridge(boundary) = &call.boundary else {
+        panic!("unprototyped call must use the assembly bridge")
+    };
+    assert_eq!(boundary.kind, ccc_abi::BridgeKind::UnprototypedCall);
+    assert_eq!(boundary.variadic_sse_count, 1);
+
+    let output = emit(&module, &config, Options { emit_clif: true }).unwrap();
+    assert_eq!(output.assemblies.len(), 1);
+    assert!(
+        output.assemblies[0].source().contains("call *%r11"),
+        "{}",
+        output.assemblies[0].source()
+    );
+    let clif = function_clif(&output.clif, "invoke");
+    assert!(clif.contains("fpromote"), "{clif}");
+    assert!(clif.contains("call fn"), "{clif}");
+}
+
+#[test]
 fn floating_storage_and_a_preallocated_label_keep_the_real_entry_first() {
     let output = emit_source(
         "int classify(float value) {\n\
@@ -584,6 +843,215 @@ fn volatile_scalar_accesses_have_exact_fence_order_in_clif_and_machine_code() {
             .filter(|bytes| *bytes == mfence)
             .count(),
         4
+    );
+}
+
+#[test]
+fn sync_synchronize_is_one_native_full_fence_without_an_external_symbol() {
+    let output = emit_source("void synchronize(void) { __sync_synchronize(); }");
+    let clif = function_clif(&output.clif, "synchronize");
+    assert_eq!(
+        clif.lines().filter(|line| line.trim() == "fence").count(),
+        1,
+        "{clif}"
+    );
+
+    let machine = symbol_bytes(&output.object, "synchronize");
+    let mfence = [0x0f, 0xae, 0xf0];
+    assert_eq!(
+        machine
+            .windows(mfence.len())
+            .filter(|bytes| *bytes == mfence)
+            .count(),
+        1
+    );
+
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    assert!(object.symbol_by_name("__sync_synchronize").is_none());
+    assert!(
+        object
+            .symbols()
+            .filter(|symbol| symbol.is_undefined())
+            .all(|symbol| symbol.name() != Ok("__sync_synchronize"))
+    );
+}
+
+#[test]
+fn legacy_sync_operations_are_native_atomics_without_external_symbols() {
+    let output = emit_source(
+        "int value;\n\
+         void *pointer;\n\
+         int protected_side_effect(void);\n\
+         int update(int delta) {\n\
+             int old = __sync_fetch_and_add(&value, delta);\n\
+             int now = __sync_add_and_fetch(&value, delta, protected_side_effect());\n\
+             int after = __sync_sub_and_fetch(&value, delta, __sync_synchronize);\n\
+             int changed = __sync_bool_compare_and_swap(&value, old, now);\n\
+             int seen = __sync_val_compare_and_swap(&value, now, after);\n\
+             pointer = __sync_lock_test_and_set(&pointer, (void *)0);\n\
+             pointer = __sync_add_and_fetch(&pointer, 1);\n\
+             return old + now + after + changed + seen;\n\
+         }",
+    );
+    let clif = function_clif(&output.clif, "update");
+    assert_eq!(clif.matches("atomic_rmw").count(), 5, "{clif}");
+    assert_eq!(clif.matches("atomic_cas").count(), 2, "{clif}");
+    assert!(clif.contains("atomic_rmw.i32 add"), "{clif}");
+    assert!(clif.contains("atomic_rmw.i32 sub"), "{clif}");
+    assert!(clif.contains("atomic_rmw.i64 xchg"), "{clif}");
+
+    let machine = symbol_bytes(&output.object, "update");
+    assert!(
+        machine.iter().filter(|byte| **byte == 0xf0).count() >= 6,
+        "the integer RMW and compare-exchange operations must use locked x86 instructions"
+    );
+
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    for symbol in [
+        "__sync_add_and_fetch",
+        "__sync_fetch_and_add",
+        "__sync_sub_and_fetch",
+        "__sync_bool_compare_and_swap",
+        "__sync_val_compare_and_swap",
+        "__sync_lock_test_and_set",
+    ] {
+        assert!(
+            object
+                .symbols()
+                .filter(|candidate| candidate.is_undefined())
+                .all(|candidate| candidate.name() != Ok(symbol)),
+            "unexpected external reference to {symbol}"
+        );
+    }
+    assert!(
+        object
+            .sections()
+            .flat_map(|section| section.relocations())
+            .all(|(_, relocation)| {
+                let RelocationTarget::Symbol(index) = relocation.target() else {
+                    return true;
+                };
+                object.symbol_by_index(index).unwrap().name() != Ok("protected_side_effect")
+            }),
+        "the ignored protected operand must not produce a call relocation"
+    );
+}
+
+#[test]
+fn pointer_add_and_fetch_derives_the_raw_new_representation_in_clif() {
+    let output =
+        emit_source("void *advance(void **slot) { return __sync_add_and_fetch(slot, 1); }");
+    let clif = function_clif(&output.clif, "advance");
+    assert!(clif.contains("atomic_rmw.i64 add"), "{clif}");
+    assert!(clif.lines().any(|line| line.contains(" = iadd ")), "{clif}");
+}
+
+#[test]
+fn integer_intrinsics_are_native_clif_operations_without_external_symbols() {
+    let output = emit_source(
+        "unsigned long swap(unsigned long value) { return __builtin_bswap64(value); }\n\
+         int clz_int(unsigned int value) { return __builtin_clz(value); }\n\
+         int clz_long(unsigned long value) { return __builtin_clzl(value); }\n\
+         int clz_long_long(unsigned long long value) { return __builtin_clzll(value); }\n\
+         int ctz_int(unsigned int value) { return __builtin_ctz(value); }\n\
+         int ctz_long_long(unsigned long long value) { return __builtin_ctzll(value); }\n\
+         int popcount_int(unsigned int value) { return __builtin_popcount(value); }\n\
+         int popcount_long_long(unsigned long long value) { return __builtin_popcountll(value); }",
+    );
+    for (operation, expected) in [("bswap", 1), ("clz", 3), ("ctz", 2), ("popcnt", 2)] {
+        assert_eq!(
+            output
+                .clif
+                .lines()
+                .filter(|line| line.contains(&format!(" = {operation} ")))
+                .count(),
+            expected,
+            "{}",
+            output.clif
+        );
+    }
+
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    for symbol in [
+        "__builtin_bswap64",
+        "__builtin_clz",
+        "__builtin_clzl",
+        "__builtin_clzll",
+        "__builtin_ctz",
+        "__builtin_ctzll",
+        "__builtin_popcount",
+        "__builtin_popcountll",
+    ] {
+        assert!(
+            object
+                .symbols()
+                .filter(|candidate| candidate.is_undefined())
+                .all(|candidate| candidate.name() != Ok(symbol)),
+            "unexpected external reference to {symbol}"
+        );
+    }
+}
+
+#[test]
+fn memory_builtins_lower_to_target_libcalls() {
+    let output = emit_source(
+        "void *operations(char *to, char *from, unsigned long count) {\n\
+             __builtin_memcpy(to, from, count);\n\
+             __builtin_memmove(to + 1, to, count - 1);\n\
+             return __builtin_memset(to, 65, count);\n\
+         }",
+    );
+    let clif = function_clif(&output.clif, "operations");
+    assert!(clif.contains("call fn"), "{clif}");
+
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    for symbol in ["memcpy", "memmove", "memset"] {
+        assert!(
+            object
+                .symbols()
+                .filter(|candidate| candidate.is_undefined())
+                .any(|candidate| candidate.name() == Ok(symbol)),
+            "missing target libcall reference to {symbol}"
+        );
+    }
+}
+
+#[test]
+fn prefetch_evaluates_its_address_once_without_a_faulting_access_or_symbol() {
+    let output = emit_source(
+        "void *next_address(void);\n\
+         int protected_side_effect(void);\n\
+         void hints(void) {\n\
+             __builtin_prefetch(\n\
+                 next_address(),\n\
+                 1 ? 0 : protected_side_effect(),\n\
+                 1 ? 3 : protected_side_effect());\n\
+             __builtin_prefetch((void *)1, 1, 0);\n\
+         }",
+    );
+    let clif = function_clif(&output.clif, "hints");
+    assert_eq!(clif.matches("call fn").count(), 1, "{clif}");
+    assert!(!clif.contains("load"), "{clif}");
+    assert!(!clif.contains("store"), "{clif}");
+
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    assert!(object.symbol_by_name("__builtin_prefetch").is_none());
+    assert!(
+        object
+            .symbol_by_name("next_address")
+            .is_some_and(|symbol| symbol.is_undefined())
+    );
+    assert!(
+        object
+            .sections()
+            .flat_map(|section| section.relocations())
+            .all(|(_, relocation)| {
+                let RelocationTarget::Symbol(index) = relocation.target() else {
+                    return true;
+                };
+                object.symbol_by_index(index).unwrap().name() != Ok("protected_side_effect")
+            }),
+        "the accepted constant hints must not produce a call relocation"
     );
 }
 
@@ -717,4 +1185,45 @@ fn packed_and_bitfield_memory_paths_remain_unaligned_and_explicit() {
     assert!(!clif.contains(" aligned"), "{clif}");
     assert!(clif.contains("ushr_imm") || clif.contains("ushr"), "{clif}");
     assert!(clif.contains("band_imm") || clif.contains("band"), "{clif}");
+}
+
+#[test]
+fn automatic_alignment_requests_reach_effective_stack_addresses() {
+    let output = emit_source(
+        "int inspect(void) {\n\
+             _Alignas(64) int value = 7;\n\
+             volatile int *address = &value;\n\
+             return *address;\n\
+         }",
+    );
+    let clif = function_clif(&output.clif, "inspect");
+    assert!(clif.contains("explicit_slot 67, align = 16"), "{clif}");
+    assert!(clif.contains("iconst.i64 -64"), "{clif}");
+    assert!(clif.contains("band"), "{clif}");
+}
+
+#[test]
+fn runtime_sized_storage_uses_checked_arena_growth_and_cleanup() {
+    let output = emit_source(
+        "int inspect(int rows, int columns) {
+             _Alignas(64) int matrix[rows][columns];
+             matrix[rows - 1][columns - 1] = 17;
+             return matrix[rows - 1][columns - 1];
+         }",
+    );
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    for name in ["realloc", "free"] {
+        let symbol = object
+            .symbols()
+            .find(|symbol| symbol.name() == Ok(name))
+            .unwrap_or_else(|| panic!("missing arena provider import `{name}`"));
+        assert!(symbol.is_undefined(), "{name}");
+    }
+
+    let clif = function_clif(&output.clif, "inspect");
+    assert!(clif.contains("umul_overflow"), "{clif}");
+    assert!(clif.contains("uadd_overflow"), "{clif}");
+    assert!(clif.contains("trapnz"), "{clif}");
+    assert!(clif.contains("iconst.i64 -64"), "{clif}");
+    assert!(clif.matches("call").count() >= 2, "{clif}");
 }

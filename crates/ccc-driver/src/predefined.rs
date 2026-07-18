@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ccc_target::{CapabilityKind, EffectiveCompilationConfig};
+use ccc_target::{CapabilityKind, EffectiveCompilationConfig, RelocationModel};
 
 pub(crate) fn additional_predefined_macros(
     config: &EffectiveCompilationConfig,
@@ -16,6 +16,20 @@ pub(crate) fn additional_predefined_macros(
         ("__CCC_PATCHLEVEL__", "0"),
     ] {
         macros.insert(name.to_owned(), replacement.to_owned());
+    }
+
+    if matches!(
+        config.relocation_model,
+        RelocationModel::Pic | RelocationModel::Pie
+    ) {
+        for name in ["__PIC__", "__pic__"] {
+            macros.insert(name.to_owned(), "2".to_owned());
+        }
+    }
+    if config.relocation_model == RelocationModel::Pie {
+        for name in ["__PIE__", "__pie__"] {
+            macros.insert(name.to_owned(), "2".to_owned());
+        }
     }
 
     for (name, capability) in [
@@ -115,6 +129,10 @@ mod tests {
         );
         assert_eq!(macros.get("__GNUC__").map(String::as_str), Some("4"));
         assert_eq!(
+            macros.get("__USER_LABEL_PREFIX__").map(String::as_str),
+            Some("")
+        );
+        assert_eq!(
             macros.get("__SIZEOF_POINTER__").map(String::as_str),
             Some("8")
         );
@@ -138,9 +156,40 @@ mod tests {
             ("__GNUC__", "4"),
             ("__GNUC_MINOR__", "2"),
             ("__GNUC_PATCHLEVEL__", "1"),
+            ("__PIC__", "2"),
+            ("__pic__", "2"),
+            ("__PIE__", "2"),
+            ("__pie__", "2"),
         ] {
             assert_eq!(macros.get(name).map(String::as_str), Some(expected));
         }
+    }
+
+    #[test]
+    fn static_relocation_model_omits_position_independent_macros() {
+        let config = EffectiveCompilationConfig {
+            relocation_model: RelocationModel::Static,
+            ..EffectiveCompilationConfig::default()
+        };
+
+        let macros = additional_predefined_macros(&config);
+        for name in ["__PIC__", "__pic__", "__PIE__", "__pie__"] {
+            assert!(!macros.contains_key(name), "unexpected macro {name}");
+        }
+    }
+
+    #[test]
+    fn pic_relocation_model_does_not_advertise_a_pie_compilation() {
+        let config = EffectiveCompilationConfig {
+            relocation_model: RelocationModel::Pic,
+            ..EffectiveCompilationConfig::default()
+        };
+
+        let macros = additional_predefined_macros(&config);
+        assert_eq!(macros.get("__PIC__").map(String::as_str), Some("2"));
+        assert_eq!(macros.get("__pic__").map(String::as_str), Some("2"));
+        assert!(!macros.contains_key("__PIE__"));
+        assert!(!macros.contains_key("__pie__"));
     }
 
     #[test]

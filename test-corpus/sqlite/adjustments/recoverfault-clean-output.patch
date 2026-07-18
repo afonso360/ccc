@@ -1,0 +1,14 @@
+diff --git a/ext/recover/recoverfault.test b/ext/recover/recoverfault.test
+--- a/ext/recover/recoverfault.test
++++ b/ext/recover/recoverfault.test
+@@ -13,6 +13,8 @@
+ source [file join [file dirname [info script]] recover_common.tcl]
+ set testprefix recoverfault
+-
+-
++
++forcedelete test.db2
++
++
+ #--------------------------------------------------------------------------
+ proc compare_result {db1 db2 sql} {

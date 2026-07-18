@@ -1,0 +1,335 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+script_directory=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+source "$script_directory/../adapter-environment.sh"
+
+: "${CCC:?set CCC to the ccc executable}"
+: "${CCC_RESOURCE_DIR:?set CCC_RESOURCE_DIR to the shipped resource directory}"
+: "${CCC_LINK_CC:=gcc}"
+
+export CCC_CC="$CCC_LINK_CC"
+
+command -v "$CCC" >/dev/null 2>&1 || {
+  echo "ccc-cc: CCC is not executable: $CCC" >&2
+  exit 2
+}
+[[ -d "$CCC_RESOURCE_DIR" ]] || {
+  echo "ccc-cc: resource directory does not exist: $CCC_RESOURCE_DIR" >&2
+  exit 2
+}
+command -v "$CCC_LINK_CC" >/dev/null 2>&1 || {
+  echo "ccc-cc: link driver is not executable: $CCC_LINK_CC" >&2
+  exit 2
+}
+
+log_command() {
+  if [[ -z "${CCC_SQLITE_COMMAND_LOG:-}" ]]; then
+    return
+  fi
+  local line=$1
+  local argument rendered
+  shift
+  for argument in "$@"; do
+    printf -v rendered '%q' "$argument"
+    line+=" $rendered"
+  done
+  printf '%s\n' "$line" >>"$CCC_SQLITE_COMMAND_LOG"
+}
+
+record_source() {
+  local source=$1
+  local parent absolute root generated_root
+  local allowed=false
+  [[ -f "$source" ]] || {
+    echo "ccc-cc: C source does not exist: $source" >&2
+    exit 2
+  }
+  parent=$(cd "$(dirname "$source")" && pwd -P)
+  absolute="$parent/$(basename "$source")"
+
+  if [[ -n "${CCC_SQLITE_SOURCE_ROOT:-}" ]]; then
+    root=$(cd "$CCC_SQLITE_SOURCE_ROOT" && pwd -P)
+    if [[ "$absolute" == "$root/"* ]]; then
+      allowed=true
+    fi
+  fi
+  if [[ -n "${CCC_SQLITE_GENERATED_SOURCE_ROOT:-}" ]]; then
+    generated_root=$(cd "$CCC_SQLITE_GENERATED_SOURCE_ROOT" && pwd -P)
+    if [[ "$absolute" == "$generated_root/"* ]]; then
+      allowed=true
+    fi
+  fi
+  if { [[ -n "${CCC_SQLITE_SOURCE_ROOT:-}" ]] ||
+    [[ -n "${CCC_SQLITE_GENERATED_SOURCE_ROOT:-}" ]]; } && ! $allowed; then
+    echo "ccc-cc: C source is outside the pinned SQLite source surface: $absolute" >&2
+    exit 2
+  fi
+  if [[ -n "${CCC_SQLITE_SOURCE_LOG:-}" ]]; then
+    printf '%s\n' "$absolute" >>"$CCC_SQLITE_SOURCE_LOG"
+  fi
+}
+
+run_ccc() {
+  local effective_standard=gnu11
+  local strict_ansi_state=absent
+  local profile=ordinary
+  local source=unknown
+  local source_parent absolute_source generated_root
+  local argument
+  local compiler_arguments=("$@")
+
+  # CCC defaults to the manifest's GNU C11 mode. Explicit supported -std
+  # options retain the normal compiler-driver "last option wins" rule.
+  for argument in "${compiler_arguments[@]}"; do
+    case "$argument" in
+      -DSQLITE_OSS_FUZZ | -DSQLITE_OSS_FUZZ=*)
+        profile=fuzzcheck-support
+        ;;
+      *.c)
+        source=$argument
+        ;;
+    esac
+  done
+
+  # Only the generated amalgamation embeds src/hwtime.h.  When that one input
+  # is part of SQLite's fuzzcheck profile, define the exact upstream predicate
+  # that selects its no-assembly timing fallback.  Keep GNU C11 for every
+  # translation: fuzzcheck support code and Linux system headers use GNU
+  # syntax unrelated to hardware timing.
+  if [[ "${CCC_SQLITE_FUZZCHECK_HWTIME_FALLBACK:-0}" == 1 ]] &&
+    [[ "$profile" == fuzzcheck-support ]] &&
+    [[ -n "${CCC_SQLITE_GENERATED_SOURCE_ROOT:-}" ]] &&
+    [[ "$source" != unknown ]]; then
+    source_parent=$(cd "$(dirname "$source")" && pwd -P)
+    absolute_source="$source_parent/$(basename "$source")"
+    generated_root=$(cd "$CCC_SQLITE_GENERATED_SOURCE_ROOT" && pwd -P)
+    if [[ "$absolute_source" == "$generated_root/sqlite3.c" ]]; then
+      compiler_arguments+=(-D__STRICT_ANSI__=1)
+      profile=fuzzcheck-amalgamation
+    fi
+  fi
+
+  for argument in "${compiler_arguments[@]}"; do
+    case "$argument" in
+      -std=*)
+        effective_standard=${argument#-std=}
+        ;;
+      -D__STRICT_ANSI__ | -D__STRICT_ANSI__=*)
+        strict_ansi_state=defined
+        ;;
+      -U__STRICT_ANSI__)
+        strict_ansi_state=absent
+        ;;
+    esac
+  done
+
+  if [[ "${CCC_SQLITE_FUZZCHECK_HWTIME_FALLBACK:-0}" == 1 ]]; then
+    [[ "$effective_standard" == gnu11 ]] || {
+      echo "ccc-cc: every SQLite translation must use GNU C11, found -std=$effective_standard" >&2
+      exit 2
+    }
+    if [[ "$profile" == fuzzcheck-amalgamation ]]; then
+      [[ "$strict_ansi_state" == defined ]] || {
+        echo "ccc-cc: fuzzcheck sqlite3.c did not select the no-assembly hwtime predicate" >&2
+        exit 2
+      }
+    elif [[ "$strict_ansi_state" != absent ]]; then
+      echo "ccc-cc: __STRICT_ANSI__ override leaked outside fuzzcheck sqlite3.c" >&2
+      exit 2
+    fi
+  fi
+
+  if [[ -n "${CCC_SQLITE_LANGUAGE_MODE_LOG:-}" ]]; then
+    printf '%s %s strict-ansi=%s %q\n' \
+      "$effective_standard" "$profile" "$strict_ansi_state" "$source" \
+      >>"$CCC_SQLITE_LANGUAGE_MODE_LOG"
+  fi
+  log_command ccc "$CCC" -resource-dir "$CCC_RESOURCE_DIR" \
+    "${compiler_arguments[@]}"
+  "$CCC" -resource-dir "$CCC_RESOURCE_DIR" "${compiler_arguments[@]}"
+}
+
+run_linker() {
+  log_command link "$CCC_LINK_CC" "$@"
+  "$CCC_LINK_CC" "$@"
+}
+
+arguments=("$@")
+sources=()
+compile_arguments=()
+output=
+compile_only=false
+frontend_only=false
+
+for ((index = 0; index < ${#arguments[@]}; index++)); do
+  argument=${arguments[index]}
+  case "$argument" in
+    *.c)
+      sources+=("$argument")
+      ;;
+    -o)
+      if ((index + 1 >= ${#arguments[@]})); then
+        echo "ccc-cc: -o requires an argument" >&2
+        exit 2
+      fi
+      output=${arguments[index + 1]}
+      ((index += 1))
+      ;;
+    -c)
+      compile_only=true
+      ;;
+    -std=c99 | -std=gnu99)
+      # The supported GNU C11 default is the upstream-compatible superset.
+      ;;
+    -E | -M | -MM | --dump-* | --emit=*)
+      frontend_only=true
+      compile_arguments+=("$argument")
+      ;;
+    -fPIE | -fpie | -fno-PIE | -fno-pie | -fno-PIC | -fno-pic | \
+      -pie | --pie | -no-pie | --no-pie | -nopie)
+      # Exercise CCC's platform-default relocation policy.
+      ;;
+    -l?* | -L?* | -Wl,* | -Wl=* | -Xlinker=*)
+      ;;
+    -l | -L | -Xlinker)
+      if ((index + 1 >= ${#arguments[@]})); then
+        echo "ccc-cc: $argument requires an argument" >&2
+        exit 2
+      fi
+      ((index += 1))
+      ;;
+    *.o | *.a | *.so | *.lo)
+      ;;
+    *.s | *.S | *.asm)
+      echo "ccc-cc: assembly input is outside the selected SQLite C surface: $argument" >&2
+      exit 2
+      ;;
+    *.i | *.ii)
+      echo "ccc-cc: preprocessed source input is unsupported and will not be delegated: $argument" >&2
+      exit 2
+      ;;
+    *.cc | *.cp | *.cpp | *.cxx | *.C | *.m | *.mm)
+      echo "ccc-cc: non-C source input is outside the selected SQLite C surface: $argument" >&2
+      exit 2
+      ;;
+    -S)
+      echo "ccc-cc: assembly output is outside the selected SQLite C surface" >&2
+      exit 2
+      ;;
+    -x)
+      echo "ccc-cc: explicit language selection is unsupported and will not be delegated" >&2
+      exit 2
+      ;;
+    @*)
+      echo "ccc-cc: response files are unsupported because their C inputs cannot be audited" >&2
+      exit 2
+      ;;
+    *)
+      compile_arguments+=("$argument")
+      ;;
+  esac
+done
+
+unresolved_link_arguments=()
+for ((index = 0; index < ${#arguments[@]}; index++)); do
+  argument=${arguments[index]}
+  case "$argument" in
+    -std=*)
+      ;;
+    -Xlinker)
+      if ((index + 1 >= ${#arguments[@]})); then
+        echo "ccc-cc: -Xlinker requires an argument" >&2
+        exit 2
+      fi
+      linker_argument=${arguments[index + 1]}
+      if ! linker_token_overrides_default_pie "$linker_argument"; then
+        unresolved_link_arguments+=("$argument" "$linker_argument")
+      fi
+      ((index += 1))
+      ;;
+    *)
+      if filtered_argument=$(filter_default_pie_driver_argument "$argument"); then
+        unresolved_link_arguments+=("$filtered_argument")
+      fi
+      ;;
+  esac
+done
+
+if ((${#sources[@]} == 0)); then
+  if ((${#arguments[@]} == 1)) && [[ "${arguments[0]}" == "--version" ]]; then
+    printf 'ccc SQLite corpus adapter (C translation by %s; linking by %s)\n' \
+      "$CCC" "$CCC_LINK_CC"
+    exit 0
+  fi
+  run_linker "${unresolved_link_arguments[@]}"
+  exit $?
+fi
+
+if $frontend_only; then
+  if ((${#sources[@]} != 1)); then
+    echo "ccc-cc: frontend-only actions require exactly one C source" >&2
+    exit 2
+  fi
+  run_ccc "${arguments[@]}"
+  exit $?
+fi
+
+if $compile_only && [[ -n "$output" ]]; then
+  if ((${#sources[@]} != 1)); then
+    echo "ccc-cc: -o with -c requires exactly one C source" >&2
+    exit 2
+  fi
+fi
+
+object_directory=
+if ! $compile_only; then
+  object_directory=$(mktemp -d "${TMPDIR:-/tmp}/ccc-sqlite-objects.XXXXXX")
+  cleanup_object_directory() {
+    if [[ -n "$object_directory" ]] && [[ -d "$object_directory" ]]; then
+      rm -rf -- "$object_directory"
+    fi
+  }
+  trap cleanup_object_directory EXIT
+fi
+objects=()
+
+for ((index = 0; index < ${#sources[@]}; index++)); do
+  source=${sources[index]}
+  record_source "$source"
+  if $compile_only; then
+    if [[ -n "$output" ]]; then
+      object=$output
+    else
+      object=$(basename "${source%.c}.o")
+    fi
+  else
+    object="$object_directory/$index.o"
+  fi
+  if ((${#compile_arguments[@]})); then
+    run_ccc "${compile_arguments[@]}" -c "$source" -o "$object"
+  else
+    run_ccc -c "$source" -o "$object"
+  fi
+  objects+=("$object")
+done
+
+if $compile_only; then
+  exit 0
+fi
+
+link_arguments=()
+source_index=0
+for argument in "${unresolved_link_arguments[@]}"; do
+  case "$argument" in
+    *.c)
+      link_arguments+=("${objects[source_index]}")
+      ((source_index += 1))
+      ;;
+    *)
+      link_arguments+=("$argument")
+      ;;
+  esac
+done
+run_linker "${link_arguments[@]}"

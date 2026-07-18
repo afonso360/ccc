@@ -21,9 +21,10 @@ int values[] = {3, 4};
 
 int main(void) {
     struct Pair copy = source;
+    const struct Pair qualified_copy = copy;
     int unsigned_enum = LARGE > 2147483647;
     int signed_character = '\xff' == -1;
 
-    return copy.left + copy.right + values[0] + values[1] + adjust(3)
+    return qualified_copy.left + qualified_copy.right + values[0] + values[1] + adjust(3)
            + unsigned_enum + signed_character;
 }

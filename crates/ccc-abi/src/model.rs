@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use ccc_ir::{InstructionId, ValueId};
-use ccc_sema::generic::FullFunctionId;
+use ccc_ir::{DataId, InstructionId, ValueId};
+use ccc_sema::generic::{FullFunctionId, TlsModel};
 use ccc_session::Span;
 use ccc_target::CallingConvention;
 use ccc_types::TypeId;
@@ -173,6 +173,7 @@ pub struct BridgePiecePlan {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum BridgeKind {
+    UnprototypedCall,
     VariadicCall,
     VariadicEntry,
 }
@@ -269,6 +270,19 @@ pub struct VariadicEntryArtifactPlan {
     pub va_state_version: u16,
 }
 
+/// One compiler-generated function that materializes the address of a TLS
+/// object without relying on Cranelift's target-specific `tls_value` lowering.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TlsAccessorArtifactPlan {
+    pub object: DataId,
+    pub object_symbol: String,
+    pub helper_symbol: String,
+    pub model: TlsModel,
+    pub source_linkage: SourceLinkage,
+    pub source_visibility: SourceVisibility,
+    pub source_defined: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackagingPlan {
     pub generated_assembly_units: u32,
@@ -284,6 +298,7 @@ pub struct PackagingPlan {
 pub struct BridgeArtifactPlan {
     pub call_bridge: Option<CallBridgeArtifactPlan>,
     pub variadic_entries: BTreeMap<FullFunctionId, VariadicEntryArtifactPlan>,
+    pub tls_accessors: BTreeMap<DataId, TlsAccessorArtifactPlan>,
     pub packaging: PackagingPlan,
 }
 

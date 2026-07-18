@@ -44,6 +44,10 @@ pub enum PragmaEvent {
         option: Option<String>,
         span: Span,
     },
+    GccOptimize {
+        payload: Vec<PpToken>,
+        span: Span,
+    },
     Pack {
         payload: Vec<PpToken>,
         span: Span,
@@ -240,6 +244,8 @@ fn build_search_entries(session: &Session, options: &PreprocessOptions) -> Vec<S
             quote_only: false,
         });
     }
+    let mut seen = BTreeSet::new();
+    entries.retain(|entry| seen.insert((entry.path.clone(), entry.system, entry.quote_only)));
     entries
 }
 
@@ -626,6 +632,8 @@ impl Engine<'_> {
         let mut pending_file = logical_file.clone();
         let mut pending_system = frame.system;
         let mut pending_line_count = 0_usize;
+        let mut pending_is_expanded = false;
+        let mut pending_can_continue = false;
         for (line_index, (mut line, line_errors)) in
             lexed.lines.into_iter().zip(lexed.line_errors).enumerate()
         {
@@ -665,12 +673,19 @@ impl Engine<'_> {
             if let Some((name, operands, hash_span)) = directive {
                 if !pending_tokens.is_empty() {
                     let item_count_before_expansion = self.items.len();
-                    self.expand_ordinary_tokens(
-                        std::mem::take(&mut pending_tokens),
-                        &pending_file,
-                        pending_system,
-                        emit_tokens,
-                    );
+                    let tokens = std::mem::take(&mut pending_tokens);
+                    if pending_is_expanded {
+                        self.process_expanded_line(tokens, emit_tokens);
+                    } else {
+                        self.expand_ordinary_tokens(
+                            tokens,
+                            &pending_file,
+                            pending_system,
+                            emit_tokens,
+                        );
+                    }
+                    pending_is_expanded = false;
+                    pending_can_continue = false;
                     self.finish_rendered_lines(
                         item_count_before_expansion,
                         emit_tokens,
@@ -702,6 +717,33 @@ impl Engine<'_> {
                 }
                 self.finish_rendered_lines(item_count_before_directive, emit_tokens, 1);
             } else if is_active(&conditionals) {
+                if !pending_tokens.is_empty()
+                    && !has_unclosed_parenthesis(&pending_tokens)
+                    && pending_can_continue
+                    && line
+                        .first()
+                        .is_some_and(|token| token.spelling.as_str() != "(")
+                {
+                    let item_count_before_expansion = self.items.len();
+                    let tokens = std::mem::take(&mut pending_tokens);
+                    if pending_is_expanded {
+                        self.process_expanded_line(tokens, emit_tokens);
+                    } else {
+                        self.expand_ordinary_tokens(
+                            tokens,
+                            &pending_file,
+                            pending_system,
+                            emit_tokens,
+                        );
+                    }
+                    pending_is_expanded = false;
+                    pending_can_continue = false;
+                    self.finish_rendered_lines(
+                        item_count_before_expansion,
+                        emit_tokens,
+                        std::mem::take(&mut pending_line_count),
+                    );
+                }
                 if !line.is_empty() {
                     if pending_tokens.is_empty() {
                         pending_file.clone_from(&logical_file);
@@ -711,6 +753,8 @@ impl Engine<'_> {
                         first.at_start_of_line = false;
                     }
                     pending_tokens.extend(line);
+                    pending_is_expanded = false;
+                    pending_can_continue = false;
                 }
                 if pending_tokens.is_empty() {
                     if emit_tokens {
@@ -720,17 +764,29 @@ impl Engine<'_> {
                     pending_line_count = pending_line_count.saturating_add(1);
                     if !has_unclosed_parenthesis(&pending_tokens) {
                         let item_count_before_expansion = self.items.len();
-                        self.expand_ordinary_tokens(
-                            std::mem::take(&mut pending_tokens),
-                            &pending_file,
-                            pending_system,
-                            emit_tokens,
-                        );
-                        self.finish_rendered_lines(
-                            item_count_before_expansion,
-                            emit_tokens,
-                            std::mem::take(&mut pending_line_count),
-                        );
+                        let (expanded, can_continue) = if pending_is_expanded {
+                            (std::mem::take(&mut pending_tokens), pending_can_continue)
+                        } else {
+                            self.expand_ordinary_sequence(
+                                std::mem::take(&mut pending_tokens),
+                                &pending_file,
+                                pending_system,
+                            )
+                        };
+                        if can_continue {
+                            pending_tokens = expanded;
+                            pending_is_expanded = true;
+                            pending_can_continue = true;
+                        } else {
+                            self.process_expanded_line(expanded, emit_tokens);
+                            pending_is_expanded = false;
+                            pending_can_continue = false;
+                            self.finish_rendered_lines(
+                                item_count_before_expansion,
+                                emit_tokens,
+                                std::mem::take(&mut pending_line_count),
+                            );
+                        }
                     }
                 }
             } else if emit_tokens {
@@ -747,7 +803,16 @@ impl Engine<'_> {
         }
         if !pending_tokens.is_empty() {
             let item_count_before_expansion = self.items.len();
-            self.expand_ordinary_tokens(pending_tokens, &pending_file, pending_system, emit_tokens);
+            if pending_is_expanded {
+                self.process_expanded_line(pending_tokens, emit_tokens);
+            } else {
+                self.expand_ordinary_tokens(
+                    pending_tokens,
+                    &pending_file,
+                    pending_system,
+                    emit_tokens,
+                );
+            }
             self.finish_rendered_lines(
                 item_count_before_expansion,
                 emit_tokens,
@@ -770,6 +835,16 @@ impl Engine<'_> {
         system: bool,
         emit_tokens: bool,
     ) {
+        let (tokens, _) = self.expand_ordinary_sequence(tokens, logical_file, system);
+        self.process_expanded_line(tokens, emit_tokens);
+    }
+
+    fn expand_ordinary_sequence(
+        &mut self,
+        tokens: Vec<PpToken>,
+        logical_file: &str,
+        system: bool,
+    ) -> (Vec<PpToken>, bool) {
         let expansion = expand(
             &mut self.session.sources,
             &mut self.macros,
@@ -780,10 +855,11 @@ impl Engine<'_> {
                 is_system_header: system,
             },
         );
+        let trailing_function_macro_can_continue = expansion.trailing_function_macro_can_continue;
         for diagnostic in expansion.diagnostics {
             self.emit(diagnostic);
         }
-        self.process_expanded_line(expansion.tokens, emit_tokens);
+        (expansion.tokens, trailing_function_macro_can_continue)
     }
 
     fn finish_rendered_lines(
@@ -1592,6 +1668,11 @@ impl Engine<'_> {
                 option,
                 span,
             }
+        } else if spellings_start_with(operands, &["GCC", "optimize"]) {
+            PragmaEvent::GccOptimize {
+                payload: operands[2..].to_vec(),
+                span,
+            }
         } else if operands
             .first()
             .is_some_and(|token| token.spelling == "pack")
@@ -2209,6 +2290,55 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_search_entries_do_not_intercept_include_next() {
+        let mut files = MemoryFiles::default();
+        files.0.insert(
+            PathBuf::from("/wrapper/assert.h"),
+            concat!(
+                "#ifndef WRAPPER_ASSERT_H\n",
+                "#define WRAPPER_ASSERT_H\n",
+                "#include_next <assert.h>\n",
+                "#endif\n",
+            )
+            .to_owned(),
+        );
+        files.0.insert(
+            PathBuf::from("/system/assert.h"),
+            "#define ASSERT_HEADER_REACHED 42\n".to_owned(),
+        );
+
+        let (output, diagnostics) = run(
+            "#include <assert.h>\nASSERT_HEADER_REACHED\n",
+            &files,
+            &PreprocessOptions {
+                include_paths: vec![
+                    crate::options::IncludePath::new("/wrapper", IncludePathKind::User),
+                    crate::options::IncludePath::new("/unrelated", IncludePathKind::User),
+                    crate::options::IncludePath::new("/wrapper", IncludePathKind::User),
+                    crate::options::IncludePath::new("/system", IncludePathKind::User),
+                ],
+                suppress_line_markers: true,
+                ..PreprocessOptions::default()
+            },
+        );
+
+        assert!(!output.had_errors, "{:#?}", diagnostics.diagnostics);
+        assert_eq!(
+            output
+                .tokens()
+                .iter()
+                .map(|token| token.spelling.as_str())
+                .collect::<Vec<_>>(),
+            ["42"]
+        );
+        assert_eq!(output.dependencies.edges.len(), 2);
+        assert_eq!(
+            output.dependencies.edges[1].to,
+            PathBuf::from("/system/assert.h")
+        );
+    }
+
+    #[test]
     fn searches_include_paths_for_forced_inputs() {
         let mut files = MemoryFiles::default();
         files.0.insert(
@@ -2608,6 +2738,88 @@ mod tests {
     }
 
     #[test]
+    fn expands_function_macro_when_newline_precedes_open_parenthesis() {
+        let source = "#define ID(x) x\nID\n(\n42\n)\n";
+        let (output, diagnostics) = run(
+            source,
+            &MemoryFiles::default(),
+            &PreprocessOptions {
+                suppress_line_markers: true,
+                ..PreprocessOptions::default()
+            },
+        );
+        assert!(!output.had_errors, "{:#?}", diagnostics.diagnostics);
+        let tokens = output.tokens();
+        assert_eq!(
+            tokens
+                .iter()
+                .map(|token| token.spelling.as_str())
+                .collect::<Vec<_>>(),
+            ["42"]
+        );
+        assert!(!tokens[0].span.origin.is_direct());
+    }
+
+    #[test]
+    fn rescans_a_function_macro_result_with_a_next_line_invocation() {
+        let source = "#define ID(x) x\n#define F() ID\nF()\n(42)\n";
+        let (output, diagnostics) = run(
+            source,
+            &MemoryFiles::default(),
+            &PreprocessOptions {
+                suppress_line_markers: true,
+                ..PreprocessOptions::default()
+            },
+        );
+        assert!(!output.had_errors, "{:#?}", diagnostics.diagnostics);
+        assert_eq!(
+            output
+                .tokens()
+                .iter()
+                .map(|token| token.spelling.as_str())
+                .collect::<Vec<_>>(),
+            ["42"]
+        );
+    }
+
+    #[test]
+    fn does_not_rescan_backward_across_an_empty_macro() {
+        let source = "#define ID(x) x\n#define F ID\n#define EMPTY\nF EMPTY\n(42)\n";
+        let (output, diagnostics) = run(
+            source,
+            &MemoryFiles::default(),
+            &PreprocessOptions {
+                suppress_line_markers: true,
+                ..PreprocessOptions::default()
+            },
+        );
+        assert!(!output.had_errors, "{:#?}", diagnostics.diagnostics);
+        assert_eq!(
+            output
+                .tokens()
+                .iter()
+                .map(|token| token.spelling.as_str())
+                .collect::<Vec<_>>(),
+            ["ID", "(", "42", ")"]
+        );
+    }
+
+    #[test]
+    fn trailing_function_macro_does_not_consume_an_unrelated_line() {
+        let source = "#define ID(x) x\nID\nint value;\n";
+        let (output, diagnostics) = run(
+            source,
+            &MemoryFiles::default(),
+            &PreprocessOptions {
+                suppress_line_markers: true,
+                ..PreprocessOptions::default()
+            },
+        );
+        assert!(!output.had_errors, "{:#?}", diagnostics.diagnostics);
+        assert_eq!(render_preprocessed(&output, true), "\nID\nint value;\n\n");
+    }
+
+    #[test]
     fn line_macro_uses_the_physical_line_after_a_splice() {
         let (output, diagnostics) = run(
             "\\\n__LINE__\n",
@@ -2709,6 +2921,23 @@ mod tests {
             .unwrap();
         assert!(pragma_lines[pragma + 1].starts_with("# 2 \"/project/main.c\""));
         assert_eq!(pragma_lines[pragma + 2], "int pragma_value;");
+    }
+
+    #[test]
+    fn recognizes_gcc_optimize_pragma_operators_without_an_unknown_warning() {
+        let (output, diagnostics) = run(
+            "int _Pragma(\"GCC optimize(\\\"no-tree-vectorize\\\")\") value;\n",
+            &MemoryFiles::default(),
+            &PreprocessOptions::default(),
+        );
+        assert!(!output.had_errors, "{:#?}", diagnostics.diagnostics);
+        assert!(diagnostics.diagnostics.is_empty());
+        assert!(output.items.iter().any(|item| matches!(
+            item,
+            PpItem::Pragma(PragmaEvent::GccOptimize { payload, .. })
+                if payload.iter().map(|token| token.spelling.as_str()).collect::<Vec<_>>()
+                    == ["(", "\"no-tree-vectorize\"", ")"]
+        )));
     }
 
     #[test]

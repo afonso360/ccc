@@ -1,0 +1,46 @@
+diff --git a/lib/common/cpu.h b/lib/common/cpu.h
+--- a/lib/common/cpu.h
++++ b/lib/common/cpu.h
+@@ -121 +121,2 @@
+-#elif defined(__x86_64__) || defined(_M_X64) || defined(__i386__)
++#elif (defined(__x86_64__) || defined(_M_X64) || defined(__i386__)) && \
++    !defined(ZSTD_DISABLE_ASM)
+diff --git a/lib/common/xxhash.h b/lib/common/xxhash.h
+--- a/lib/common/xxhash.h
++++ b/lib/common/xxhash.h
+@@ -2462 +2462 @@
+-#if defined(__GNUC__) || defined(__clang__)
++#if (defined(__GNUC__) || defined(__clang__)) && !defined(ZSTD_DISABLE_ASM)
+diff --git a/lib/compress/zstd_compress_internal.h b/lib/compress/zstd_compress_internal.h
+--- a/lib/compress/zstd_compress_internal.h
++++ b/lib/compress/zstd_compress_internal.h
+@@ -633 +633 @@
+-#if defined(__GNUC__) && defined(__x86_64__)
++#if defined(__GNUC__) && defined(__x86_64__) && !defined(ZSTD_DISABLE_ASM)
+diff --git a/lib/compress/zstd_fast.c b/lib/compress/zstd_fast.c
+--- a/lib/compress/zstd_fast.c
++++ b/lib/compress/zstd_fast.c
+@@ -121 +121 @@
+-#if defined(__GNUC__)
++#if defined(__GNUC__) && !defined(ZSTD_DISABLE_ASM)
+diff --git a/lib/compress/zstd_lazy.c b/lib/compress/zstd_lazy.c
+--- a/lib/compress/zstd_lazy.c
++++ b/lib/compress/zstd_lazy.c
+@@ -1574 +1574 @@
+-#if defined(__GNUC__) && defined(__x86_64__)
++#if defined(__GNUC__) && defined(__x86_64__) && !defined(ZSTD_DISABLE_ASM)
+@@ -1972 +1972 @@
+-#if defined(__GNUC__) && defined(__x86_64__)
++#if defined(__GNUC__) && defined(__x86_64__) && !defined(ZSTD_DISABLE_ASM)
+diff --git a/lib/decompress/zstd_decompress_block.c b/lib/decompress/zstd_decompress_block.c
+--- a/lib/decompress/zstd_decompress_block.c
++++ b/lib/decompress/zstd_decompress_block.c
+@@ -1484 +1484 @@
+-#if defined(__GNUC__) && defined(__x86_64__)
++#if defined(__GNUC__) && defined(__x86_64__) && !defined(ZSTD_DISABLE_ASM)
+@@ -1546 +1546 @@
+-#if defined(__GNUC__) && defined(__x86_64__)
++#if defined(__GNUC__) && defined(__x86_64__) && !defined(ZSTD_DISABLE_ASM)
+@@ -1645 +1645 @@
+-#if defined(__GNUC__) && defined(__x86_64__)
++#if defined(__GNUC__) && defined(__x86_64__) && !defined(ZSTD_DISABLE_ASM)

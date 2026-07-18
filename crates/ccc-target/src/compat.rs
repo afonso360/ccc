@@ -55,7 +55,7 @@ impl GnuCompatibilityProfile {
         Self {
             name: "gcc-4.2.1".to_owned(),
             version: CompatibilityVersion::new(4, 2, 1),
-            scope: CompatibilityScope::Parsing,
+            scope: CompatibilityScope::CodeGeneration,
         }
     }
 }
@@ -137,11 +137,23 @@ impl CapabilityRegistry {
             "__volatile__",
             "__alignof",
             "__alignof__",
+            "__thread",
+            "gnu-declaration-asm-labels",
+            "gnu-function-name-aliases",
+            "gnu-statement-expressions",
         ] {
             registry.insert(
                 CapabilityKind::Extension,
                 name,
                 CapabilityState::Implemented,
+            );
+        }
+        for name in ["__builtin_memcpy", "__builtin_memmove", "__builtin_memset"] {
+            registry.insert_with_rationale(
+                CapabilityKind::Builtin,
+                name,
+                CapabilityState::Implemented,
+                "the frontend enforces the libc memory-operation signature and the backend emits the matching target libcall",
             );
         }
 
@@ -152,10 +164,8 @@ impl CapabilityRegistry {
             "__attribute__",
             "__typeof",
             "__typeof__",
-            "__thread",
             "gnu-alternative-keywords",
             "gnu-attribute-specifiers",
-            "gnu-declaration-asm-labels",
             "gnu-typeof",
         ] {
             registry.insert_with_rationale(
@@ -180,12 +190,62 @@ impl CapabilityRegistry {
             CapabilityState::Implemented,
         );
 
-        for name in ["nothrow", "__nothrow__", "pure", "__pure__"] {
+        for name in [
+            "nothrow",
+            "__nothrow__",
+            "pure",
+            "__pure__",
+            "const",
+            "__const__",
+            "malloc",
+            "__malloc__",
+            "format",
+            "__format__",
+            "nonnull",
+            "__nonnull__",
+            "warn_unused_result",
+            "__warn_unused_result__",
+            "unused",
+            "__unused__",
+            "deprecated",
+            "__deprecated__",
+            "noinline",
+            "__noinline__",
+            "always_inline",
+            "__always_inline__",
+            "may_alias",
+            "__may_alias__",
+            "alloc_size",
+            "__alloc_size__",
+        ] {
             registry.insert_with_rationale(
                 CapabilityKind::Attribute,
                 name,
                 CapabilityState::BehaviorCompatibleNoOp,
-                "ignoring this optimization contract preserves C program behavior",
+                "the optimization or diagnostic contract does not alter generated C behavior",
+            );
+        }
+        for name in [
+            "noreturn",
+            "__noreturn__",
+            "packed",
+            "__packed__",
+            "mode",
+            "__mode__",
+            "aligned",
+            "__aligned__",
+            "weak",
+            "__weak__",
+            "transparent_union",
+            "__transparent_union__",
+            "tls_model",
+            "__tls_model__",
+        ] {
+            registry.insert_with_rationale(
+                CapabilityKind::Attribute,
+                name,
+                CapabilityState::Implemented,
+                "the frontend preserves the attribute's control-flow, type, alignment, or symbol-emission effect",
             );
         }
         registry.insert_with_rationale(
@@ -194,16 +254,7 @@ impl CapabilityRegistry {
             CapabilityState::Implemented,
             "the frontend carries ELF visibility through ABI planning and object emission",
         );
-        for name in [
-            "warn_unused_result",
-            "__warn_unused_result__",
-            "nonnull",
-            "__nonnull__",
-            "aligned",
-            "__aligned__",
-            "gnu_inline",
-            "__gnu_inline__",
-        ] {
+        for name in ["gnu_inline", "__gnu_inline__"] {
             registry.insert_with_rationale(
                 CapabilityKind::Attribute,
                 name,
@@ -217,6 +268,59 @@ impl CapabilityRegistry {
             CapabilityState::Implemented,
             "the operator uses the canonical target layout engine",
         );
+        registry.insert_with_rationale(
+            CapabilityKind::Builtin,
+            "__builtin_expect",
+            CapabilityState::Implemented,
+            "the GNU 4.2 operator requires a folded compile-time integer expectation and evaluates only the long-converted value operand; backend branch metadata is optional",
+        );
+        registry.insert_with_rationale(
+            CapabilityKind::Builtin,
+            "__builtin_huge_val",
+            CapabilityState::Implemented,
+            "the operator produces the target binary64 positive-infinity constant",
+        );
+        registry.insert_with_rationale(
+            CapabilityKind::Builtin,
+            "__builtin_inff",
+            CapabilityState::Implemented,
+            "the operator produces the target binary32 positive-infinity constant",
+        );
+        registry.insert_with_rationale(
+            CapabilityKind::Builtin,
+            "__builtin_nanf",
+            CapabilityState::Implemented,
+            "the certified empty narrow string-literal form produces a canonical target binary32 quiet NaN",
+        );
+        for name in [
+            "__builtin_bswap64",
+            "__builtin_clz",
+            "__builtin_clzl",
+            "__builtin_clzll",
+            "__builtin_ctz",
+            "__builtin_ctzll",
+            "__builtin_popcount",
+            "__builtin_popcountll",
+        ] {
+            registry.insert_with_rationale(
+                CapabilityKind::Builtin,
+                name,
+                CapabilityState::Implemented,
+                "the exact integer signature is typed by the frontend and lowered to a native Cranelift integer intrinsic",
+            );
+        }
+        registry.insert_with_rationale(
+            CapabilityKind::Builtin,
+            "__builtin_prefetch",
+            CapabilityState::BehaviorCompatibleNoOp,
+            "the address expression is evaluated exactly once and validated constant hints are discarded without introducing a faulting access",
+        );
+        registry.insert_with_rationale(
+            CapabilityKind::Pragma,
+            "GCC optimize",
+            CapabilityState::BehaviorCompatibleNoOp,
+            "the optimization hint does not alter the C abstract-machine behavior and CCC does not expose per-function optimization controls",
+        );
         for name in [
             "__builtin_va_start",
             "__builtin_va_arg",
@@ -228,6 +332,27 @@ impl CapabilityRegistry {
                 name,
                 CapabilityState::Implemented,
                 "the operator is typed by the frontend and lowered through the target ABI plan",
+            );
+        }
+        registry.insert_with_rationale(
+            CapabilityKind::Builtin,
+            "__sync_synchronize",
+            CapabilityState::Implemented,
+            "the operator is typed and lowered as a sequentially consistent full memory fence",
+        );
+        for name in [
+            "__sync_add_and_fetch",
+            "__sync_fetch_and_add",
+            "__sync_sub_and_fetch",
+            "__sync_bool_compare_and_swap",
+            "__sync_val_compare_and_swap",
+            "__sync_lock_test_and_set",
+        ] {
+            registry.insert_with_rationale(
+                CapabilityKind::Builtin,
+                name,
+                CapabilityState::Implemented,
+                "the operator is typed and lowered as a native sequentially consistent atomic read-modify-write",
             );
         }
 
@@ -298,7 +423,7 @@ mod tests {
         assert!(!CompatibilityScope::Preprocessing.includes(CompatibilityScope::Parsing));
         assert_eq!(
             GnuCompatibilityProfile::gcc_4_2_1().scope,
-            CompatibilityScope::Parsing
+            CompatibilityScope::CodeGeneration
         );
     }
 
@@ -312,6 +437,10 @@ mod tests {
             "__restrict__",
             "__signed__",
             "__alignof__",
+            "__thread",
+            "gnu-declaration-asm-labels",
+            "gnu-function-name-aliases",
+            "gnu-statement-expressions",
         ] {
             assert_eq!(
                 registry.state(CapabilityKind::Extension, name),
@@ -319,14 +448,7 @@ mod tests {
                 "unexpected state for {name}"
             );
         }
-        for name in [
-            "__asm__",
-            "__attribute__",
-            "__typeof__",
-            "__thread",
-            "gnu-declaration-asm-labels",
-            "gnu-typeof",
-        ] {
+        for name in ["__asm__", "__attribute__", "__typeof__", "gnu-typeof"] {
             assert_eq!(
                 registry.state(CapabilityKind::Extension, name),
                 CapabilityState::ParseOnly,
@@ -342,10 +464,49 @@ mod tests {
             );
             assert!(registry.is_available(CapabilityKind::Extension, name));
         }
-        for name in ["__nothrow__", "__pure__"] {
+        for name in [
+            "__nothrow__",
+            "__pure__",
+            "__const__",
+            "__malloc__",
+            "__format__",
+            "__nonnull__",
+            "__warn_unused_result__",
+            "unused",
+            "__unused__",
+            "__deprecated__",
+            "noinline",
+            "__noinline__",
+            "always_inline",
+            "__always_inline__",
+            "may_alias",
+            "__may_alias__",
+            "alloc_size",
+            "__alloc_size__",
+        ] {
             assert_eq!(
                 registry.state(CapabilityKind::Attribute, name),
                 CapabilityState::BehaviorCompatibleNoOp,
+                "unexpected state for {name}"
+            );
+            assert!(registry.is_available(CapabilityKind::Attribute, name));
+        }
+        for name in [
+            "__noreturn__",
+            "packed",
+            "__packed__",
+            "__mode__",
+            "__aligned__",
+            "weak",
+            "__weak__",
+            "transparent_union",
+            "__transparent_union__",
+            "tls_model",
+            "__tls_model__",
+        ] {
+            assert_eq!(
+                registry.state(CapabilityKind::Attribute, name),
+                CapabilityState::Implemented,
                 "unexpected state for {name}"
             );
             assert!(registry.is_available(CapabilityKind::Attribute, name));
@@ -354,25 +515,39 @@ mod tests {
             registry.state(CapabilityKind::Attribute, "visibility"),
             CapabilityState::Implemented
         );
-        for name in [
-            "__warn_unused_result__",
-            "__nonnull__",
-            "__aligned__",
-            "__gnu_inline__",
-        ] {
-            assert_eq!(
-                registry.state(CapabilityKind::Attribute, name),
-                CapabilityState::ParseOnly,
-                "unexpected state for {name}"
-            );
-            assert!(!registry.is_available(CapabilityKind::Attribute, name));
-        }
+        assert_eq!(
+            registry.state(CapabilityKind::Attribute, "__gnu_inline__"),
+            CapabilityState::ParseOnly
+        );
+        assert!(!registry.is_available(CapabilityKind::Attribute, "__gnu_inline__"));
         for name in [
             "__builtin_offsetof",
+            "__builtin_expect",
+            "__builtin_huge_val",
+            "__builtin_inff",
+            "__builtin_nanf",
+            "__builtin_bswap64",
+            "__builtin_clz",
+            "__builtin_clzl",
+            "__builtin_clzll",
+            "__builtin_ctz",
+            "__builtin_ctzll",
+            "__builtin_popcount",
+            "__builtin_popcountll",
+            "__builtin_memcpy",
+            "__builtin_memmove",
+            "__builtin_memset",
             "__builtin_va_start",
             "__builtin_va_arg",
             "__builtin_va_copy",
             "__builtin_va_end",
+            "__sync_add_and_fetch",
+            "__sync_fetch_and_add",
+            "__sync_sub_and_fetch",
+            "__sync_bool_compare_and_swap",
+            "__sync_val_compare_and_swap",
+            "__sync_lock_test_and_set",
+            "__sync_synchronize",
         ] {
             assert_eq!(
                 registry.state(CapabilityKind::Builtin, name),
@@ -380,6 +555,16 @@ mod tests {
             );
             assert!(registry.is_available(CapabilityKind::Builtin, name));
         }
+        assert_eq!(
+            registry.state(CapabilityKind::Builtin, "__builtin_prefetch"),
+            CapabilityState::BehaviorCompatibleNoOp
+        );
+        assert!(registry.is_available(CapabilityKind::Builtin, "__builtin_prefetch"));
+        assert_eq!(
+            registry.state(CapabilityKind::Builtin, "__builtin_bswap32"),
+            CapabilityState::Unsupported
+        );
+        assert!(!registry.is_available(CapabilityKind::Builtin, "__builtin_bswap32"));
     }
 
     #[test]

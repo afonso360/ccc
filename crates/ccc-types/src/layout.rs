@@ -244,7 +244,7 @@ impl LayoutEngine<'_> {
     fn array_layout(&mut self, id: TypeId, array: ArrayType) -> Result<TypeLayout, LayoutError> {
         let length = match array.length {
             ArrayLength::Incomplete => return Err(LayoutError::IncompleteArray(id)),
-            ArrayLength::Variable(bound) => {
+            ArrayLength::Variable(bound) | ArrayLength::UnspecifiedVariable(bound) => {
                 return Err(LayoutError::VariableLengthArray { ty: id, bound });
             }
             ArrayLength::Constant(length) => length,
@@ -491,7 +491,7 @@ impl LayoutEngine<'_> {
             active_bitfield = None;
             let is_last = index + 1 == fields.len();
             let field_layout = self.object_field_layout(record, index, field, is_last, false)?;
-            let field_align = packing.field_alignment(field_layout.align);
+            let field_align = effective_field_alignment(field, &field_layout, packing)?;
             self.validate_alignment(field_align)?;
             record_align = record_align.max(field_align);
             let offset = align_up(cursor, field_align)?;
@@ -611,7 +611,7 @@ impl LayoutEngine<'_> {
             }
 
             let field_layout = self.object_field_layout(record, index, field, false, true)?;
-            let field_align = packing.field_alignment(field_layout.align);
+            let field_align = effective_field_alignment(field, &field_layout, packing)?;
             self.validate_alignment(field_align)?;
             record_align = record_align.max(field_align);
             size = size.max(field_layout.size);
@@ -702,6 +702,21 @@ impl LayoutEngine<'_> {
             Err(LayoutError::InvalidAlignment(align))
         }
     }
+}
+
+fn effective_field_alignment(
+    field: &Field,
+    layout: &TypeLayout,
+    packing: PackingPolicy,
+) -> Result<u64, LayoutError> {
+    let packed = packing.field_alignment(layout.align);
+    let Some(requested) = field.requested_alignment else {
+        return Ok(packed);
+    };
+    if !requested.is_power_of_two() || requested < layout.align {
+        return Err(LayoutError::InvalidAlignment(requested));
+    }
+    Ok(packed.max(requested))
 }
 
 #[derive(Clone, Copy)]

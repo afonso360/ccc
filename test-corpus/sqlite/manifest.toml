@@ -1,0 +1,179 @@
+format_version = 2
+name = "sqlite"
+version = "3.47.2"
+release_date = "2024-12-07"
+distribution = "canonical-source"
+origin = "https://www.sqlite.org/2024/sqlite-src-3470200.zip"
+archive = "sqlite-src-3470200.zip"
+archive_bytes = 14421983
+archive_sha256 = "e6a471f1238225f34c2c48c5601b54024cc538044368230f59ff0672be1fc623"
+archive_sha3_256 = "1f908b251b88ce5644261581d1955b5d0e86485a84793fd8b490b3e6fdb834b9"
+source_id = "2024-12-07 20:39:59 2aabe05e2e8cae4847a802ee2daddc1d7413d8fc560254d93ee3e72c14685b6c"
+generated_sqlite3_sha3_256 = "586b5789453ee5c51e8d858cd836f20ce60df882323f2070547cbaf23a5898af"
+generated_strict_ansi_predicate_uses = 4
+generated_strict_ansi_negated_uses = 3
+test_adjustment_patch = "recoverfault-clean-output.patch"
+test_adjustment_sha256 = "dcd0621e2d8a1129d87813ca13adb61b297e6c194acf27672b351628fdd4b243"
+test_adjustment_target = "ext/recover/recoverfault.test"
+test_adjustment_target_before_sha256 = "7add293646c87a737e23f542ac66c869da2bada5a5d5a8821ca71934ade5fefb"
+test_adjustment_target_after_sha256 = "7e675d756975182877553c00bd951eced8053049ca6f9c1d8fea553ac2410ecc"
+test_adjustment_rationale = "SQLite 3.47.2 leaves the truncated recovercorrupt4.test input at test.db2; recoverfault.test reuses that path and its fault loop becomes order-dependent, including under GCC. Removing the stale output once restores the test's intended initial state without omitting any test."
+license = "public-domain"
+upstream_license_file = "LICENSE.md"
+fetched_not_vendored = true
+
+target = "x86_64-unknown-linux-gnu"
+language_mode = "gnu11"
+language_mode_selection = "driver-default"
+gnu_compatibility_tuple = "4.2.1"
+build_interface = "classic-autoconf-make"
+configure_entrypoint = "./configure"
+build_target = "testfixture"
+testfixture_translation_units = 91
+fuzzcheck_translation_units = 9
+fuzzcheck_support_translation_units = 8
+default_test_suite = "veryquick"
+supported_test_suites = ["veryquick", "quick", "all", "full"]
+build_compiler = "gcc"
+target_compiler = "ccc"
+link_driver = "gcc"
+link_mode = "platform-default-pie-executable"
+configure_arguments = [
+    "--disable-shared",
+    "--disable-readline",
+    "--disable-load-extension",
+]
+configure_environment = []
+required_tools = [
+    "awk",
+    "bash",
+    "basename",
+    "cat",
+    "cmp",
+    "cp",
+    "dirname",
+    "find",
+    "gcc",
+    "grep",
+    "id",
+    "make",
+    "mkdir",
+    "mktemp",
+    "mv",
+    "openssl",
+    "patch",
+    "pkg-config",
+    "readelf",
+    "rm",
+    "sed",
+    "sort",
+    "tclsh",
+    "tee",
+    "tr",
+    "unzip",
+    "wc",
+]
+conditional_download_tools = ["curl"]
+required_development_packages = ["tcl", "zlib"]
+requires_non_root_user = true
+requires_native_linux_filesystem = true
+
+pin_rationales = [
+    "Release 3.47.0 removed SQLite's remaining long double use by switching that calculation to Dekker's algorithm.",
+    "Release 3.47.2 is the final canonical-source release before the configure and Makefile interface migrated from Autoconf to Autosetup in 3.48.0.",
+    "The hosted math wrapper preserves libc declarations while supplying a compiler-compatible binary64 isnan macro, allowing configure to detect the interface without a cache override.",
+]
+
+[expected_inventory]
+selected_builtins = ["__sync_synchronize"]
+available_hosted_builtins = ["__builtin_inff", "__builtin_nanf"]
+suite_consumers_of_hosted_float_builtins = ["all", "full"]
+unselected_builtin_families = [
+    "__atomic_load_n-and-__atomic_store_n",
+    "__builtin_bswap",
+    "__builtin_overflow",
+    "__builtin_clz",
+]
+inline_assembly_forms = []
+wide_integer_uses = []
+variable_length_array_objects = []
+statement_expressions = []
+computed_gotos = []
+
+[default_and_tcl_configuration_gates]
+macros = [
+    "VDBE_PROFILE",
+    "SQLITE_PERFORMANCE_TRACE",
+    "SQLITE_ENABLE_STMT_SCANSTATUS",
+]
+rationale = "These macros are inactive for testfixture and the Tcl suites, excluding src/hwtime.h and its rdtsc inline assembly from that surface. The full suite's fuzzcheck profile enables SQLITE_ENABLE_STMT_SCANSTATUS under the scoped hwtime predicate override below."
+
+[fuzzcheck_capability_adjustment]
+component = "fuzzcheck generated sqlite3.c translation"
+language_mode = "gnu11"
+preprocessor_override = "__STRICT_ANSI__=1"
+upstream_feature_macro = "SQLITE_ENABLE_STMT_SCANSTATUS"
+timing_backend = "upstream-no-assembly-zero-fallback"
+additional_effect = "SQLITE_INLINE is disabled in the amalgamation"
+unmodified_components = ["alltest", "fuzzcheck support translation units", "sessionfuzz"]
+rationale = "SQLite's checked fuzzcheck profile enables statement scan status, which selects rdtsc inline assembly in the generated amalgamation under the advertised GNU x86-64 identity. Defining SQLite's __STRICT_ANSI__ predicate for that one sqlite3.c translation selects src/hwtime.h's upstream no-assembly timing fallback without changing source, removing fuzz inputs, disabling feature macros, or exposing strict-mode parsing to GNU system headers. In this release the predicate's only other SQLite effect is suppressing the SQLITE_INLINE optimization hint."
+
+[test_suites.veryquick]
+driver = "make-target"
+make_target = "tcltest"
+primary_tcl_entrypoint = "test/veryquick.test"
+components = ["tcltest"]
+command = "make -j1 tcltest"
+
+[test_suites.quick]
+driver = "test-script"
+make_target = "testfixture"
+primary_tcl_entrypoint = "test/quick.test"
+components = ["quick"]
+command = "make -j1 testfixture && ./testfixture \"$TOP/test/quick.test\" --verbose=file --output=test-out.txt"
+rationale = "SQLite's quicktest Make target runs the smaller test/extraquick.test script, so the adapter invokes the upstream test/quick.test entrypoint directly."
+
+[test_suites.all]
+driver = "make-target"
+make_target = "alltest"
+primary_tcl_entrypoint = "test/all.test"
+components = ["alltest"]
+required_hosted_builtins = ["__builtin_inff", "__builtin_nanf"]
+command = "make -j1 alltest"
+
+[test_suites.full]
+driver = "make-target"
+make_target = "fulltest"
+primary_tcl_entrypoint = "test/all.test"
+components = ["alltest", "fuzztest"]
+required_hosted_builtins = ["__builtin_inff", "__builtin_nanf"]
+command = "make -j1 fulltest"
+
+[adapter_artifacts]
+retain = [
+    "build-run.log",
+    "config.log",
+    "configure-commands.txt",
+    "effective-macros.txt",
+    "elf-dynamic-tags.txt",
+    "elf-headers.txt",
+    "fuzzcheck-elf-dynamic-tags.txt",
+    "fuzzcheck-elf-headers.txt",
+    "language-modes.txt",
+    "link-driver-identity.txt",
+    "link-driver-macros.txt",
+    "predicate-probe.txt",
+    "compile-commands.txt",
+    "capability-inventory.txt",
+    "expected-testfixture-source-inputs.txt",
+    "source-inputs.txt",
+    "source-adjustment-apply.log",
+    "source-adjustment.patch",
+    "source-adjustment.txt",
+    "sessionfuzz-elf-dynamic-tags.txt",
+    "sessionfuzz-elf-headers.txt",
+    "suite-plan.txt",
+    "testfixture-source-inputs.txt",
+    "test-out.txt",
+    "test-run.log",
+]
