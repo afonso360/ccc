@@ -42,7 +42,7 @@ configure_arguments = [
     "--disable-readline",
     "--disable-load-extension",
 ]
-configure_environment = ["LDFLAGS=-no-pie"]
+configure_environment = []
 required_tools = [
     "awk",
     "bash",

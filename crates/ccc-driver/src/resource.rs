@@ -728,7 +728,10 @@ mod tests {
             "#define isinf(value) __ccc_math_isinf(value)",
             "#define isnan(value) __ccc_math_isnan(value)",
         ] {
-            assert!(math.contains(contract), "math.h is missing contract {contract:?}");
+            assert!(
+                math.contains(contract),
+                "math.h is missing contract {contract:?}"
+            );
         }
     }
 

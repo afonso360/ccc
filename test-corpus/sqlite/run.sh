@@ -241,8 +241,7 @@ unset OPTS TCC TESTOPTS
 cd "$build_directory"
 : >"$CCC_SQLITE_COMMAND_LOG"
 
-LDFLAGS=-no-pie \
-  CC="$script_directory/ccc-cc" \
+CC="$script_directory/ccc-cc" \
   "$source_directory/configure" \
   --disable-shared \
   --disable-readline \
