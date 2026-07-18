@@ -366,6 +366,7 @@ cmp -s "$fake_bin/ccc" "$pass_directory/tool-identities/ccc-executable"
 cmp -s "$resource_directory/manifest.toml" \
   "$pass_directory/tool-identities/ccc-resource-dir/manifest.toml"
 [[ "$(find "$pass_directory/cases" -name program.c | wc -l | tr -d '[:space:]')" == 3 ]]
+! grep -R -E -- '-fno-pie|-no-pie' "$pass_directory/cases"/*/commands.txt
 
 mismatch_directory="$temporary_directory/mismatch results"
 set +e

@@ -98,10 +98,12 @@ test-corpus/csmith/run.sh --cases 1 --start-seed SEED --work-dir EMPTY_PATH
 The suite treats reference disagreement as a failed oracle, not as evidence
 against CCC. A timeout shared by all references is inconclusive and causes the
 suite to try the next seed; partial timeouts are failed oracles. CCC emits one
-object, which the recorded GCC driver links with `-lm`, so CCC compile and link
-failures remain distinct. Sanitizers may be useful while investigating a
-retained source, but their silence is not treated as proof that a program is
-defined.
+object, which the recorded GCC driver links with `-lm` under its default
+relocation policy. Neither the reference executables nor CCC's linked
+executable receive a non-PIE override, so CCC compile and link failures remain
+distinct and the suite exercises the platform's default PIE configuration.
+Sanitizers may be useful while investigating a retained source, but their
+silence is not treated as proof that a program is defined.
 
 ## Harness test
 

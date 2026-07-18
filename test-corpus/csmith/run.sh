@@ -287,7 +287,7 @@ run_case() {
       "$directory/reference-${label}.compile.stderr" \
       "$command_log" \
       "$compile_status" \
-      "$compiler" -std=c11 "$optimization" -fno-pie -no-pie \
+      "$compiler" -std=c11 "$optimization" \
       -I "$csmith_runtime" "$source_file" -o "$executable" -lm
     if ! status_is_zero "$compile_status"; then
       write_result "$directory" reference-compile-failure \
@@ -370,7 +370,7 @@ run_case() {
     "$directory/ccc.link.stderr" \
     "$command_log" \
     "$directory/ccc.link.status" \
-    "$reference_gcc" -fno-pie -no-pie "$ccc_object" -o "$ccc_executable" -lm
+    "$reference_gcc" "$ccc_object" -o "$ccc_executable" -lm
   if ! status_is_zero "$directory/ccc.link.status"; then
     write_result "$directory" ccc-link-failure \
       "GCC failed or timed out while linking CCC's object for seed $seed" 1 1 1
