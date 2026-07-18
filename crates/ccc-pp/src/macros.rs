@@ -207,21 +207,27 @@ impl Expander<'_, '_> {
                 // Preserve the operand during rescan so it remains a macro name
                 // for the conditional-expression evaluator instead of expanding
                 // to the macro's replacement first.
-                output.push(token);
+                let start = index;
                 index += 1;
                 let parenthesized = stream.get(index).is_some_and(|next| next.spelling == "(");
                 if parenthesized {
-                    output.push(stream[index].clone());
                     index += 1;
                 }
-                if let Some(operand) = stream.get(index) {
-                    output.push(operand.clone());
+                if stream.get(index).is_some() {
                     index += 1;
                 }
-                if parenthesized && let Some(close) = stream.get(index) {
-                    output.push(close.clone());
+                if parenthesized && stream.get(index).is_some() {
                     index += 1;
                 }
+                let preserved = &stream[start..index];
+                if self.emitted_tokens.saturating_add(preserved.len())
+                    > self.options.limits.output_tokens
+                {
+                    self.error(&token, "CCC1102", "preprocessing token limit exceeded");
+                    break;
+                }
+                output.extend_from_slice(preserved);
+                self.emitted_tokens += preserved.len();
                 trailing_function_macro_can_continue = false;
                 continue;
             }

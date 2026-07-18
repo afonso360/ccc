@@ -66,7 +66,10 @@ const HELP: &str = "Usage: ccc [options] <input.c>\n\
   --dump-tokens              Dump converted parser tokens\n\
   --dump-ast|--dump-typed-ast|--dump-ir|--dump-abi\n\
                              Dump frontend representations\n\
-  --emit=clif                Dump Cranelift IR\n";
+  --emit=clif                Dump Cranelift IR\n\
+  --version                  Print the CCC driver version\n";
+
+const VERSION: &str = concat!("ccc ", env!("CARGO_PKG_VERSION"), "\n");
 
 static TEMPORARY_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -101,6 +104,10 @@ pub fn run(arguments: impl IntoIterator<Item = String>) -> Result<DriverOutput, 
     match args::parse(arguments).map_err(DriverError::new)? {
         ParsedCommand::Help => Ok(DriverOutput {
             stdout: HELP.to_owned(),
+            stderr: String::new(),
+        }),
+        ParsedCommand::Version => Ok(DriverOutput {
+            stdout: VERSION.to_owned(),
             stderr: String::new(),
         }),
         ParsedCommand::Run(options) => execute(*options),
@@ -1085,6 +1092,16 @@ fn with_prior_diagnostics(prior: &str, error: DriverError) -> DriverError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_reports_the_driver_identity_without_an_input() {
+        let output = run(["--version".to_owned()]).unwrap();
+        assert_eq!(
+            output.stdout,
+            format!("ccc {}\n", env!("CARGO_PKG_VERSION"))
+        );
+        assert!(output.stderr.is_empty());
+    }
 
     #[test]
     fn enforces_the_ordered_hosted_header_phase_ceiling() {

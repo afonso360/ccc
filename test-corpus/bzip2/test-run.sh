@@ -113,6 +113,35 @@ elif [[ "$host_os" == Darwin && ("$host_arch" == arm64 || "$host_arch" == aarch6
   [[ ! -e "$missing_sdk_work" ]]
 fi
 
+openssl_tool=${BZIP2_OPENSSL:-openssl}
+if command -v "$openssl_tool" >/dev/null 2>&1; then
+  checksum_input="$temporary_directory/checksum-input"
+  checksum_file="$temporary_directory/checksums.md5"
+  checksum_stdin_file="$temporary_directory/checksums-stdin.md5"
+  printf 'ccc checksum adapter test\n' >"$checksum_input"
+
+  BZIP2_OPENSSL="$openssl_tool" \
+    "$script_directory/md5sum-darwin" "$checksum_input" >"$checksum_file"
+  BZIP2_OPENSSL="$openssl_tool" \
+    "$script_directory/md5sum-darwin" --check "$checksum_file" >/dev/null
+
+  checksum=$(
+    BZIP2_OPENSSL="$openssl_tool" \
+      "$script_directory/md5sum-darwin" "$checksum_input" | awk '{ print $1 }'
+  )
+  printf '%s  -\n' "$checksum" >"$checksum_stdin_file"
+  BZIP2_OPENSSL="$openssl_tool" \
+    "$script_directory/md5sum-darwin" -c "$checksum_stdin_file" \
+    <"$checksum_input" >/dev/null
+
+  printf 'corrupt\n' >>"$checksum_input"
+  if BZIP2_OPENSSL="$openssl_tool" \
+    "$script_directory/md5sum-darwin" -c "$checksum_file" >/dev/null 2>&1; then
+    echo "md5sum-darwin accepted a corrupted input" >&2
+    exit 1
+  fi
+fi
+
 "$script_directory/test-ccc-cc.sh"
 
 echo "bzip2 runner tests passed"

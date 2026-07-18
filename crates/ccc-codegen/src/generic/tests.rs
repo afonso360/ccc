@@ -181,6 +181,32 @@ fn darwin_symbols_tentative_data_and_libcalls_match_apple_spelling() {
 }
 
 #[test]
+fn darwin_emits_text_before_data_for_linker_unwind_conversion() {
+    let output = emit_source_with_config(
+        "int first(void) { return \"x\"[0]; }\n\
+         int main(void) { return first() == 'x' ? 0 : 1; }",
+        &EffectiveCompilationConfig::aarch64_apple_darwin(),
+    );
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    let section_names = object
+        .sections()
+        .map(|section| section.name().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    let text = section_names
+        .iter()
+        .position(|name| name == "__text")
+        .expect("Darwin text section");
+    let data = section_names
+        .iter()
+        .position(|name| name == "__const")
+        .expect("Darwin constant-data section");
+    assert!(
+        text < data,
+        "Apple's linker requires text before data when deriving compact unwind: {section_names:?}"
+    );
+}
+
+#[test]
 fn arm64_fixed_aggregate_exhaustion_emits_complete_stack_transports() {
     const INTEGER_SOURCE: &str = "struct Pair { long first; long second; };\n\
          long pair_after_seven(long a0, long a1, long a2, long a3, long a4, long a5, long a6, struct Pair value) {\n\

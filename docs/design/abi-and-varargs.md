@@ -156,7 +156,9 @@ by eight sixteen-byte XMM slots.
 AAPCS64 Linux exposes the five-field array-of-one register-save form. RISC-V
 LP64D exposes a pointer cursor and routes unnamed variadic arguments through
 the integer convention, including aligned pairs and the stack transition.
-Darwin exposes `char *`; its unnamed arguments occupy compact stack slots.
+Darwin exposes `char *`. Fixed overflow arguments retain Apple's naturally
+compact stack layout, while each unnamed variadic argument consumes the
+appropriate number of 8-byte stack slots.
 Target-specific `va_start`, `va_copy`, and `va_arg` state is derived from the
 same ABI identity used by the boundary planner.
 
@@ -189,8 +191,8 @@ as assembler line records. If assembly is present, the driver:
 1. assembles it through the resolved target compiler driver;
 2. combines it with the primary object through a driver-mediated relocatable
    link;
-3. localizes only the exact generated-symbol allowlist with a compatible
-   object copier;
+3. localizes only the exact generated-symbol allowlist with GNU-compatible
+   `objcopy` on ELF or Apple `nmedit` on Mach-O;
 4. verifies architecture, relocatable format, bindings, visibility,
    relocations, CFI, and non-generated symbol preservation;
 5. publishes the final single object atomically.

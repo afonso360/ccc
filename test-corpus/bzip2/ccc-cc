@@ -13,8 +13,13 @@ source "$script_directory/../adapter-environment.sh"
 case "$CCC_BZIP2_TARGET" in
   x86_64-unknown-linux-gnu | aarch64-unknown-linux-gnu | \
     riscv64-unknown-linux-gnu)
-    : "${CCC_BZIP2_SYSROOT:?set CCC_BZIP2_SYSROOT to the compiler sysroot}"
-    [[ -d "$CCC_BZIP2_SYSROOT" ]] || {
+    : "${CCC_BZIP2_SYSROOT:=}"
+    if [[ -z "$CCC_BZIP2_SYSROOT" &&
+      "$CCC_BZIP2_TARGET" != x86_64-unknown-linux-gnu ]]; then
+      echo "ccc-cc: set CCC_BZIP2_SYSROOT to the cross compiler sysroot" >&2
+      exit 2
+    fi
+    [[ -z "$CCC_BZIP2_SYSROOT" || -d "$CCC_BZIP2_SYSROOT" ]] || {
       echo "ccc-cc: compiler sysroot does not exist: $CCC_BZIP2_SYSROOT" >&2
       exit 2
     }
@@ -91,7 +96,9 @@ run_ccc() {
       "-mmacosx-version-min=$CCC_BZIP2_DEPLOYMENT_TARGET"
     )
   else
-    target_arguments+=("--sysroot=$CCC_BZIP2_SYSROOT")
+    if [[ -n "$CCC_BZIP2_SYSROOT" ]]; then
+      target_arguments+=("--sysroot=$CCC_BZIP2_SYSROOT")
+    fi
   fi
   log_command ccc "$CCC" -resource-dir "$CCC_RESOURCE_DIR" \
     "${target_arguments[@]}" "$@"
@@ -107,7 +114,9 @@ run_linker() {
       "-mmacosx-version-min=$CCC_BZIP2_DEPLOYMENT_TARGET"
     )
   else
-    target_arguments+=("--sysroot=$CCC_BZIP2_SYSROOT")
+    if [[ -n "$CCC_BZIP2_SYSROOT" ]]; then
+      target_arguments+=("--sysroot=$CCC_BZIP2_SYSROOT")
+    fi
   fi
   log_command link "$CCC_LINK_CC" "${target_arguments[@]}" "$@"
   "$CCC_LINK_CC" "${target_arguments[@]}" "$@"

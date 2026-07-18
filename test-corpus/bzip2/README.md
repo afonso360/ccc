@@ -114,9 +114,10 @@ the runtime root. Darwin may override `BZIP2_SDKROOT` and
 
 `BZIP2_OPENSSL` must name an OpenSSL implementation with SHA3-256. Darwin's
 system LibreSSL is not sufficient. `BZIP2_MD5SUM` must name a GNU-compatible
-MD5 utility; the usual Darwin choice is `gmd5sum`. Both are probed before any
-download or build. Pass an already-downloaded archive with `--source-archive`
-and a Git repository containing the pinned test commit with
+MD5 utility. Darwin CI uses the tracked OpenSSL-backed `md5sum-darwin` adapter,
+including the checked-stdin mode required by the official suite. Both hash
+tools are probed before any download or build. Pass an already-downloaded
+archive with `--source-archive` and a Git repository containing the pinned test commit with
 `--test-repository`, or let the adapter populate its disposable cache. The
 work directory must be empty and is retained with the artifacts named in
 `manifest.toml`.

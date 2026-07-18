@@ -158,6 +158,16 @@ fi
 
 : >"$TRACE"
 : >"$CCC_BZIP2_COMMAND_LOG"
+export CCC_BZIP2_TARGET=x86_64-unknown-linux-gnu
+export CCC_BZIP2_SYSROOT=
+"$script_directory/ccc-cc" -c "$source_directory/a.c" \
+  -o "$temporary_directory/native-default.o"
+grep '^ccc ' "$CCC_BZIP2_COMMAND_LOG" | grep -Fq -- ' --target=x86_64-unknown-linux-gnu'
+! grep '^ccc ' "$CCC_BZIP2_COMMAND_LOG" | grep -q -- ' --sysroot='
+[[ -f "$temporary_directory/native-default.o" ]]
+
+: >"$TRACE"
+: >"$CCC_BZIP2_COMMAND_LOG"
 export CCC_BZIP2_TARGET=aarch64-apple-darwin
 export CCC_BZIP2_SDKROOT="$temporary_directory/resource-dir"
 export CCC_BZIP2_DEPLOYMENT_TARGET=11.0

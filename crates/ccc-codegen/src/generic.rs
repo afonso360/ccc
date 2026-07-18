@@ -128,8 +128,6 @@ fn emit_inner(
         .verify_against(module, config)
         .map_err(abi_error)?;
     let declarations = declare_module(module, config, abi_plan, &mut object_module)?;
-    data::define_strings(module, &declarations, &mut object_module)?;
-    data::define_globals(module, config, &declarations, &mut object_module)?;
 
     let mut clif = String::new();
     for function in &module.functions {
@@ -197,6 +195,16 @@ fn emit_inner(
             .record_function(id, &context, object_module.isa())
             .map_err(error)?;
     }
+
+    // Define code before data so Mach-O's `__text` section is created first.
+    // Apple's linker derives compact-unwind records from `.eh_frame`; when a
+    // data section precedes `__text`, its relocatable-link pass can associate
+    // a section-relative FDE with data after reordering the sections.  Data
+    // references only require declarations while functions are lowered, so
+    // deferring their definitions preserves those references and gives the
+    // object the conventional text-before-data section order.
+    data::define_strings(module, &declarations, &mut object_module)?;
+    data::define_globals(module, config, &declarations, &mut object_module)?;
 
     let mut product = object_module.finish();
     if config.target.abi == AbiIdentity::DarwinArm64 {

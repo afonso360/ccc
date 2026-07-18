@@ -120,6 +120,7 @@ record_gnu_target_driver() {
   local identity_artifact=$4
   local macro_artifact=$5
   local reported_target version identity identity_lower
+  local -a sysroot_arguments=()
 
   reported_target=$(LC_ALL=C "$driver" -dumpmachine) ||
     die "bzip2 target driver did not report its target"
@@ -129,7 +130,10 @@ record_gnu_target_driver() {
     die "bzip2 target driver did not report its version"
   identity=$(LC_ALL=C "$driver" --version) ||
     die "bzip2 target driver did not report its identity"
-  LC_ALL=C "$driver" --sysroot="$CCC_BZIP2_SYSROOT" -dM -E -x c /dev/null \
+  if [[ -n "$CCC_BZIP2_SYSROOT" ]]; then
+    sysroot_arguments+=("--sysroot=$CCC_BZIP2_SYSROOT")
+  fi
+  LC_ALL=C "$driver" "${sysroot_arguments[@]}" -dM -E -x c /dev/null \
     >"$macro_artifact" || die "bzip2 target driver macro probe failed"
   identity_lower=$(printf '%s\n' "$identity" | tr '[:upper:]' '[:lower:]')
   [[ "$identity_lower" != *clang* ]] ||
@@ -151,7 +155,7 @@ record_gnu_target_driver() {
   {
     printf 'executable=%s\n' "$driver"
     printf 'target=%s\n' "$reported_target"
-    printf 'sysroot=%s\n' "$CCC_BZIP2_SYSROOT"
+    printf 'sysroot=%s\n' "${CCC_BZIP2_SYSROOT:-<driver-default>}"
     printf 'version=%s\n' "$version"
     printf '%s\n%s\n' '--version:' "$identity"
   } >"$identity_artifact"
@@ -364,9 +368,13 @@ else
   else
     reported_sysroot=$(LC_ALL=C "$CCC_LINK_CC" --print-sysroot) ||
       die "bzip2 target driver did not report a compiler sysroot"
-    [[ -n "$reported_sysroot" ]] ||
-      die "bzip2 target driver reported an empty compiler sysroot"
-    CCC_BZIP2_SYSROOT=$(absolute_directory "$reported_sysroot")
+    if [[ -n "$reported_sysroot" ]]; then
+      CCC_BZIP2_SYSROOT=$(absolute_directory "$reported_sysroot")
+    elif [[ "$execution_kind" == native ]]; then
+      CCC_BZIP2_SYSROOT=
+    else
+      die "bzip2 cross-target driver reported an empty compiler sysroot"
+    fi
   fi
   if [[ "$execution_kind" == qemu ]]; then
     qemu=$(resolve_executable "$BZIP2_QEMU")
@@ -426,7 +434,7 @@ work_directory=$(absolute_directory "$work_directory")
     printf 'sdkroot=%s\n' "$CCC_BZIP2_SDKROOT"
     printf 'deployment_target=%s\n' "$CCC_BZIP2_DEPLOYMENT_TARGET"
   else
-    printf 'compiler_sysroot=%s\n' "$CCC_BZIP2_SYSROOT"
+    printf 'compiler_sysroot=%s\n' "${CCC_BZIP2_SYSROOT:-<driver-default>}"
     printf 'readelf=%s\n' "$readelf_tool"
   fi
   if [[ "$execution_kind" == qemu ]]; then

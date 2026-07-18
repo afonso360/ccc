@@ -25,7 +25,7 @@ use crate::{
 
 static WORKSPACE_ID: AtomicU64 = AtomicU64::new(0);
 
-/// Identity of the object copier that passed the complete packaging probe.
+/// Identity of the symbol-localization tool that passed the complete packaging probe.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackagingToolIdentity {
     pub command: ToolCommandSpec,
@@ -36,7 +36,7 @@ pub struct PackagingToolIdentity {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackagingReport {
     pub used_generated_assembly: bool,
-    pub object_copier: Option<PackagingToolIdentity>,
+    pub symbol_localizer: Option<PackagingToolIdentity>,
 }
 
 /// Verifies and atomically materializes an artifact. Tool discovery is skipped
@@ -51,7 +51,7 @@ pub fn package_artifact_bundle(
         publish_bridge_free(&verified, output)?;
         return Ok(PackagingReport {
             used_generated_assembly: false,
-            object_copier: None,
+            symbol_localizer: None,
         });
     }
 
@@ -61,13 +61,18 @@ pub fn package_artifact_bundle(
         ToolchainRequirements::package_generated_assembly()
     };
     let toolchain = ToolchainResolver::new(config).resolve(requirements)?;
+    let candidates = if config.target.triple.binary_format == BinaryFormat::Macho {
+        macho_localizer_candidates()
+    } else {
+        object_copier_candidates(config, &toolchain)
+    };
     package_with_runner(
         &verified,
         output,
         config,
         &toolchain,
         &ProcessProbeRunner,
-        object_copier_candidates(config, &toolchain),
+        candidates,
     )
 }
 
@@ -84,13 +89,17 @@ pub fn package_artifact_bundle_with_runner<R: ProbeRunner>(
         publish_bridge_free(&verified, output)?;
         return Ok(PackagingReport {
             used_generated_assembly: false,
-            object_copier: None,
+            symbol_localizer: None,
         });
     }
-    let candidates = vec![toolchain.object_copier.clone().ok_or_else(|| LinkError {
-        code: "CCC5011",
-        message: "resolved toolchain has no object copier for generated assembly".to_owned(),
-    })?];
+    let candidates = if config.target.triple.binary_format == BinaryFormat::Macho {
+        macho_localizer_candidates()
+    } else {
+        vec![toolchain.object_copier.clone().ok_or_else(|| LinkError {
+            code: "CCC5011",
+            message: "resolved toolchain has no object copier for generated assembly".to_owned(),
+        })?]
+    };
     package_with_runner(&verified, output, config, toolchain, runner, candidates)
 }
 
@@ -122,7 +131,7 @@ fn package_with_runner<R: ProbeRunner>(
         })?;
     let workspace = ArtifactWorkspace::create(output)?;
     let macho = config.target.triple.binary_format == BinaryFormat::Macho;
-    let copier = Some(probe_packaging_capabilities(
+    let localizer = Some(probe_packaging_capabilities(
         workspace.path(),
         driver,
         &candidates,
@@ -176,19 +185,20 @@ fn package_with_runner<R: ProbeRunner>(
     let final_object = workspace.path().join("final.o");
     localize_symbols(
         runner,
-        &copier
+        &localizer
             .as_ref()
-            .expect("generated-assembly packaging probes an object copier")
+            .expect("generated-assembly packaging probes a symbol localizer")
             .command,
         &localization_file,
         &combined,
         &final_object,
+        macho,
     )?;
     inspect_combined_object(&final_object, bundle, true)?;
     workspace.publish(&final_object, output)?;
     Ok(PackagingReport {
         used_generated_assembly: true,
-        object_copier: copier,
+        symbol_localizer: localizer,
     })
 }
 
@@ -258,11 +268,12 @@ fn probe_packaging_capabilities<R: ProbeRunner>(
             &localization_file,
             &probe_combined,
             &output,
+            macho,
         )
         .and_then(|()| inspect_localized_probe(&output))
         {
             Ok(()) => {
-                let fingerprint = fingerprint_tool(runner, candidate)?;
+                let fingerprint = fingerprint_tool(runner, candidate, macho)?;
                 return Ok(PackagingToolIdentity {
                     command: candidate.clone(),
                     fingerprint,
@@ -274,7 +285,12 @@ fn probe_packaging_capabilities<R: ProbeRunner>(
     Err(LinkError {
         code: "CCC5012",
         message: format!(
-            "no object copier supports exact generated-symbol localization for {}: {}",
+            "no {} supports exact generated-symbol localization for {}: {}",
+            if macho {
+                "Mach-O symbol editor"
+            } else {
+                "object copier"
+            },
             if macho { "Mach-O" } else { "ELF" },
             failures.join("; ")
         ),
@@ -321,16 +337,31 @@ fn partial_link<R: ProbeRunner>(
 
 fn localize_symbols<R: ProbeRunner>(
     runner: &R,
-    copier: &ToolCommandSpec,
+    localizer: &ToolCommandSpec,
     localization_file: &Path,
     input: &Path,
     output: &Path,
+    macho: bool,
 ) -> Result<(), LinkError> {
+    if macho {
+        return run_tool(
+            runner,
+            localizer,
+            vec![
+                OsString::from("-R"),
+                localization_file.as_os_str().to_owned(),
+                OsString::from("-o"),
+                output.as_os_str().to_owned(),
+                input.as_os_str().to_owned(),
+            ],
+            "exact Mach-O generated-symbol localization",
+        );
+    }
     let mut option = OsString::from("--localize-symbols=");
     option.push(localization_file);
     run_tool(
         runner,
-        copier,
+        localizer,
         vec![
             option,
             input.as_os_str().to_owned(),
@@ -376,6 +407,7 @@ fn run_tool<R: ProbeRunner>(
 fn fingerprint_tool<R: ProbeRunner>(
     runner: &R,
     command: &ToolCommandSpec,
+    allow_unsupported_version_option: bool,
 ) -> Result<String, LinkError> {
     let output = runner
         .run(&ProbeRequest {
@@ -386,11 +418,11 @@ fn fingerprint_tool<R: ProbeRunner>(
         .map_err(|error| LinkError {
             code: "CCC5013",
             message: format!(
-                "cannot fingerprint object copier `{}`: {error}",
+                "cannot fingerprint packaging localizer `{}`: {error}",
                 command.display()
             ),
         })?;
-    if !output.success {
+    if !output.success && !allow_unsupported_version_option {
         return Err(LinkError {
             code: "CCC5014",
             message: format!(
@@ -401,7 +433,7 @@ fn fingerprint_tool<R: ProbeRunner>(
         });
     }
     let mut digest = Sha256::new();
-    digest.update(b"ccc-object-copier-v1\0");
+    digest.update(b"ccc-object-localizer-v2\0");
     digest.update(command.program.as_os_str().as_encoded_bytes());
     for argument in &command.arguments {
         digest.update([0]);
@@ -418,6 +450,7 @@ fn fingerprint_tool<R: ProbeRunner>(
     }
     digest.update(&output.stdout);
     digest.update(&output.stderr);
+    digest.update(output.status.as_bytes());
     Ok(format!("sha256:{:x}", digest.finalize()))
 }
 
@@ -473,7 +506,7 @@ fn inspect_localized_probe(path: &Path) -> Result<(), LinkError> {
         .ok_or_else(|| artifact_error("localized capability object lost its sentinel symbol"))?;
     if symbol.scope() != SymbolScope::Compilation {
         return Err(artifact_error(
-            "object copier did not localize the sentinel symbol",
+            "packaging tool did not localize the sentinel symbol",
         ));
     }
     Ok(())
@@ -738,6 +771,17 @@ fn object_copier_candidates(
         return toolchain.object_copier.iter().cloned().collect();
     }
     fallback_object_copier_candidates(config, toolchain)
+}
+
+fn macho_localizer_candidates() -> Vec<ToolCommandSpec> {
+    if let Some(explicit) = env::var_os("CCC_NMEDIT") {
+        return vec![ToolCommandSpec::new(explicit)];
+    }
+    vec![
+        ToolCommandSpec::with_arguments("xcrun", ["nmedit"]),
+        ToolCommandSpec::new("/usr/bin/nmedit"),
+        ToolCommandSpec::new("nmedit"),
+    ]
 }
 
 fn fallback_object_copier_candidates(
@@ -1196,6 +1240,35 @@ mod tests {
     }
 
     #[test]
+    fn macho_localization_uses_the_exact_nmedit_remove_list_contract() {
+        let directory = test_directory("nmedit-contract");
+        let localization = directory.join("localize.txt");
+        let input = directory.join("input.o");
+        let output = directory.join("output.o");
+        fs::write(&localization, b"___ccc_internal\n").unwrap();
+        fs::write(&input, b"input").unwrap();
+        let runner = FakeRunner::successful();
+        let command = ToolCommandSpec::with_arguments("xcrun", ["nmedit"]);
+
+        localize_symbols(&runner, &command, &localization, &input, &output, true).unwrap();
+
+        let requests = runner.requests.borrow();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].command, command);
+        assert_eq!(
+            requests[0].arguments,
+            [
+                OsString::from("-R"),
+                localization.as_os_str().to_owned(),
+                OsString::from("-o"),
+                output.as_os_str().to_owned(),
+                input.as_os_str().to_owned(),
+            ]
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn bridge_free_publication_does_not_invoke_tools() {
         let directory = test_directory("bridge-free");
         let output = directory.join("result.o");
@@ -1266,7 +1339,7 @@ mod tests {
         assert!(report.used_generated_assembly);
         assert!(
             report
-                .object_copier
+                .symbol_localizer
                 .unwrap()
                 .fingerprint
                 .starts_with("sha256:")

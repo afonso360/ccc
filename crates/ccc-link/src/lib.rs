@@ -120,15 +120,16 @@ impl ToolchainRequirements {
         }
     }
 
-    /// Mach-O partial linking preserves source-hidden private externs, then
-    /// LLVM objcopy localizes only compiler-internal manifest symbols.
+    /// Mach-O partial linking preserves source-hidden private externs, then a
+    /// Mach-native symbol editor localizes only compiler-internal manifest
+    /// symbols while updating symbol-indexed relocations.
     pub const fn package_generated_macho_assembly() -> Self {
         Self {
             system_headers: false,
             disable_system_headers: false,
             assembler: false,
             linker: false,
-            object_copier: true,
+            object_copier: false,
             archiver: false,
         }
     }
@@ -194,6 +195,7 @@ impl ProbeRunner for ProcessProbeRunner {
 const RELEVANT_ENVIRONMENT_VARIABLES: &[&str] = &[
     "CCC_CC",
     "CCC_OBJCOPY",
+    "CCC_NMEDIT",
     "CC",
     "OBJCOPY",
     "PATH",
