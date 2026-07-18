@@ -103,6 +103,7 @@ pub(crate) struct DriverOptions {
     pub resource_dir: Option<PathBuf>,
     pub target: Option<String>,
     pub target_arch: Option<String>,
+    pub target_cpu: Option<String>,
     pub target_abi: Option<String>,
     pub sdk_root: Option<PathBuf>,
     pub deployment_target: Option<String>,
@@ -139,6 +140,7 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
     let mut resource_dir = None;
     let mut target = None;
     let mut target_arch = None;
+    let mut target_cpu = None;
     let mut target_abi = None;
     let mut sdk_root = None;
     let mut deployment_target = None;
@@ -275,6 +277,10 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
                 require_joined_value(value, "-march")?;
                 target_arch = Some(value.to_owned());
             }
+            _ if let Some(value) = argument.strip_prefix("-mcpu=") => {
+                require_joined_value(value, "-mcpu")?;
+                target_cpu = Some(value.to_owned());
+            }
             _ if let Some(value) = argument.strip_prefix("-mabi=") => {
                 require_joined_value(value, "-mabi")?;
                 target_abi = Some(value.to_owned());
@@ -394,6 +400,7 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
         resource_dir,
         target,
         target_arch,
+        target_cpu,
         target_abi,
         sdk_root,
         deployment_target,
@@ -549,7 +556,6 @@ mod tests {
     #[test]
     fn rejects_unsupported_or_conflicting_modes() {
         assert!(parse(["-std=c17".to_owned(), "input.c".to_owned()]).is_err());
-        assert!(parse(["-mcpu=native".to_owned(), "input.c".to_owned()]).is_err());
         assert!(parse(["-M".to_owned(), "-MD".to_owned(), "input.c".to_owned()]).is_err());
         assert!(parse(["-MG".to_owned(), "input.c".to_owned()]).is_err());
         assert!(parse(["-dM".to_owned(), "-M".to_owned(), "input.c".to_owned()]).is_err());
@@ -587,6 +593,7 @@ mod tests {
         let options = options(&[
             "--target=aarch64-apple-darwin",
             "-march=armv8-a",
+            "-mcpu=generic",
             "-mabi=darwin",
             "--sdk-root=/SDK",
             "-mmacosx-version-min=14.2",
@@ -594,6 +601,7 @@ mod tests {
         ]);
         assert_eq!(options.target.as_deref(), Some("aarch64-apple-darwin"));
         assert_eq!(options.target_arch.as_deref(), Some("armv8-a"));
+        assert_eq!(options.target_cpu.as_deref(), Some("generic"));
         assert_eq!(options.target_abi.as_deref(), Some("darwin"));
         assert_eq!(options.sdk_root, Some(PathBuf::from("/SDK")));
         assert_eq!(options.deployment_target.as_deref(), Some("14.2"));

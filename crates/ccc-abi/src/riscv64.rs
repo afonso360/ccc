@@ -299,7 +299,7 @@ fn plan_native_signature(
                         piece.offset,
                         piece.valid_bytes,
                         piece.class,
-                        piece_carrier(piece)?,
+                        flattened_piece_carrier(piece)?,
                         IntegerExtension::None,
                         NativePurpose::Normal,
                     )?);
@@ -370,6 +370,7 @@ fn plan_native_signature(
         }
         PassingMode::Registers => {
             let mut carrier_indices = Vec::new();
+            let flattened = uses_hardware_float(&result_classified);
             for piece in &result_classified.pieces {
                 carrier_indices.push(push_carrier(
                     &mut clif_results,
@@ -378,7 +379,11 @@ fn plan_native_signature(
                     piece.offset,
                     piece.valid_bytes,
                     piece.class,
-                    piece_carrier(piece)?,
+                    if flattened {
+                        flattened_piece_carrier(piece)?
+                    } else {
+                        piece_carrier(piece)?
+                    },
                     IntegerExtension::None,
                     NativePurpose::Normal,
                 )?);
@@ -662,7 +667,11 @@ fn allocate_integer_slot(
     stack_size: &mut u64,
     variadic_stack_started: &mut bool,
 ) -> Result<Vec<BridgeLocation>, AbiError> {
-    if align >= 16 && *gp_used < ARGUMENT_REGISTERS && !gp_used.is_multiple_of(2) {
+    if unnamed
+        && align >= 16
+        && *gp_used < ARGUMENT_REGISTERS
+        && !gp_used.is_multiple_of(2)
+    {
         *gp_used += 1;
     }
     let pair_must_fit = unnamed && slots == 2 && align >= 16;
@@ -862,11 +871,24 @@ fn flatten_aggregate(
                 class: AbiClass::Integer,
             }]))
         }
-        Some(TypeKind::Pointer(_) | TypeKind::Enum(_)) => Ok(Some(vec![FlattenedLeaf {
+        Some(TypeKind::Pointer(_)) => Ok(Some(vec![FlattenedLeaf {
             offset: base,
             size: 8,
             class: AbiClass::Integer,
         }])),
+        Some(TypeKind::Enum(id)) => {
+            let underlying = types
+                .enumeration(*id)
+                .and_then(|definition| definition.body.as_ref())
+                .ok_or_else(|| {
+                    AbiError::new(
+                        "CCC3502",
+                        format!("type `{}` is incomplete", types.display(ty)),
+                    )
+                })?
+                .underlying;
+            flatten_aggregate(types, underlying, config, base)
+        }
         Some(TypeKind::Array(array)) => {
             let ArrayLength::Constant(length) = array.length else {
                 return Ok(None);
@@ -1087,6 +1109,21 @@ fn piece_carrier(piece: &AbiPiece) -> Result<AbiCarrier, AbiError> {
     }
 }
 
+fn flattened_piece_carrier(piece: &AbiPiece) -> Result<AbiCarrier, AbiError> {
+    match (piece.class, piece.valid_bytes) {
+        (AbiClass::Integer, 1) => Ok(AbiCarrier::I8),
+        (AbiClass::Integer, 2) => Ok(AbiCarrier::I16),
+        (AbiClass::Integer, 4) => Ok(AbiCarrier::I32),
+        (AbiClass::Integer, 8) => Ok(AbiCarrier::I64),
+        (AbiClass::Sse, 4) => Ok(AbiCarrier::F32),
+        (AbiClass::Sse, 8) => Ok(AbiCarrier::F64),
+        _ => Err(AbiError::new(
+            "CCC3503",
+            "RISC-V flattened aggregate has an invalid register carrier",
+        )),
+    }
+}
+
 fn reject_binary128_recursive(
     types: &TypeStore,
     ty: TypeId,
@@ -1223,6 +1260,103 @@ mod tests {
             NativePurpose::IndirectArgument
         );
         assert!(matches!(plan.result, NativeResultPlan::Indirect { .. }));
+    }
+
+    #[test]
+    fn mixed_fp_aggregate_integer_leaves_keep_their_true_width() {
+        let config = EffectiveCompilationConfig::riscv64_unknown_linux_gnu();
+        let mut types = TypeStore::default();
+        let (enum_id, enumeration) = types.declare_enum(None);
+        types
+            .complete_enum(enum_id, TypeId::INT, Vec::new())
+            .unwrap();
+        for (first, second, carriers) in [
+            (
+                TypeId::FLOAT,
+                TypeId::INT,
+                [AbiCarrier::F32, AbiCarrier::I32],
+            ),
+            (
+                TypeId::INT,
+                TypeId::FLOAT,
+                [AbiCarrier::I32, AbiCarrier::F32],
+            ),
+            (
+                TypeId::DOUBLE,
+                enumeration,
+                [AbiCarrier::F64, AbiCarrier::I32],
+            ),
+            (
+                enumeration,
+                TypeId::FLOAT,
+                [AbiCarrier::I32, AbiCarrier::F32],
+            ),
+        ] {
+            let mixed = record(
+                &mut types,
+                vec![Field::named("first", first), Field::named("second", second)],
+            );
+            let signature = types.function_type(FunctionType::prototype(
+                QualifiedType::unqualified(mixed),
+                vec![QualifiedType::unqualified(mixed)],
+            ));
+            let plan = plan_function_type(&types, signature, &config).unwrap();
+            assert_eq!(
+                plan.clif_parameters
+                    .iter()
+                    .map(|carrier| carrier.carrier)
+                    .collect::<Vec<_>>(),
+                carriers
+            );
+            assert_eq!(
+                plan.clif_results
+                    .iter()
+                    .map(|carrier| carrier.carrier)
+                    .collect::<Vec<_>>(),
+                carriers
+            );
+        }
+    }
+
+    #[test]
+    fn named_aligned_pair_does_not_use_the_variadic_even_register_rule() {
+        let config = EffectiveCompilationConfig::riscv64_unknown_linux_gnu();
+        let mut types = TypeStore::default();
+        let aligned = record(
+            &mut types,
+            vec![
+                Field::named("first", TypeId::LONG).with_requested_alignment(Some(16)),
+                Field::named("second", TypeId::LONG),
+            ],
+        );
+        let signature = types.function_type(FunctionType::variadic(
+            QualifiedType::unqualified(TypeId::LONG),
+            vec![
+                QualifiedType::unqualified(TypeId::INT),
+                QualifiedType::unqualified(aligned),
+            ],
+        ));
+        let plan = plan_variadic_call(
+            &types,
+            signature,
+            &[TypeId::INT, aligned],
+            2,
+            &config,
+        )
+        .unwrap();
+        let locations = plan
+            .parameter_pieces
+            .iter()
+            .filter(|piece| piece.source_index == Some(1))
+            .map(|piece| piece.location)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            locations,
+            [
+                BridgeLocation::Register(RegisterSlot::integer(1)),
+                BridgeLocation::Register(RegisterSlot::integer(2)),
+            ]
+        );
     }
 
     #[test]

@@ -96,6 +96,52 @@ fn enabled_non_x86_targets_emit_native_objects_with_fixed_aggregate_calls() {
 }
 
 #[test]
+fn arm64_fixed_aggregate_exhaustion_emits_complete_stack_transports() {
+    const INTEGER_SOURCE: &str = "struct Pair { long first; long second; };\n\
+         long pair_after_seven(long a0, long a1, long a2, long a3, long a4, long a5, long a6, struct Pair value) {\n\
+         return a0+a1+a2+a3+a4+a5+a6+value.first+value.second; }\n\
+         long invoke(void) { struct Pair pair = {8, 9};\n\
+           return pair_after_seven(1,2,3,4,5,6,7,pair); }";
+    const HFA_SOURCE: &str = "struct Hfa { double first; double second; };\n\
+         long hfa_after_seven(double a0, double a1, double a2, double a3, double a4, double a5, double a6, struct Hfa value) {\n\
+           return (long)(a0+a1+a2+a3+a4+a5+a6+value.first+value.second); }";
+    let integer_module = lower_source(INTEGER_SOURCE);
+    let hfa_module = lower_source(HFA_SOURCE);
+    for config in [
+        EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+        EffectiveCompilationConfig::aarch64_apple_darwin(),
+    ] {
+        let plan = ccc_abi::plan_module(&integer_module, &config).unwrap();
+        assert!(plan.definitions.values().any(|definition| {
+            let ccc_abi::BoundaryPlan::Native(native) = &definition.boundary else {
+                return false;
+            };
+            native
+                .clif_parameters
+                .iter()
+                .any(|carrier| carrier.purpose == ccc_abi::NativePurpose::Padding)
+        }));
+        let output = emit(&integer_module, &config, Options::default()).unwrap();
+        let object = object::File::parse(output.object.as_slice()).unwrap();
+        assert_eq!(object.architecture(), object::Architecture::Aarch64);
+
+        let plan = ccc_abi::plan_module(&hfa_module, &config).unwrap();
+        assert!(plan.definitions.values().any(|definition| {
+            let ccc_abi::BoundaryPlan::Native(native) = &definition.boundary else {
+                return false;
+            };
+            native
+                .clif_parameters
+                .iter()
+                .any(|carrier| carrier.purpose == ccc_abi::NativePurpose::Padding)
+        }));
+        let output = emit(&hfa_module, &config, Options::default()).unwrap();
+        let object = object::File::parse(output.object.as_slice()).unwrap();
+        assert_eq!(object.architecture(), object::Architecture::Aarch64);
+    }
+}
+
+#[test]
 fn enabled_non_x86_targets_plan_target_variadics_and_emit_matching_adapters() {
     let source = "typedef __builtin_va_list va_list;\n\
                   struct Pair { long first, second; };\n\
@@ -662,7 +708,7 @@ fn complete_abi_plan_and_aggregate_clif_have_exact_snapshots() {
     assert!(dump.contains("packaging assembly-units=2"), "{dump}");
     assert_eq!(
         sha256(&dump),
-        "cb2555b2f23457372fcf9d0a90db412724a2be11fc893903dc4f130fd69d59bb"
+        "2b3301ff4fc39297d5c3605d13385b2d8224fc1226ff0146b729ba70c5b6e347"
     );
 
     let output = emit(&module, &config, Options { emit_clif: true }).unwrap();

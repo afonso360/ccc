@@ -6,18 +6,18 @@ Targets are named by exact triples. A target is enabled only when its object for
 | ----------------------------- | ----------------------------------------------------- | ------ | ------------------------ | ---------- | ---------------------------------------------------------------------------------------------- |
 | `x86_64-unknown-linux-gnu`    | same                                                  | ELF    | System V AMD64, LP64     | glibc      | signed `char`; f80 `long double`                                                               |
 | `x86_64-unknown-linux-musl`   | same                                                  | ELF    | System V AMD64, LP64     | musl       | catalog entry only; not an enabled profile                                                     |
-| `aarch64-unknown-linux-gnu`   | same                                                  | ELF    | AAPCS64, LP64            | glibc      | unsigned `char`; HFA/HVA; binary128 `long double`                                              |
+| `aarch64-unknown-linux-gnu`   | same                                                  | ELF    | AAPCS64, LP64            | glibc      | unsigned `char`; HFA; binary128 `long double`                                                  |
 | `riscv64-unknown-linux-gnu`   | same, with optional exact `-march=rv64gc -mabi=lp64d` | ELF    | RISC-V LP64D             | glibc      | unsigned `char`; FP aggregates; binary128 `long double`                                        |
 | `aarch64-apple-darwin`        | same, plus deployment target                          | Mach-O | Darwin arm64             | Apple libc | signed `char`; Apple variadics; `long double == double`                                        |
 
 Internal triples use target-lexicon canonical forms. The enabled profiles have
 fixed baseline architecture and ABI spellings: `x86-64`/LP64,
-`armv8-a`/LP64, `rv64gc`/LP64D, and Darwin arm64. The driver accepts `-march`
-and `-mabi` only when they restate the selected profile, includes the normalized
-values in the ABI key, propagates applicable explicit spellings to target
-tools, and rejects contradictory or unknown values before preprocessing.
-There is no accepted `-mcpu` option until a non-default CPU profile is wired to
-both Cranelift and every target tool.
+`armv8-a`/LP64, `rv64gc`/LP64D, and Darwin arm64. The driver accepts `-march`,
+`-mcpu=generic`, and `-mabi` only when they restate the selected profile, includes the normalized
+values in the ABI key, propagates applicable architecture and ABI spellings to
+target tools, and rejects contradictory or unknown values before preprocessing.
+`generic` is CCC's own fixed feature baseline: it is not forwarded to another
+driver whose interpretation of that spelling could differ.
 
 The compiler-owned ABI identities are `sysv-amd64-lp64`, `aapcs64-lp64`,
 `riscv-lp64d`, and `darwin-arm64`. Backend calling-convention enums are derived

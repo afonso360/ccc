@@ -25,8 +25,9 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ccc_target::{
-    EffectiveCompilationConfig, RelocationModel, SystemIncludeEntry, SystemIncludeKind,
-    ToolCommandSpec, ToolchainFingerprint, ToolchainSpec, Triple,
+    Architecture, EffectiveCompilationConfig, OperatingSystem, RelocationModel,
+    SystemIncludeEntry, SystemIncludeKind, ToolCommandSpec, ToolchainFingerprint, ToolchainSpec,
+    Triple,
 };
 
 #[derive(Debug)]
@@ -525,6 +526,24 @@ impl ToolchainResolver<ProcessProbeRunner> {
 
 impl<R: ProbeRunner> ToolchainResolver<R> {
     pub fn with_runner(config: &EffectiveCompilationConfig, runner: R) -> Self {
+        let mut target_arguments = vec![OsString::from(format!(
+            "-march={}",
+            config.normalized_target_arch()
+        ))];
+        if matches!(
+            config.target.abi,
+            ccc_target::AbiIdentity::Aapcs64Lp64 | ccc_target::AbiIdentity::RiscvLp64d
+        ) {
+            target_arguments.push(OsString::from(format!(
+                "-mabi={}",
+                config.normalized_target_abi()
+            )));
+        }
+        if let Some(version) = config.normalized_deployment_target() {
+            target_arguments.push(OsString::from(format!(
+                "-mmacosx-version-min={version}"
+            )));
+        }
         Self {
             target: config.target.triple.clone(),
             driver: config
@@ -535,7 +554,7 @@ impl<R: ProbeRunner> ToolchainResolver<R> {
             explicit_sysroot: config.toolchain.sysroot.clone(),
             explicit_resource_dir: config.toolchain.resource_dir.clone(),
             existing: config.toolchain.clone(),
-            target_arguments: Vec::new(),
+            target_arguments,
             cache_process_resolution: false,
             runner,
         }
@@ -582,7 +601,7 @@ impl<R: ProbeRunner> ToolchainResolver<R> {
         let candidate = self
             .driver
             .clone()
-            .map_or_else(|| driver_from_environment(&environment), Ok)?;
+            .map_or_else(|| driver_from_environment(&environment, &self.target), Ok)?;
         let executable = ExecutableIdentity::resolve(&candidate.program, &environment);
         let working_directory = current_working_directory();
         if self.cache_process_resolution {
@@ -619,7 +638,10 @@ impl<R: ProbeRunner> ToolchainResolver<R> {
                     let Ok(fresh_candidate) = self
                         .driver
                         .clone()
-                        .map_or_else(|| driver_from_environment(&fresh_environment), Ok)
+                        .map_or_else(
+                            || driver_from_environment(&fresh_environment, &self.target),
+                            Ok,
+                        )
                     else {
                         return false;
                     };
@@ -1269,9 +1291,14 @@ fn parse_clang_trace_arguments(line: &str) -> Option<Vec<String>> {
 }
 
 pub fn target_matches(reported: &Triple, expected: &Triple) -> bool {
+    let is_macos = |operating_system: OperatingSystem| {
+        matches!(
+            operating_system,
+            OperatingSystem::Darwin(_) | OperatingSystem::MacOSX(_)
+        )
+    };
     let operating_system_matches = reported.operating_system == expected.operating_system
-        || (reported.operating_system.is_like_darwin()
-            && expected.operating_system.is_like_darwin());
+        || (is_macos(reported.operating_system) && is_macos(expected.operating_system));
     reported.architecture == expected.architecture
         && operating_system_matches
         && reported.environment == expected.environment
@@ -1296,11 +1323,33 @@ fn requirements_satisfied(
         && (!requirements.archiver || (spec.archiver.is_some() && spec.ranlib.is_some()))
 }
 
-fn driver_from_environment(environment: &[EnvironmentEntry]) -> Result<ToolCommandSpec, LinkError> {
+fn driver_from_environment(
+    environment: &[EnvironmentEntry],
+    target: &Triple,
+) -> Result<ToolCommandSpec, LinkError> {
     environment_value(environment, "CCC_CC")
         .or_else(|| environment_value(environment, "CC"))
         .map(OsStr::to_os_string)
-        .map_or_else(|| Ok(ToolCommandSpec::new("cc")), parse_driver_command)
+        .map_or_else(
+            || {
+                Ok(match target.architecture {
+                    Architecture::Aarch64(_) if target.operating_system == OperatingSystem::Linux => {
+                        ToolCommandSpec::new("aarch64-linux-gnu-gcc")
+                    }
+                    Architecture::Riscv64(_) => ToolCommandSpec::new("riscv64-linux-gnu-gcc"),
+                    Architecture::Aarch64(_)
+                        if matches!(
+                            target.operating_system,
+                            OperatingSystem::Darwin(_) | OperatingSystem::MacOSX(_)
+                        ) =>
+                    {
+                        ToolCommandSpec::with_arguments("xcrun", [OsString::from("clang")])
+                    }
+                    _ => ToolCommandSpec::new("cc"),
+                })
+            },
+            parse_driver_command,
+        )
 }
 
 fn parse_driver_command(value: OsString) -> Result<ToolCommandSpec, LinkError> {
@@ -1495,6 +1544,15 @@ mod tests {
         assert!(!target_matches(
             &"x86_64-apple-darwin".parse().unwrap(),
             &expected
+        ));
+        let macos: Triple = "aarch64-apple-darwin".parse().unwrap();
+        assert!(target_matches(
+            &"aarch64-apple-macosx".parse().unwrap(),
+            &macos
+        ));
+        assert!(!target_matches(
+            &"aarch64-apple-ios".parse().unwrap(),
+            &macos
         ));
     }
 
@@ -1935,7 +1993,7 @@ mod tests {
         assert_eq!(requests.len(), 5);
         assert_eq!(
             requests[2].arguments,
-            ["-###", "-E", "-x", "c", "-"]
+            ["-march=x86-64", "-###", "-E", "-x", "c", "-"]
                 .into_iter()
                 .map(OsString::from)
                 .collect::<Vec<_>>()
@@ -1972,7 +2030,10 @@ mod tests {
         assert_eq!(spec.sysroot.as_deref(), Some(Path::new("/sdk")));
         assert_eq!(
             spec.linker_driver,
-            Some(ToolCommandSpec::new("fixture-gcc"))
+            Some(ToolCommandSpec::with_arguments(
+                "fixture-gcc",
+                [OsString::from("-march=x86-64")]
+            ))
         );
         let requests = resolver.runner.requests.borrow();
         assert_eq!(requests.len(), 3);
@@ -2016,7 +2077,7 @@ mod tests {
         assert_eq!(requests.len(), 5);
         assert_eq!(
             requests[2].arguments,
-            ["-###", "-E", "-x", "c", "-"]
+            ["-march=x86-64", "-###", "-E", "-x", "c", "-"]
                 .into_iter()
                 .map(OsString::from)
                 .collect::<Vec<_>>()

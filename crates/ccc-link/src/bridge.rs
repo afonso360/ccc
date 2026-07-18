@@ -726,6 +726,7 @@ fn render_riscv64_call_helper(symbol: &str) -> Result<GeneratedAssembly, LinkErr
          sd s2, 0(sp)\n\
          .cfi_offset s2, -32\n\
          addi s0, sp, 32\n\
+         .cfi_def_cfa s0, 0\n\
          mv s1, a0\n\
          lwu s2, 16(s1)\n\
          addi s2, s2, 15\n\
@@ -768,12 +769,17 @@ fn render_riscv64_call_helper(symbol: &str) -> Result<GeneratedAssembly, LinkErr
          fsd fa2, 288(s1)\n\
          fsd fa3, 304(s1)\n\
          addi sp, s0, -32\n\
+         .cfi_def_cfa sp, 32\n\
          ld s2, 0(sp)\n\
+         .cfi_restore s2\n\
          ld s1, 8(sp)\n\
+         .cfi_restore s1\n\
          ld s0, 16(sp)\n\
+         .cfi_restore s0\n\
          ld ra, 24(sp)\n\
+         .cfi_restore ra\n\
          addi sp, sp, 32\n\
-         .cfi_def_cfa_offset 0\n\
+         .cfi_def_cfa sp, 0\n\
          ret\n",
     );
     target_function_footer(symbol, AbiIdentity::RiscvLp64d, &mut source);
@@ -1150,6 +1156,11 @@ fn render_riscv64_variadic_entry(plan: &VariadicEntryPlan) -> Result<GeneratedAs
          sd zero, 296(sp)\n\
          sd zero, 304(sp)\n\
          sd zero, 312(sp)\n\
+         li t0, -1\n\
+         sw t0, 260(sp)\n\
+         sw t0, 276(sp)\n\
+         sw t0, 292(sp)\n\
+         sw t0, 308(sp)\n\
          mv a0, sp\n",
     );
     writeln!(source, "call {}", plan.hidden_body_symbol).unwrap();
@@ -1343,6 +1354,25 @@ mod tests {
         assert!(!source.contains("ldmxcsr"));
         assert!(!source.contains("fldcw"));
         assert!(!source.contains("cld"));
+    }
+
+    #[test]
+    fn riscv_call_helper_uses_a_stable_cfa_across_dynamic_outgoing_storage() {
+        let assembly = render_target_call_helper(
+            "__ccc_call_helper_riscv_test",
+            AbiIdentity::RiscvLp64d,
+        )
+        .unwrap();
+        let source = assembly.source();
+        let establish = source.find("addi s0, sp, 32").unwrap();
+        let stable_cfa = source[establish..].find(".cfi_def_cfa s0, 0").unwrap() + establish;
+        let dynamic = source.find("sub sp, sp, s2").unwrap();
+        let restore_sp = source.find("addi sp, s0, -32").unwrap();
+        let restore_cfa = source[restore_sp..].find(".cfi_def_cfa sp, 32").unwrap() + restore_sp;
+        let call = source.find("jalr t0").unwrap();
+        assert!(establish < stable_cfa && stable_cfa < dynamic && dynamic < call);
+        assert!(call < restore_sp && restore_sp < restore_cfa);
+        assert!(source.contains(".cfi_def_cfa sp, 0"));
     }
 
     #[test]

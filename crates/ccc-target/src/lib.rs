@@ -208,17 +208,17 @@ impl TargetSpec {
                 BinaryFormat::Elf,
             ) => AARCH64_UNKNOWN_LINUX_GNU,
             (
-                Architecture::Riscv64(_),
+                Architecture::Riscv64(Riscv64Architecture::Riscv64),
                 OperatingSystem::Linux,
                 Environment::Gnu,
                 BinaryFormat::Elf,
             ) => RISCV64_UNKNOWN_LINUX_GNU,
             (
                 Architecture::Aarch64(Aarch64Architecture::Aarch64),
-                operating_system,
+                OperatingSystem::Darwin(_) | OperatingSystem::MacOSX(_),
                 Environment::Unknown,
                 BinaryFormat::Macho,
-            ) if operating_system.is_like_darwin() => AARCH64_APPLE_DARWIN,
+            ) => AARCH64_APPLE_DARWIN,
             _ => {
                 return Err(format!(
                     "target `{triple}` is not an enabled CCC target profile"
@@ -337,11 +337,25 @@ impl TargetSpec {
             facts.insert("__aarch64__", "1");
             facts.insert("__AARCH64EL__", "1");
             facts.insert("__ARM_ARCH", "8");
-            facts.insert("__ARM_ARCH_8A__", "1");
             facts.insert("__ARM_ARCH_ISA_A64", "1");
             facts.insert("__ARM_64BIT_STATE", "1");
             facts.insert("__ARM_PCS_AAPCS64", "1");
+            facts.insert("__ARM_SIZEOF_MINIMAL_ENUM", "4");
             facts.insert("__ARM_SIZEOF_WCHAR_T", "4");
+            if self.abi == AbiIdentity::DarwinArm64 {
+                facts.insert("__ARM64_ARCH_8__", "1");
+                facts.insert("__ARM_ARCH_PROFILE", "'A'");
+                facts.insert("__ARM_FP", "0xE");
+                facts.insert("__ARM_ALIGN_MAX_STACK_PWR", "4");
+                facts.insert("__BIGGEST_ALIGNMENT__", "8");
+            } else {
+                facts.insert("__ARM_ARCH_8A", "1");
+                facts.insert("__ARM_ARCH_PROFILE", "65");
+                facts.insert("__ARM_FP", "14");
+                facts.insert("__ARM_ALIGN_MAX_PWR", "28");
+                facts.insert("__ARM_ALIGN_MAX_STACK_PWR", "16");
+                facts.insert("__BIGGEST_ALIGNMENT__", "16");
+            }
         }
         if matches!(self.abi, AbiIdentity::RiscvLp64d) {
             facts.insert("__riscv", "1");
@@ -355,6 +369,8 @@ impl TargetSpec {
                 ("__riscv_c", "2000000"),
                 ("__riscv_f", "2002000"),
                 ("__riscv_d", "2002000"),
+                ("__riscv_zicsr", "2000000"),
+                ("__riscv_zifencei", "2000000"),
             ] {
                 facts.insert(name, version);
             }
@@ -369,13 +385,17 @@ impl TargetSpec {
             ] {
                 facts.insert(name, "1");
             }
+            facts.insert("__BIGGEST_ALIGNMENT__", "16");
         }
         if self.triple.operating_system == OperatingSystem::Linux {
             for name in ["__linux__", "__linux", "__unix__", "__unix"] {
                 facts.insert(name, "1");
             }
         }
-        if self.triple.operating_system.is_like_darwin() {
+        if matches!(
+            self.triple.operating_system,
+            OperatingSystem::Darwin(_) | OperatingSystem::MacOSX(_)
+        ) {
             facts.insert("__APPLE__", "1");
             facts.insert("__MACH__", "1");
             facts.insert("__arm64", "1");
@@ -462,6 +482,7 @@ fn insert_long_double_compatibility_facts(target: &TargetSpec, facts: &mut Prede
                 ("HAS_INFINITY", "1"),
                 ("HAS_QUIET_NAN", "1"),
                 ("MAX", "0x1.fffffffffffffp+1023L"),
+                ("NORM_MAX", "0x1.fffffffffffffp+1023L"),
                 ("EPSILON", "0x1p-52L"),
                 ("MIN", "0x1p-1022L"),
                 ("DENORM_MIN", "0x1p-1074L"),
@@ -859,10 +880,13 @@ pub struct EffectiveCompilationConfig {
     pub toolchain: ToolchainSpec,
     pub relocation_model: RelocationModel,
     pub target_arch: Option<String>,
+    pub target_cpu: Option<String>,
     pub target_abi: Option<String>,
     pub sdk_root: Option<PathBuf>,
     pub deployment_target: Option<String>,
 }
+
+pub const DARWIN_ARM64_MINIMUM_DEPLOYMENT_TARGET: &str = "11.0";
 
 impl EffectiveCompilationConfig {
     pub fn x86_64_unknown_linux_gnu() -> Self {
@@ -903,6 +927,7 @@ impl EffectiveCompilationConfig {
             toolchain: ToolchainSpec::default(),
             relocation_model: RelocationModel::Pie,
             target_arch: None,
+            target_cpu: None,
             target_abi: None,
             sdk_root: None,
             deployment_target: None,
@@ -929,6 +954,11 @@ impl EffectiveCompilationConfig {
         self
     }
 
+    pub fn with_target_cpu(mut self, cpu: impl Into<String>) -> Self {
+        self.target_cpu = Some(cpu.into());
+        self
+    }
+
     pub fn with_target_abi(mut self, abi: impl Into<String>) -> Self {
         self.target_abi = Some(abi.into());
         self
@@ -950,6 +980,13 @@ impl EffectiveCompilationConfig {
         }
     }
 
+    /// CCC's enabled targets deliberately use a fixed, compiler-owned CPU
+    /// baseline. `generic` names that baseline without importing host features
+    /// or relying on another driver's interpretation of a CPU spelling.
+    pub const fn normalized_target_cpu(&self) -> &'static str {
+        "generic"
+    }
+
     pub fn validate_target_profile_options(&self) -> Result<(), String> {
         if let Some(architecture) = self.target_arch.as_deref()
             && architecture != self.normalized_target_arch()
@@ -958,6 +995,15 @@ impl EffectiveCompilationConfig {
                 "target architecture option `{architecture}` contradicts the enabled `{}` profile `{}`",
                 self.target.abi.name(),
                 self.normalized_target_arch()
+            ));
+        }
+        if let Some(cpu) = self.target_cpu.as_deref()
+            && cpu != self.normalized_target_cpu()
+        {
+            return Err(format!(
+                "target CPU option `{cpu}` contradicts the enabled `{}` profile `{}`",
+                self.target.abi.name(),
+                self.normalized_target_cpu()
             ));
         }
         if let Some(abi) = self.target_abi.as_deref()
@@ -980,6 +1026,14 @@ impl EffectiveCompilationConfig {
     pub fn with_deployment_target(mut self, deployment_target: impl Into<String>) -> Self {
         self.deployment_target = Some(deployment_target.into());
         self
+    }
+
+    pub fn normalized_deployment_target(&self) -> Option<&str> {
+        (self.target.abi == AbiIdentity::DarwinArm64).then(|| {
+            self.deployment_target
+                .as_deref()
+                .unwrap_or(DARWIN_ARM64_MINIMUM_DEPLOYMENT_TARGET)
+        })
     }
 
     pub fn sysroot(&self) -> Option<&Path> {
@@ -1015,14 +1069,25 @@ impl EffectiveCompilationConfig {
                 profile.version.patch.to_string(),
             );
         }
-        if let Some(version) = &self.deployment_target
-            && self.target.abi == AbiIdentity::DarwinArm64
+        if self.target.abi == AbiIdentity::RiscvLp64d {
+            match self.relocation_model {
+                RelocationModel::Static => {
+                    macros.insert("__riscv_cmodel_medlow".to_owned(), "1".to_owned());
+                }
+                RelocationModel::Pic | RelocationModel::Pie => {
+                    macros.insert("__riscv_cmodel_medany".to_owned(), "1".to_owned());
+                    macros.insert("__riscv_cmodel_pic".to_owned(), "1".to_owned());
+                }
+            }
+        }
+        if let Some(version) = self.normalized_deployment_target()
             && let Some(encoded) = encode_apple_deployment_version(version)
         {
             macros.insert(
                 "__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__".to_owned(),
-                encoded,
+                encoded.clone(),
             );
+            macros.insert("__ENVIRONMENT_OS_VERSION_MIN_REQUIRED__".to_owned(), encoded);
         }
         macros
     }
@@ -1273,6 +1338,24 @@ mod tests {
     }
 
     #[test]
+    fn near_match_triples_do_not_inherit_an_incompatible_fixed_profile() {
+        for triple in [
+            "riscv64imac-unknown-linux-gnu",
+            "riscv64a23-unknown-linux-gnu",
+            "aarch64-apple-ios",
+            "aarch64-apple-tvos",
+            "aarch64-apple-watchos",
+            "aarch64-apple-visionos",
+        ] {
+            let triple: Triple = triple.parse().unwrap();
+            assert!(
+                EffectiveCompilationConfig::for_target(triple.clone()).is_err(),
+                "{triple}"
+            );
+        }
+    }
+
+    #[test]
     fn target_profile_options_are_exact_and_cannot_be_silently_discarded() {
         for (config, architecture, abi) in [
             (
@@ -1298,9 +1381,11 @@ mod tests {
         ] {
             assert_eq!(config.normalized_target_arch(), architecture);
             assert_eq!(config.normalized_target_abi(), abi);
+            assert_eq!(config.normalized_target_cpu(), "generic");
             config
                 .clone()
                 .with_target_arch(architecture)
+                .with_target_cpu("generic")
                 .with_target_abi(abi)
                 .validate_target_profile_options()
                 .unwrap();
@@ -1308,6 +1393,13 @@ mod tests {
                 config
                     .clone()
                     .with_target_arch("contradictory-architecture")
+                    .validate_target_profile_options()
+                    .is_err()
+            );
+            assert!(
+                config
+                    .clone()
+                    .with_target_cpu("native")
                     .validate_target_profile_options()
                     .is_err()
             );

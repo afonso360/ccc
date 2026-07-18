@@ -102,6 +102,11 @@ pub fn abi_config_key(config: &EffectiveCompilationConfig) -> Result<AbiConfigKe
         backend_profile: "cranelift-0.132.0-no-llvm-extensions-no-implicit-sret",
         normalized_target_arch: config.normalized_target_arch(),
         normalized_target_abi: config.normalized_target_abi(),
+        normalized_target_cpu: config.normalized_target_cpu(),
+        normalized_deployment_target: config
+            .normalized_deployment_target()
+            .unwrap_or("<none>")
+            .to_owned(),
     })
 }
 
@@ -241,6 +246,8 @@ fn encode_config_key(encoder: &mut Encoder, key: &AbiConfigKey) {
     // v1 encoder below must not be renumbered when another profile is added.
     encoder.string(key.normalized_target_arch);
     encoder.string(key.normalized_target_abi);
+    encoder.string(key.normalized_target_cpu);
+    encoder.string(&key.normalized_deployment_target);
 }
 
 fn encode_config_key_v1(encoder: &mut Encoder, key: &AbiConfigKey) {
@@ -1143,9 +1150,26 @@ mod tests {
             assert_eq!(key.boundary_profile, profile);
             assert_eq!(key.normalized_target_arch, architecture);
             assert_eq!(key.normalized_target_abi, abi);
+            assert_eq!(key.normalized_target_cpu, "generic");
+            assert_eq!(
+                key.normalized_deployment_target,
+                if identity == AbiIdentity::DarwinArm64 {
+                    "11.0"
+                } else {
+                    "<none>"
+                }
+            );
             assert_ne!(key.specification_source_sha256, "embedded-policy");
             assert_eq!(key.specification_source_sha256.len(), 64);
         }
+        assert_eq!(
+            abi_config_key(&EffectiveCompilationConfig::aarch64_apple_darwin()).unwrap(),
+            abi_config_key(
+                &EffectiveCompilationConfig::aarch64_apple_darwin()
+                    .with_deployment_target("11.0")
+            )
+            .unwrap()
+        );
     }
 
     #[test]

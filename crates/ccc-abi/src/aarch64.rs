@@ -185,7 +185,9 @@ pub(crate) fn plan_va_arg(
             .filter(|piece| piece.class == AbiClass::Sse)
             .count() as u8
     };
-    let overflow_align = if config.target.abi == AbiIdentity::DarwinArm64 {
+    let overflow_align = if indirect {
+        8
+    } else if config.target.abi == AbiIdentity::DarwinArm64 {
         classified.align.clamp(1, 16)
     } else {
         classified.align.clamp(8, 16)
@@ -255,7 +257,7 @@ fn plan_native_signature(
     let mut planned_parameters = Vec::with_capacity(parameters.len());
     for (source_index, parameter) in parameters.iter().enumerate() {
         reject_array_boundary(types, parameter.ty, "parameter")?;
-        let classified = classify(types, parameter.ty, config, "parameter")?;
+        let mut classified = classify(types, parameter.ty, config, "parameter")?;
         if classified.passing == PassingMode::Void {
             return Err(AbiError::new(
                 "CCC3507",
@@ -287,34 +289,59 @@ fn plan_native_signature(
             }
             PassingMode::Registers if is_homogeneous(&classified) => {
                 let pieces = classified.pieces.len() as u8;
-                if fp_used < MAX_ARGUMENT_REGISTERS
-                    && fp_used.saturating_add(pieces) > MAX_ARGUMENT_REGISTERS
-                {
-                    return Err(AbiError::new(
-                        "CCC3521",
-                        format!(
-                            "parameter type `{}` is a homogeneous aggregate that straddles the arm64 FP-register boundary",
-                            types.display(parameter.ty)
-                        ),
-                    ));
-                }
-                fp_used = fp_used.saturating_add(pieces).min(MAX_ARGUMENT_REGISTERS);
-                for piece in &classified.pieces {
-                    carrier_indices.push(push_carrier(
-                        &mut clif_parameters,
-                        Some(source_index),
-                        Some(piece.index),
-                        piece.offset,
-                        piece.valid_bytes,
-                        piece.class,
-                        float_piece_carrier(piece)?,
-                        IntegerExtension::None,
-                        NativePurpose::Normal,
-                    )?);
+                if fp_used.saturating_add(pieces) > MAX_ARGUMENT_REGISTERS {
+                    while fp_used < MAX_ARGUMENT_REGISTERS {
+                        push_carrier(
+                            &mut clif_parameters,
+                            None,
+                            None,
+                            0,
+                            8,
+                            AbiClass::Sse,
+                            AbiCarrier::F64,
+                            IntegerExtension::None,
+                            NativePurpose::Padding,
+                        )?;
+                        fp_used += 1;
+                    }
+                    classified = homogeneous_stack_classification(&classified, config.target.abi);
+                    for piece in &classified.pieces {
+                        carrier_indices.push(push_carrier(
+                            &mut clif_parameters,
+                            Some(source_index),
+                            Some(piece.index),
+                            piece.offset,
+                            piece.valid_bytes,
+                            piece.class,
+                            if config.target.abi == AbiIdentity::DarwinArm64 {
+                                float_piece_carrier(piece)?
+                            } else {
+                                vector_piece_carrier(piece)?
+                            },
+                            IntegerExtension::None,
+                            NativePurpose::Normal,
+                        )?);
+                    }
+                } else {
+                    fp_used += pieces;
+                    for piece in &classified.pieces {
+                        carrier_indices.push(push_carrier(
+                            &mut clif_parameters,
+                            Some(source_index),
+                            Some(piece.index),
+                            piece.offset,
+                            piece.valid_bytes,
+                            piece.class,
+                            float_piece_carrier(piece)?,
+                            IntegerExtension::None,
+                            NativePurpose::Normal,
+                        )?);
+                    }
                 }
             }
             PassingMode::Registers => {
-                if classified.align >= 16
+                if config.target.abi == AbiIdentity::Aapcs64Lp64
+                    && classified.align >= 16
                     && gp_used < MAX_ARGUMENT_REGISTERS
                     && !gp_used.is_multiple_of(2)
                 {
@@ -331,9 +358,28 @@ fn plan_native_signature(
                     )?;
                     gp_used += 1;
                 }
-                gp_used = gp_used
-                    .saturating_add(classified.pieces.len() as u8)
-                    .min(MAX_ARGUMENT_REGISTERS);
+                let pieces = classified.pieces.len() as u8;
+                if gp_used.saturating_add(pieces) > MAX_ARGUMENT_REGISTERS {
+                    while gp_used < MAX_ARGUMENT_REGISTERS {
+                        push_carrier(
+                            &mut clif_parameters,
+                            None,
+                            None,
+                            0,
+                            8,
+                            AbiClass::Integer,
+                            AbiCarrier::I64,
+                            IntegerExtension::None,
+                            NativePurpose::Padding,
+                        )?;
+                        gp_used += 1;
+                    }
+                    if classified.align > 8 {
+                        classified = aligned_stack_classification(&classified)?;
+                    }
+                } else {
+                    gp_used += pieces;
+                }
                 for piece in &classified.pieces {
                     carrier_indices.push(push_carrier(
                         &mut clif_parameters,
@@ -342,7 +388,11 @@ fn plan_native_signature(
                         piece.offset,
                         piece.valid_bytes,
                         AbiClass::Integer,
-                        AbiCarrier::I64,
+                        if piece.valid_bytes == 16 {
+                            AbiCarrier::I128
+                        } else {
+                            AbiCarrier::I64
+                        },
                         IntegerExtension::None,
                         NativePurpose::Normal,
                     )?);
@@ -647,14 +697,14 @@ fn allocate_bridge_argument(
         );
     }
 
-    if classified.align >= 16 && *gp_used < MAX_ARGUMENT_REGISTERS && !gp_used.is_multiple_of(2) {
+    if abi == AbiIdentity::Aapcs64Lp64
+        && classified.align >= 16
+        && *gp_used < MAX_ARGUMENT_REGISTERS
+        && !gp_used.is_multiple_of(2)
+    {
         *gp_used += 1;
     }
-    let first_stack_piece = classified
-        .pieces
-        .iter()
-        .position(|_| *gp_used >= MAX_ARGUMENT_REGISTERS);
-    if first_stack_piece.is_none() && (*gp_used as usize + classified.pieces.len()) <= 8 {
+    if (*gp_used as usize + classified.pieces.len()) <= usize::from(MAX_ARGUMENT_REGISTERS) {
         for piece in &classified.pieces {
             pieces.push(BridgePiecePlan {
                 source_index: Some(source_index),
@@ -668,35 +718,17 @@ fn allocate_bridge_argument(
         return Ok(());
     }
 
-    // AAPCS64 permits a small composite to split between the remaining
-    // general registers and the stack. Darwin unnamed arguments were handled
-    // above and are always wholly stack resident.
-    let mut first_spilled_offset = None;
-    let stack_base = align_up(*stack_size, classified.align.clamp(8, 16))?;
-    for piece in &classified.pieces {
-        let location = if *gp_used < MAX_ARGUMENT_REGISTERS {
-            let location = BridgeLocation::Register(RegisterSlot::integer(*gp_used));
-            *gp_used += 1;
-            location
-        } else {
-            let first = *first_spilled_offset.get_or_insert(piece.offset);
-            BridgeLocation::Stack {
-                offset: u32::try_from(stack_base + piece.offset - first)
-                    .map_err(|_| AbiError::new("CCC3503", "arm64 bridge stack offset overflow"))?,
-            }
-        };
-        pieces.push(BridgePiecePlan {
-            source_index: Some(source_index),
-            piece: piece.clone(),
-            extension,
-            indirect: false,
-            location,
-        });
-    }
-    if let Some(first) = first_spilled_offset {
-        *stack_size = align_up(stack_base + classified.size.saturating_sub(first), 8)?;
-    }
-    Ok(())
+    // AAPCS64 C.13-C.15 exhaust NGRN and place the complete composite at the
+    // naturally aligned NSAA. AAPCS32's register/stack split does not apply.
+    *gp_used = MAX_ARGUMENT_REGISTERS;
+    allocate_whole_on_stack(
+        classified,
+        source_index,
+        extension,
+        abi,
+        stack_size,
+        pieces,
+    )
 }
 
 fn allocate_whole_on_stack(
@@ -833,6 +865,11 @@ fn classify(
     }
     if let Some(members) = homogeneous_members(types, ty, config, 0)?
         && (1..=4).contains(&members.len())
+        && layout.size == u64::from(members[0].size) * members.len() as u64
+        && members
+            .iter()
+            .enumerate()
+            .all(|(index, member)| member.offset == u64::from(member.size) * index as u64)
     {
         let class = AbiClass::Sse;
         let pieces = members
@@ -875,7 +912,7 @@ fn classify(
     })
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 struct HomogeneousMember {
     offset: u64,
     size: u8,
@@ -889,12 +926,21 @@ fn homogeneous_members(
     base: u64,
 ) -> Result<Option<Vec<HomogeneousMember>>, AbiError> {
     let result = match types.try_kind(ty) {
-        Some(TypeKind::Builtin(builtin @ (BuiltinType::Float | BuiltinType::Double))) => {
-            let size = if *builtin == BuiltinType::Float { 4 } else { 8 };
+        Some(TypeKind::Builtin(
+            builtin @ (BuiltinType::Float | BuiltinType::Double | BuiltinType::LongDouble),
+        )) if *builtin != BuiltinType::LongDouble
+            || config.target.data_layout.long_double_width == 64 =>
+        {
+            let normalized = if *builtin == BuiltinType::LongDouble {
+                BuiltinType::Double
+            } else {
+                *builtin
+            };
+            let size = if normalized == BuiltinType::Float { 4 } else { 8 };
             Some(vec![HomogeneousMember {
                 offset: base,
                 size,
-                builtin: *builtin,
+                builtin: normalized,
             }])
         }
         Some(TypeKind::Array(array)) => {
@@ -922,9 +968,6 @@ fn homogeneous_members(
             let definition = types
                 .record(*id)
                 .ok_or_else(|| AbiError::new("CCC3502", format!("record {} is unknown", id.0)))?;
-            if definition.kind != RecordKind::Struct {
-                return Ok(None);
-            }
             let fields = definition.fields.as_ref().ok_or_else(|| {
                 AbiError::new(
                     "CCC3502",
@@ -937,6 +980,28 @@ fn homogeneous_members(
             let LayoutShape::Record(record_layout) = layout.shape else {
                 return Ok(None);
             };
+            if definition.kind == RecordKind::Union {
+                let mut canonical = None;
+                for field_layout in &record_layout.fields {
+                    if field_layout.bitfield.is_some() {
+                        return Ok(None);
+                    }
+                    let field = &fields[field_layout.index];
+                    let Some(field_members) =
+                        homogeneous_members(types, field.ty.ty, config, base)?
+                    else {
+                        return Ok(None);
+                    };
+                    if canonical
+                        .as_ref()
+                        .is_some_and(|members: &Vec<HomogeneousMember>| *members != field_members)
+                    {
+                        return Ok(None);
+                    }
+                    canonical = Some(field_members);
+                }
+                return Ok(canonical);
+            }
             let mut members = Vec::new();
             for field_layout in &record_layout.fields {
                 if field_layout.bitfield.is_some() {
@@ -987,6 +1052,66 @@ fn memory_classification(ty: TypeId, size: u64, align: u64) -> ClassifiedType {
         pieces: Vec::new(),
         passing: PassingMode::Memory,
     }
+}
+
+/// Once the FP register bank is exhausted, a homogeneous aggregate is one
+/// contiguous stack object. Vector carriers preserve that byte layout while
+/// keeping the synthetic signature in the FP register class, so later integer
+/// arguments can still use otherwise available x-registers.
+fn homogeneous_stack_classification(
+    classified: &ClassifiedType,
+    abi: AbiIdentity,
+) -> ClassifiedType {
+    if abi == AbiIdentity::DarwinArm64 {
+        return classified.clone();
+    }
+    let mut offset = 0;
+    let mut pieces = Vec::new();
+    while offset < classified.size {
+        let remaining = classified.size - offset;
+        let bytes = if remaining >= 8 {
+            8
+        } else {
+            4
+        };
+        pieces.push(AbiPiece {
+            index: pieces.len() as u8,
+            offset,
+            valid_bytes: bytes as u8,
+            class: AbiClass::Sse,
+        });
+        offset += bytes;
+    }
+    let classes = vec![AbiClass::Sse; pieces.len()];
+    ClassifiedType {
+        pieces,
+        classes,
+        ..classified.clone()
+    }
+}
+
+/// Cranelift's arm64 ABI implementation gives I128 stack carriers the exact
+/// 16-byte alignment required by AAPCS C.14 and Darwin's natural stack
+/// alignment. The source object has already been rounded to 16 bytes.
+fn aligned_stack_classification(
+    classified: &ClassifiedType,
+) -> Result<ClassifiedType, AbiError> {
+    if classified.size != 16 {
+        return Err(AbiError::new(
+            "CCC3521",
+            "arm64 over-aligned register aggregate does not have a 16-byte stack representation",
+        ));
+    }
+    Ok(ClassifiedType {
+        classes: vec![AbiClass::Integer],
+        pieces: vec![AbiPiece {
+            index: 0,
+            offset: 0,
+            valid_bytes: 16,
+            class: AbiClass::Integer,
+        }],
+        ..classified.clone()
+    })
 }
 
 fn boundary_scalar(
@@ -1106,6 +1231,17 @@ fn float_piece_carrier(piece: &AbiPiece) -> Result<AbiCarrier, AbiError> {
         _ => Err(AbiError::new(
             "CCC3503",
             "homogeneous arm64 aggregate has an invalid element width",
+        )),
+    }
+}
+
+fn vector_piece_carrier(piece: &AbiPiece) -> Result<AbiCarrier, AbiError> {
+    match piece.valid_bytes {
+        4 => Ok(AbiCarrier::V32),
+        8 => Ok(AbiCarrier::V64),
+        _ => Err(AbiError::new(
+            "CCC3503",
+            "arm64 stack homogeneous aggregate has an invalid vector carrier",
         )),
     }
 }
@@ -1243,6 +1379,208 @@ mod tests {
             NativePurpose::IndirectArgument
         );
         assert!(matches!(plan.result, NativeResultPlan::Indirect { .. }));
+    }
+
+    #[test]
+    fn arm64_models_whole_stack_aggregate_transport_after_register_exhaustion() {
+        let mut types = TypeStore::default();
+        let integer_pair = record(
+            &mut types,
+            vec![
+                Field::named("first", TypeId::LONG),
+                Field::named("second", TypeId::LONG),
+            ],
+        );
+        let float_pair = record(
+            &mut types,
+            vec![
+                Field::named("first", TypeId::DOUBLE),
+                Field::named("second", TypeId::DOUBLE),
+            ],
+        );
+        for config in [
+            EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+            EffectiveCompilationConfig::aarch64_apple_darwin(),
+        ] {
+            let mut integer_parameters = vec![QualifiedType::unqualified(TypeId::LONG); 7];
+            integer_parameters.push(QualifiedType::unqualified(integer_pair));
+            let integer_signature = types.function_type(FunctionType::prototype(
+                QualifiedType::unqualified(TypeId::INT),
+                integer_parameters,
+            ));
+            let plan = plan_function_type(&types, integer_signature, &config).unwrap();
+            assert_eq!(
+                plan.parameters[7].classified.passing,
+                PassingMode::Registers
+            );
+            assert_eq!(plan.clif_parameters[7].purpose, NativePurpose::Padding);
+            assert_eq!(plan.parameters[7].carrier_indices, [8, 9]);
+
+            let mut float_parameters = vec![QualifiedType::unqualified(TypeId::DOUBLE); 7];
+            float_parameters.push(QualifiedType::unqualified(float_pair));
+            let float_signature = types.function_type(FunctionType::prototype(
+                QualifiedType::unqualified(TypeId::INT),
+                float_parameters,
+            ));
+            let plan = plan_function_type(&types, float_signature, &config).unwrap();
+            assert_eq!(plan.clif_parameters[7].purpose, NativePurpose::Padding);
+            assert_eq!(plan.parameters[7].carrier_indices, [8, 9]);
+            if config.target.abi == AbiIdentity::Aapcs64Lp64 {
+                assert!(plan.parameters[7].carrier_indices.iter().all(|index| {
+                    matches!(
+                        plan.clif_parameters[*index as usize].carrier,
+                        AbiCarrier::V64
+                    )
+                }));
+            } else {
+                assert!(plan.parameters[7].carrier_indices.iter().all(|index| {
+                    matches!(
+                        plan.clif_parameters[*index as usize].carrier,
+                        AbiCarrier::F64
+                    )
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn darwin_does_not_apply_aapcs_even_register_padding() {
+        let mut types = TypeStore::default();
+        let aligned_pair = record(
+            &mut types,
+            vec![
+                Field::named("first", TypeId::LONG).with_requested_alignment(Some(16)),
+                Field::named("second", TypeId::LONG),
+            ],
+        );
+        let parameters = vec![
+            QualifiedType::unqualified(TypeId::LONG),
+            QualifiedType::unqualified(aligned_pair),
+        ];
+        let linux_signature = types.function_type(FunctionType::prototype(
+            QualifiedType::unqualified(TypeId::INT),
+            parameters.clone(),
+        ));
+        let linux = plan_function_type(
+            &types,
+            linux_signature,
+            &EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+        )
+        .unwrap();
+        assert_eq!(linux.clif_parameters[1].purpose, NativePurpose::Padding);
+        assert_eq!(linux.parameters[1].carrier_indices, [2, 3]);
+
+        let darwin_signature = types.function_type(FunctionType::prototype(
+            QualifiedType::unqualified(TypeId::INT),
+            parameters,
+        ));
+        let darwin = plan_function_type(
+            &types,
+            darwin_signature,
+            &EffectiveCompilationConfig::aarch64_apple_darwin(),
+        )
+        .unwrap();
+        assert_eq!(darwin.parameters[1].carrier_indices, [1, 2]);
+        assert!(
+            darwin
+                .clif_parameters
+                .iter()
+                .all(|carrier| carrier.purpose != NativePurpose::Padding)
+        );
+    }
+
+    #[test]
+    fn union_hfas_deduplicate_uniquely_addressable_members() {
+        let mut types = TypeStore::default();
+        let (id, union) = types.declare_record(RecordKind::Union, None);
+        types
+            .complete_record(
+                id,
+                vec![
+                    Field::named("first", TypeId::DOUBLE),
+                    Field::named("second", TypeId::DOUBLE),
+                ],
+            )
+            .unwrap();
+        let signature = types.function_type(FunctionType::prototype(
+            QualifiedType::unqualified(TypeId::INT),
+            vec![QualifiedType::unqualified(union)],
+        ));
+        let plan = plan_function_type(
+            &types,
+            signature,
+            &EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+        )
+        .unwrap();
+        assert_eq!(plan.parameters[0].classified.classes, [AbiClass::Sse]);
+        assert_eq!(plan.parameters[0].classified.pieces.len(), 1);
+        assert_eq!(plan.clif_parameters[0].carrier, AbiCarrier::F64);
+    }
+
+    #[test]
+    fn aapcs64_variadic_bridge_places_an_exhausted_composite_wholly_on_stack() {
+        let config = EffectiveCompilationConfig::aarch64_unknown_linux_gnu();
+        let mut types = TypeStore::default();
+        let pair = record(
+            &mut types,
+            vec![
+                Field::named("first", TypeId::LONG),
+                Field::named("second", TypeId::LONG),
+            ],
+        );
+        let signature = types.function_type(FunctionType::variadic(
+            QualifiedType::unqualified(TypeId::LONG),
+            vec![QualifiedType::unqualified(TypeId::INT)],
+        ));
+        let mut actual = vec![TypeId::INT];
+        actual.extend([TypeId::LONG; 7]);
+        actual.push(pair);
+        let plan = plan_variadic_call(&types, signature, &actual, 1, &config).unwrap();
+        let aggregate = plan
+            .parameter_pieces
+            .iter()
+            .filter(|piece| piece.source_index == Some(8))
+            .collect::<Vec<_>>();
+        assert_eq!(aggregate.len(), 2);
+        assert!(
+            aggregate
+                .iter()
+                .all(|piece| matches!(piece.location, BridgeLocation::Stack { .. }))
+        );
+    }
+
+    #[test]
+    fn indirect_va_arg_uses_the_pointer_slots_alignment() {
+        let config = EffectiveCompilationConfig::aarch64_unknown_linux_gnu();
+        let mut types = TypeStore::default();
+        let large = record(
+            &mut types,
+            vec![
+                Field::named("first", TypeId::LONG).with_requested_alignment(Some(16)),
+                Field::named("second", TypeId::LONG),
+                Field::named("third", TypeId::LONG),
+            ],
+        );
+        let va_arg = plan_va_arg(&types, large, &config).unwrap();
+        assert!(va_arg.indirect);
+        assert_eq!(va_arg.overflow_align, 8);
+        assert_eq!(va_arg.overflow_size, 8);
+
+        let signature = types.function_type(FunctionType::variadic(
+            QualifiedType::unqualified(TypeId::LONG),
+            vec![QualifiedType::unqualified(TypeId::INT)],
+        ));
+        let mut actual = vec![TypeId::INT];
+        actual.extend([TypeId::LONG; 8]);
+        actual.push(large);
+        let call = plan_variadic_call(&types, signature, &actual, 1, &config).unwrap();
+        let pointer = call
+            .parameter_pieces
+            .iter()
+            .find(|piece| piece.source_index == Some(9))
+            .unwrap();
+        assert!(pointer.indirect);
+        assert_eq!(pointer.location, BridgeLocation::Stack { offset: 8 });
     }
 
     #[test]

@@ -268,10 +268,10 @@ fn darwin_build_version(
     // minimum version is mandatory: Apple's linker rejects Mach-O objects
     // whose LC_BUILD_VERSION uses PLATFORM_UNKNOWN (the value produced by a
     // target-lexicon `darwin` triple without this override).
-    let (major, minor, patch) = match config.deployment_target.as_deref() {
-        Some(version) => parse_darwin_version(version)?,
-        None => (11, 0, 0),
-    };
+    let deployment = config
+        .normalized_deployment_target()
+        .ok_or_else(|| error("Darwin build version requested for a non-Darwin target"))?;
+    let (major, minor, patch) = parse_darwin_version(deployment)?;
     let mut version = object::write::MachOBuildVersion::default();
     version.platform = object::macho::PLATFORM_MACOS;
     version.minos = (u32::from(major) << 16) | (u32::from(minor) << 8) | u32::from(patch);

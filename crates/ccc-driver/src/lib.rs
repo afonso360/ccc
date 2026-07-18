@@ -57,7 +57,8 @@ const HELP: &str = "Usage: ccc [options] <input.c>\n\
   -include file -imacros file Process a forced input\n\
   -M|-MM|-MD|-MMD            Generate Make dependencies\n\
   --target triple            Select an enabled target (defaults to the native host)\n\
-  -march=name -mabi=name     Select an enabled architecture and ABI spelling\n\
+  -march=name -mcpu=name     Select an enabled architecture and CPU baseline\n\
+  -mabi=name                 Select an enabled ABI spelling\n\
   --sysroot dir              Select a target sysroot\n\
   --sdk-root dir             Select a Darwin SDK root\n\
   -mmacosx-version-min=ver   Select the minimum Darwin deployment version\n\
@@ -232,6 +233,9 @@ fn effective_config(
     if let Some(architecture) = &options.target_arch {
         config = config.with_target_arch(architecture);
     }
+    if let Some(cpu) = &options.target_cpu {
+        config = config.with_target_cpu(cpu);
+    }
     if let Some(abi) = &options.target_abi {
         config = config.with_target_abi(abi);
     }
@@ -287,17 +291,6 @@ fn effective_config(
         !options.no_standard_includes && should_probe_native_toolchain(&config);
     if resolve_system_headers || link || effective_sysroot.is_some() {
         let mut resolver = ToolchainResolver::new(&config);
-        if let Some(architecture) = &options.target_arch {
-            resolver = resolver.target_argument(format!("-march={architecture}"));
-        }
-        if let Some(abi) = &options.target_abi
-            && matches!(
-                config.target.abi,
-                ccc_target::AbiIdentity::Aapcs64Lp64 | ccc_target::AbiIdentity::RiscvLp64d
-            )
-        {
-            resolver = resolver.target_argument(format!("-mabi={abi}"));
-        }
         if let Some(sysroot) = effective_sysroot {
             resolver = resolver.sysroot(sysroot);
         }
@@ -324,9 +317,8 @@ fn effective_config(
 }
 
 fn should_probe_native_toolchain(config: &EffectiveCompilationConfig) -> bool {
-    std::env::var_os("CCC_CC").is_some()
-        || ccc_target::TargetSpec::enabled(ccc_target::Triple::host())
-            .is_ok_and(|host| host.abi == config.target.abi)
+    let _ = config;
+    true
 }
 
 fn unsupported_hosted_header<'a>(

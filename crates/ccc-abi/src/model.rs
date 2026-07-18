@@ -35,8 +35,11 @@ pub enum AbiCarrier {
     I16,
     I32,
     I64,
+    I128,
     F32,
     F64,
+    V32,
+    V64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -333,6 +336,8 @@ pub struct AbiConfigKey {
     pub backend_profile: &'static str,
     pub normalized_target_arch: &'static str,
     pub normalized_target_abi: &'static str,
+    pub normalized_target_cpu: &'static str,
+    pub normalized_deployment_target: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

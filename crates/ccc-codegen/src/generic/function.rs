@@ -1551,12 +1551,20 @@ impl FunctionState<'_> {
     ) -> Result<(), CodegenError> {
         let gr_offset_address = address_offset(builder, list, 24)?;
         let vr_offset_address = address_offset(builder, list, 28)?;
-        let gr_offset = builder
+        let mut gr_offset = builder
             .ins()
             .load(ir::types::I32, MemFlags::new(), gr_offset_address, 0);
         let vr_offset = builder
             .ins()
             .load(ir::types::I32, MemFlags::new(), vr_offset_address, 0);
+        if !plan.indirect
+            && plan.gp_slots != 0
+            && plan.sse_slots == 0
+            && plan.classified.align >= 16
+        {
+            let advanced = builder.ins().iadd_imm(gr_offset, 15);
+            gr_offset = builder.ins().band_imm(advanced, -16);
+        }
         let gr_available = if plan.gp_slots == 0 {
             builder.ins().iconst(ir::types::I8, 1)
         } else {
@@ -1654,6 +1662,21 @@ impl FunctionState<'_> {
         builder.ins().jump(merge_block, &[]);
 
         builder.switch_to_block(overflow_block);
+        // AAPCS C.13 and C.14 exhaust the applicable register bank when an
+        // argument cannot fit wholly. Later va_arg operations must therefore
+        // continue in the overflow area rather than reusing a trailing slot.
+        if plan.gp_slots != 0 {
+            let exhausted = builder.ins().iconst(ir::types::I32, 0);
+            builder
+                .ins()
+                .store(MemFlags::new(), exhausted, gr_offset_address, 0);
+        }
+        if plan.sse_slots != 0 {
+            let exhausted = builder.ins().iconst(ir::types::I32, 0);
+            builder
+                .ins()
+                .store(MemFlags::new(), exhausted, vr_offset_address, 0);
+        }
         self.va_arg_cursor(builder, list, result, plan)?;
         builder.ins().jump(merge_block, &[]);
 
@@ -1921,6 +1944,20 @@ impl FunctionState<'_> {
             .ok_or_else(|| error("variadic call frame size overflow"))?;
         let frame = create_stack_backing(builder, frame_size, 16)?;
         zero_memory(builder, frame, frame_size)?;
+        if plan.abi_identity == ccc_target::AbiIdentity::RiscvLp64d {
+            // LP64D requires narrower values in an FLEN=64 register to be
+            // NaN-boxed. The helper restores every slot with `fld`, so seed
+            // the high half of each slot before width-specific F32 stores.
+            for index in 0..8_u64 {
+                store_integer(
+                    builder,
+                    frame,
+                    layout.call_float_arguments + index * 16 + 4,
+                    ir::types::I32,
+                    -1,
+                )?;
+            }
+        }
         store_integer(builder, frame, 0, ir::types::I32, 0x4642_4343)?;
         store_integer(
             builder,
@@ -2121,11 +2158,7 @@ impl FunctionState<'_> {
                 continue;
             }
             if carrier.purpose == ccc_abi::NativePurpose::Padding {
-                lowered.push(
-                    builder
-                        .ins()
-                        .iconst(native_carrier_type(carrier.carrier), 0),
-                );
+                lowered.push(zero_carrier_value(builder, carrier.carrier)?);
                 continue;
             }
             let source_index = carrier
@@ -2703,9 +2736,30 @@ fn native_carrier_type(carrier: ccc_abi::AbiCarrier) -> ir::Type {
         ccc_abi::AbiCarrier::I16 => ir::types::I16,
         ccc_abi::AbiCarrier::I32 => ir::types::I32,
         ccc_abi::AbiCarrier::I64 => ir::types::I64,
+        ccc_abi::AbiCarrier::I128 => ir::types::I128,
         ccc_abi::AbiCarrier::F32 => ir::types::F32,
         ccc_abi::AbiCarrier::F64 => ir::types::F64,
+        ccc_abi::AbiCarrier::V32 => ir::types::I8X4,
+        ccc_abi::AbiCarrier::V64 => ir::types::I8X8,
     }
+}
+
+fn zero_carrier_value(
+    builder: &mut FunctionBuilder<'_>,
+    carrier: ccc_abi::AbiCarrier,
+) -> Result<ir::Value, CodegenError> {
+    Ok(match carrier {
+        ccc_abi::AbiCarrier::I8
+        | ccc_abi::AbiCarrier::I16
+        | ccc_abi::AbiCarrier::I32
+        | ccc_abi::AbiCarrier::I64
+        | ccc_abi::AbiCarrier::I128 => builder.ins().iconst(native_carrier_type(carrier), 0),
+        ccc_abi::AbiCarrier::F32 => builder.ins().f32const(0.0),
+        ccc_abi::AbiCarrier::F64 => builder.ins().f64const(0.0),
+        ccc_abi::AbiCarrier::V32 | ccc_abi::AbiCarrier::V64 => {
+            return Err(error("vector ABI carriers cannot be synthetic padding"));
+        }
+    })
 }
 
 fn va_list_size(config: &EffectiveCompilationConfig) -> u64 {

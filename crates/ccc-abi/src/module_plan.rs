@@ -509,6 +509,18 @@ pub fn dump_module_plan(verified: VerifiedModuleAbiPlan<'_>) -> String {
         plan.config_key.normalized_target_abi
     )
     .unwrap();
+    writeln!(
+        output,
+        "normalized-target-cpu={}",
+        plan.config_key.normalized_target_cpu
+    )
+    .unwrap();
+    writeln!(
+        output,
+        "normalized-deployment-target={}",
+        plan.config_key.normalized_deployment_target
+    )
+    .unwrap();
     writeln!(output, "ir-shape-sha256={}", plan.ir_shape_digest).unwrap();
     writeln!(
         output,
@@ -940,8 +952,11 @@ fn render_native_carrier(carrier: &crate::NativeCarrierPlan) -> String {
             AbiCarrier::I16 => "i16",
             AbiCarrier::I32 => "i32",
             AbiCarrier::I64 => "i64",
+            AbiCarrier::I128 => "i128",
             AbiCarrier::F32 => "f32",
             AbiCarrier::F64 => "f64",
+            AbiCarrier::V32 => "v32",
+            AbiCarrier::V64 => "v64",
         },
         extension_name(carrier.extension),
         purpose
