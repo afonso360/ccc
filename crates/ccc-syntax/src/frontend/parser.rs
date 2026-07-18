@@ -352,6 +352,9 @@ impl Parser<'_> {
                 Some(TokenKind::Keyword(Keyword::Imaginary)) => {
                     self.simple_type(TypeSpecifier::Imaginary)
                 }
+                Some(TokenKind::Keyword(Keyword::Float16)) => {
+                    self.simple_type(TypeSpecifier::Float16)
+                }
                 Some(TokenKind::Keyword(Keyword::Int128)) => {
                     self.simple_type(TypeSpecifier::Int128)
                 }
@@ -2240,6 +2243,7 @@ impl Parser<'_> {
                     | Keyword::Attribute
                     | Keyword::Extension
                     | Keyword::Typeof
+                    | Keyword::Float16
                     | Keyword::Int128
                     | Keyword::Int128T
                     | Keyword::UInt128T
@@ -2275,6 +2279,7 @@ impl Parser<'_> {
                         | Keyword::Complex
                         | Keyword::Imaginary
                         | Keyword::Typeof
+                        | Keyword::Float16
                         | Keyword::Int128
                         | Keyword::Int128T
                         | Keyword::UInt128T
@@ -2328,6 +2333,7 @@ impl Parser<'_> {
                     | Keyword::Imaginary
                     | Keyword::Typeof
                     | Keyword::Attribute
+                    | Keyword::Float16
                     | Keyword::Int128
                     | Keyword::Int128T
                     | Keyword::UInt128T

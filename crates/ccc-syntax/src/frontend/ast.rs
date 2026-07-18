@@ -97,6 +97,7 @@ pub enum TypeSpecifier {
     Bool,
     Complex,
     Imaginary,
+    Float16,
     Int128,
     Int128T,
     UInt128T,

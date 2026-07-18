@@ -114,6 +114,10 @@ pub struct FullTypedGlobal {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GlobalEmission {
     pub symbol_name: String,
+    /// Whether `symbol_name` came from an explicit declaration assembly label
+    /// and therefore names the physical object-file symbol without target
+    /// mangling.
+    pub symbol_name_is_exact: bool,
     pub binding: SymbolBinding,
     pub visibility: SymbolVisibility,
     pub section: Option<String>,

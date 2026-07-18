@@ -21,7 +21,10 @@ impl TestDirectory {
         Self { path }
     }
 
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[cfg(any(
+        all(target_arch = "x86_64", target_os = "linux"),
+        all(target_arch = "aarch64", target_os = "macos")
+    ))]
     fn write(&self, relative: &str, contents: &str) -> PathBuf {
         let path = self.path.join(relative);
         if let Some(parent) = path.parent() {
@@ -40,6 +43,19 @@ impl TestDirectory {
             .env("LANG", "C");
         command
     }
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+fn macos_sdk_root() -> String {
+    let output = Command::new("xcrun")
+        .args(["--sdk", "macosx", "--show-sdk-path"])
+        .output()
+        .expect("the Darwin hosted-header gate requires xcrun");
+    assert!(
+        output.status.success(),
+        "xcrun could not locate the macOS SDK"
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
 impl Drop for TestDirectory {
@@ -102,6 +118,39 @@ fn curated_hosted_declarations_reach_the_ast_intact() {
             "asm-label __asm__ \"fixture_read_impl\"",
             "function-definition fixture_identity",
             "declarator hosted_header_preprocessing_sentinel",
+        ],
+    );
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[test]
+fn apple_math_private_classification_helpers_reach_the_ast_without_public_replacement() {
+    let directory = TestDirectory::new("apple-math-private-helpers");
+    let source = directory.write(
+        "apple-math-ast.c",
+        "#include <math.h>\n\
+         long double ccc_public_fabsl(long double value) { return fabsl(value); }\n\
+         int ccc_public_isfinite(double value) { return isfinite(value); }\n",
+    );
+    let sdk = macos_sdk_root();
+    let output = Command::new(env!("CARGO_BIN_EXE_ccc"))
+        .current_dir(&directory.path)
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .args(["--target=aarch64-apple-darwin", "--sdk-root"])
+        .arg(sdk)
+        .arg("--dump-ast")
+        .arg(source)
+        .output()
+        .unwrap();
+    assert_success(&output, "Apple math hosted-header parsing failed");
+    assert_ast_lines(
+        &output,
+        &[
+            "function-definition __inline_isfinitef",
+            "function-definition __inline_isfinitel",
+            "function-definition ccc_public_fabsl",
+            "function-definition ccc_public_isfinite",
         ],
     );
 }

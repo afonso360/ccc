@@ -283,6 +283,7 @@ pub struct CallBridgeArtifactPlan {
 pub struct VariadicEntryArtifactPlan {
     pub function: FullFunctionId,
     pub public_symbol: String,
+    pub public_symbol_is_exact: bool,
     pub source_linkage: SourceLinkage,
     pub source_visibility: SourceVisibility,
     pub body_symbol: String,

@@ -169,3 +169,58 @@ fn rejected_translations_match_diagnostic_goldens_and_emit_no_object() {
         fs::remove_dir_all(directory).unwrap();
     }
 }
+
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "riscv64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "macos")
+))]
+#[test]
+fn float16_value_paths_fail_before_object_publication() {
+    for (name, source) in [
+        ("initialization", "_Float16 value = 1.0;\n"),
+        (
+            "definition",
+            "_Float16 defined(_Float16 value) { return value; }\n",
+        ),
+        (
+            "call",
+            "extern _Float16 operation(_Float16); int call(void) { return operation(1.0) != 0; }\n",
+        ),
+        (
+            "arithmetic",
+            "int arithmetic(void) { _Float16 value; return value + value != 0; }\n",
+        ),
+        (
+            "va-arg",
+            "typedef __builtin_va_list va_list; int read(int count, ...) { va_list list; __builtin_va_start(list, count); return __builtin_va_arg(list, _Float16) != 0; }\n",
+        ),
+    ] {
+        let directory = temporary_directory(name);
+        let input = directory.join(format!("float16-{name}.c"));
+        let output = directory.join(format!("float16-{name}.o"));
+        fs::write(&input, source).unwrap();
+        let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+            .env("LC_ALL", "C")
+            .env("LANG", "C")
+            .args(["-nostdinc", "-c"])
+            .arg(&input)
+            .arg("-o")
+            .arg(&output)
+            .output()
+            .unwrap();
+
+        assert!(!result.status.success(), "{name} unexpectedly compiled");
+        assert!(result.stdout.is_empty(), "{name} wrote stdout");
+        let stderr = String::from_utf8(result.stderr).unwrap();
+        assert_eq!(
+            stderr.matches("error[CCC3518]").count(),
+            1,
+            "{name}: {stderr}"
+        );
+        assert!(stderr.contains("_Float16"), "{name}: {stderr}");
+        assert!(!output.exists(), "{name} emitted an object");
+        fs::remove_dir_all(directory).unwrap();
+    }
+}

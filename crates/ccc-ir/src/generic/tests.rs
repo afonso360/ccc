@@ -384,6 +384,9 @@ fn declaration_assembly_labels_are_exact_in_ir_symbols_and_references() {
          int invoke(int value) { return source_function(value) + source_object; }",
     );
     verify_frontend(&module).unwrap();
+    assert!(module.globals[0].emission.symbol_name_is_exact);
+    assert!(module.functions[0].symbol_name_is_exact);
+    assert!(!module.functions[1].symbol_name_is_exact);
     assert_eq!(
         dump_frontend_ir(&module),
         concat!(

@@ -166,15 +166,13 @@ fn package_with_runner<R: ProbeRunner>(
     let localization_file = workspace.path().join("localize-symbols.txt");
     let mut localization = bundle
         .manifest()
-        .localization_symbols()
-        .into_iter()
-        .map(|symbol| {
-            if macho {
-                format!("_{symbol}")
-            } else {
-                symbol.to_owned()
-            }
+        .localization_object_symbols(if macho {
+            object::BinaryFormat::MachO
+        } else {
+            object::BinaryFormat::Elf
         })
+        .into_iter()
+        .map(|symbol| symbol.into_owned())
         .collect::<Vec<_>>()
         .join("\n");
     if !localization.is_empty() {
@@ -537,14 +535,12 @@ fn inspect_combined_object(
     }
     let mut symbols = BTreeMap::new();
     for symbol in object.symbols() {
-        let name = symbol
-            .name()
-            .ok()
-            .map(|name| canonical_symbol_name(object.format(), name));
-        if symbol.is_undefined() && name.is_some_and(is_bridge_generated_symbol) {
+        let name = symbol.name().ok();
+        let canonical_name = name.map(|name| canonical_symbol_name(object.format(), name));
+        if symbol.is_undefined() && canonical_name.is_some_and(is_bridge_generated_symbol) {
             return Err(artifact_error(format!(
                 "packaged object retains unresolved generated symbol `{}`",
-                name.unwrap_or("<invalid>")
+                canonical_name.unwrap_or("<invalid>")
             )));
         }
         if symbol.is_undefined() {
@@ -600,7 +596,10 @@ fn inspect_combined_object(
         "__libc_csu_init",
         "__libc_csu_fini",
     ] {
-        if symbols.contains_key(forbidden) {
+        if symbols
+            .keys()
+            .any(|name| canonical_symbol_name(object.format(), name) == forbidden)
+        {
             return Err(artifact_error(format!(
                 "partial linking unexpectedly introduced startup symbol `{forbidden}`"
             )));
@@ -612,18 +611,19 @@ fn inspect_combined_object(
         .iter()
         .map(|symbol| symbol.name.as_str())
         .collect::<BTreeSet<_>>();
-    for name in symbols
-        .keys()
-        .filter(|name| is_bridge_generated_symbol(name))
-    {
-        if !manifest_names.contains(name.as_str()) {
+    for name in symbols.keys().filter_map(|name| {
+        let canonical = canonical_symbol_name(object.format(), name);
+        is_bridge_generated_symbol(canonical).then_some(canonical)
+    }) {
+        if !manifest_names.contains(name) {
             return Err(artifact_error(format!(
                 "packaged object contains unmanifested generated symbol `{name}`"
             )));
         }
     }
     for expected in bundle.manifest().symbols() {
-        let facts = symbols.get(&expected.name).ok_or_else(|| {
+        let object_name = expected.object_name(object.format());
+        let facts = symbols.get(object_name.as_ref()).ok_or_else(|| {
             artifact_error(format!(
                 "packaged object does not define manifest symbol `{}`",
                 expected.name
@@ -718,7 +718,6 @@ fn inspect_combined_object(
         let Ok(name) = symbol.name() else {
             continue;
         };
-        let name = canonical_symbol_name(primary.format(), name);
         if name.is_empty() {
             continue;
         }
@@ -746,7 +745,7 @@ fn inspect_combined_object(
             )));
         }
         let intentionally_localized = bundle.manifest().symbols().iter().any(|generated| {
-            generated.name == name
+            generated.object_name(primary.format()) == name
                 && generated.owner == GeneratedSymbolOwner::PrimaryObject
                 && matches!(
                     generated.visibility,
@@ -1408,6 +1407,7 @@ mod tests {
             let body = format!("__ccc_variadic_body_visibility_{index}");
             let assembly = render_variadic_entry(&VariadicEntryPlan {
                 public_symbol: (*public).to_owned(),
+                public_symbol_is_exact: false,
                 hidden_body_symbol: body.clone(),
                 linkage: *linkage,
                 fixed_gp_used: 1,
@@ -1667,6 +1667,7 @@ mod tests {
         let hidden_body = "__ccc_variadic_body_local_test";
         let assembly = crate::bridge::render_variadic_entry(&crate::bridge::VariadicEntryPlan {
             public_symbol: public_symbol.to_owned(),
+            public_symbol_is_exact: false,
             hidden_body_symbol: hidden_body.to_owned(),
             linkage: crate::bridge::AssemblyFunctionLinkage::Internal,
             fixed_gp_used: 0,

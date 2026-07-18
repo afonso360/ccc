@@ -102,6 +102,7 @@ impl Default for TypeStore {
             TypeKind::Builtin(BuiltinType::LongDouble),
             TypeKind::Builtin(BuiltinType::Int128),
             TypeKind::Builtin(BuiltinType::UnsignedInt128),
+            TypeKind::Builtin(BuiltinType::Float16),
         ];
         let interned = kinds
             .iter()
