@@ -228,6 +228,8 @@ impl CapabilityRegistry {
             "__weak__",
             "transparent_union",
             "__transparent_union__",
+            "tls_model",
+            "__tls_model__",
         ] {
             registry.insert_with_rationale(
                 CapabilityKind::Attribute,
@@ -485,6 +487,8 @@ mod tests {
             "__weak__",
             "transparent_union",
             "__transparent_union__",
+            "tls_model",
+            "__tls_model__",
         ] {
             assert_eq!(
                 registry.state(CapabilityKind::Attribute, name),

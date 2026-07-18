@@ -212,16 +212,21 @@ bytes happen to match.
 | Linkage                | File objects and functions have internal or external linkage; block declarations without linkage remain distinct. Incompatible redeclarations are errors. `extern` followed by `static` is rejected at the later declaration (`CCC2372`) for objects and functions.                                                                                   |
 | Composite declarations | Compatible incomplete/complete arrays and unspecified/prototype function declarations form a composite type independent of declaration order. Top-level parameter qualifiers are ignored when forming function types.                                                                                                                                 |
 | Definitions            | Multiple initialized object definitions and multiple function definitions are rejected. Tentative external objects become ELF common symbols with target size/alignment; an initialized definition supersedes a tentative declaration.                                                                                                                |
-| Static locals          | Block statics use translation-unit-local ELF data symbols and require constant initialization. They are never initialized by an automatic-entry store.                                                                                                                                                                                                |
+| Static locals          | Block statics use translation-unit-local ELF data symbols and require constant initialization. They are never initialized by an automatic-entry store. Thread-duration block objects use TLS sections and per-thread initialization instead.                                                                                                                  |
 | Automatic locals       | Non-address-taken, nonvolatile scalar locals are promoted to SSA. Address-taken, volatile, aggregate, atomic, and variably modified locals retain explicit storage.                                                                                                                                                                                   |
 | Strings and globals    | Objects and functions carry symbol name, binding, and visibility through semantic analysis, IR, ABI planning, and ELF emission. `visibility("default")`, `visibility("hidden")`, `visibility("protected")`, and `visibility("internal")` are implemented; other layout and linkage override attributes remain outside the default supported registry. |
-| ELF proof              | Object tests inspect `.text`, `.data`, `.bss`, `.rodata`, local/global/undefined bindings, data and string relocations, `R_X86_64_GOTPCREL` position-independent data accesses, and `R_X86_64_PLT32` direct external calls. Linux tests require normal links to produce executable ELF `DYN` files without runtime text relocations, execute relocated data and function pointers, cross-link CCC callers and callees with a reference compiler in both directions, and prove same-spelled `static` names stay local. |
+| ELF proof              | Object tests inspect `.text`, `.data`, `.bss`, `.rodata`, `.tdata`, `.tbss`, local/global/undefined bindings, ordinary and TLS relocations, `R_X86_64_GOTPCREL` position-independent data accesses, and `R_X86_64_PLT32` direct external calls. Linux tests require normal links to produce executable ELF `DYN` files without runtime text relocations, execute relocated data and function pointers, cross-link CCC callers and callees with a reference compiler in both directions, and prove same-spelled internal names stay local. |
 
-Standard `_Thread_local` objects are represented through TLS storage and
-relocation nodes, but the current acceptance suite does not certify a
-cross-linked TLS access model. It is therefore not part of the advertised
-cross-link contract. The GNU `__thread` spelling remains parse-only in the
-registry even though it is recognized by token conversion.
+Standard `_Thread_local` objects use ELF TLS sections and compiler-generated
+address accessors. Each accessor is planned from the translation-unit digest,
+assembled through the verified artifact pipeline, and localized after the
+relocatable link. The default global-dynamic model and the explicit
+`tls_model` global-dynamic, local-dynamic, initial-exec, and local-exec models
+map to their canonical x86-64 relocations. Linux tests inspect those
+relocations, execute every model in a PIE, prove per-thread identity and
+initialization with pthreads, and cross-link TLS definitions and references
+with the platform compiler. The GNU `__thread` spelling remains parse-only in
+the registry even though it is recognized by token conversion.
 
 ### Statements and CFG behavior
 

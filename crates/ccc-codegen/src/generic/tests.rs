@@ -280,6 +280,81 @@ fn weak_binding_reaches_defined_and_undefined_elf_symbols() {
 }
 
 #[test]
+fn thread_local_accesses_use_manifested_generated_accessors() {
+    const SOURCE: &str = "_Thread_local int external_value = 7;\n\
+         int read_values(void) {\n\
+             _Thread_local int block_value = 5;\n\
+             ++external_value;\n\
+             return external_value + block_value;\n\
+         }";
+    let module = lower_source(SOURCE);
+    let config = EffectiveCompilationConfig::default();
+    let plan = ccc_abi::plan_module(&module, &config).unwrap();
+    assert_eq!(plan.artifacts.tls_accessors.len(), 2);
+    assert_eq!(
+        plan.artifacts.packaging.generated_assembly_units, 2,
+        "one deterministic assembly unit is planned per TLS object"
+    );
+    let first_dump = ccc_abi::dump_module_plan(plan.verify_against(&module, &config).unwrap());
+    let second = ccc_abi::plan_module(&module, &config).unwrap();
+    assert_eq!(
+        first_dump,
+        ccc_abi::dump_module_plan(second.verify_against(&module, &config).unwrap())
+    );
+
+    let output = emit(&module, &config, Options { emit_clif: true }).unwrap();
+    assert!(!output.clif.contains("tls_value"), "{}", output.clif);
+    assert_eq!(output.assemblies.len(), 2);
+    assert_eq!(
+        output
+            .manifest
+            .symbols()
+            .iter()
+            .filter(|symbol| symbol.kind == ccc_link::bridge::GeneratedSymbolKind::TlsAccessor)
+            .count(),
+        2
+    );
+    let block = module
+        .globals
+        .iter()
+        .find(|global| global.name == "block_value")
+        .unwrap();
+    let block_manifest = output
+        .manifest
+        .symbols()
+        .iter()
+        .find(|symbol| symbol.name == block.emission.symbol_name)
+        .unwrap();
+    assert_eq!(
+        block_manifest.kind,
+        ccc_link::bridge::GeneratedSymbolKind::TlsObject
+    );
+    assert_eq!(
+        block_manifest.visibility,
+        ccc_link::artifact::GeneratedSymbolVisibility::SourceInternal
+    );
+    let block_accessor = output
+        .assemblies
+        .iter()
+        .find(|assembly| assembly.source().contains(&block.emission.symbol_name))
+        .unwrap();
+    assert!(
+        block_accessor
+            .source()
+            .contains(&format!(".hidden {}", block.emission.symbol_name))
+    );
+
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    for global in &module.globals {
+        let symbol = object
+            .symbol_by_name(&global.emission.symbol_name)
+            .unwrap_or_else(|| panic!("missing TLS symbol `{}`", global.emission.symbol_name));
+        assert_eq!(symbol.kind(), object::SymbolKind::Tls);
+    }
+    output.into_artifact_bundle().verify().unwrap();
+}
+
+#[test]
 fn incomplete_extern_arrays_remain_layout_free_undefined_data() {
     const SOURCE: &str = "extern const char bytes[];\n\
          extern int values[];\n\

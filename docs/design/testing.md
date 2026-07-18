@@ -70,6 +70,16 @@ transport also test calls in both directions, while profiles that do not must
 reject those boundaries exactly. Explicit compatibility-mode objects must be
 rejected when mixed with incompatible CCC objects.
 
+TLS tests inspect `.tdata`/`.tbss`, symbol type and binding, and the exact
+`R_X86_64_TLSGD`, `R_X86_64_TLSLD`, `R_X86_64_DTPOFF32`,
+`R_X86_64_GOTTPOFF`, and `R_X86_64_TPOFF32` relocation families. Each model
+links and executes in a default PIE. A pthread fixture proves distinct
+addresses and initializer values per thread for external and block-local TLS,
+while two-direction reference-compiler links verify ELF TLS symbol
+interoperability. Generated accessors must retain unwind information, a
+non-executable stack note, deterministic manifest ownership, and exact local
+binding after packaging.
+
 Planner, IR, digest, renderer, fake-command, and manifest tests run on every
 host. Native `x86_64-unknown-linux-gnu` execution and object suites compile only
 on Linux x86-64. The required CI feature rejects the wrong host at compile time,

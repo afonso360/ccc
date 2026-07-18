@@ -185,6 +185,96 @@ int main(void) {
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
+fn thread_local_objects_are_isolated_in_pthreads_and_pie() {
+    use object::{Object as _, ObjectKind};
+
+    let directory = test_directory("thread-local-pthreads");
+    let executable = directory.join("thread-local-pthreads");
+    let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+        .arg(fixture("thread_local_pthreads.c"))
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .unwrap();
+    assert!(
+        compilation.status.success(),
+        "ccc failed: {}",
+        String::from_utf8_lossy(&compilation.stderr)
+    );
+    let bytes = fs::read(&executable).unwrap();
+    let file = object::File::parse(bytes.as_slice()).unwrap();
+    assert_eq!(
+        file.kind(),
+        ObjectKind::Dynamic,
+        "default output must be PIE"
+    );
+
+    let execution = Command::new(&executable).output().unwrap();
+    assert_eq!(
+        execution.status.code(),
+        Some(66),
+        "pthread TLS fixture failed: {}",
+        String::from_utf8_lossy(&execution.stderr)
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn all_elf_tls_models_link_and_execute_as_pie() {
+    use object::{Object as _, ObjectKind};
+
+    let directory = test_directory("thread-local-models-pie");
+    let source = directory.join("thread-local-models-pie.c");
+    let executable = directory.join("thread-local-models-pie");
+    fs::write(
+        &source,
+        r#"
+_Thread_local int gd __attribute__((tls_model("global-dynamic"))) = 3;
+_Thread_local int ld __attribute__((tls_model("local-dynamic"))) = 5;
+_Thread_local int ie __attribute__((tls_model("initial-exec"))) = 7;
+_Thread_local int le __attribute__((tls_model("local-exec"))) = 11;
+
+int main(void) {
+    if (gd + ld + ie + le != 26) return 1;
+    gd = 13;
+    ld = 17;
+    ie = 19;
+    le = 23;
+    return gd + ld + ie + le == 72 ? 0 : 2;
+}
+"#,
+    )
+    .unwrap();
+    let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+        .arg(&source)
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .unwrap();
+    assert!(
+        compilation.status.success(),
+        "ccc failed: {}",
+        String::from_utf8_lossy(&compilation.stderr)
+    );
+    let bytes = fs::read(&executable).unwrap();
+    let file = object::File::parse(bytes.as_slice()).unwrap();
+    assert_eq!(
+        file.kind(),
+        ObjectKind::Dynamic,
+        "default output must be PIE"
+    );
+    let execution = Command::new(&executable).output().unwrap();
+    assert!(
+        execution.status.success(),
+        "TLS model PIE failed: {}",
+        String::from_utf8_lossy(&execution.stderr)
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
 fn an_invalid_computed_goto_target_traps() {
     use std::os::unix::process::ExitStatusExt as _;
 
@@ -339,7 +429,7 @@ fn execution_cases() -> &'static [ExecutionExpectation] {
     &EXECUTION_CASES
 }
 
-static EXECUTION_CASES: [ExecutionExpectation; 52] = [
+static EXECUTION_CASES: [ExecutionExpectation; 53] = [
     exit_status("return_constant.c", 42),
     exit_status("arithmetic_precedence.c", 14),
     exit_status("unary_arithmetic.c", 3),
@@ -380,6 +470,7 @@ static EXECUTION_CASES: [ExecutionExpectation; 52] = [
     exit_status("flexible_array_members.c", 59),
     exit_status("sync_atomic_builtins.c", 60),
     exit_status("sync_atomic_pthreads.c", 64),
+    bridged_exit_status("thread_local_pthreads.c", 66),
     exit_status("integer_intrinsics.c", 61),
     exit_status("predefined_function_name.c", 62),
     exit_status("alignment_and_transparent_union.c", 65),

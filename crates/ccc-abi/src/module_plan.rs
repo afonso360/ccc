@@ -8,8 +8,8 @@ use crate::{
     AbiCarrier, AbiClass, AbiError, BoundaryPlan, BridgeArtifactPlan, BridgeLocation,
     CallBridgeArtifactPlan, CallPlan, CallTarget, DefinitionPlan, LoweredSignaturePlan,
     ModuleAbiPlan, NativePurpose, PackagingPlan, PassingMode, SourceLinkage, SourceVisibility,
-    VariadicEntryArtifactPlan, VerifiedModuleAbiPlan, abi_config_key, hex, ir_shape_digest,
-    plan_boundary_type, plan_function_type, plan_unprototyped_call, plan_va_arg,
+    TlsAccessorArtifactPlan, VariadicEntryArtifactPlan, VerifiedModuleAbiPlan, abi_config_key, hex,
+    ir_shape_digest, plan_boundary_type, plan_function_type, plan_unprototyped_call, plan_va_arg,
     plan_variadic_call, translation_unit_digest,
 };
 
@@ -261,6 +261,57 @@ fn plan_artifacts(
         );
     }
 
+    let mut tls_accessors = std::collections::BTreeMap::new();
+    for object in &module.globals {
+        let is_tls = object.duration == ccc_sema::generic::StorageDuration::Thread
+            || object.emission.tls.is_some();
+        if !is_tls {
+            continue;
+        }
+        if object.duration != ccc_sema::generic::StorageDuration::Thread {
+            return Err(AbiError::new(
+                "CCC3516",
+                format!(
+                    "TLS model on non-thread object `{}` is not a valid backend contract",
+                    object.name
+                ),
+            )
+            .with_span_if_none(object.span));
+        }
+        let source_linkage = match object.linkage {
+            ccc_sema::generic::Linkage::None => SourceLinkage::None,
+            ccc_sema::generic::Linkage::Internal => SourceLinkage::Internal,
+            ccc_sema::generic::Linkage::External => SourceLinkage::External,
+        };
+        let source_visibility = match object.emission.visibility {
+            ccc_sema::generic::SymbolVisibility::Default => SourceVisibility::Default,
+            ccc_sema::generic::SymbolVisibility::Hidden => SourceVisibility::Hidden,
+            ccc_sema::generic::SymbolVisibility::Protected => SourceVisibility::Protected,
+            ccc_sema::generic::SymbolVisibility::Internal => SourceVisibility::Internal,
+        };
+        tls_accessors.insert(
+            object.id,
+            TlsAccessorArtifactPlan {
+                object: object.id,
+                object_symbol: object.emission.symbol_name.clone(),
+                helper_symbol: generated_symbol_for(
+                    translation_unit_digest,
+                    "tls_accessor",
+                    ccc_sema::generic::FullFunctionId(object.id.0),
+                    None,
+                ),
+                model: object
+                    .emission
+                    .tls
+                    .unwrap_or(ccc_sema::generic::TlsModel::GeneralDynamic),
+                source_linkage,
+                source_visibility,
+                source_defined: object.emission.definition
+                    != ccc_sema::generic::ObjectDefinitionPolicy::Declaration,
+            },
+        );
+    }
+
     let mut exact_localization_symbols = Vec::new();
     if let Some(call_bridge) = &call_bridge {
         exact_localization_symbols.push(call_bridge.helper_symbol.clone());
@@ -274,15 +325,28 @@ fn plan_artifacts(
             exact_localization_symbols.push(entry.public_symbol.clone());
         }
     }
+    for accessor in tls_accessors.values() {
+        exact_localization_symbols.push(accessor.helper_symbol.clone());
+        if accessor.source_defined
+            && matches!(
+                accessor.source_linkage,
+                SourceLinkage::None | SourceLinkage::Internal
+            )
+        {
+            exact_localization_symbols.push(accessor.object_symbol.clone());
+        }
+    }
     exact_localization_symbols.sort();
     exact_localization_symbols.dedup();
-    let generated_assembly_units =
-        u32::try_from(usize::from(call_bridge.is_some()) + variadic_entries.len())
-            .map_err(|_| AbiError::new("CCC3503", "generated assembly unit count overflow"))?;
+    let generated_assembly_units = u32::try_from(
+        usize::from(call_bridge.is_some()) + variadic_entries.len() + tls_accessors.len(),
+    )
+    .map_err(|_| AbiError::new("CCC3503", "generated assembly unit count overflow"))?;
     let needs_packaging = generated_assembly_units != 0;
     Ok(BridgeArtifactPlan {
         call_bridge,
         variadic_entries,
+        tls_accessors,
         packaging: PackagingPlan {
             generated_assembly_units,
             requires_assembler: needs_packaging,
@@ -522,6 +586,20 @@ fn dump_artifacts(output: &mut String, artifacts: &BridgeArtifactPlan) {
         )
         .unwrap();
     }
+    for accessor in artifacts.tls_accessors.values() {
+        writeln!(
+            output,
+            "tls-accessor object={} symbol={} helper={} model={} linkage={} visibility={} defined={}",
+            accessor.object.0,
+            accessor.object_symbol,
+            accessor.helper_symbol,
+            tls_model_name(accessor.model),
+            source_linkage_name(accessor.source_linkage),
+            source_visibility_name(accessor.source_visibility),
+            accessor.source_defined,
+        )
+        .unwrap();
+    }
     writeln!(
         output,
         "packaging assembly-units={} assembler={} relocatable-link={} object-copier={} exact-localize={}",
@@ -532,6 +610,15 @@ fn dump_artifacts(output: &mut String, artifacts: &BridgeArtifactPlan) {
         artifacts.packaging.exact_localization_symbols.join(",")
     )
     .unwrap();
+}
+
+fn tls_model_name(model: ccc_sema::generic::TlsModel) -> &'static str {
+    match model {
+        ccc_sema::generic::TlsModel::GeneralDynamic => "global-dynamic",
+        ccc_sema::generic::TlsModel::LocalDynamic => "local-dynamic",
+        ccc_sema::generic::TlsModel::InitialExec => "initial-exec",
+        ccc_sema::generic::TlsModel::LocalExec => "local-exec",
+    }
 }
 
 fn source_linkage_name(linkage: SourceLinkage) -> &'static str {

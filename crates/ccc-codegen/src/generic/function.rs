@@ -24,8 +24,8 @@ struct FunctionReference {
 
 #[derive(Clone, Copy)]
 struct DataReference {
-    value: ir::GlobalValue,
-    tls: bool,
+    value: Option<ir::GlobalValue>,
+    tls_accessor: Option<ir::FuncRef>,
 }
 
 #[derive(Clone, Copy)]
@@ -65,8 +65,11 @@ pub(super) fn declare_function_references(
         globals.insert(
             *raw,
             DataReference {
-                value: object_module.declare_data_in_func(declaration.id, function),
-                tls: declaration.tls,
+                value: (!declaration.tls)
+                    .then(|| object_module.declare_data_in_func(declaration.id, function)),
+                tls_accessor: declaration
+                    .tls_accessor
+                    .map(|id| object_module.declare_func_in_func(id, function)),
             },
         );
     }
@@ -1131,11 +1134,18 @@ impl FunctionState<'_> {
             .get(&raw)
             .copied()
             .ok_or_else(|| error(format!("reference to undeclared data object {raw}")))?;
-        Ok(if reference.tls {
-            builder.ins().tls_value(ir::types::I64, reference.value)
-        } else {
-            builder.ins().global_value(ir::types::I64, reference.value)
-        })
+        if let Some(accessor) = reference.tls_accessor {
+            let call = builder.ins().call(accessor, &[]);
+            return builder
+                .inst_results(call)
+                .first()
+                .copied()
+                .ok_or_else(|| error("TLS address accessor returned no pointer"));
+        }
+        let value = reference
+            .value
+            .ok_or_else(|| error("non-TLS data reference has no global value"))?;
+        Ok(builder.ins().global_value(ir::types::I64, value))
     }
 
     fn address_constant(

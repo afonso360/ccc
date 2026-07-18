@@ -80,7 +80,9 @@ pub(super) fn define_globals(
     for global in &module.globals {
         if global.emission.definition == ObjectDefinitionPolicy::Declaration
             || (global.emission.definition == ObjectDefinitionPolicy::TentativeCommon
-                && global.linkage == CLinkage::External)
+                && global.linkage == CLinkage::External
+                && global.duration != StorageDuration::Thread
+                && global.emission.tls.is_none())
         {
             continue;
         }
@@ -527,15 +529,15 @@ fn apply_relocations(
     for relocation in relocations {
         match relocation.target {
             PendingRelocationTarget::Object(raw) => {
+                if relocation.kind == gir::RelocationKind::ThreadLocalAddress {
+                    return Err(error(
+                        "a static initializer cannot contain a thread-local object address",
+                    ));
+                }
                 let target =
                     declarations.globals.get(&raw).copied().ok_or_else(|| {
                         error(format!("relocation references unknown data {raw}"))
                     })?;
-                if relocation.kind == gir::RelocationKind::ThreadLocalAddress && !target.tls {
-                    return Err(error(format!(
-                        "thread-local relocation references non-thread-local data {raw}"
-                    )));
-                }
                 let reference = object_module.declare_data_in_data(target.id, description);
                 description.write_data_addr(relocation.offset, reference, relocation.addend);
             }
