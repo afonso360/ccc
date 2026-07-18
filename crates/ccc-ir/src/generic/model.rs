@@ -196,6 +196,7 @@ pub struct FullStorage {
     pub ty: QualifiedType,
     pub duration: StorageDuration,
     pub location: StorageLocation,
+    pub requested_alignment: Option<u64>,
     pub required_by: Vec<MemoryResidencyReason>,
     pub span: Span,
 }

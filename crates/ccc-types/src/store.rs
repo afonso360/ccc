@@ -259,6 +259,7 @@ impl TypeStore {
             tag,
             fields: None,
             packing: PackingPolicy::NATIVE,
+            transparent_union: false,
         });
         let ty = self.intern(TypeKind::Record(id));
         (id, ty)
@@ -266,6 +267,15 @@ impl TypeStore {
 
     pub fn record(&self, id: RecordId) -> Option<&RecordDefinition> {
         self.records.get(id.index())
+    }
+
+    pub fn mark_transparent_union(&mut self, id: RecordId) -> Result<(), DefinitionError> {
+        let definition = self
+            .records
+            .get_mut(id.index())
+            .ok_or(DefinitionError::UnknownRecord(id))?;
+        definition.transparent_union = true;
+        Ok(())
     }
 
     pub fn complete_record(

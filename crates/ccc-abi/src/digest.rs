@@ -260,6 +260,7 @@ fn encode_types(encoder: &mut Encoder, types: &TypeStore) -> Result<(), AbiError
                 encoder.option_string(definition.tag.as_deref());
                 encoder.option_u64(definition.packing.maximum_field_alignment);
                 encoder.u64(definition.packing.minimum_record_alignment);
+                encoder.bool(definition.transparent_union);
                 encoder.bool(definition.fields.is_some());
                 if let Some(fields) = &definition.fields {
                     encoder.len(fields.len());
@@ -268,6 +269,7 @@ fn encode_types(encoder: &mut Encoder, types: &TypeStore) -> Result<(), AbiError
                         encoder.qualified(field.ty);
                         encoder
                             .option_u64(field.bitfield.map(|bitfield| u64::from(bitfield.width)));
+                        encoder.option_u64(field.requested_alignment);
                     }
                 }
             }
@@ -379,6 +381,7 @@ fn encode_function(encoder: &mut Encoder, function: &gir::FullFunction) {
         encoder.qualified(storage.ty);
         encoder.tag(storage.duration as u8);
         encoder.tag(storage.location as u8);
+        encoder.option_u64(storage.requested_alignment);
         encoder.len(storage.required_by.len());
         for reason in &storage.required_by {
             encoder.tag(*reason as u8);

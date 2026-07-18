@@ -203,6 +203,10 @@ impl CapabilityRegistry {
             "__noinline__",
             "always_inline",
             "__always_inline__",
+            "may_alias",
+            "__may_alias__",
+            "alloc_size",
+            "__alloc_size__",
         ] {
             registry.insert_with_rationale(
                 CapabilityKind::Attribute,
@@ -222,6 +226,8 @@ impl CapabilityRegistry {
             "__aligned__",
             "weak",
             "__weak__",
+            "transparent_union",
+            "__transparent_union__",
         ] {
             registry.insert_with_rationale(
                 CapabilityKind::Attribute,
@@ -457,6 +463,10 @@ mod tests {
             "__noinline__",
             "always_inline",
             "__always_inline__",
+            "may_alias",
+            "__may_alias__",
+            "alloc_size",
+            "__alloc_size__",
         ] {
             assert_eq!(
                 registry.state(CapabilityKind::Attribute, name),
@@ -473,6 +483,8 @@ mod tests {
             "__aligned__",
             "weak",
             "__weak__",
+            "transparent_union",
+            "__transparent_union__",
         ] {
             assert_eq!(
                 registry.state(CapabilityKind::Attribute, name),

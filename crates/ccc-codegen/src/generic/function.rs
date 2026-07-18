@@ -132,7 +132,8 @@ pub(super) fn lower_function(
                 object.name
             ))
         })?;
-        let align_shift = u8::try_from(layout.align.trailing_zeros())
+        let alignment = super::data::requested_alignment(object.requested_alignment, layout.align)?;
+        let align_shift = u8::try_from(alignment.trailing_zeros())
             .map_err(|_| error("stack object alignment is too large"))?;
         let slot = builder.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,

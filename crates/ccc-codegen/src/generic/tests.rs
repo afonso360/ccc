@@ -419,7 +419,7 @@ fn complete_abi_plan_and_aggregate_clif_have_exact_snapshots() {
     assert!(dump.contains("packaging assembly-units=2"), "{dump}");
     assert_eq!(
         sha256(&dump),
-        "44272afee9e620a37d1a152d7cdb7009226fe58394e981d96b3c57ad753fb66d"
+        "6e96880231371cdc038ca2453549b5d3a0c047b96766193efe448cd1df17c742"
     );
 
     let output = emit(&module, &config, Options { emit_clif: true }).unwrap();
@@ -1084,4 +1084,17 @@ fn packed_and_bitfield_memory_paths_remain_unaligned_and_explicit() {
     assert!(!clif.contains(" aligned"), "{clif}");
     assert!(clif.contains("ushr_imm") || clif.contains("ushr"), "{clif}");
     assert!(clif.contains("band_imm") || clif.contains("band"), "{clif}");
+}
+
+#[test]
+fn automatic_alignment_requests_reach_cranelift_stack_slots() {
+    let output = emit_source(
+        "int inspect(void) {\n\
+             _Alignas(64) int value = 7;\n\
+             volatile int *address = &value;\n\
+             return *address;\n\
+         }",
+    );
+    let clif = function_clif(&output.clif, "inspect");
+    assert!(clif.contains("explicit_slot 4, align = 64"), "{clif}");
 }

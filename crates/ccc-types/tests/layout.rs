@@ -559,6 +559,84 @@ fn enums_flexible_arrays_and_recursive_records_are_structured() {
 }
 
 #[test]
+fn member_alignment_requests_shape_struct_union_and_flexible_array_layouts() {
+    let mut types = TypeStore::default();
+    let values = types.array(ArrayType {
+        element: TypeId::LONG.into(),
+        length: ArrayLength::Constant(8),
+    });
+    let (record_id, record) = types.declare_record(RecordKind::Struct, None);
+    types
+        .complete_record(
+            record_id,
+            vec![
+                Field::named("tag", TypeId::CHAR),
+                Field::named("values", values).with_requested_alignment(Some(64)),
+                Field::named("tail", TypeId::CHAR),
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        types.layout_of(record, &config()).unwrap().size_align(),
+        SizeAlign {
+            size: 192,
+            align: 64
+        }
+    );
+    assert_eq!(
+        record_fields(&types, record)
+            .into_iter()
+            .map(|(offset, size, align, _)| (offset, size, align))
+            .collect::<Vec<_>>(),
+        vec![(0, 1, 1), (64, 64, 64), (128, 1, 1)]
+    );
+
+    let (union_id, union) = types.declare_record(RecordKind::Union, None);
+    types
+        .complete_record(
+            union_id,
+            vec![
+                Field::named("byte", TypeId::CHAR),
+                Field::named("word", TypeId::LONG).with_requested_alignment(Some(64)),
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        types.layout_of(union, &config()).unwrap().size_align(),
+        SizeAlign {
+            size: 64,
+            align: 64
+        }
+    );
+
+    let flexible = types.array(ArrayType {
+        element: TypeId::CHAR.into(),
+        length: ArrayLength::Incomplete,
+    });
+    let (flexible_id, flexible_record) = types.declare_record(RecordKind::Struct, None);
+    types
+        .complete_record(
+            flexible_id,
+            vec![
+                Field::named("length", TypeId::INT),
+                Field::named("bytes", flexible).with_requested_alignment(Some(64)),
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        types
+            .layout_of(flexible_record, &config())
+            .unwrap()
+            .size_align(),
+        SizeAlign {
+            size: 64,
+            align: 64
+        }
+    );
+    assert_eq!(record_fields(&types, flexible_record)[1].0, 64);
+}
+
+#[test]
 fn function_types_remain_unsized() {
     let mut types = TypeStore::default();
     let function = types.function_type(FunctionType::unspecified(TypeId::INT));

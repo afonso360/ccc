@@ -129,12 +129,15 @@ pub fn dump_frontend_ir(module: &FullModule) -> String {
                 .join(",");
             let _ = writeln!(
                 output,
-                "  storage m{} l{} %{}: {} [{:?}; {}]",
+                "  storage m{} l{} %{}: {} [{:?}{}; {}]",
                 storage.id.0,
                 storage.local.0,
                 storage.name,
                 module.types.display_qualified(storage.ty),
                 storage.location,
+                storage
+                    .requested_alignment
+                    .map_or_else(String::new, |alignment| format!("; align={alignment}")),
                 reasons,
             );
         }

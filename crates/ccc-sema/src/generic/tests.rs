@@ -568,6 +568,160 @@ fn aligned_attribute_preserves_object_and_private_typedef_alignment() {
     );
 }
 
+#[test]
+fn alignment_specifiers_reach_members_static_objects_and_automatic_storage() {
+    let unit = analyze_source(
+        "_Alignas(64) int global_value;\n\
+         struct State { char tag; _Alignas(64) unsigned long lanes[8]; };\n\
+         struct State state;\n\
+         int f(void) {\n\
+             _Alignas(64) int automatic_value = 1;\n\
+             _Alignas(long) static int static_value = 2;\n\
+             return automatic_value + static_value;\n\
+         }",
+    )
+    .unwrap();
+    let global = unit
+        .globals
+        .iter()
+        .find(|global| global.name == "global_value")
+        .unwrap();
+    assert_eq!(global.emission.requested_alignment, Some(64));
+    let state = unit
+        .globals
+        .iter()
+        .find(|global| global.name == "state")
+        .unwrap();
+    let layout = unit
+        .types
+        .layout_of(state.ty.ty, &EffectiveCompilationConfig::default())
+        .unwrap();
+    assert_eq!((layout.size, layout.align), (128, 64));
+    let TypeKind::Record(state_record) = unit.types.kind(state.ty.ty) else {
+        panic!("state has record type")
+    };
+    let fields = unit
+        .types
+        .record(*state_record)
+        .unwrap()
+        .fields
+        .as_ref()
+        .unwrap();
+    assert_eq!(fields[1].requested_alignment, Some(64));
+
+    let function = unit
+        .functions
+        .iter()
+        .find(|function| function.name == "f")
+        .unwrap();
+    let FullTypedStatementKind::Compound(items) = &function.body.as_ref().unwrap().kind else {
+        panic!("function body is compound")
+    };
+    let locals = items
+        .iter()
+        .filter_map(|item| match item {
+            FullTypedBlockItem::Declaration(declaration) => Some(declaration.as_ref()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(locals[0].requested_alignment, Some(64));
+    assert_eq!(locals[1].requested_alignment, Some(8));
+    assert_eq!(
+        locals[1].emission.as_ref().unwrap().requested_alignment,
+        Some(8)
+    );
+}
+
+#[test]
+fn alignment_specifiers_enforce_subject_strength_backend_and_redeclaration_rules() {
+    analyze_source(
+        "_Alignas(64) extern int value;\n\
+         extern int value;\n\
+         _Alignas(64) int value = 1;\n\
+         _Alignas(0) int ordinary;",
+    )
+    .unwrap();
+    for source in [
+        "_Alignas(1) int value;",
+        "_Alignas(3) int value;",
+        "_Alignas(9223372036854775808ULL) int value;",
+        "typedef _Alignas(8) int value_t;",
+        "_Alignas(8) int f(void);",
+        "int f(_Alignas(8) int value);",
+        "int f(void) { _Alignas(8) register int value; return value; }",
+        "struct S { _Alignas(8) unsigned int bits : 1; };",
+        "_Alignas(64) extern int value; int value = 1;",
+        "int value = 1; _Alignas(64) extern int value;",
+        "_Alignas(32) extern int value; _Alignas(64) int value = 1;",
+    ] {
+        assert_eq!(diagnostic_codes(source), vec!["CCC2437"], "{source}");
+    }
+}
+
+#[test]
+fn narrow_gnu_alias_allocation_and_transparent_union_contracts_are_explicit() {
+    let unit = analyze_source(
+        "struct IPv4; struct IPv6;\n\
+         typedef union {\n\
+             struct IPv4 *v4;\n\
+             const struct IPv6 *v6;\n\
+         } SocketAddress __attribute__((__transparent_union__));\n\
+         typedef __attribute__((__aligned__(1))) __attribute__((__may_alias__))\n\
+             unsigned int unaligned_word;\n\
+         void *allocate(unsigned long) __attribute__((alloc_size(1)));\n\
+         int consume(SocketAddress);\n\
+         int use_pointer(struct IPv4 *address) { return consume(address); }\n\
+         int use_union(SocketAddress address) { return consume(address); }\n\
+         int use_null(void) { return consume(0); }",
+    )
+    .unwrap();
+    let transparent = unit
+        .typedefs
+        .iter()
+        .find(|typedef| typedef.name == "SocketAddress")
+        .unwrap();
+    let TypeKind::Record(record) = unit.types.kind(transparent.ty.ty) else {
+        panic!("transparent typedef has union type")
+    };
+    assert!(unit.types.record(*record).unwrap().transparent_union);
+    let consume = unit
+        .functions
+        .iter()
+        .find(|function| function.name == "consume")
+        .unwrap();
+    let signature = unit.types.function_signature(consume.signature).unwrap();
+    let ccc_types::FunctionParameters::Prototype(parameters) = signature.parameters else {
+        panic!("consume has a prototype")
+    };
+    assert_eq!(parameters[0].ty, transparent.ty.ty);
+
+    for source in [
+        "void *f(unsigned long) __attribute__((alloc_size()));",
+        "void *f(unsigned long) __attribute__((alloc_size(0)));",
+        "void *f(unsigned long) __attribute__((alloc_size(1, 0)));",
+    ] {
+        assert_eq!(diagnostic_codes(source), vec!["CCC2438"], "{source}");
+    }
+    for source in [
+        "typedef union Named { int *pointer; } Alias __attribute__((transparent_union));",
+        "typedef union { int value; } Alias __attribute__((transparent_union));",
+        "union __attribute__((transparent_union)) U { int *pointer; };",
+        "int value __attribute__((transparent_union));",
+    ] {
+        assert_eq!(diagnostic_codes(source), vec!["CCC2439"], "{source}");
+    }
+    assert_eq!(
+        diagnostic_codes(
+            "struct A; struct B; struct C;\n\
+             typedef union { struct A *a; struct B *b; } U\n\
+                 __attribute__((transparent_union));\n\
+             int consume(U);\n\
+             int use(struct C *value) { return consume(value); }"
+        ),
+        vec!["CCC2440"]
+    );
+}
+
 fn diagnostic_codes(source: &str) -> Vec<String> {
     analyze_source(source)
         .unwrap_err()

@@ -210,6 +210,9 @@ pub struct FullTypedLocalDeclaration {
     pub variable_length_bounds: Vec<FullTypedVariableLengthBound>,
     pub initializer: Option<FullTypedInitializer>,
     pub attributes: Vec<FullTypedAttribute>,
+    /// Strongest object-specific alignment requested by a standard alignment
+    /// specifier or an implemented GNU alignment attribute.
+    pub requested_alignment: Option<u64>,
     /// Present for static- or thread-duration block objects. These objects are
     /// emitted as data and never initialized by a runtime stack store.
     pub emission: Option<GlobalEmission>,

@@ -101,6 +101,8 @@ struct DeclarationInfo {
     storage: Option<syntax::StorageClass>,
     properties: FunctionProperties,
     attributes: Vec<FullTypedAttribute>,
+    has_alignment_specifier: bool,
+    requested_alignment: Option<u64>,
 }
 
 #[derive(Default)]
@@ -124,6 +126,12 @@ struct FunctionState {
     variadic: bool,
     last_named_parameter: Option<FullLocalId>,
     last_named_parameter_restriction: Option<&'static str>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct GlobalStandardAlignment {
+    explicit: Option<u64>,
+    definition: Option<Option<u64>>,
 }
 
 #[derive(Clone, Debug)]
@@ -170,6 +178,7 @@ struct Analyzer<'a> {
     typedefs: Vec<FullTypedTypedef>,
     strings: Vec<FullTypedString>,
     string_pool: HashMap<StringPoolKey, StringId>,
+    global_standard_alignments: HashMap<GlobalId, GlobalStandardAlignment>,
     scopes: ScopeStack,
     function: Option<FunctionState>,
     parameter_scope_depth: usize,
@@ -189,6 +198,7 @@ impl<'a> Analyzer<'a> {
             typedefs: Vec::new(),
             strings: Vec::new(),
             string_pool: HashMap::new(),
+            global_standard_alignments: HashMap::new(),
             scopes: ScopeStack::new(),
             function: None,
             parameter_scope_depth: 0,
@@ -263,6 +273,7 @@ impl<'a> Analyzer<'a> {
         let info = self.resolve_declaration_specifiers(&declaration.specifiers)?;
         self.reject_packed_attribute(&info.attributes, declaration.span)?;
         if declaration.declarators.is_empty() {
+            self.reject_alignment_specifier(&info, declaration.span, "a type declaration")?;
             self.reject_weak_attribute(&info.attributes, declaration.span, "a type declaration")?;
             self.external_items
                 .push(FullTypedExternalItem::TypeDeclaration {
@@ -286,6 +297,7 @@ impl<'a> Analyzer<'a> {
             attributes.extend(self.validate_attributes(&init.attributes)?);
             self.reject_packed_attribute(&attributes, init.span)?;
             if info.storage == Some(syntax::StorageClass::Typedef) {
+                self.reject_alignment_specifier(&info, init.span, "a typedef")?;
                 if init.initializer.is_some() || init.asm_label.is_some() {
                     return self.fail(
                         "CCC2202",
@@ -293,7 +305,7 @@ impl<'a> Analyzer<'a> {
                         "a typedef cannot have an initializer or assembly label",
                     );
                 }
-                let ty = self.apply_typedef_alignment(
+                let ty = self.apply_file_typedef_attributes(
                     resolved.ty,
                     &attributes,
                     declaration.declarators.len() == 1
@@ -302,6 +314,12 @@ impl<'a> Analyzer<'a> {
                 )?;
                 self.declare_typedef(name, ty, attributes, init.span)?;
             } else if self.types.function_signature(resolved.ty.ty).is_some() {
+                self.reject_transparent_union_attribute(
+                    &attributes,
+                    init.span,
+                    "a function declaration",
+                )?;
+                self.reject_alignment_specifier(&info, init.span, "a function")?;
                 if init.initializer.is_some() {
                     return self.fail(
                         "CCC2203",
@@ -322,12 +340,18 @@ impl<'a> Analyzer<'a> {
                 self.external_items
                     .push(FullTypedExternalItem::Function(id));
             } else {
+                self.reject_transparent_union_attribute(
+                    &attributes,
+                    init.span,
+                    "an object declaration",
+                )?;
                 let asm_label = self.resolve_asm_label(init.asm_label.as_ref())?;
                 let id = self.declare_global(
                     name,
                     resolved.ty,
                     info.storage,
                     attributes,
+                    info.requested_alignment,
                     asm_label,
                     init.initializer.as_ref(),
                     init.span,
@@ -344,6 +368,7 @@ impl<'a> Analyzer<'a> {
     ) -> AnalysisResult<()> {
         let info = self.resolve_declaration_specifiers(&definition.specifiers)?;
         self.reject_packed_attribute(&info.attributes, definition.specifiers.span)?;
+        self.reject_alignment_specifier(&info, definition.specifiers.span, "a function")?;
         if info.storage == Some(syntax::StorageClass::Typedef) {
             return self.fail(
                 "CCC2204",
@@ -382,6 +407,11 @@ impl<'a> Analyzer<'a> {
         let mut attributes = info.attributes;
         attributes.extend(resolved.attributes);
         self.reject_packed_attribute(&attributes, definition.declarator.span)?;
+        self.reject_transparent_union_attribute(
+            &attributes,
+            definition.declarator.span,
+            "a function definition",
+        )?;
         let id = self.declare_function(
             name.clone(),
             resolved.ty.ty,
@@ -525,6 +555,7 @@ impl<'a> Analyzer<'a> {
         let mut qualifiers = TypeQualifiers::NONE;
         let mut type_specifiers = Vec::new();
         let mut attributes = Vec::new();
+        let mut alignment_specifiers = Vec::new();
 
         for item in &specifiers.items {
             match item {
@@ -552,12 +583,8 @@ impl<'a> Analyzer<'a> {
                     syntax::FunctionSpecifier::Inline => properties.inline = true,
                     syntax::FunctionSpecifier::NoReturn => properties.no_return = true,
                 },
-                syntax::DeclarationSpecifier::Alignment(_) => {
-                    return self.fail(
-                        "CCC2211",
-                        specifiers.span,
-                        "alignment specifiers are parsed but are not semantically supported",
-                    );
+                syntax::DeclarationSpecifier::Alignment(specifier) => {
+                    alignment_specifiers.push(specifier)
                 }
                 syntax::DeclarationSpecifier::Attribute(attribute) => {
                     attributes.push(self.validate_attribute(attribute)?);
@@ -573,12 +600,76 @@ impl<'a> Analyzer<'a> {
         }
         let mut base = self.resolve_type_specifiers(&type_specifiers, specifiers.span)?;
         base.qualifiers |= qualifiers;
+        let mut requested_alignment = None;
+        for specifier in &alignment_specifiers {
+            if let Some(alignment) = self.resolve_alignment_specifier(specifier, specifiers.span)? {
+                requested_alignment = Some(
+                    requested_alignment.map_or(alignment, |current: u64| current.max(alignment)),
+                );
+            }
+        }
         Ok(DeclarationInfo {
             base,
             storage,
             properties,
             attributes,
+            has_alignment_specifier: !alignment_specifiers.is_empty(),
+            requested_alignment,
         })
+    }
+
+    fn resolve_alignment_specifier(
+        &mut self,
+        specifier: &syntax::AlignmentSpecifier,
+        span: Span,
+    ) -> AnalysisResult<Option<u64>> {
+        let value = match specifier {
+            syntax::AlignmentSpecifier::Type(type_name) => {
+                let ty = self.resolve_type_name(type_name)?;
+                self.types
+                    .layout_of(ty.ty, self.config)
+                    .map_err(|error| self.emit("CCC2437", span, error.to_string()))?
+                    .align
+            }
+            syntax::AlignmentSpecifier::Expression(expression) => {
+                let value = self.evaluate_integer_constant(expression)?;
+                u64::try_from(value).map_err(|_| {
+                    self.emit(
+                        "CCC2437",
+                        span,
+                        "an alignment must be a nonnegative integer constant",
+                    );
+                })?
+            }
+        };
+        if value == 0 {
+            return Ok(None);
+        }
+        if !supported_object_alignment(value) {
+            return self.fail(
+                "CCC2437",
+                span,
+                "a nonzero alignment must be a backend-supported power of two",
+            );
+        }
+        Ok(Some(value))
+    }
+
+    fn reject_alignment_specifier(
+        &mut self,
+        info: &DeclarationInfo,
+        span: Span,
+        subject: &str,
+    ) -> AnalysisResult<()> {
+        if info.has_alignment_specifier {
+            self.fail(
+                "CCC2437",
+                span,
+                format!("an alignment specifier cannot be applied to {subject}"),
+            )
+        } else {
+            Ok(())
+        }
     }
 
     fn resolve_type_specifiers(
@@ -765,6 +856,8 @@ impl<'a> Analyzer<'a> {
     ) -> AnalysisResult<(QualifiedType, Vec<FullTypedVariableLengthBound>)> {
         let info = self.resolve_declaration_specifiers(&type_name.specifiers)?;
         self.reject_packed_attribute(&info.attributes, type_name.specifiers.span)?;
+        self.reject_transparent_union_attribute(&info.attributes, type_name.span, "a type name")?;
+        self.reject_alignment_specifier(&info, type_name.span, "a type name")?;
         if info.storage.is_some() || info.properties != FunctionProperties::default() {
             return self.fail(
                 "CCC2219",
@@ -1051,6 +1144,12 @@ impl<'a> Analyzer<'a> {
         let info = self.resolve_declaration_specifiers(&parameter.specifiers)?;
         self.reject_weak_attribute(&info.attributes, parameter.span, "a parameter")?;
         self.reject_packed_attribute(&info.attributes, parameter.span)?;
+        self.reject_transparent_union_attribute(
+            &info.attributes,
+            parameter.span,
+            "a parameter declaration",
+        )?;
+        self.reject_alignment_specifier(&info, parameter.span, "a parameter")?;
         if !matches!(info.storage, None | Some(syntax::StorageClass::Register)) {
             return self.fail(
                 "CCC2227",
@@ -1169,6 +1268,11 @@ impl<'a> Analyzer<'a> {
 
         let record_attributes = self.validate_attributes(&specifier.attributes)?;
         self.reject_weak_attribute(&record_attributes, specifier.span, "a record type")?;
+        self.reject_transparent_union_attribute(
+            &record_attributes,
+            specifier.span,
+            "a record specifier",
+        )?;
         let Some(items) = &specifier.items else {
             return Ok(ty);
         };
@@ -1209,6 +1313,11 @@ impl<'a> Analyzer<'a> {
                         "a record member",
                     )?;
                     self.reject_packed_attribute(&info.attributes, declaration.span)?;
+                    self.reject_transparent_union_attribute(
+                        &info.attributes,
+                        declaration.span,
+                        "a record member",
+                    )?;
                     if info.storage.is_some() || info.properties != FunctionProperties::default() {
                         return self.fail(
                             "CCC2232",
@@ -1224,7 +1333,16 @@ impl<'a> Analyzer<'a> {
                                 "an unnamed record member must have struct or union type",
                             );
                         }
-                        fields.push(Field::anonymous(info.base));
+                        let requested_alignment = self.object_requested_alignment(
+                            info.base,
+                            info.requested_alignment,
+                            &info.attributes,
+                            declaration.span,
+                        )?;
+                        fields.push(
+                            Field::anonymous(info.base)
+                                .with_requested_alignment(requested_alignment),
+                        );
                         continue;
                     }
                     for member in &declaration.declarators {
@@ -1235,7 +1353,12 @@ impl<'a> Analyzer<'a> {
                             "a record member",
                         )?;
                         self.reject_packed_attribute(&member_attributes, member.span)?;
-                        let (name, field_ty, has_variable_length_bounds) =
+                        self.reject_transparent_union_attribute(
+                            &member_attributes,
+                            member.span,
+                            "a record member",
+                        )?;
+                        let (name, field_ty, has_variable_length_bounds, declarator_attributes) =
                             if let Some(declarator) = &member.declarator {
                                 let resolved = self.resolve_declarator(info.base, declarator)?;
                                 self.reject_weak_attribute(
@@ -1247,9 +1370,10 @@ impl<'a> Analyzer<'a> {
                                     resolved.name,
                                     resolved.ty,
                                     !resolved.variable_length_bounds.is_empty(),
+                                    resolved.attributes,
                                 )
                             } else {
-                                (None, info.base, false)
+                                (None, info.base, false, Vec::new())
                             };
                         if let Some(name) = &name
                             && !field_names.insert(name.clone())
@@ -1292,7 +1416,17 @@ impl<'a> Analyzer<'a> {
                                 "a structure member cannot contain a flexible array member",
                             );
                         }
+                        let mut alignment_attributes = info.attributes.clone();
+                        alignment_attributes.extend(declarator_attributes);
+                        alignment_attributes.extend(member_attributes);
                         let field = if let Some(width) = &member.bit_width {
+                            if info.has_alignment_specifier {
+                                return self.fail(
+                                    "CCC2437",
+                                    member.span,
+                                    "an alignment specifier cannot be applied to a bit-field",
+                                );
+                            }
                             if !self.types.is_integer(field_ty.ty) {
                                 return self.fail(
                                     "CCC2236",
@@ -1310,7 +1444,13 @@ impl<'a> Analyzer<'a> {
                             })?;
                             Field::bitfield(name, field_ty, width)
                         } else {
-                            Field::new(name, field_ty)
+                            let requested_alignment = self.object_requested_alignment(
+                                field_ty,
+                                info.requested_alignment,
+                                &alignment_attributes,
+                                member.span,
+                            )?;
+                            Field::new(name, field_ty).with_requested_alignment(requested_alignment)
                         };
                         if flexible {
                             flexible_members.push((fields.len(), member.span));
@@ -1398,6 +1538,11 @@ impl<'a> Analyzer<'a> {
         let enum_attributes = self.validate_attributes(&specifier.attributes)?;
         self.reject_weak_attribute(&enum_attributes, specifier.span, "an enum type")?;
         self.reject_packed_attribute(&enum_attributes, specifier.span)?;
+        self.reject_transparent_union_attribute(
+            &enum_attributes,
+            specifier.span,
+            "an enum specifier",
+        )?;
         let Some(enumerators) = &specifier.enumerators else {
             return Ok(ty);
         };
@@ -1418,6 +1563,11 @@ impl<'a> Analyzer<'a> {
             let enumerator_attributes = self.validate_attributes(&enumerator.attributes)?;
             self.reject_weak_attribute(&enumerator_attributes, enumerator.span, "an enumerator")?;
             self.reject_packed_attribute(&enumerator_attributes, enumerator.span)?;
+            self.reject_transparent_union_attribute(
+                &enumerator_attributes,
+                enumerator.span,
+                "an enumerator",
+            )?;
             let value = if let Some(expression) = &enumerator.value {
                 self.evaluate_integer_constant(expression)?
             } else {
@@ -1638,10 +1788,12 @@ impl<'a> Analyzer<'a> {
         mut ty: QualifiedType,
         storage: Option<syntax::StorageClass>,
         attributes: Vec<FullTypedAttribute>,
+        standard_alignment: Option<u64>,
         asm_label: Option<FullTypedAsmLabel>,
         initializer: Option<&syntax::Initializer>,
         span: Span,
     ) -> AnalysisResult<GlobalId> {
+        let is_definition = initializer.is_some();
         if matches!(
             storage,
             Some(
@@ -1671,6 +1823,8 @@ impl<'a> Analyzer<'a> {
         } else {
             None
         };
+        let requested_alignment =
+            self.object_requested_alignment(ty, standard_alignment, &attributes, span)?;
         let tentative = initializer.is_none() && storage != Some(syntax::StorageClass::Extern);
         let definition = if initializer.is_some() {
             ObjectDefinitionPolicy::Definition
@@ -1708,6 +1862,12 @@ impl<'a> Analyzer<'a> {
 
         if let Some(existing) = self.lookup_file_ordinary(&name).cloned() {
             if let OrdinarySymbol::Global(id, existing_ty) = existing {
+                self.register_global_standard_alignment(
+                    id,
+                    standard_alignment,
+                    is_definition,
+                    span,
+                )?;
                 let existing_linkage = self.globals[id.0 as usize].linkage;
                 if storage == Some(syntax::StorageClass::Static)
                     && existing_linkage == Linkage::External
@@ -1781,6 +1941,8 @@ impl<'a> Analyzer<'a> {
                     global.tentative = false;
                     global.emission.definition = ObjectDefinitionPolicy::Definition;
                 }
+                global.emission.requested_alignment =
+                    strongest_alignment(global.emission.requested_alignment, requested_alignment);
                 global.ty = composite;
                 self.scopes
                     .replace_file_ordinary(name, OrdinarySymbol::Global(id, composite));
@@ -1794,6 +1956,7 @@ impl<'a> Analyzer<'a> {
         }
 
         let id = GlobalId(self.globals.len() as u32);
+        self.register_global_standard_alignment(id, standard_alignment, is_definition, span)?;
         let symbol_name = asm_label
             .as_ref()
             .map_or_else(|| name.clone(), |label| label.symbol.clone());
@@ -1802,7 +1965,7 @@ impl<'a> Analyzer<'a> {
             binding: declared_binding.unwrap_or_default(),
             visibility: SymbolVisibility::Default,
             section: None,
-            requested_alignment: None,
+            requested_alignment,
             tls: (duration == StorageDuration::Thread).then_some(TlsModel::GeneralDynamic),
             definition,
         };
@@ -1831,12 +1994,79 @@ impl<'a> Analyzer<'a> {
         Ok(id)
     }
 
+    fn register_global_standard_alignment(
+        &mut self,
+        id: GlobalId,
+        incoming: Option<u64>,
+        definition: bool,
+        span: Span,
+    ) -> AnalysisResult<()> {
+        let current = self
+            .global_standard_alignments
+            .get(&id)
+            .copied()
+            .unwrap_or_default();
+        if let (Some(existing), Some(incoming)) = (current.explicit, incoming)
+            && existing != incoming
+        {
+            return self.fail(
+                "CCC2437",
+                span,
+                "object redeclarations specify different standard alignments",
+            );
+        }
+        if let Some(definition_alignment) = current.definition {
+            match (definition_alignment, incoming) {
+                (None, Some(_)) => {
+                    return self.fail(
+                        "CCC2437",
+                        span,
+                        "an aligned declaration follows a definition without an alignment specifier",
+                    );
+                }
+                (Some(expected), Some(incoming)) if expected != incoming => {
+                    return self.fail(
+                        "CCC2437",
+                        span,
+                        "object declaration alignment differs from its definition",
+                    );
+                }
+                _ => {}
+            }
+        }
+        if definition
+            && let Some(expected) = current.explicit
+            && incoming != Some(expected)
+        {
+            return self.fail(
+                "CCC2437",
+                span,
+                "an object definition must repeat the standard alignment from an earlier declaration",
+            );
+        }
+        self.global_standard_alignments.insert(
+            id,
+            GlobalStandardAlignment {
+                explicit: current.explicit.or(incoming),
+                definition: if definition {
+                    Some(incoming)
+                } else {
+                    current.definition
+                },
+            },
+        );
+        Ok(())
+    }
+
     fn analyze_block_declaration(
         &mut self,
         declaration: &syntax::Declaration,
     ) -> AnalysisResult<Vec<FullTypedBlockItem>> {
         let info = self.resolve_declaration_specifiers(&declaration.specifiers)?;
         self.reject_packed_attribute(&info.attributes, declaration.span)?;
+        if declaration.declarators.is_empty() {
+            self.reject_alignment_specifier(&info, declaration.span, "a type declaration")?;
+        }
         let mut output = Vec::new();
         for init in &declaration.declarators {
             let resolved = self.resolve_declarator(info.base, &init.declarator)?;
@@ -1852,6 +2082,12 @@ impl<'a> Analyzer<'a> {
             attributes.extend(self.validate_attributes(&init.attributes)?);
             self.reject_packed_attribute(&attributes, init.span)?;
             if info.storage == Some(syntax::StorageClass::Typedef) {
+                self.reject_alignment_specifier(&info, init.span, "a typedef")?;
+                self.reject_transparent_union_attribute(
+                    &attributes,
+                    init.span,
+                    "a block-scope typedef",
+                )?;
                 self.reject_weak_attribute(&attributes, init.span, "a typedef")?;
                 if init.initializer.is_some() || init.asm_label.is_some() {
                     return self.fail(
@@ -1887,6 +2123,12 @@ impl<'a> Analyzer<'a> {
                 continue;
             }
             if self.types.function_signature(resolved.ty.ty).is_some() {
+                self.reject_transparent_union_attribute(
+                    &attributes,
+                    init.span,
+                    "a block-scope function declaration",
+                )?;
+                self.reject_alignment_specifier(&info, init.span, "a function")?;
                 if !resolved.variable_length_bounds.is_empty() {
                     return self.fail(
                         "CCC2418",
@@ -1910,6 +2152,11 @@ impl<'a> Analyzer<'a> {
                 continue;
             }
             if info.storage == Some(syntax::StorageClass::Extern) {
+                self.reject_transparent_union_attribute(
+                    &attributes,
+                    init.span,
+                    "an object declaration",
+                )?;
                 if init.initializer.is_some() {
                     return self.fail(
                         "CCC2256",
@@ -1932,6 +2179,7 @@ impl<'a> Analyzer<'a> {
                     resolved.ty,
                     info.storage,
                     attributes,
+                    info.requested_alignment,
                     asm_label,
                     None,
                     init.span,
@@ -1945,6 +2193,11 @@ impl<'a> Analyzer<'a> {
                 &attributes,
                 init.span,
                 "an automatic or block-scope static object",
+            )?;
+            self.reject_transparent_union_attribute(
+                &attributes,
+                init.span,
+                "an object declaration",
             )?;
             if init.asm_label.is_some() {
                 return self.fail(
@@ -1995,6 +2248,11 @@ impl<'a> Analyzer<'a> {
                     .insert(local, duration);
             }
             if storage == SemanticStorageClass::Register {
+                self.reject_alignment_specifier(
+                    &info,
+                    init.span,
+                    "an object declared with `register` storage class",
+                )?;
                 self.function
                     .as_mut()
                     .expect("block objects occur inside a function")
@@ -2016,6 +2274,12 @@ impl<'a> Analyzer<'a> {
                 None => (None, resolved.ty),
             };
             self.validate_object_type(completed_ty, init.span, true)?;
+            let requested_alignment = self.object_requested_alignment(
+                completed_ty,
+                info.requested_alignment,
+                &attributes,
+                init.span,
+            )?;
             if completed_ty != resolved.ty {
                 self.scopes.replace_current_ordinary(
                     name.clone(),
@@ -2037,7 +2301,7 @@ impl<'a> Analyzer<'a> {
                     binding: SymbolBinding::Strong,
                     visibility: SymbolVisibility::Internal,
                     section: None,
-                    requested_alignment: None,
+                    requested_alignment,
                     tls: (duration == StorageDuration::Thread).then_some(TlsModel::GeneralDynamic),
                     definition: ObjectDefinitionPolicy::Definition,
                 };
@@ -2054,6 +2318,7 @@ impl<'a> Analyzer<'a> {
                     variable_length_bounds: resolved.variable_length_bounds,
                     initializer,
                     attributes,
+                    requested_alignment,
                     emission,
                     span: init.span,
                 },
@@ -2077,6 +2342,11 @@ impl<'a> Analyzer<'a> {
                     let attributes = self.validate_attributes(attributes)?;
                     self.reject_weak_attribute(&attributes, statement.span, "a statement label")?;
                     self.reject_packed_attribute(&attributes, statement.span)?;
+                    self.reject_transparent_union_attribute(
+                        &attributes,
+                        statement.span,
+                        "a statement label",
+                    )?;
                     let id = {
                         let labels = &mut self
                             .function
@@ -4592,7 +4862,11 @@ impl<'a> Analyzer<'a> {
             let argument_span = argument.span;
             let converted = match &signature.parameters {
                 FunctionParameters::Prototype(parameters) if index < parameters.len() => {
-                    self.assignment_conversion(argument, parameters[index], argument_span)?
+                    if self.is_transparent_union(parameters[index].ty) {
+                        self.transparent_union_argument(argument, parameters[index], argument_span)?
+                    } else {
+                        self.assignment_conversion(argument, parameters[index], argument_span)?
+                    }
                 }
                 _ => self.default_argument_promotion(argument)?,
             };
@@ -4613,6 +4887,83 @@ impl<'a> Analyzer<'a> {
             constant_expression_kind: ConstantExpressionKind::Invalid,
             span,
         })
+    }
+
+    fn is_transparent_union(&self, ty: TypeId) -> bool {
+        let Some(TypeKind::Record(record)) = self.types.try_kind(ty) else {
+            return false;
+        };
+        self.types.record(*record).is_some_and(|definition| {
+            definition.kind == RecordKind::Union && definition.transparent_union
+        })
+    }
+
+    fn transparent_union_argument(
+        &mut self,
+        argument: FullTypedExpression,
+        target: QualifiedType,
+        span: Span,
+    ) -> AnalysisResult<FullTypedExpression> {
+        let Some(TypeKind::Record(record_id)) = self.types.try_kind(target.ty).cloned() else {
+            unreachable!("the caller checked the transparent union type")
+        };
+        let fields = self
+            .types
+            .record(record_id)
+            .and_then(|record| record.fields.clone())
+            .expect("a validated transparent union is complete");
+        let argument = self.value_conversion(argument)?;
+        if self.type_ids_compatible(target.ty, argument.ty.ty) {
+            return self.assignment_conversion(argument, target, span);
+        }
+        let selected = fields.iter().enumerate().find(|(_, field)| {
+            if argument.constant.is_some_and(ConstantValue::is_zero)
+                && self.types.is_integer(argument.ty.ty)
+            {
+                return true;
+            }
+            self.pointer_pointee(argument.ty.ty).is_some()
+                && self.pointers_assignment_compatible(field.ty.ty, argument.ty.ty)
+        });
+        let Some((field_index, field)) = selected else {
+            return self.fail(
+                "CCC2440",
+                span,
+                "argument is incompatible with every member of the transparent union parameter",
+            );
+        };
+        let converted = self.assignment_conversion(argument, field.ty, span)?;
+        let scalar = FullTypedInitializer {
+            ty: field.ty,
+            kind: FullTypedInitializerKind::Scalar(converted),
+            span,
+        };
+        let initializer = FullTypedInitializer {
+            ty: target,
+            kind: FullTypedInitializerKind::Aggregate(vec![FullTypedInitializerEntry {
+                path: vec![InitializerPathElement::Field {
+                    index: field_index,
+                    name: field.name.clone(),
+                    bitfield: None,
+                }],
+                initializer: Box::new(scalar),
+            }]),
+            span,
+        };
+        let local = self.fresh_local();
+        let literal = FullTypedExpression {
+            kind: FullTypedExpressionKind::CompoundLiteral {
+                local,
+                initializer: Box::new(initializer),
+            },
+            ty: target,
+            category: ValueCategory::Lvalue,
+            place: Some(self.object_place(PlaceBase::CompoundLiteral(local), target, true)),
+            constant: None,
+            constant_expression_kind: ConstantExpressionKind::Invalid,
+            span,
+        };
+        self.value_conversion(literal)
     }
 
     fn analyze_sizeof(
@@ -6483,11 +6834,11 @@ impl<'a> Analyzer<'a> {
                     "implemented typedef `aligned` accepts at most one integer argument",
                 );
             };
-            if !alignment.is_power_of_two() {
+            if !supported_object_alignment(alignment) {
                 return self.fail(
                     "CCC2422",
                     span,
-                    "requested typedef alignment must be a power of two",
+                    "requested typedef alignment must be a backend-supported power of two",
                 );
             }
             requested = Some(requested.map_or(alignment, |current: u64| current.max(alignment)));
@@ -6495,6 +6846,17 @@ impl<'a> Analyzer<'a> {
         let Some(alignment) = requested else {
             return Ok(ty);
         };
+        if alignment == 1
+            && self.types.is_integer(ty.ty)
+            && attributes
+                .iter()
+                .any(|attribute| attribute_has_name(attribute, "may_alias"))
+        {
+            // CCC does not attach TBAA metadata, and its scalar load/store
+            // paths are explicitly unaligned-safe. Preserve the ordinary
+            // scalar type for this narrow GNU unaligned-access idiom.
+            return Ok(ty);
+        }
         if !defines_private_record {
             return self.fail(
                 "CCC2422",
@@ -6531,6 +6893,85 @@ impl<'a> Analyzer<'a> {
             .complete_record_with_packing(aligned_record, fields, packing)
             .expect("a newly declared aligned record is incomplete");
         Ok(QualifiedType::new(aligned_ty, ty.qualifiers))
+    }
+
+    fn apply_file_typedef_attributes(
+        &mut self,
+        ty: QualifiedType,
+        attributes: &[FullTypedAttribute],
+        defines_private_record: bool,
+        span: Span,
+    ) -> AnalysisResult<QualifiedType> {
+        let ty = self.apply_typedef_alignment(ty, attributes, defines_private_record, span)?;
+        if !attributes
+            .iter()
+            .any(|attribute| attribute_has_name(attribute, "transparent_union"))
+        {
+            return Ok(ty);
+        }
+        if !defines_private_record {
+            return self.fail(
+                "CCC2439",
+                span,
+                "`transparent_union` is supported only on a single inline anonymous union typedef",
+            );
+        }
+        let Some(TypeKind::Record(record_id)) = self.types.try_kind(ty.ty).cloned() else {
+            return self.fail("CCC2439", span, "`transparent_union` requires a union type");
+        };
+        let Some(record) = self.types.record(record_id).cloned() else {
+            return self.fail(
+                "CCC2439",
+                span,
+                "`transparent_union` refers to an unknown union",
+            );
+        };
+        if record.kind != RecordKind::Union {
+            return self.fail(
+                "CCC2439",
+                span,
+                "`transparent_union` requires a union rather than a structure",
+            );
+        }
+        let Some(fields) = record.fields else {
+            return self.fail(
+                "CCC2439",
+                span,
+                "`transparent_union` requires a complete union",
+            );
+        };
+        if fields.is_empty()
+            || fields.iter().any(|field| {
+                field.bitfield.is_some() || self.pointer_pointee(field.ty.ty).is_none()
+            })
+        {
+            return self.fail(
+                "CCC2439",
+                span,
+                "the supported `transparent_union` form requires one or more pointer members",
+            );
+        }
+        let first = self
+            .types
+            .layout_of(fields[0].ty.ty, self.config)
+            .map_err(|error| self.emit("CCC2439", span, error.to_string()))?;
+        for field in fields.iter().skip(1) {
+            let layout = self
+                .types
+                .layout_of(field.ty.ty, self.config)
+                .map_err(|error| self.emit("CCC2439", span, error.to_string()))?;
+            if layout.size != first.size || layout.align != first.align {
+                return self.fail(
+                    "CCC2439",
+                    span,
+                    "all supported `transparent_union` members must have the first member's representation",
+                );
+            }
+        }
+        self.types
+            .mark_transparent_union(record_id)
+            .map_err(|error| self.emit("CCC2439", span, error.to_string()))?;
+        Ok(ty)
     }
 
     fn validate_attributes(
@@ -6584,11 +7025,30 @@ impl<'a> Analyzer<'a> {
                 "implemented `weak` does not accept arguments",
             );
         }
-        if matches!(canonical_name, "packed" | "unused") && !attribute.arguments.is_empty() {
+        if matches!(
+            canonical_name,
+            "packed" | "unused" | "may_alias" | "transparent_union"
+        ) && !attribute.arguments.is_empty()
+        {
             return self.fail(
                 "CCC2435",
                 attribute.span,
                 format!("implemented `{canonical_name}` does not accept arguments"),
+            );
+        }
+        if canonical_name == "alloc_size"
+            && !valid_alloc_size_arguments(
+                &attribute
+                    .arguments
+                    .iter()
+                    .map(|token| token.spelling.as_str())
+                    .collect::<Vec<_>>(),
+            )
+        {
+            return self.fail(
+                "CCC2438",
+                attribute.span,
+                "`alloc_size` requires one or two positive parameter indexes",
             );
         }
         Ok(FullTypedAttribute {
@@ -6635,6 +7095,25 @@ impl<'a> Analyzer<'a> {
                 "CCC2432",
                 span,
                 "implemented `packed` is supported only on record specifiers",
+            );
+        }
+        Ok(())
+    }
+
+    fn reject_transparent_union_attribute(
+        &mut self,
+        attributes: &[FullTypedAttribute],
+        span: Span,
+        placement: &str,
+    ) -> AnalysisResult<()> {
+        if attributes
+            .iter()
+            .any(|attribute| attribute_has_name(attribute, "transparent_union"))
+        {
+            return self.fail(
+                "CCC2439",
+                span,
+                format!("`transparent_union` is not supported on {placement}"),
             );
         }
         Ok(())
@@ -6745,14 +7224,15 @@ impl<'a> Analyzer<'a> {
                         };
                         value
                     };
-                    if !value.is_power_of_two() {
+                    if !supported_object_alignment(value) {
                         return self.fail(
                             "CCC2352",
                             span,
-                            "requested alignment must be a power of two",
+                            "requested alignment must be a backend-supported power of two",
                         );
                     }
-                    emission.requested_alignment = Some(value);
+                    emission.requested_alignment =
+                        strongest_alignment(emission.requested_alignment, Some(value));
                 }
                 "section" => {
                     emission.section = attribute_argument_string(&attribute.arguments);
@@ -6797,6 +7277,69 @@ impl<'a> Analyzer<'a> {
             }
         }
         Ok(())
+    }
+
+    fn object_requested_alignment(
+        &mut self,
+        ty: QualifiedType,
+        standard_alignment: Option<u64>,
+        attributes: &[FullTypedAttribute],
+        span: Span,
+    ) -> AnalysisResult<Option<u64>> {
+        let mut requested = standard_alignment;
+        for attribute in attributes {
+            if !attribute_has_name(attribute, "aligned") {
+                continue;
+            }
+            let alignment = if attribute.arguments.is_empty() {
+                self.maximum_supported_alignment()
+            } else {
+                let Some(alignment) = attribute_argument_number(&attribute.arguments) else {
+                    return self.fail(
+                        "CCC2351",
+                        span,
+                        "implemented `aligned` requires an integer argument",
+                    );
+                };
+                alignment
+            };
+            if !supported_object_alignment(alignment) {
+                return self.fail(
+                    "CCC2352",
+                    span,
+                    "requested alignment must be a backend-supported power of two",
+                );
+            }
+            requested = strongest_alignment(requested, Some(alignment));
+        }
+        let natural = match self.types.try_kind(ty.ty).cloned() {
+            Some(TypeKind::Array(ArrayType {
+                element,
+                length: ArrayLength::Incomplete,
+            })) => {
+                self.types
+                    .layout_of(element.ty, self.config)
+                    .map_err(|error| self.emit("CCC2437", span, error.to_string()))?
+                    .align
+            }
+            _ => {
+                self.types
+                    .layout_of(ty.ty, self.config)
+                    .map_err(|error| self.emit("CCC2437", span, error.to_string()))?
+                    .align
+            }
+        };
+        if standard_alignment.is_some() && requested.is_some_and(|value| value < natural) {
+            return self.fail(
+                "CCC2437",
+                span,
+                format!(
+                    "requested alignment {} is weaker than the type's natural alignment {natural}",
+                    requested.unwrap_or_default()
+                ),
+            );
+        }
+        Ok(requested)
     }
 
     fn maximum_supported_alignment(&self) -> u64 {
@@ -7745,6 +8288,27 @@ fn attribute_argument_number(arguments: &[String]) -> Option<u64> {
     arguments
         .iter()
         .find_map(|argument| argument.parse::<u64>().ok())
+}
+
+fn strongest_alignment(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
+fn supported_object_alignment(alignment: u64) -> bool {
+    alignment.is_power_of_two() && alignment.trailing_zeros() < 32
+}
+
+fn valid_alloc_size_arguments(arguments: &[&str]) -> bool {
+    let positive = |value: &str| value.parse::<u64>().is_ok_and(|value| value != 0);
+    match arguments {
+        [first] => positive(first),
+        [first, comma, second] => *comma == "," && positive(first) && positive(second),
+        _ => false,
+    }
 }
 
 fn attribute_argument_string(arguments: &[String]) -> Option<String> {

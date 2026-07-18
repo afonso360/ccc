@@ -476,6 +476,15 @@ fn verify_function(module: &FullModule, function: &FullFunction) -> Result<(), I
             )));
         }
         verify_type(&module.types, storage.ty, "local storage")?;
+        if storage
+            .requested_alignment
+            .is_some_and(|alignment| !alignment.is_power_of_two())
+        {
+            return Err(IrError::verify(format!(
+                "function `{}` storage {} has an invalid requested alignment",
+                function.name, storage.id.0
+            )));
+        }
         if storage.required_by.is_empty() {
             return Err(IrError::verify(format!(
                 "function `{}` storage {} has no residency classification",

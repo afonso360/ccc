@@ -501,6 +501,7 @@ struct LocalFact {
     name: String,
     ty: QualifiedType,
     duration: StorageDuration,
+    requested_alignment: Option<u64>,
     span: Span,
     reasons: BTreeSet<MemoryResidencyReason>,
 }
@@ -518,6 +519,7 @@ fn local_facts(
                 parameter.name.clone(),
                 parameter.ty,
                 StorageDuration::Automatic,
+                None,
                 parameter.span,
                 types,
             ),
@@ -572,6 +574,7 @@ fn make_local_fact(
     name: String,
     ty: QualifiedType,
     duration: StorageDuration,
+    requested_alignment: Option<u64>,
     span: Span,
     types: &TypeStore,
 ) -> LocalFact {
@@ -593,6 +596,7 @@ fn make_local_fact(
         name,
         ty,
         duration,
+        requested_alignment,
         span,
         reasons,
     }
@@ -622,6 +626,7 @@ fn collect_automatic_local_facts(
                                 declaration.name.clone(),
                                 declaration.ty,
                                 declaration.duration,
+                                declaration.requested_alignment,
                                 declaration.span,
                                 types,
                             ),
@@ -661,6 +666,7 @@ fn collect_automatic_local_facts(
                                 declaration.name.clone(),
                                 declaration.ty,
                                 declaration.duration,
+                                declaration.requested_alignment,
                                 declaration.span,
                                 types,
                             ),
@@ -865,6 +871,7 @@ fn scan_expression_for_address_taken(
                 format!("<compound-literal-{}>", local.0),
                 expression.ty,
                 StorageDuration::Automatic,
+                None,
                 expression.span,
                 types,
             );
@@ -1082,6 +1089,7 @@ impl<'a> FunctionBuilder<'a> {
                     StorageDuration::Static => StorageLocation::Static,
                     StorageDuration::Thread => StorageLocation::ThreadLocal,
                 },
+                requested_alignment: fact.requested_alignment,
                 required_by: fact.reasons.iter().copied().collect(),
                 span: fact.span,
             });
