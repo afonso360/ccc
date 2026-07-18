@@ -182,6 +182,9 @@ Automatic VLA objects use the hosted arena in
 Runtime `sizeof` and several variably modified typedef/type-name contexts remain
 explicit boundaries, so the complete VLA capability is not yet advertised.
 Arena storage neither implies native-stack mutation nor enables GNU `alloca`.
+Named and switch jumps cannot enter a variably modified declaration path;
+computed goto is conservatively rejected when such an automatic object exists
+in the same function.
 
 ## GNU C semantics
 

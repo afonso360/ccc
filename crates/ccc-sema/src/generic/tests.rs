@@ -3022,6 +3022,38 @@ fn no_argument_attributes_reject_argument_lists() {
 #[test]
 fn accepts_automatic_variable_length_and_thread_local_objects() {
     assert!(analyze_source("int f(int n) { int values[n]; return values[n - 1]; }").is_ok());
+    assert!(
+        analyze_source("int f(int n) { int values[n]; goto inside; inside: return values[0]; }")
+            .is_ok()
+    );
+    assert!(
+        analyze_source("int f(int n) { { int values[n]; goto outside; } outside: return 0; }")
+            .is_ok()
+    );
+    assert_eq!(
+        diagnostic_codes("int f(int n) { goto inside; int values[n]; inside: return 0; }"),
+        vec!["CCC2442"]
+    );
+    assert_eq!(
+        diagnostic_codes(
+            "int f(int n, int choice) {
+                 switch (choice) { int values[n]; case 0: return values[0]; }
+                 return 0;
+             }"
+        ),
+        vec!["CCC2442"]
+    );
+    assert_eq!(
+        diagnostic_codes(
+            "int f(int n) {
+                 void *target = &&done;
+                 int values[n];
+                 goto *target;
+                 done: return values[0];
+             }"
+        ),
+        vec!["CCC2442"]
+    );
     assert_eq!(
         diagnostic_codes("int f(int n) { static int values[n]; return 0; }"),
         vec!["CCC2258"]

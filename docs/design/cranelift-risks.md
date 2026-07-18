@@ -40,16 +40,15 @@ capacity may remain reserved after the C lifetime ends, but it is unreachable
 from defined C execution, bounded by the number of syntactic declarations, and
 released on every ordinary function return after the return value is evaluated.
 
-Semantic analysis must reject named-goto and switch ingress that bypasses a
-variably modified declaration before the complete VLA capability is advertised.
-Computed-goto dispatch cannot enter a deeper or unrelated VLA scope. Runtime
-`sizeof` remains a separate frontend/IR boundary.
+Semantic analysis rejects named-goto and switch ingress that bypasses a
+variably modified declaration. Until computed dispatch can prove a target's
+declaration path, it is rejected in any function containing a variably modified
+automatic object. Runtime `sizeof` remains a separate frontend/IR boundary.
 
 The selected hosted provider is the per-invocation arena recorded by
 [ADR-0011](../adr/0011-arena-backed-runtime-sized-automatic-storage.md).
 Automatic object allocation is enabled; `__STDC_NO_VLA__` remains defined until
-the outstanding runtime-layout, control-flow-ingress, and variably modified
-type-context gates pass.
+the outstanding runtime-layout and variably modified type-context gates pass.
 
 ## Native dynamic-stack capability contract
 

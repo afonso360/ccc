@@ -46,11 +46,13 @@ produces a null or undersized VLA object.
 
 Semantic analysis records the active variably modified declaration path at
 labels and switch targets. It rejects control-flow ingress that bypasses a
-declaration. Lowering restores the active suffix for normal fallthrough,
-`break`, `continue`, outward or backward `goto`, and return. A return operand is
-fully evaluated and copied before restoration. When computed goto is enabled
-alongside this provider, its dispatch must perform the same verified restoration
-and reject targets that enter a region.
+declaration. Named jumps may remain within a path or leave it, and switch labels
+may not enter a path deeper than the switch entry. Because an arbitrary computed
+target cannot yet prove its destination path, a function may not combine a
+computed goto with a variably modified automatic object. The arena retains
+physical capacity across scope exits but exposes no address after the C lifetime
+ends. A return operand, including an aggregate, is fully evaluated and copied
+before the cached bases are released.
 
 The logical version-one provider surface is the target profile's exact hosted
 `realloc(void *, size_t)` and `free(void *)` ABI. A generated object linked by an

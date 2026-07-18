@@ -94,15 +94,20 @@ evaluated once and retained in the typed AST, including parameter-order binding,
 and multidimensional pointer strides. Diagnostics distinguish prototype-scope
 `[*]`, legal fixed-size objects with variably modified types, nonautomatic VLA
 objects, invalid bounds, and illegal storage classes. Runtime `sizeof` and
-control-flow ingress that bypasses a declaration remain explicit gates before
-the complete VLA capability can be advertised.
+several variably modified typedef/type-name contexts remain explicit gates
+before the complete VLA capability can be advertised. Named-goto and switch
+tests reject ingress that bypasses a declaration, and a computed goto is
+rejected conservatively in any function that also declares a variably modified
+automatic object.
 
 CCC-IR tests pin runtime storage identities, allocation effects, retained
 extents, dynamic pointer strides, verifier type/dominance checks, and append-only
 digest tags. Execution fixtures cover bound-once evaluation, multidimensional
 access, normal return cleanup, recursion, concurrent invocations, and
-over-alignment. Named/switch/computed-goto ingress and runtime `sizeof` remain
-negative capability gates rather than silently approximated behavior.
+over-alignment. Aggregate returns sourced from arena storage are copied before
+the provider is released. Named/switch/computed-goto ingress diagnostics and
+runtime `sizeof` remain negative capability gates rather than silently
+approximated behavior.
 
 Provider tests inject nonpositive bounds, extent and alignment overflow,
 allocation failure, and alignments through over-aligned `_Alignas` declarations.

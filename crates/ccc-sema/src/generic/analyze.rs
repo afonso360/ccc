@@ -111,6 +111,13 @@ struct DeclarationInfo {
 struct SwitchState {
     cases: HashMap<i128, Span>,
     default: Option<Span>,
+    entry_variably_modified_path: Vec<FullLocalId>,
+}
+
+struct VariablyModifiedGoto {
+    label: LabelId,
+    span: Span,
+    source_path: Vec<FullLocalId>,
 }
 
 struct FunctionState {
@@ -123,6 +130,12 @@ struct FunctionState {
     unaddressable_locals: HashSet<FullLocalId>,
     static_duration_locals: HashMap<FullLocalId, StorageDuration>,
     labels: LabelScope,
+    active_variably_modified_path: Vec<FullLocalId>,
+    variably_modified_scope_starts: Vec<usize>,
+    variably_modified_label_paths: HashMap<LabelId, (Span, Vec<FullLocalId>)>,
+    variably_modified_gotos: Vec<VariablyModifiedGoto>,
+    computed_gotos: Vec<Span>,
+    has_variably_modified_local: bool,
     loop_depth: usize,
     switches: Vec<SwitchState>,
     variadic: bool,
@@ -480,6 +493,12 @@ impl<'a> Analyzer<'a> {
             unaddressable_locals: HashSet::new(),
             static_duration_locals: HashMap::new(),
             labels: LabelScope::default(),
+            active_variably_modified_path: Vec::new(),
+            variably_modified_scope_starts: Vec::new(),
+            variably_modified_label_paths: HashMap::new(),
+            variably_modified_gotos: Vec::new(),
+            computed_gotos: Vec::new(),
+            has_variably_modified_local: false,
             loop_depth: 0,
             switches: Vec::new(),
             variadic: signature.variadic,
@@ -1149,7 +1168,9 @@ impl<'a> Analyzer<'a> {
         is_prototype_scope: bool,
     ) -> AnalysisResult<(Vec<ResolvedParameter>, DetachedSemanticScope)> {
         self.parameter_scope_depth += 1;
-        self.push_scope();
+        // Declarator parameter scopes do not participate in statement-level
+        // control-flow paths, even when resolved inside a function body.
+        self.scopes.push();
         let resolved = (|| {
             let mut resolved = Vec::with_capacity(parameters.len());
             for (index, parameter) in parameters.iter().enumerate() {
@@ -2413,6 +2434,17 @@ impl<'a> Analyzer<'a> {
                 self.apply_emission_attributes(&mut emission, &attributes, init.span)?;
                 Some(emission)
             };
+            if duration == StorageDuration::Automatic
+                && (!resolved.variable_length_bounds.is_empty()
+                    || self.is_variably_modified(completed_ty.ty))
+            {
+                let function = self
+                    .function
+                    .as_mut()
+                    .expect("variably modified locals occur inside a function");
+                function.active_variably_modified_path.push(local);
+                function.has_variably_modified_local = true;
+            }
             output.push(FullTypedBlockItem::Declaration(Box::new(
                 FullTypedLocalDeclaration {
                     local,
@@ -2452,6 +2484,12 @@ impl<'a> Analyzer<'a> {
                         statement.span,
                         "a statement label",
                     )?;
+                    let variably_modified_path = self
+                        .function
+                        .as_ref()
+                        .expect("labels only occur inside functions")
+                        .active_variably_modified_path
+                        .clone();
                     let id = {
                         let labels = &mut self
                             .function
@@ -2469,6 +2507,11 @@ impl<'a> Analyzer<'a> {
                             }
                         }
                     };
+                    self.function
+                        .as_mut()
+                        .expect("labels only occur inside functions")
+                        .variably_modified_label_paths
+                        .insert(id, (label.span, variably_modified_path));
                     FullTypedStatementKind::Label {
                         label: id,
                         name: label.name.clone(),
@@ -2480,6 +2523,7 @@ impl<'a> Analyzer<'a> {
                     statement: nested,
                 } => {
                     let value = self.evaluate_integer_constant(value)?;
+                    self.reject_switch_variably_modified_ingress(statement.span)?;
                     let Some(switch) = self
                         .function
                         .as_mut()
@@ -2505,6 +2549,7 @@ impl<'a> Analyzer<'a> {
                     }
                 }
                 S::Default(nested) => {
+                    self.reject_switch_variably_modified_ingress(statement.span)?;
                     let Some(switch) = self
                         .function
                         .as_mut()
@@ -2567,11 +2612,20 @@ impl<'a> Analyzer<'a> {
                             "a switch controlling expression must have integer type",
                         );
                     }
+                    let entry_variably_modified_path = self
+                        .function
+                        .as_ref()
+                        .expect("switches only occur inside functions")
+                        .active_variably_modified_path
+                        .clone();
                     self.function
                         .as_mut()
                         .expect("switches only occur inside functions")
                         .switches
-                        .push(SwitchState::default());
+                        .push(SwitchState {
+                            entry_variably_modified_path,
+                            ..SwitchState::default()
+                        });
                     let nested = self.analyze_statement(nested);
                     self.function
                         .as_mut()
@@ -2631,12 +2685,27 @@ impl<'a> Analyzer<'a> {
                     }
                 }
                 S::Goto(label) => {
+                    let source_path = self
+                        .function
+                        .as_ref()
+                        .expect("gotos only occur inside functions")
+                        .active_variably_modified_path
+                        .clone();
                     let labels = &mut self
                         .function
                         .as_mut()
                         .expect("gotos only occur inside functions")
                         .labels;
                     let id = labels.note_use(&label.name, label.span);
+                    self.function
+                        .as_mut()
+                        .expect("gotos only occur inside functions")
+                        .variably_modified_gotos
+                        .push(VariablyModifiedGoto {
+                            label: id,
+                            span: label.span,
+                            source_path,
+                        });
                     FullTypedStatementKind::Goto {
                         label: id,
                         name: label.name.clone(),
@@ -2664,6 +2733,11 @@ impl<'a> Analyzer<'a> {
                             "a computed goto cannot use a label from another function",
                         );
                     }
+                    self.function
+                        .as_mut()
+                        .expect("computed gotos only occur inside functions")
+                        .computed_gotos
+                        .push(statement.span);
                     FullTypedStatementKind::ComputedGoto(expression)
                 }
                 S::Continue => {
@@ -7834,13 +7908,64 @@ impl<'a> Analyzer<'a> {
     }
 
     fn validate_labels(&mut self) {
-        let Some(function) = &self.function else {
+        let Some(function) = self.function.as_ref() else {
             return;
         };
         let missing = function.labels.undefined_uses();
+        let variably_modified_gotos = function
+            .variably_modified_gotos
+            .iter()
+            .filter_map(|jump| {
+                let (definition_span, target_path) =
+                    function.variably_modified_label_paths.get(&jump.label)?;
+                variably_modified_path_enters(&jump.source_path, target_path)
+                    .then_some((jump.span, *definition_span))
+            })
+            .collect::<Vec<_>>();
+        let computed_gotos = function
+            .has_variably_modified_local
+            .then(|| function.computed_gotos.clone())
+            .unwrap_or_default();
         for (name, span) in missing {
             self.emit("CCC2363", span, format!("use of undefined label `{name}`"));
         }
+        for (jump_span, definition_span) in variably_modified_gotos {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "CCC2442",
+                    "a goto cannot enter the scope of a variably modified object",
+                )
+                .with_primary(jump_span, "this jump bypasses the declaration")
+                .with_secondary(definition_span, "the target is inside that scope"),
+            );
+        }
+        for span in computed_gotos {
+            self.emit(
+                "CCC2442",
+                span,
+                "a computed goto is not supported in a function with variably modified automatic objects",
+            );
+        }
+    }
+
+    fn reject_switch_variably_modified_ingress(&mut self, span: Span) -> AnalysisResult<()> {
+        let Some(function) = self.function.as_ref() else {
+            return Ok(());
+        };
+        let Some(switch) = function.switches.last() else {
+            return Ok(());
+        };
+        if variably_modified_path_enters(
+            &switch.entry_variably_modified_path,
+            &function.active_variably_modified_path,
+        ) {
+            return self.fail(
+                "CCC2442",
+                span,
+                "a switch label cannot bypass the declaration of a variably modified object",
+            );
+        }
+        Ok(())
     }
 
     fn initializer_references_thread_storage(&self, initializer: &FullTypedInitializer) -> bool {
@@ -7900,10 +8025,20 @@ impl<'a> Analyzer<'a> {
     }
 
     fn push_scope(&mut self) {
+        if let Some(function) = self.function.as_mut() {
+            function
+                .variably_modified_scope_starts
+                .push(function.active_variably_modified_path.len());
+        }
         self.scopes.push();
     }
 
     fn pop_scope(&mut self) {
+        if let Some(function) = self.function.as_mut()
+            && let Some(start) = function.variably_modified_scope_starts.pop()
+        {
+            function.active_variably_modified_path.truncate(start);
+        }
         self.scopes.pop();
     }
 
@@ -8546,6 +8681,10 @@ fn evaluate_binary_constant(
         },
         _ => None,
     }
+}
+
+fn variably_modified_path_enters(source: &[FullLocalId], target: &[FullLocalId]) -> bool {
+    target.iter().any(|local| !source.contains(local))
 }
 
 fn has_direct_label_address_provenance(expression: &FullTypedExpression) -> bool {
