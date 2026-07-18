@@ -475,6 +475,14 @@ impl AstDumper {
             PragmaEvent::Once { .. } => "once".to_owned(),
             PragmaEvent::SystemHeader { .. } => "GCC system_header".to_owned(),
             PragmaEvent::Diagnostic { .. } => "GCC diagnostic".to_owned(),
+            PragmaEvent::GccOptimize { payload, .. } => format!(
+                "GCC optimize {}",
+                payload
+                    .iter()
+                    .map(|token| token.spelling.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
             PragmaEvent::Pack { payload, .. } => format!(
                 "pack {}",
                 payload

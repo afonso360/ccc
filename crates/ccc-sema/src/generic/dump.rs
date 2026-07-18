@@ -743,6 +743,14 @@ fn render_pragma(pragma: &ccc_pp::PragmaEvent) -> String {
             || format!("diagnostic {action:?}"),
             |option| format!("diagnostic {action:?} {option}"),
         ),
+        ccc_pp::PragmaEvent::GccOptimize { payload, .. } => format!(
+            "GCC optimize {}",
+            payload
+                .iter()
+                .map(|token| token.spelling.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
         ccc_pp::PragmaEvent::Pack { payload, .. } => format!(
             "pack {}",
             payload

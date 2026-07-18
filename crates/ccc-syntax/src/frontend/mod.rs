@@ -105,6 +105,25 @@ mod tests {
     }
 
     #[test]
+    fn optimization_pragma_may_separate_declaration_tokens() {
+        let mut sources = SourceMap::new();
+        let file = sources.add_file("pragma.c", "int function(void) { return 0; }");
+        let tokens = lex(file, sources.source(file).unwrap()).unwrap();
+        let mut items = vec![PpItem::Token(tokens[0].clone())];
+        items.push(PpItem::Pragma(PragmaEvent::GccOptimize {
+            payload: Vec::new(),
+            span: tokens[0].span,
+        }));
+        items.extend(tokens[1..].iter().cloned().map(PpItem::Token));
+
+        let unit = parse(&convert_pp_items(items).unwrap()).unwrap();
+        assert!(matches!(
+            unit.items.as_slice(),
+            [ExternalItem::FunctionDefinition(_)]
+        ));
+    }
+
+    #[test]
     fn parses_recursive_declarators_records_and_initializers() {
         let unit = parse_source(
             "typedef unsigned long size_t;\n\

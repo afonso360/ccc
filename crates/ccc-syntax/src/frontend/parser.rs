@@ -2517,6 +2517,7 @@ fn pragma_span(pragma: &PragmaEvent) -> Span {
         PragmaEvent::Once { span }
         | PragmaEvent::SystemHeader { span }
         | PragmaEvent::Diagnostic { span, .. }
+        | PragmaEvent::GccOptimize { span, .. }
         | PragmaEvent::Pack { span, .. }
         | PragmaEvent::Unknown { span, .. } => *span,
     }

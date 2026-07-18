@@ -313,6 +313,12 @@ impl CapabilityRegistry {
             CapabilityState::BehaviorCompatibleNoOp,
             "the address expression is evaluated exactly once and validated constant hints are discarded without introducing a faulting access",
         );
+        registry.insert_with_rationale(
+            CapabilityKind::Pragma,
+            "GCC optimize",
+            CapabilityState::BehaviorCompatibleNoOp,
+            "the optimization hint does not alter the C abstract-machine behavior and CCC does not expose per-function optimization controls",
+        );
         for name in [
             "__builtin_va_start",
             "__builtin_va_arg",

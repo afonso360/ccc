@@ -241,23 +241,15 @@ unset OPTS TCC TESTOPTS
 cd "$build_directory"
 : >"$CCC_SQLITE_COMMAND_LOG"
 
-# glibc exposes isnan as a type-generic macro whose expansion mentions
-# __isnanl even for a double operand. CCC deliberately has no long-double ABI,
-# so the configure link probe is not a sufficient test of whether that macro is
-# usable. Selecting SQLite's own binary64 test keeps the configured surface
-# aligned with the compiler's advertised ABI without changing production C.
 LDFLAGS=-no-pie \
-ac_cv_func_isnan=no \
   CC="$script_directory/ccc-cc" \
   "$source_directory/configure" \
   --disable-shared \
   --disable-readline \
   --disable-load-extension
 
-grep -Fxq 'ac_cv_func_isnan=no' config.log ||
-  die "SQLite configure did not honor the pinned isnan capability decision"
-grep -Fq '/* #undef HAVE_ISNAN */' sqlite_cfg.h ||
-  die "SQLite configure unexpectedly enabled the host isnan interface"
+grep -Fq '#define HAVE_ISNAN 1' sqlite_cfg.h ||
+  die "SQLite configure did not detect the hosted isnan interface"
 
 "$script_directory/ccc-cc" -std=gnu11 -dM -E \
   "$script_directory/predicate-probe.c" >effective-macros.txt

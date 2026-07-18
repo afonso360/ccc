@@ -280,7 +280,7 @@ them.
 | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Builtin | Implemented: `__builtin_offsetof`, `__builtin_expect`, `__builtin_huge_val`, `__builtin_inff`, `__builtin_nanf`, `__builtin_bswap64`, `__builtin_clz`, `__builtin_clzl`, `__builtin_clzll`, `__builtin_ctz`, `__builtin_ctzll`, `__builtin_popcount`, `__builtin_popcountll`, `__builtin_memcpy`, `__builtin_memmove`, `__builtin_memset`, `__builtin_va_start`, `__builtin_va_arg`, `__builtin_va_copy`, `__builtin_va_end`, `__sync_add_and_fetch`, `__sync_fetch_and_add`, `__sync_sub_and_fetch`, `__sync_bool_compare_and_swap`, `__sync_val_compare_and_swap`, `__sync_lock_test_and_set`, and `__sync_synchronize`. Behavior-compatible no-op: `__builtin_prefetch`. Every other builtin key, including `__builtin_bswap32`, is unsupported. |
 | Feature | No default entries. Feature predicates are false unless the effective configuration explicitly inserts an implemented or behavior-compatible entry.                                                                                                                   |
-| Pragma  | No generic registry entries. Ordered built-in handling implements `#pragma pack`, `#pragma once`, `#pragma GCC system_header`, and the supported `#pragma GCC diagnostic` forms; unknown semantic pragmas are rejected with `CCC2355`.                                |
+| Pragma  | Behavior-compatible no-op: `GCC optimize`. Ordered built-in handling implements `#pragma pack`, `#pragma once`, `#pragma GCC system_header`, and the supported `#pragma GCC diagnostic` forms; unknown semantic pragmas are rejected with `CCC2355`.                 |
 
 `__has_attribute`, `__has_builtin`, `__has_feature`, and related predicates
 report true only for registry states whose promised behavior is available.
@@ -376,8 +376,8 @@ The shipped
 [`resource-dir/manifest.toml`](../../resource-dir/manifest.toml) advertises the
 named GCC 4.2.1 compatibility profile through code generation. Its exact
 shipped header inventory is four compiler-owned spelling
-headers (`stdalign.h`, `stdbool.h`, `stdarg.h`, `stdnoreturn.h`) plus
-target-derived `stddef.h`; it ships no hosted wrapper headers in this profile.
+headers (`stdalign.h`, `stdbool.h`, `stdarg.h`, `stdnoreturn.h`), target-derived
+`stddef.h`, and the hosted `math.h` classification wrapper.
 
 Builtin and inline-assembly inventories are preprocessed under CCC's effective
 predefined-macro identity, including that exact advertised GNU version and the

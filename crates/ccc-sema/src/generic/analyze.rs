@@ -7577,7 +7577,8 @@ impl<'a> Analyzer<'a> {
             }
             PragmaEvent::Once { .. }
             | PragmaEvent::SystemHeader { .. }
-            | PragmaEvent::Diagnostic { .. } => Ok(()),
+            | PragmaEvent::Diagnostic { .. }
+            | PragmaEvent::GccOptimize { .. } => Ok(()),
         }
     }
 

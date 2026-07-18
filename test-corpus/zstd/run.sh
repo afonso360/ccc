@@ -154,10 +154,6 @@ adjustment_hashes=$(manifest_string source_adjustment_hashes)
 expected_adjustment_hashes_sha256=$(manifest_string source_adjustment_hashes_sha256)
 adjustment_target_files=$(manifest_integer source_adjustment_target_files)
 adjustment_rationale=$(manifest_string source_adjustment_rationale)
-dependency_override=$(manifest_string dependency_override)
-expected_dependency_override_sha256=$(manifest_string dependency_override_sha256)
-portable_assert_header=$(manifest_string portable_assert_header)
-expected_portable_assert_sha256=$(manifest_string portable_assert_header_sha256)
 expected_translation_occurrences=$(manifest_integer source_translation_occurrences)
 expected_probe_translation_occurrences=$(manifest_integer generated_pthread_probe_translation_occurrences)
 expected_probe_sha256=$(manifest_string generated_pthread_probe_sha256)
@@ -221,18 +217,6 @@ apply_zstd_source_adjustment \
   "$expected_adjustment_hashes_sha256" \
   "$adjustment_rationale"
 
-dependency_override_path="$script_directory/$dependency_override"
-actual_dependency_override_sha256=$(zstd_sha256_file "$dependency_override_path")
-[[ "$actual_dependency_override_sha256" == "$expected_dependency_override_sha256" ]] ||
-  die "zstd dependency-override header SHA-256 mismatch"
-cp "$dependency_override_path" "$work_directory/dependency-override.h"
-portable_assert_path="$script_directory/$portable_assert_header"
-actual_portable_assert_sha256=$(zstd_sha256_file "$portable_assert_path")
-[[ "$actual_portable_assert_sha256" == "$expected_portable_assert_sha256" ]] ||
-  die "zstd portable-assert header SHA-256 mismatch"
-portable_assert_include=$(absolute_directory "$(dirname "$portable_assert_path")")
-cp "$portable_assert_path" "$work_directory/portable-assert.h"
-
 : "${CCC:=$repository/target/debug/ccc}"
 : "${CCC_RESOURCE_DIR:=$repository/resource-dir}"
 : "${CCC_LINK_CC:=gcc}"
@@ -255,16 +239,12 @@ unset BACKTRACE DATAGEN_BIN DIFF EXE_PREFIX GREP OS PYTHON QEMU_SYS
 unset TESTFLAGS UNAME ZSTD_BIN isTerminal size
 
 : >"$CCC_ZSTD_COMMAND_LOG"
-"$script_directory/ccc-cc" -std=gnu11 -DZSTD_DISABLE_ASM -DNO_PREFETCH \
+"$script_directory/ccc-cc" -DZSTD_DISABLE_ASM \
   -DMEM_FORCE_MEMORY_ACCESS=0 -DXXH_FORCE_MEMORY_ACCESS=0 \
-  -I"$portable_assert_include" \
-  -include "$dependency_override_path" \
   -dM -E "$script_directory/predicate-probe.c" \
   >"$work_directory/effective-macros.txt"
-"$script_directory/ccc-cc" -std=gnu11 -DZSTD_DISABLE_ASM -DNO_PREFETCH \
+"$script_directory/ccc-cc" -DZSTD_DISABLE_ASM \
   -DMEM_FORCE_MEMORY_ACCESS=0 -DXXH_FORCE_MEMORY_ACCESS=0 \
-  -I"$portable_assert_include" \
-  -include "$dependency_override_path" \
   -P -E "$script_directory/predicate-probe.c" \
   >"$work_directory/predicate-probe.txt"
 
@@ -275,36 +255,31 @@ for macro in \
   '#define __x86_64__ 1' \
   '#define __LP64__ 1' \
   '#define ZSTD_DISABLE_ASM 1' \
-  '#define NO_PREFETCH 1' \
   '#define MEM_FORCE_MEMORY_ACCESS 0' \
   '#define XXH_FORCE_MEMORY_ACCESS 0' \
-  '#define CCC_ZSTD_LIBC_MEMORY_DEPS 1' \
-  '#define CCC_ZSTD_PORTABLE_ASSERT 1' \
-  '#define CCC_ZSTD_GNU_FEATURES_PRIMED 1' \
   '#define _GNU_SOURCE' \
   '#define __USE_GNU 1' \
   '#define __USE_MISC 1' \
-  '#define __USE_XOPEN2K8 1' \
-  '#define __ASSERT_FUNCTION __func__'; do
+  '#define __USE_XOPEN2K8 1'; do
   grep -Fxq "$macro" "$work_directory/effective-macros.txt" ||
     die "CCC does not expose zstd's pinned compiler configuration: $macro"
 done
 if grep -Fq '#define __STRICT_ANSI__' "$work_directory/effective-macros.txt"; then
-  die "zstd portable-assert header did not restore GNU header mode"
+  die "zstd compiler profile unexpectedly selected strict header mode"
 fi
 for selection in \
   'gnu_compatibility_tuple=4.2.1' \
   'selected_data_model=x86_64-lp64' \
   'selected_builtin=__builtin_expect' \
-  'count_bit_builtin_registry=clz-clzll-ctzll-without-ctz' \
+  'count_bit_builtin_registry=clz-clzll-ctz-ctzll' \
   'additional_builtin_registry=bswap64-prefetch-only' \
   'selected_assembly=disabled' \
-  'selected_count_bits=generic-c' \
-  'selected_prefetch=disabled' \
+  'selected_count_bits=gnu-builtins' \
+  'selected_prefetch=compiler-builtin' \
   'selected_zstd_unaligned_access=memcpy' \
   'selected_xxhash_unaligned_access=memcpy' \
-  'selected_memory_dependencies=libc' \
-  'selected_assert=standard-c-macro-gnu-mode-restored' \
+  'selected_memory_dependencies=compiler-builtins' \
+  'selected_assert=system-gnu-macro' \
   'selected_host_features=glibc-gnu'; do
   grep -Fxq "$selection" "$work_directory/predicate-probe.txt" ||
     die "CCC does not select zstd's pinned source path: $selection"
@@ -318,17 +293,12 @@ done
     'optional_format_library=lz4-disabled' \
     'threading=pthread-enabled' \
     'unaligned_memory_access=upstream-memcpy-fallbacks' \
-    'memory_dependency_override=ZSTD_DEPS_COMMON-libc' \
+    'memory_dependencies=compiler-builtins' \
     'advertised_but_unselected_builtin=__builtin_bswap64' \
-    'advertised_but_unselected_builtin=__builtin_clz' \
-    'advertised_but_unselected_builtin=__builtin_clzll' \
-    'advertised_but_unselected_builtin=__builtin_ctzll' \
-    'advertised_but_unselected_builtin=__builtin_prefetch' \
     'unavailable_source_spelling=__builtin_altivec_vmuleuw' \
     'unavailable_source_spelling=__builtin_altivec_vmulouw' \
     'unavailable_source_spelling=__builtin_assume' \
     'unavailable_source_spelling=__builtin_bswap32' \
-    'unavailable_source_spelling=__builtin_ctz' \
     'unavailable_source_spelling=__builtin_rotateleft32' \
     'unavailable_source_spelling=__builtin_rotateleft64' \
     'unavailable_source_spelling=__builtin_unreachable' \
@@ -387,7 +357,7 @@ make -C "$source_directory" -j"$jobs" check \
   HAVE_LZMA=0 \
   HAVE_LZ4=0 \
   ALIGN_LOOP= \
-  MOREFLAGS="-std=gnu11 -DNO_PREFETCH -DMEM_FORCE_MEMORY_ACCESS=0 -DXXH_FORCE_MEMORY_ACCESS=0 -I$portable_assert_include -include $dependency_override_path -no-pie" \
+  MOREFLAGS="-DMEM_FORCE_MEMORY_ACCESS=0 -DXXH_FORCE_MEMORY_ACCESS=0 -no-pie" \
   2>&1 | tee "$work_directory/build-test.log"
 
 grep -Fq "$success_marker" "$work_directory/build-test.log" ||
@@ -409,12 +379,6 @@ actual_probe_translations=$(grep -Fc "$expected_probe_sha256  $pthread_probe" \
 if grep '^link ' "$CCC_ZSTD_COMMAND_LOG" | grep -Eq '\.(c|i)( |$)'; then
   die "zstd native link command received a C source input"
 fi
-if grep '^link ' "$CCC_ZSTD_COMMAND_LOG" | grep -Fq "$dependency_override_path"; then
-  die "zstd native link command received the forced dependency header"
-fi
-if grep '^link ' "$CCC_ZSTD_COMMAND_LOG" | grep -Fq "$portable_assert_include"; then
-  die "zstd native link command received the portable-assert include path"
-fi
 actual_link_commands=$(grep -c '^link ' "$CCC_ZSTD_COMMAND_LOG" || true)
 [[ "$actual_link_commands" == "$expected_link_commands" ]] ||
   die "zstd build invoked $actual_link_commands native links; expected $expected_link_commands"
@@ -426,13 +390,9 @@ non_pie_links=$(grep '^link ' "$CCC_ZSTD_COMMAND_LOG" | grep -c -- ' -no-pie' ||
 [[ "$non_pie_links" == "$expected_link_commands" ]] ||
   die "zstd native links did not all receive the pinned -no-pie option"
 for option in \
-  ' -std=gnu11' \
   ' -DZSTD_DISABLE_ASM' \
-  ' -DNO_PREFETCH' \
   ' -DMEM_FORCE_MEMORY_ACCESS=0' \
-  ' -DXXH_FORCE_MEMORY_ACCESS=0' \
-  " -I$portable_assert_include" \
-  " -include $dependency_override_path"; do
+  ' -DXXH_FORCE_MEMORY_ACCESS=0'; do
   matches=$(grep '^ccc ' "$CCC_ZSTD_COMMAND_LOG" | grep -c -- "$option" || true)
   [[ "$matches" == "$expected_translation_occurrences" ]] ||
     die "zstd C translations did not all retain the pinned option:$option"

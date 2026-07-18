@@ -230,7 +230,6 @@ expected_sha3=$(manifest_string archive_sha3_256)
 expected_translation_units=$(manifest_integer source_translation_units)
 expected_native_links=$(manifest_integer native_link_commands)
 expected_adjustment_targets=$(manifest_integer source_adjustment_targets)
-expected_classification_rewrites=$(manifest_integer source_adjustment_classification_calls_rewritten)
 expected_xxhash_noop_definitions=$(manifest_integer source_adjustment_xxhash_ccc_noop_definitions)
 expected_xxhash_guard_call_sites=$(manifest_integer source_adjustment_xxhash_guard_call_sites)
 expected_xxhash_clang_guard_call_sites=$(manifest_integer source_adjustment_xxhash_clang_neon_guard_call_sites)
@@ -240,8 +239,6 @@ adjustment_sha256=$(manifest_string source_adjustment_sha256)
 adjustment_hash_name=$(manifest_string source_adjustment_hashes)
 adjustment_hash_sha256=$(manifest_string source_adjustment_hashes_sha256)
 adjustment_rationale=$(manifest_string source_adjustment_rationale)
-portable_assert_name=$(manifest_string portable_assert_header)
-portable_assert_sha256=$(manifest_string portable_assert_header_sha256)
 
 if [[ -z "$work_directory" ]]; then
   work_directory=$(mktemp -d "${TMPDIR:-/tmp}/ccc-redis-$version.XXXXXX")
@@ -302,9 +299,9 @@ actual_adjustment_targets=$(grep -Evc '^[[:space:]]*(#|$)' \
 
 adjustment_audit="$work_directory/source-adjustment-audit.txt"
 : >"$adjustment_audit"
-require_adjusted_count "$adjustment_audit" upstream_statement_expression_cas_uses 0 \
+require_adjusted_count "$adjustment_audit" upstream_statement_expression_cas_uses 1 \
   'atomicCompareExchange(size_t, zmalloc_peak' "$source_directory/src/zmalloc.c"
-require_adjusted_count "$adjustment_audit" replacement_peak_cas_helper_references 2 \
+require_adjusted_count "$adjustment_audit" replacement_peak_cas_helper_references 0 \
   'zmalloc_compare_exchange_peak(' "$source_directory/src/zmalloc.c"
 require_adjusted_count "$adjustment_audit" histogram_val_cas_uses 3 \
   '__sync_val_compare_and_swap' "$source_directory/deps/hdr_histogram/hdr_atomic.h"
@@ -312,21 +309,21 @@ require_adjusted_count "$adjustment_audit" histogram_exchange_uses 3 \
   '__sync_lock_test_and_set' "$source_directory/deps/hdr_histogram/hdr_atomic.h"
 require_adjusted_count "$adjustment_audit" histogram_inline_assembly_uses 0 \
   'asm volatile' "$source_directory/deps/hdr_histogram/hdr_atomic.h"
-require_adjusted_count "$adjustment_audit" hiredis_binary64_finite_checks 1 \
+require_adjusted_count "$adjustment_audit" hiredis_binary64_finite_checks 0 \
   'd >= -DBL_MAX && d <= DBL_MAX' "$source_directory/deps/hiredis/read.c"
-require_adjusted_count "$adjustment_audit" hiredis_generic_finite_checks 0 \
+require_adjusted_count "$adjustment_audit" hiredis_generic_finite_checks 1 \
   'isfinite(d)' "$source_directory/deps/hiredis/read.c"
-require_adjusted_count "$adjustment_audit" lua_cjson_binary64_inf_calls 2 \
+require_adjusted_count "$adjustment_audit" lua_cjson_binary64_inf_calls 0 \
   'json_is_inf(num)' "$source_directory/deps/lua/src/lua_cjson.c"
-require_adjusted_count "$adjustment_audit" lua_cjson_binary64_nan_calls 3 \
+require_adjusted_count "$adjustment_audit" lua_cjson_binary64_nan_calls 0 \
   'json_is_nan(num)' "$source_directory/deps/lua/src/lua_cjson.c"
-require_adjusted_count "$adjustment_audit" lua_cjson_generic_inf_calls 0 \
+require_adjusted_count "$adjustment_audit" lua_cjson_generic_inf_calls 2 \
   'isinf(num)' "$source_directory/deps/lua/src/lua_cjson.c"
-require_adjusted_count "$adjustment_audit" lua_cjson_generic_nan_calls 0 \
+require_adjusted_count "$adjustment_audit" lua_cjson_generic_nan_calls 3 \
   'isnan(num)' "$source_directory/deps/lua/src/lua_cjson.c"
-require_adjusted_count "$adjustment_audit" lua_cmsgpack_binary64_inf_calls 1 \
+require_adjusted_count "$adjustment_audit" lua_cmsgpack_binary64_inf_calls 0 \
   'cmsgpack_is_inf(x)' "$source_directory/deps/lua/src/lua_cmsgpack.c"
-require_adjusted_count "$adjustment_audit" lua_cmsgpack_generic_inf_calls 0 \
+require_adjusted_count "$adjustment_audit" lua_cmsgpack_generic_inf_calls 1 \
   'isinf(x)' "$source_directory/deps/lua/src/lua_cmsgpack.c"
 require_adjusted_count "$adjustment_audit" xxhash_ccc_noop_definitions \
   "$expected_xxhash_noop_definitions" \
@@ -346,17 +343,7 @@ require_adjusted_count "$adjustment_audit" xxhash_gnu_guard_definitions 1 \
 require_adjusted_count "$adjustment_audit" xxhash_upstream_noop_guard_definitions 1 \
   '#  define XXH_COMPILER_GUARD(var) ((void)0)' \
   "$source_directory/deps/xxhash/xxhash.h"
-actual_classification_rewrites=$((1 + 2 + 3 + 1))
-[[ "$actual_classification_rewrites" == "$expected_classification_rewrites" ]] ||
-  die "Redis source-adjustment classification count does not match the manifest"
-printf 'binary64_classification_calls_rewritten=%s\n' \
-  "$actual_classification_rewrites" >>"$adjustment_audit"
-
-portable_assert_path="$script_directory/$portable_assert_name"
-[[ "$(redis_sha256_file "$portable_assert_path")" == "$portable_assert_sha256" ]] ||
-  die "Redis portable-assert header SHA-256 mismatch"
-portable_assert_include=$(absolute_directory "$(dirname "$portable_assert_path")")
-cp "$portable_assert_path" "$work_directory/portable-assert.h"
+printf '%s\n' 'binary64_classification_calls_rewritten=0' >>"$adjustment_audit"
 
 : "${CCC:=$repository/target/debug/ccc}"
 : "${CCC_RESOURCE_DIR:=$repository/resource-dir}"
@@ -386,9 +373,9 @@ unset CCC_REDIS_PREPROCESS_DIR CCC_REDIS_SOURCE_LOG CCC_REDIS_SOURCE_ROOT
 export LC_ALL=C TZ=UTC SOURCE_DATE_EPOCH=1779667200
 
 : >"$CCC_REDIS_COMMAND_LOG"
-"$script_directory/ccc-cc" -std=gnu11 -I"$portable_assert_include" -dM -E \
+"$script_directory/ccc-cc" -std=gnu11 -dM -E \
   "$script_directory/predicate-probe.c" >"$work_directory/effective-macros.txt"
-"$script_directory/ccc-cc" -std=gnu11 -I"$portable_assert_include" -P -E \
+"$script_directory/ccc-cc" -std=gnu11 -P -E \
   "$script_directory/predicate-probe.c" >"$work_directory/predicate-probe.txt"
 
 grep -Fxq '#define __GNUC__ 4' "$work_directory/effective-macros.txt" ||
@@ -399,18 +386,12 @@ grep -Fxq '#define __GNUC_PATCHLEVEL__ 1' "$work_directory/effective-macros.txt"
   die "CCC does not advertise the pinned __GNUC_PATCHLEVEL__ value"
 grep -Fxq '#define __STDC_NO_ATOMICS__ 1' "$work_directory/effective-macros.txt" ||
   die "CCC does not advertise the pinned C11 atomic denial"
-grep -Fxq '#define CCC_REDIS_PORTABLE_ASSERT 1' "$work_directory/effective-macros.txt" ||
-  die "CCC does not select Redis's portable hosted assert header"
-grep -Fxq '#define CCC_REDIS_HOSTED_FEATURES_PRIMED 1' "$work_directory/effective-macros.txt" ||
-  die "Redis portable hosted assert header did not prime glibc features"
-grep -Fxq '#define __ASSERT_FUNCTION __func__' "$work_directory/effective-macros.txt" ||
-  die "Redis portable hosted assert header does not select __func__"
 if grep -Fq '#define __STRICT_ANSI__' "$work_directory/effective-macros.txt"; then
-  die "Redis portable hosted assert header did not restore GNU mode"
+  die "Redis compiler profile unexpectedly selected strict header mode"
 fi
 for selection in \
   'gnu_compatibility_tuple=4.2.1' \
-  'selected_assert=standard-c-macro-gnu-mode-restored' \
+  'selected_assert=system-gnu-macro' \
   'selected_c11_atomic_surface=unavailable' \
   'selected_core_atomic_surface=sync-builtin' \
   'selected_upstream_hdr_atomic_surface=x86-inline-assembly'; do
@@ -423,7 +404,7 @@ done
     "$work_directory/predicate-probe.txt"
   printf '%s\n' \
     'allocator=libc' \
-    'assertions=enabled-with-portable-hosted-header' \
+    'assertions=enabled-with-system-hosted-header' \
     'c11-atomics=unavailable' \
     'dynamic-stack-storage=none' \
     'inline-assembly=none-after-source-adjustment' \
@@ -462,7 +443,6 @@ LC_ALL=C sort "$expected_source_inputs" >"$expected_source_inputs.sorted"
 mv "$expected_source_inputs.sorted" "$expected_source_inputs"
 
 compiler_adapter="$script_directory/ccc-cc"
-portable_assert_flag="-I$portable_assert_include"
 redis_std="-std=gnu11 -DREDIS_STATIC=''"
 redis_warn='-Wall -W -Wno-missing-field-initializers -Werror=deprecated-declarations -Wstrict-prototypes'
 
@@ -475,7 +455,7 @@ build_redis_settings=(
   OPTIMIZATION=-O2
   ENABLE_LTO=
   DEBUG=
-  CFLAGS="$portable_assert_flag"
+  CFLAGS=
   LDFLAGS=-no-pie
   REDIS_CFLAGS=
   REDIS_LDFLAGS=
@@ -495,32 +475,32 @@ build_redis_settings=(
   make -C "$source_directory/deps/hiredis" -j"$jobs" static \
     CC="$compiler_adapter" AR="$archiver" \
     OPTIMIZATION=-O2 DEBUG_FLAGS= CFLAGS= CPPFLAGS= LDFLAGS= \
-    HIREDIS_CFLAGS="$portable_assert_flag" HIREDIS_LDFLAGS=
+    HIREDIS_CFLAGS= HIREDIS_LDFLAGS=
 
   make -C "$source_directory/deps/linenoise" -j"$jobs" linenoise.o \
-    CC="$compiler_adapter" STD= OPT=-O2 DEBUG= CFLAGS="$portable_assert_flag" LDFLAGS=
+    CC="$compiler_adapter" STD= OPT=-O2 DEBUG= CFLAGS= LDFLAGS=
 
   make -C "$source_directory/deps/lua/src" -j"$jobs" a \
     CC="$compiler_adapter" \
-    CFLAGS="-O2 -Wall $portable_assert_flag -DLUA_ANSI -DENABLE_CJSON_GLOBAL -DREDIS_STATIC='' -DLUA_USE_MKSTEMP" \
+    CFLAGS="-O2 -Wall -DLUA_ANSI -DENABLE_CJSON_GLOBAL -DREDIS_STATIC='' -DLUA_USE_MKSTEMP" \
     AR="$archiver rcs" RANLIB="$archive_indexer" MYLDFLAGS= MYLIBS=
 
   make -C "$source_directory/deps/hdr_histogram" -j"$jobs" libhdrhistogram.a \
     CC="$compiler_adapter" AR="$archiver" ARFLAGS=rcs \
-    STD=-std=gnu11 OPT=-O2 DEBUG= CFLAGS="$portable_assert_flag" LDFLAGS=
+    STD=-std=gnu11 OPT=-O2 DEBUG= CFLAGS= LDFLAGS=
 
   make -C "$source_directory/deps/fpconv" -j"$jobs" libfpconv.a \
     CC="$compiler_adapter" AR="$archiver" ARFLAGS=rcs \
-    STD=-std=gnu11 OPT=-O2 DEBUG= CFLAGS="$portable_assert_flag" LDFLAGS=
+    STD=-std=gnu11 OPT=-O2 DEBUG= CFLAGS= LDFLAGS=
 
   make -C "$source_directory/deps/xxhash" -j"$jobs" libxxhash.a \
     CC="$compiler_adapter" AR="$archiver" \
-    CFLAGS="-O2 $portable_assert_flag" CPPFLAGS= LDFLAGS= DEBUGFLAGS= MOREFLAGS= \
+    CFLAGS=-O2 CPPFLAGS= LDFLAGS= DEBUGFLAGS= MOREFLAGS= \
     DISPATCH=0 LIBXXH_DISPATCH=0
 
   make -C "$source_directory/deps/tre" -j"$jobs" libtre.a \
     CC="$compiler_adapter" AR="$archiver" ARFLAGS=rcs \
-    STD=-std=gnu11 OPT=-O2 DEBUG= CFLAGS="$portable_assert_flag" LDFLAGS=
+    STD=-std=gnu11 OPT=-O2 DEBUG= CFLAGS= LDFLAGS=
 
   # Avoid Redis's developer-only multi-source dependency scan. Per-object MMD
   # inputs remain on every audited CCC translation command.
@@ -703,10 +683,6 @@ gnu11_translations=$(grep '^ccc ' "$CCC_REDIS_COMMAND_LOG" | grep -c -- ' -std=g
 if grep '^ccc ' "$CCC_REDIS_COMMAND_LOG" | grep -Fq -- ' -DNDEBUG'; then
   die "Redis C translations unexpectedly disabled assertions"
 fi
-portable_assert_translations=$(grep '^ccc ' "$CCC_REDIS_COMMAND_LOG" |
-  grep -Fc -- " -I$portable_assert_include" || true)
-[[ "$portable_assert_translations" == "$expected_translation_units" ]] ||
-  die "Redis C translations did not all select the portable hosted assert header"
 if grep -Eq -- '-flto|-DUSE_JEMALLOC|-DUSE_OPENSSL|-DINCLUDE_VEC_SETS|-DHAVE_LIBSYSTEMD' \
   "$CCC_REDIS_COMMAND_LOG"; then
   die "Redis build selected a capability outside the pinned profile"
