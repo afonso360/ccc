@@ -1317,7 +1317,7 @@ mod tests {
         let cases = [
             (
                 "atomic.c",
-                "int main(void) { _Atomic int value; return value; }",
+                "_Atomic int value; int main(void) { return value; }",
                 "CCC4011",
             ),
             (
