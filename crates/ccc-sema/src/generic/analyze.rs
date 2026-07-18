@@ -4478,17 +4478,17 @@ impl<'a> Analyzer<'a> {
                 step.field.ty.qualifiers | step.record_ty.qualifiers,
             );
             let member_access = access_semantics(result_ty);
+            let layout = self
+                .types
+                .layout_of(step.record_ty.ty, self.config)
+                .map_err(|error| {
+                    self.emit("CCC2297", span, error.to_string());
+                })?;
+            let LayoutShape::Record(layout) = layout.shape else {
+                unreachable!("the queried type is a record")
+            };
+            let field_layout = &layout.fields[step.field_index];
             let bitfield = if step.field.bitfield.is_some() {
-                let layout = self
-                    .types
-                    .layout_of(step.record_ty.ty, self.config)
-                    .map_err(|error| {
-                        self.emit("CCC2297", span, error.to_string());
-                    })?;
-                let LayoutShape::Record(layout) = layout.shape else {
-                    unreachable!("the queried type is a record")
-                };
-                let field_layout = &layout.fields[step.field_index];
                 let shared = field_layout
                     .bitfield
                     .expect("a semantic bitfield has a bitfield layout");
@@ -4506,6 +4506,22 @@ impl<'a> Analyzer<'a> {
                     signed: self.is_signed_integer(step.field.ty.ty),
                     access: member_access,
                 })
+            } else {
+                None
+            };
+            let constant = if bitfield.is_none() {
+                match expression.constant {
+                    Some(ConstantValue::Address(mut address)) => {
+                        address.addend = address
+                            .addend
+                            .checked_add(i128::from(field_layout.offset))
+                            .ok_or_else(|| {
+                                self.emit("CCC2297", span, "member address offset overflows");
+                            })?;
+                        Some(ConstantValue::Address(address))
+                    }
+                    _ => None,
+                }
             } else {
                 None
             };
@@ -4532,7 +4548,7 @@ impl<'a> Analyzer<'a> {
                 ty: result_ty,
                 category,
                 place: place.clone(),
-                constant: None,
+                constant,
                 constant_expression_kind: ConstantExpressionKind::Invalid,
                 span,
             };

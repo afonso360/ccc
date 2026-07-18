@@ -2327,6 +2327,38 @@ fn global_addresses_are_relocation_bearing_constants() {
 }
 
 #[test]
+fn global_subobject_addresses_include_array_and_member_offsets() {
+    let unit = analyze_source(
+        "struct Pair { int first; int second; };\n\
+         struct Pair values[2];\n\
+         int *pointer = &values[1].second;",
+    )
+    .unwrap();
+    let values = unit
+        .globals
+        .iter()
+        .find(|global| global.name == "values")
+        .unwrap();
+    let pointer = unit
+        .globals
+        .iter()
+        .find(|global| global.name == "pointer")
+        .unwrap();
+    let FullTypedInitializerKind::Scalar(expression) = &pointer.initializer.as_ref().unwrap().kind
+    else {
+        panic!("pointer initializer is scalar")
+    };
+    assert_eq!(
+        expression.constant,
+        Some(ConstantValue::Address(RelocatableAddress {
+            base: RelocatableBase::Global(values.id),
+            addend: 12,
+            one_past: false,
+        }))
+    );
+}
+
+#[test]
 fn static_initializers_fold_array_addresses_decay_and_mixed_shift_counts() {
     let unit = analyze_source(
         "int values[4];\n\

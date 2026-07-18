@@ -1453,6 +1453,27 @@ fn lowers_static_array_addresses_decay_and_mixed_shift_constants() {
 }
 
 #[test]
+fn lowers_static_subobject_addresses_with_complete_addends() {
+    let module = lower_source(
+        "struct Pair { int first; int second; };\n\
+         struct Pair values[2];\n\
+         int *pointer = &values[1].second;",
+    );
+    verify_frontend(&module).unwrap();
+
+    let pointer = module.globals[1].initializer.as_ref().unwrap();
+    assert_eq!(
+        pointer.nodes[pointer.root.0 as usize].kind,
+        InitializerNodeKind::Relocation {
+            target: RelocationTarget::Object(DataId(0)),
+            addend: 12,
+            one_past: false,
+            kind: RelocationKind::ObjectAddress,
+        }
+    );
+}
+
+#[test]
 fn lowers_block_static_addresses_in_block_static_initializers() {
     let module = lower_source(
         "void *address(void) {\n\
