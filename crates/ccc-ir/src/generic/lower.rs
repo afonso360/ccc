@@ -2,11 +2,13 @@ use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 use ccc_pp::StringLiteralPrefix;
 use ccc_sema::generic::{
-    AccessSemantics, BitfieldPlace, CompoundAssignmentPlan, ConstantValue, ConversionKind,
-    FullFunctionId, FullLocalId, FullTypedBlockItem, FullTypedExpression, FullTypedExpressionKind,
+    AccessSemantics, AtomicReadModifyWriteOperation as TypedAtomicReadModifyWriteOperation,
+    BitfieldPlace, CompoundAssignmentPlan, ConstantValue, ConversionKind, FullFunctionId,
+    FullLocalId, FullTypedBlockItem, FullTypedExpression, FullTypedExpressionKind,
     FullTypedForInitializer, FullTypedFunction, FullTypedInitializer, FullTypedInitializerKind,
     FullTypedLocalDeclaration, FullTypedStatement, FullTypedStatementKind,
-    FullTypedTranslationUnit, GlobalId, InitializerPathElement, LabelId, Linkage,
+    FullTypedTranslationUnit, GlobalId, InitializerPathElement,
+    IntegerIntrinsicOperation as TypedIntegerIntrinsicOperation, LabelId, Linkage,
     MemoryOrder as TypedMemoryOrder, Place, PlaceBase, StorageDuration, StringId, SymbolReference,
 };
 use ccc_session::Span;
@@ -19,13 +21,14 @@ use ccc_types::{
 };
 
 use super::{
-    AggregateOverlap, AggregateProjection, BinaryOperation, BitfieldDescriptor, BlockId,
-    CallEffects, DataId, DataOrigin, FullBlock, FullEdge, FullFunction, FullGlobal,
-    FullInstruction, FullInstructionKind, FullModule, FullParameter, FullStorage, FullString,
-    FullTerminator, InitializerEdge, InitializerGraph, InitializerNode, InitializerNodeId,
-    InitializerNodeKind, InitializerPath, InstructionId, IrError, MemoryAccess, MemoryOrder,
-    MemoryResidencyReason, RelocationKind, RelocationTarget, ScalarConstant, ScalarConversion,
-    StorageId, StorageLocation, StringEncoding, SwitchEdge, UnaryOperation, ValueId,
+    AggregateOverlap, AggregateProjection, AtomicReadModifyWriteOperation, BinaryOperation,
+    BitfieldDescriptor, BlockId, CallEffects, DataId, DataOrigin, FullBlock, FullEdge,
+    FullFunction, FullGlobal, FullInstruction, FullInstructionKind, FullModule, FullParameter,
+    FullStorage, FullString, FullTerminator, InitializerEdge, InitializerGraph, InitializerNode,
+    InitializerNodeId, InitializerNodeKind, InitializerPath, InstructionId,
+    IntegerIntrinsicOperation, IrError, MemoryAccess, MemoryOrder, MemoryResidencyReason,
+    RelocationKind, RelocationTarget, ScalarConstant, ScalarConversion, StorageId, StorageLocation,
+    StringEncoding, SwitchEdge, UnaryOperation, ValueId,
 };
 
 const LOWERING_ERROR: &str = "CCC3101";
@@ -522,7 +525,7 @@ fn local_facts(
     }
     if let Some(body) = &function.body {
         collect_automatic_local_facts(body, types, &mut facts);
-        scan_statement_for_address_taken(body, &mut facts);
+        scan_statement_for_address_taken(body, types, &mut facts);
         if contains_computed_goto(body) {
             for fact in facts.values_mut() {
                 fact.reasons
@@ -708,24 +711,25 @@ fn variably_modified(types: &TypeStore, ty: TypeId, active: &mut HashSet<TypeId>
 
 fn scan_statement_for_address_taken(
     statement: &FullTypedStatement,
+    types: &TypeStore,
     facts: &mut BTreeMap<FullLocalId, LocalFact>,
 ) {
     use FullTypedStatementKind as S;
     match &statement.kind {
         S::Label { statement, .. } | S::Case { statement, .. } => {
-            scan_statement_for_address_taken(statement, facts);
+            scan_statement_for_address_taken(statement, types, facts);
         }
-        S::Default(statement) => scan_statement_for_address_taken(statement, facts),
+        S::Default(statement) => scan_statement_for_address_taken(statement, types, facts),
         S::Compound(items) => {
             for item in items {
                 match item {
                     FullTypedBlockItem::Declaration(declaration) => {
                         if let Some(initializer) = &declaration.initializer {
-                            scan_initializer_for_address_taken(initializer, facts);
+                            scan_initializer_for_address_taken(initializer, types, facts);
                         }
                     }
                     FullTypedBlockItem::Statement(statement) => {
-                        scan_statement_for_address_taken(statement, facts);
+                        scan_statement_for_address_taken(statement, types, facts);
                     }
                     _ => {}
                 }
@@ -733,7 +737,7 @@ fn scan_statement_for_address_taken(
         }
         S::Expression(expression) => {
             if let Some(expression) = expression {
-                scan_expression_for_address_taken(expression, facts);
+                scan_expression_for_address_taken(expression, types, facts);
             }
         }
         S::If {
@@ -741,32 +745,32 @@ fn scan_statement_for_address_taken(
             then_statement,
             else_statement,
         } => {
-            scan_expression_for_address_taken(condition, facts);
-            scan_statement_for_address_taken(then_statement, facts);
+            scan_expression_for_address_taken(condition, types, facts);
+            scan_statement_for_address_taken(then_statement, types, facts);
             if let Some(statement) = else_statement {
-                scan_statement_for_address_taken(statement, facts);
+                scan_statement_for_address_taken(statement, types, facts);
             }
         }
         S::Switch {
             expression,
             statement,
         } => {
-            scan_expression_for_address_taken(expression, facts);
-            scan_statement_for_address_taken(statement, facts);
+            scan_expression_for_address_taken(expression, types, facts);
+            scan_statement_for_address_taken(statement, types, facts);
         }
         S::While {
             condition,
             statement,
         } => {
-            scan_expression_for_address_taken(condition, facts);
-            scan_statement_for_address_taken(statement, facts);
+            scan_expression_for_address_taken(condition, types, facts);
+            scan_statement_for_address_taken(statement, types, facts);
         }
         S::DoWhile {
             statement,
             condition,
         } => {
-            scan_statement_for_address_taken(statement, facts);
-            scan_expression_for_address_taken(condition, facts);
+            scan_statement_for_address_taken(statement, types, facts);
+            scan_expression_for_address_taken(condition, types, facts);
         }
         S::For {
             initializer,
@@ -777,47 +781,48 @@ fn scan_statement_for_address_taken(
             match initializer {
                 FullTypedForInitializer::Empty => {}
                 FullTypedForInitializer::Expression(expression) => {
-                    scan_expression_for_address_taken(expression, facts);
+                    scan_expression_for_address_taken(expression, types, facts);
                 }
                 FullTypedForInitializer::Declarations(items) => {
                     for item in items {
                         if let FullTypedBlockItem::Declaration(declaration) = item
                             && let Some(initializer) = &declaration.initializer
                         {
-                            scan_initializer_for_address_taken(initializer, facts);
+                            scan_initializer_for_address_taken(initializer, types, facts);
                         }
                     }
                 }
             }
             if let Some(condition) = condition {
-                scan_expression_for_address_taken(condition, facts);
+                scan_expression_for_address_taken(condition, types, facts);
             }
             if let Some(step) = step {
-                scan_expression_for_address_taken(step, facts);
+                scan_expression_for_address_taken(step, types, facts);
             }
-            scan_statement_for_address_taken(statement, facts);
+            scan_statement_for_address_taken(statement, types, facts);
         }
         S::Return(expression) => {
             if let Some(expression) = expression {
-                scan_expression_for_address_taken(expression, facts);
+                scan_expression_for_address_taken(expression, types, facts);
             }
         }
-        S::ComputedGoto(expression) => scan_expression_for_address_taken(expression, facts),
+        S::ComputedGoto(expression) => scan_expression_for_address_taken(expression, types, facts),
         S::Goto { .. } | S::Continue | S::Break => {}
     }
 }
 
 fn scan_initializer_for_address_taken(
     initializer: &FullTypedInitializer,
+    types: &TypeStore,
     facts: &mut BTreeMap<FullLocalId, LocalFact>,
 ) {
     match &initializer.kind {
         FullTypedInitializerKind::Scalar(expression) => {
-            scan_expression_for_address_taken(expression, facts);
+            scan_expression_for_address_taken(expression, types, facts);
         }
         FullTypedInitializerKind::Aggregate(entries) => {
             for entry in entries {
-                scan_initializer_for_address_taken(&entry.initializer, facts);
+                scan_initializer_for_address_taken(&entry.initializer, types, facts);
             }
         }
         FullTypedInitializerKind::String(_) | FullTypedInitializerKind::Zero => {}
@@ -826,6 +831,7 @@ fn scan_initializer_for_address_taken(
 
 fn scan_expression_for_address_taken(
     expression: &FullTypedExpression,
+    types: &TypeStore,
     facts: &mut BTreeMap<FullLocalId, LocalFact>,
 ) {
     use FullTypedExpressionKind as E;
@@ -834,7 +840,7 @@ fn scan_expression_for_address_taken(
             if let Some(place) = &operand.place {
                 mark_place_address_taken(place, facts);
             }
-            scan_expression_for_address_taken(operand, facts);
+            scan_expression_for_address_taken(operand, types, facts);
         }
         E::Conversion { expression, .. }
         | E::Unary {
@@ -842,28 +848,41 @@ fn scan_expression_for_address_taken(
             ..
         }
         | E::Dereference(expression) => {
-            scan_expression_for_address_taken(expression, facts);
+            scan_expression_for_address_taken(expression, types, facts);
         }
         E::Binary { left, right, .. }
         | E::Subscript {
             base: left,
             index: right,
         } => {
-            scan_expression_for_address_taken(left, facts);
-            scan_expression_for_address_taken(right, facts);
+            scan_expression_for_address_taken(left, types, facts);
+            scan_expression_for_address_taken(right, types, facts);
         }
-        E::Member { base, .. } => scan_expression_for_address_taken(base, facts),
+        E::Member { base, .. } => scan_expression_for_address_taken(base, types, facts),
+        E::CompoundLiteral { local, initializer } => {
+            let mut fact = make_local_fact(
+                *local,
+                format!("<compound-literal-{}>", local.0),
+                expression.ty,
+                StorageDuration::Automatic,
+                expression.span,
+                types,
+            );
+            fact.reasons.insert(MemoryResidencyReason::AddressTaken);
+            facts.insert(*local, fact);
+            scan_initializer_for_address_taken(initializer, types, facts);
+        }
         E::Assignment { target, value, .. } => {
-            scan_expression_for_address_taken(target, facts);
-            scan_expression_for_address_taken(value, facts);
+            scan_expression_for_address_taken(target, types, facts);
+            scan_expression_for_address_taken(value, types, facts);
         }
-        E::Increment { operand, .. } => scan_expression_for_address_taken(operand, facts),
+        E::Increment { operand, .. } => scan_expression_for_address_taken(operand, types, facts),
         E::Call {
             callee, arguments, ..
         } => {
-            scan_expression_for_address_taken(callee, facts);
+            scan_expression_for_address_taken(callee, types, facts);
             for argument in arguments {
-                scan_expression_for_address_taken(argument, facts);
+                scan_expression_for_address_taken(argument, types, facts);
             }
         }
         E::Conditional {
@@ -871,20 +890,42 @@ fn scan_expression_for_address_taken(
             then_expression,
             else_expression,
         } => {
-            scan_expression_for_address_taken(condition, facts);
-            scan_expression_for_address_taken(then_expression, facts);
-            scan_expression_for_address_taken(else_expression, facts);
+            scan_expression_for_address_taken(condition, types, facts);
+            scan_expression_for_address_taken(then_expression, types, facts);
+            scan_expression_for_address_taken(else_expression, types, facts);
         }
         E::Comma(expressions) => {
             for expression in expressions {
-                scan_expression_for_address_taken(expression, facts);
+                scan_expression_for_address_taken(expression, types, facts);
             }
         }
         E::BuiltinExpect { value, expected: _ } => {
-            scan_expression_for_address_taken(value, facts);
+            scan_expression_for_address_taken(value, types, facts);
+        }
+        E::IntegerIntrinsic { operand, .. } => {
+            scan_expression_for_address_taken(operand, types, facts);
+        }
+        E::Prefetch { address, .. } => {
+            scan_expression_for_address_taken(address, types, facts);
+        }
+        E::AtomicReadModifyWrite {
+            pointer, operand, ..
+        } => {
+            scan_expression_for_address_taken(pointer, types, facts);
+            scan_expression_for_address_taken(operand, types, facts);
+        }
+        E::AtomicCompareExchange {
+            pointer,
+            expected,
+            replacement,
+            ..
+        } => {
+            scan_expression_for_address_taken(pointer, types, facts);
+            scan_expression_for_address_taken(expected, types, facts);
+            scan_expression_for_address_taken(replacement, types, facts);
         }
         E::VaStart { list, .. } | E::VaArg { list, .. } | E::VaEnd { list } => {
-            scan_expression_for_address_taken(list, facts);
+            scan_expression_for_address_taken(list, types, facts);
             if let Some(place) = &list.place {
                 mark_place_address_taken(place, facts);
             }
@@ -893,8 +934,8 @@ fn scan_expression_for_address_taken(
             destination,
             source,
         } => {
-            scan_expression_for_address_taken(destination, facts);
-            scan_expression_for_address_taken(source, facts);
+            scan_expression_for_address_taken(destination, types, facts);
+            scan_expression_for_address_taken(source, types, facts);
             if let Some(place) = &destination.place {
                 mark_place_address_taken(place, facts);
             }
@@ -1657,6 +1698,23 @@ fn remap_instruction_values(
             map(address)?;
             map(value)?;
         }
+        FullInstructionKind::AtomicReadModifyWrite {
+            address, operand, ..
+        } => {
+            map(address)?;
+            map(operand)?;
+        }
+        FullInstructionKind::AtomicCompareExchange {
+            address,
+            expected,
+            replacement,
+            ..
+        } => {
+            map(address)?;
+            map(expected)?;
+            map(replacement)?;
+        }
+        FullInstructionKind::Prefetch { address, .. } => map(address)?,
         FullInstructionKind::ZeroInitialize { destination, .. }
         | FullInstructionKind::StringInitialize { destination, .. } => map(destination)?,
         FullInstructionKind::AggregateCopy {
@@ -1668,7 +1726,8 @@ fn remap_instruction_values(
             map(source)?;
         }
         FullInstructionKind::Convert { operand, .. }
-        | FullInstructionKind::Unary { operand, .. } => map(operand)?,
+        | FullInstructionKind::Unary { operand, .. }
+        | FullInstructionKind::IntegerIntrinsic { operand, .. } => map(operand)?,
         FullInstructionKind::DirectCall { arguments, .. } => {
             for argument in arguments {
                 map(argument)?;
@@ -2360,7 +2419,7 @@ impl FunctionBuilder<'_> {
             E::DeclRef(SymbolReference::Function(function)) => self
                 .address_of_function(*function, expression.span)
                 .map(Some),
-            E::DeclRef(_) => {
+            E::DeclRef(_) | E::CompoundLiteral { .. } => {
                 if expression.place.is_some() {
                     Err(IrError::lower(
                         LOWERING_ERROR,
@@ -2516,6 +2575,139 @@ impl FunctionBuilder<'_> {
                 Ok(result)
             }
             E::BuiltinExpect { value, expected: _ } => self.expression(value),
+            E::IntegerIntrinsic { operation, operand } => {
+                let operand = self.expect_value(operand)?;
+                let operation = match operation {
+                    TypedIntegerIntrinsicOperation::ByteSwap64 => {
+                        IntegerIntrinsicOperation::ByteSwap64
+                    }
+                    TypedIntegerIntrinsicOperation::CountLeadingZerosInt => {
+                        IntegerIntrinsicOperation::CountLeadingZerosInt
+                    }
+                    TypedIntegerIntrinsicOperation::CountLeadingZerosLong => {
+                        IntegerIntrinsicOperation::CountLeadingZerosLong
+                    }
+                    TypedIntegerIntrinsicOperation::CountLeadingZerosLongLong => {
+                        IntegerIntrinsicOperation::CountLeadingZerosLongLong
+                    }
+                    TypedIntegerIntrinsicOperation::CountTrailingZerosLongLong => {
+                        IntegerIntrinsicOperation::CountTrailingZerosLongLong
+                    }
+                    TypedIntegerIntrinsicOperation::PopulationCountInt => {
+                        IntegerIntrinsicOperation::PopulationCountInt
+                    }
+                    TypedIntegerIntrinsicOperation::PopulationCountLongLong => {
+                        IntegerIntrinsicOperation::PopulationCountLongLong
+                    }
+                };
+                self.emit_result(
+                    FullInstructionKind::IntegerIntrinsic { operation, operand },
+                    expression.ty,
+                    expression.span,
+                )
+                .map(Some)
+            }
+            E::Prefetch {
+                address,
+                write,
+                locality,
+            } => {
+                let address = self.expect_value(address)?;
+                self.emit_effect(
+                    FullInstructionKind::Prefetch {
+                        address,
+                        write: *write,
+                        locality: *locality,
+                    },
+                    expression.span,
+                )?;
+                Ok(None)
+            }
+            E::AtomicReadModifyWrite {
+                operation,
+                pointer,
+                operand,
+                object,
+                return_new,
+                order,
+            } => {
+                let address = self.expect_value(pointer)?;
+                let operand = self.expect_value(operand)?;
+                let operation = match operation {
+                    TypedAtomicReadModifyWriteOperation::Add => AtomicReadModifyWriteOperation::Add,
+                    TypedAtomicReadModifyWriteOperation::Subtract => {
+                        AtomicReadModifyWriteOperation::Subtract
+                    }
+                    TypedAtomicReadModifyWriteOperation::Exchange => {
+                        AtomicReadModifyWriteOperation::Exchange
+                    }
+                };
+                let order = match order {
+                    TypedMemoryOrder::SequentiallyConsistent => MemoryOrder::SequentiallyConsistent,
+                };
+                if *return_new && operation == AtomicReadModifyWriteOperation::Exchange {
+                    return Err(IrError::lower(
+                        LOWERING_ERROR,
+                        expression.span,
+                        "atomic exchange cannot request the replacement value",
+                    ));
+                }
+                let value_ty = QualifiedType::unqualified(object.ty);
+                self.emit_result(
+                    FullInstructionKind::AtomicReadModifyWrite {
+                        operation,
+                        address,
+                        operand,
+                        object: *object,
+                        return_new: *return_new,
+                        order,
+                    },
+                    value_ty,
+                    expression.span,
+                )
+                .map(Some)
+            }
+            E::AtomicCompareExchange {
+                pointer,
+                expected,
+                replacement,
+                object,
+                return_boolean,
+                order,
+            } => {
+                let address = self.expect_value(pointer)?;
+                let expected = self.expect_value(expected)?;
+                let replacement = self.expect_value(replacement)?;
+                let order = match order {
+                    TypedMemoryOrder::SequentiallyConsistent => MemoryOrder::SequentiallyConsistent,
+                };
+                let value_ty = QualifiedType::unqualified(object.ty);
+                let old = self.emit_result(
+                    FullInstructionKind::AtomicCompareExchange {
+                        address,
+                        expected,
+                        replacement,
+                        object: *object,
+                        order,
+                    },
+                    value_ty,
+                    expression.span,
+                )?;
+                if *return_boolean {
+                    self.emit_result(
+                        FullInstructionKind::Binary {
+                            operator: BinaryOperation::Equal,
+                            left: old,
+                            right: expected,
+                        },
+                        QualifiedType::unqualified(TypeId::BOOL),
+                        expression.span,
+                    )
+                    .map(Some)
+                } else {
+                    Ok(Some(old))
+                }
+            }
             E::Sizeof { size, .. } => self
                 .emit_result(
                     FullInstructionKind::Constant(ScalarConstant::Unsigned(*size as u128)),
@@ -2905,6 +3097,27 @@ impl FunctionBuilder<'_> {
                     })?;
                     self.address_of_storage(storage, expression.span)?
                 }
+            }
+            FullTypedExpressionKind::DeclRef(SymbolReference::PredefinedFunctionName(string)) => {
+                self.address_of_string(*string, expression.ty, expression.span)?
+            }
+            FullTypedExpressionKind::CompoundLiteral { local, initializer } => {
+                let storage = *self.storage_by_local.get(local).ok_or_else(|| {
+                    IrError::lower(
+                        LOWERING_ERROR,
+                        expression.span,
+                        format!("reference to unknown compound literal {}", local.0),
+                    )
+                })?;
+                let address = self.address_of_storage(storage, expression.span)?;
+                let destination = LoweredPlace {
+                    address,
+                    object: expression.ty,
+                    access: access_from_qualified(expression.ty),
+                    bitfield: None,
+                };
+                self.runtime_initializer(destination, initializer)?;
+                address
             }
             FullTypedExpressionKind::StringLiteral(string) => {
                 self.address_of_string(*string, expression.ty, expression.span)?

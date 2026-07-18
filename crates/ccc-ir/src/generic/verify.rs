@@ -1186,6 +1186,20 @@ impl FunctionVerifier<'_> {
                     ));
                 }
             }
+            FullInstructionKind::IntegerIntrinsic { operation, operand } => {
+                let (input, output) = integer_intrinsic_signature(*operation);
+                if self.value_type(*operand)?.ty != input {
+                    return Err(IrError::verify(
+                        "integer intrinsic operand has the wrong exact type",
+                    ));
+                }
+                let result = require_result(result, instruction, "integer intrinsic")?;
+                if result.ty != output {
+                    return Err(IrError::verify(
+                        "integer intrinsic result has the wrong exact type",
+                    ));
+                }
+            }
             FullInstructionKind::DirectCall {
                 function,
                 signature,
@@ -1232,6 +1246,79 @@ impl FunctionVerifier<'_> {
                     instruction,
                 )?;
                 self.verify_noreturn(block, position, effects.no_return)?;
+            }
+            FullInstructionKind::AtomicReadModifyWrite {
+                address,
+                operand,
+                object,
+                return_new,
+                order: _,
+                operation,
+            } => {
+                verify_atomic_object(types, *object)?;
+                require_address(types, self.value_type(*address)?, *object, "atomic RMW")?;
+                if self.value_type(*operand)?.ty != object.ty {
+                    return Err(IrError::verify(
+                        "atomic RMW operand type disagrees with its object",
+                    ));
+                }
+                let result = require_result(result, instruction, "atomic RMW")?;
+                if result.ty != object.ty {
+                    return Err(IrError::verify(
+                        "atomic RMW result type disagrees with its object",
+                    ));
+                }
+                if *return_new && *operation == super::AtomicReadModifyWriteOperation::Exchange {
+                    return Err(IrError::verify(
+                        "atomic exchange cannot return a derived replacement value",
+                    ));
+                }
+            }
+            FullInstructionKind::AtomicCompareExchange {
+                address,
+                expected,
+                replacement,
+                object,
+                order: _,
+            } => {
+                verify_atomic_object(types, *object)?;
+                require_address(
+                    types,
+                    self.value_type(*address)?,
+                    *object,
+                    "atomic compare-exchange",
+                )?;
+                if self.value_type(*expected)?.ty != object.ty
+                    || self.value_type(*replacement)?.ty != object.ty
+                {
+                    return Err(IrError::verify(
+                        "atomic compare-exchange values disagree with its object",
+                    ));
+                }
+                let result = require_result(result, instruction, "atomic compare-exchange")?;
+                if result.ty != object.ty {
+                    return Err(IrError::verify(
+                        "atomic compare-exchange result type disagrees with its object",
+                    ));
+                }
+            }
+            FullInstructionKind::Prefetch {
+                address,
+                write: _,
+                locality,
+            } => {
+                require_no_result(result, instruction, "prefetch")?;
+                require_address(
+                    types,
+                    self.value_type(*address)?,
+                    QualifiedType::new(TypeId::VOID, TypeQualifiers::CONST),
+                    "prefetch",
+                )?;
+                if *locality > 3 {
+                    return Err(IrError::verify(
+                        "prefetch locality is outside the supported range",
+                    ));
+                }
             }
             FullInstructionKind::MemoryFence { order: _ } => {
                 require_no_result(result, instruction, "memory fence")?;
@@ -1714,13 +1801,24 @@ fn instruction_operands(kind: &FullInstructionKind) -> Vec<ValueId> {
             .collect(),
         FullInstructionKind::Store { address, value, .. }
         | FullInstructionKind::BitfieldStore { address, value, .. } => vec![*address, *value],
+        FullInstructionKind::AtomicReadModifyWrite {
+            address, operand, ..
+        } => vec![*address, *operand],
+        FullInstructionKind::AtomicCompareExchange {
+            address,
+            expected,
+            replacement,
+            ..
+        } => vec![*address, *expected, *replacement],
         FullInstructionKind::AggregateCopy {
             destination,
             source,
             ..
         } => vec![*destination, *source],
         FullInstructionKind::Convert { operand, .. }
-        | FullInstructionKind::Unary { operand, .. } => vec![*operand],
+        | FullInstructionKind::Unary { operand, .. }
+        | FullInstructionKind::IntegerIntrinsic { operand, .. } => vec![*operand],
+        FullInstructionKind::Prefetch { address, .. } => vec![*address],
         FullInstructionKind::DirectCall { arguments, .. } => arguments.clone(),
         FullInstructionKind::IndirectCall {
             callee, arguments, ..
@@ -1872,6 +1970,32 @@ fn verify_access(access: MemoryAccess) -> Result<(), IrError> {
         ));
     }
     Ok(())
+}
+
+fn verify_atomic_object(types: &TypeStore, object: QualifiedType) -> Result<(), IrError> {
+    if object.qualifiers.contains(TypeQualifiers::CONST) {
+        return Err(IrError::verify("atomic operation modifies a const object"));
+    }
+    let integer =
+        types.is_integer(object.ty) && types.builtin_type(object.ty) != Some(BuiltinType::Bool);
+    if !integer && pointer_pointee(types, object.ty).is_none() {
+        return Err(IrError::verify(
+            "atomic operation object is not an integer or pointer",
+        ));
+    }
+    Ok(())
+}
+
+fn integer_intrinsic_signature(operation: super::IntegerIntrinsicOperation) -> (TypeId, TypeId) {
+    use super::IntegerIntrinsicOperation as O;
+    match operation {
+        O::ByteSwap64 => (TypeId::UNSIGNED_LONG, TypeId::UNSIGNED_LONG),
+        O::CountLeadingZerosInt | O::PopulationCountInt => (TypeId::UNSIGNED_INT, TypeId::INT),
+        O::CountLeadingZerosLong => (TypeId::UNSIGNED_LONG, TypeId::INT),
+        O::CountLeadingZerosLongLong
+        | O::CountTrailingZerosLongLong
+        | O::PopulationCountLongLong => (TypeId::UNSIGNED_LONG_LONG, TypeId::INT),
+    }
 }
 
 fn verify_bitfield(bitfield: super::BitfieldDescriptor) -> Result<(), IrError> {

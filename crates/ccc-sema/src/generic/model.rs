@@ -323,6 +323,24 @@ pub enum MemoryOrder {
     SequentiallyConsistent,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AtomicReadModifyWriteOperation {
+    Add,
+    Subtract,
+    Exchange,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IntegerIntrinsicOperation {
+    ByteSwap64,
+    CountLeadingZerosInt,
+    CountLeadingZerosLong,
+    CountLeadingZerosLongLong,
+    CountTrailingZerosLongLong,
+    PopulationCountInt,
+    PopulationCountLongLong,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct AccessSemantics {
     pub volatile: bool,
@@ -450,6 +468,10 @@ pub enum FullTypedExpressionKind {
         indirect: bool,
         bitfield: Option<Box<BitfieldPlace>>,
     },
+    CompoundLiteral {
+        local: FullLocalId,
+        initializer: Box<FullTypedInitializer>,
+    },
     Assignment {
         operator: AssignmentOperator,
         target: Box<FullTypedExpression>,
@@ -507,6 +529,31 @@ pub enum FullTypedExpressionKind {
     VaEnd {
         list: Box<FullTypedExpression>,
     },
+    IntegerIntrinsic {
+        operation: IntegerIntrinsicOperation,
+        operand: Box<FullTypedExpression>,
+    },
+    Prefetch {
+        address: Box<FullTypedExpression>,
+        write: bool,
+        locality: u8,
+    },
+    AtomicReadModifyWrite {
+        operation: AtomicReadModifyWriteOperation,
+        pointer: Box<FullTypedExpression>,
+        operand: Box<FullTypedExpression>,
+        object: QualifiedType,
+        return_new: bool,
+        order: MemoryOrder,
+    },
+    AtomicCompareExchange {
+        pointer: Box<FullTypedExpression>,
+        expected: Box<FullTypedExpression>,
+        replacement: Box<FullTypedExpression>,
+        object: QualifiedType,
+        return_boolean: bool,
+        order: MemoryOrder,
+    },
     MemoryFence {
         order: MemoryOrder,
     },
@@ -517,6 +564,7 @@ pub enum SymbolReference {
     Global(GlobalId),
     Function(FullFunctionId),
     Local(FullLocalId),
+    PredefinedFunctionName(StringId),
     Enumerator { value: i128 },
 }
 

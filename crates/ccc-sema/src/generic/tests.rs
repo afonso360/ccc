@@ -111,6 +111,63 @@ fn zero_length_arrays_are_limited_to_gnu_language_mode() {
 }
 
 #[test]
+fn types_block_scope_compound_literals_as_initialized_addressable_lvalues() {
+    let unit = analyze_source(
+        "struct Pair { int left; int right; };
+         int read(void) {
+             struct Pair pair = (struct Pair){ .left = 19, .right = 23 };
+             return pair.left + pair.right;
+         }
+         enum State { __attribute__((deprecated)) old_state = 1, current_state = 2 };",
+    )
+    .unwrap();
+    let function = unit
+        .functions
+        .iter()
+        .find(|function| function.name == "read")
+        .unwrap();
+    let FullTypedStatementKind::Compound(items) = &function.body.as_ref().unwrap().kind else {
+        panic!("read has a compound body")
+    };
+    let FullTypedBlockItem::Declaration(declaration) = &items[0] else {
+        panic!("read starts with a declaration")
+    };
+    let FullTypedInitializerKind::Scalar(expression) =
+        &declaration.initializer.as_ref().unwrap().kind
+    else {
+        panic!("pair has a scalar aggregate initializer")
+    };
+    let FullTypedExpressionKind::Conversion {
+        kind: ConversionKind::LvalueToValue { .. },
+        expression,
+    } = &expression.kind
+    else {
+        panic!("compound literal is converted for aggregate initialization")
+    };
+    let FullTypedExpressionKind::CompoundLiteral { local, initializer } = &expression.kind else {
+        panic!("pair is initialized from a compound literal")
+    };
+    assert_eq!(expression.category, ValueCategory::Lvalue);
+    assert!(
+        expression.place.as_ref().is_some_and(|place| place.base
+            == PlaceBase::CompoundLiteral(*local)
+            && place.addressable)
+    );
+    assert!(matches!(
+        initializer.kind,
+        FullTypedInitializerKind::Aggregate(ref entries) if entries.len() == 2
+    ));
+
+    assert_eq!(
+        diagnostic_codes(
+            "struct Pair { int left; int right; };
+             struct Pair pair = (struct Pair){ .left = 1, .right = 2 };"
+        ),
+        vec!["CCC2430"]
+    );
+}
+
+#[test]
 fn label_tokens_and_computed_goto_have_exact_typed_semantics() {
     let source = "int dispatch(int opcode) {\n\
          static const void *const table[2] = {&&zero, &&one};\n\
@@ -386,7 +443,8 @@ fn accepts_hosted_header_diagnostic_and_optimization_attributes_as_no_ops() {
     let unit = analyze_source(
         "extern void *allocate(const char *format, ...)\n\
          __attribute__((__const__, __malloc__, __format__(__printf__, 1, 2),\n\
-                        __nonnull__(1), __warn_unused_result__, __deprecated__));",
+                        __nonnull__(1), __warn_unused_result__, unused, __unused__,\n\
+                        __deprecated__));",
     )
     .unwrap();
     let function = unit
@@ -400,6 +458,8 @@ fn accepts_hosted_header_diagnostic_and_optimization_attributes_as_no_ops() {
         "__format__",
         "__nonnull__",
         "__warn_unused_result__",
+        "unused",
+        "__unused__",
         "__deprecated__",
     ] {
         let attribute = function
@@ -610,6 +670,261 @@ fn types_sync_synchronize_as_a_registry_gated_sequentially_consistent_fence() {
             .collect::<Vec<_>>(),
         ["CCC2407"]
     );
+}
+
+#[test]
+fn types_legacy_sync_operations_with_native_scalar_and_pointer_contracts() {
+    let unit = analyze_preprocessed_source(
+        "sync-operations.c",
+        "#if !__has_builtin(__sync_add_and_fetch) || \
+             !__has_builtin(__sync_fetch_and_add) || \
+             !__has_builtin(__sync_sub_and_fetch) || \
+             !__has_builtin(__sync_bool_compare_and_swap) || \
+             !__has_builtin(__sync_val_compare_and_swap) || \
+             !__has_builtin(__sync_lock_test_and_set)\n\
+         #error missing atomic builtin\n\
+         #endif\n\
+         int value;\n\
+         void *pointer;\n\
+         int protected_side_effect(void);\n\
+         int update(int delta) {\n\
+             int old = __sync_fetch_and_add(&value, delta);\n\
+             int now = __sync_add_and_fetch(&value, delta, protected_side_effect());\n\
+             int after = __sync_sub_and_fetch(&value, delta, __sync_synchronize);\n\
+             int changed = __sync_bool_compare_and_swap(&value, old, now);\n\
+             int seen = __sync_val_compare_and_swap(&value, now, after);\n\
+             pointer = __sync_lock_test_and_set(&pointer, (void *)0);\n\
+             pointer = __sync_add_and_fetch(&pointer, (void *)1);\n\
+             return old + now + after + changed + seen;\n\
+         }",
+    )
+    .unwrap();
+    let dump = dump_frontend_typed_ast(&unit);
+    assert_eq!(dump.matches("atomic-rmw Add").count(), 3, "{dump}");
+    assert_eq!(dump.matches("atomic-rmw Subtract").count(), 1, "{dump}");
+    assert_eq!(dump.matches("atomic-rmw Exchange").count(), 1, "{dump}");
+    assert_eq!(dump.matches("atomic-cmpxchg").count(), 2, "{dump}");
+    assert!(
+        dump.contains("atomic-cmpxchg object=int return-boolean=true"),
+        "{dump}"
+    );
+    assert!(
+        dump.contains("atomic-cmpxchg object=int return-boolean=true order=SequentiallyConsistent : _Bool Value"),
+        "{dump}"
+    );
+    assert!(
+        dump.contains("atomic-cmpxchg object=int return-boolean=false"),
+        "{dump}"
+    );
+    assert_eq!(dump.matches("order=SequentiallyConsistent").count(), 7);
+    assert!(
+        !dump.contains("call function=Some(FullFunctionId(0))"),
+        "the protected operand must not become an evaluated call: {dump}"
+    );
+
+    for (source, code) in [
+        (
+            "int f(void) { return __sync_fetch_and_add(1, 2); }",
+            "CCC2433",
+        ),
+        (
+            "const int x = 0; int f(void) { return __sync_fetch_and_add(&x, 1); }",
+            "CCC2433",
+        ),
+        (
+            "float x; int f(void) { return __sync_fetch_and_add(&x, 1); }",
+            "CCC2434",
+        ),
+        (
+            "_Bool x; int f(void) { return __sync_fetch_and_add(&x, 1); }",
+            "CCC2434",
+        ),
+        (
+            "struct Pair { int x; }; struct Pair value; int f(void) { return __sync_bool_compare_and_swap(&value, value, value); }",
+            "CCC2434",
+        ),
+    ] {
+        assert_eq!(diagnostic_codes(source), vec![code], "{source}");
+    }
+
+    let raw_conversions = analyze_source(
+        "typedef void (*callback)(void);\n\
+         callback g_callback;\n\
+         void *pointer;\n\
+         int raw;\n\
+         _Bool atomic_set(void) {\n\
+             return __sync_bool_compare_and_swap(\n\
+                 &g_callback, ((void *)0), ((void *)0));\n\
+         }\n\
+         void *exchange_integer(void) {\n\
+             return __sync_lock_test_and_set(&pointer, 1);\n\
+         }\n\
+         int exchange_pointer(void) {\n\
+             return __sync_lock_test_and_set(&raw, (void *)1);\n\
+         }",
+    )
+    .unwrap();
+    let dump = dump_frontend_typed_ast(&raw_conversions);
+    assert_eq!(
+        dump.matches("convert PointerConversion").count(),
+        8,
+        "{dump}"
+    );
+}
+
+#[test]
+fn types_the_exact_integer_intrinsic_and_prefetch_contracts() {
+    let unit = analyze_preprocessed_source(
+        "integer-intrinsics.c",
+        "#if !__has_builtin(__builtin_bswap64) || \
+             !__has_builtin(__builtin_clz) || \
+             !__has_builtin(__builtin_clzl) || \
+             !__has_builtin(__builtin_clzll) || \
+             !__has_builtin(__builtin_ctzll) || \
+             !__has_builtin(__builtin_popcount) || \
+             !__has_builtin(__builtin_popcountll) || \
+             !__has_builtin(__builtin_prefetch)\n\
+         #error missing selected builtin\n\
+         #endif\n\
+         #if __has_builtin(__builtin_bswap32) || \
+             __has_builtin(__builtin_ctz) || \
+             __has_builtin(__builtin_ctzl) || \
+             __has_builtin(__builtin_popcountl)\n\
+         #error unselected builtin was advertised\n\
+         #endif\n\
+         unsigned long swap(int value) { return __builtin_bswap64(value); }\n\
+         int clz_int(int value) { return __builtin_clz(value); }\n\
+         int clz_long(long value) { return __builtin_clzl(value); }\n\
+         int clz_long_long(long long value) { return __builtin_clzll(value); }\n\
+         int ctz_long_long(long long value) { return __builtin_ctzll(value); }\n\
+         int popcount_int(int value) { return __builtin_popcount(value); }\n\
+         int popcount_long_long(long long value) { return __builtin_popcountll(value); }\n\
+         void *next_address(void);\n\
+         int side_effect(void);\n\
+         void hints(void) {\n\
+             __builtin_prefetch(next_address());\n\
+             __builtin_prefetch(next_address(), 1, 0);\n\
+             __builtin_prefetch(\n\
+                 next_address(), 1 ? 0 : side_effect(), 1 ? 3 : side_effect());\n\
+             __builtin_prefetch(0);\n\
+         }",
+    )
+    .unwrap();
+    let dump = dump_frontend_typed_ast(&unit);
+    for (operation, result) in [
+        ("ByteSwap64", "unsigned long int"),
+        ("CountLeadingZerosInt", "int"),
+        ("CountLeadingZerosLong", "int"),
+        ("CountLeadingZerosLongLong", "int"),
+        ("CountTrailingZerosLongLong", "int"),
+        ("PopulationCountInt", "int"),
+        ("PopulationCountLongLong", "int"),
+    ] {
+        assert!(
+            dump.contains(&format!("integer-intrinsic {operation} : {result} Value")),
+            "{dump}"
+        );
+    }
+    for input in [
+        "unsigned int",
+        "unsigned long int",
+        "unsigned long long int",
+    ] {
+        assert!(
+            dump.contains(&format!("convert IntegerConversion : {input} Value")),
+            "{dump}"
+        );
+    }
+    assert_eq!(
+        dump.matches("prefetch write=false locality=3").count(),
+        3,
+        "{dump}"
+    );
+    assert_eq!(
+        dump.matches("prefetch write=true locality=0").count(),
+        1,
+        "{dump}"
+    );
+
+    for source in [
+        "void f(void) { __builtin_prefetch(1); }",
+        "void f(volatile int *p) { __builtin_prefetch(p); }",
+    ] {
+        assert_eq!(diagnostic_codes(source), vec!["CCC2335"], "{source}");
+    }
+    for source in [
+        "void f(void *p) { __builtin_prefetch(p, 2); }",
+        "void f(void *p) { __builtin_prefetch(p, 0, 4); }",
+        "void f(void *p, int write) { __builtin_prefetch(p, write); }",
+        "void f(void *p) { __builtin_prefetch(p, 0.0); }",
+        "void f(void *p) { __builtin_prefetch(p, 0, 3.0); }",
+    ] {
+        assert_eq!(diagnostic_codes(source), vec!["CCC2436"], "{source}");
+    }
+    analyze_source(
+        "void f(void *p) {\n\
+             __builtin_prefetch(p, (unsigned char)256, (unsigned char)259);\n\
+             __builtin_prefetch(p, 4294967296ULL, 4294967299ULL);\n\
+         }",
+    )
+    .unwrap();
+
+    for (name, source) in [
+        (
+            "__builtin_bswap64",
+            "unsigned long f(unsigned long value) { return __builtin_bswap64(value); }",
+        ),
+        (
+            "__builtin_prefetch",
+            "void f(void *pointer) { __builtin_prefetch(pointer); }",
+        ),
+    ] {
+        let mut config = EffectiveCompilationConfig::default();
+        config
+            .capabilities
+            .insert(CapabilityKind::Builtin, name, CapabilityState::ParseOnly);
+        let diagnostics = analyze_source_with_config(source, &config).unwrap_err();
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code.as_str())
+                .collect::<Vec<_>>(),
+            ["CCC2407"],
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn folds_integer_intrinsics_in_integer_constant_expression_contexts() {
+    analyze_source(
+        "enum folded {\n\
+             swapped = __builtin_bswap64(1UL),\n\
+             leading_int = __builtin_clz(1U),\n\
+             leading_long = __builtin_clzl(1UL),\n\
+             leading_long_long = __builtin_clzll(1ULL),\n\
+             trailing_long_long = __builtin_ctzll(0x100ULL),\n\
+             population_int = __builtin_popcount(0xf0U),\n\
+             population_long_long = __builtin_popcountll(0xf00000000000000fULL)\n\
+         };\n\
+         _Static_assert(swapped == 0x0100000000000000UL, \"bswap64\");\n\
+         _Static_assert(leading_int == 31, \"clz\");\n\
+         _Static_assert(leading_long == 63, \"clzl\");\n\
+         _Static_assert(leading_long_long == 63, \"clzll\");\n\
+         _Static_assert(trailing_long_long == 8, \"ctzll\");\n\
+         _Static_assert(population_int == 4, \"popcount\");\n\
+         _Static_assert(population_long_long == 8, \"popcountll\");\n\
+         int folded_array[(swapped == 0x0100000000000000UL &&\n\
+             leading_int + leading_long + leading_long_long +\n\
+             trailing_long_long + population_int + population_long_long == 177) ? 7 : -1];",
+    )
+    .unwrap();
+
+    assert!(
+        analyze_source("enum invalid { value = __builtin_clz(0U) };").is_err(),
+        "zero-input clz must remain outside constant folding"
+    );
+    analyze_source("int runtime(unsigned value) { return __builtin_clz(value); }").unwrap();
 }
 
 #[test]
@@ -1564,6 +1879,70 @@ fn completes_string_initialized_arrays_before_requiring_layout() {
 }
 
 #[test]
+fn types_predefined_function_names_as_unique_static_const_arrays() {
+    let unused = analyze_source("int unused(void) { return 0; }").unwrap();
+    assert!(unused.strings.is_empty());
+
+    let unit = analyze_source(
+        "typedef int __func__;
+         const char *capture(void) {
+             _Static_assert(sizeof __func__ == sizeof \"capture\", \"wrong function name\");
+             static const char *saved = __func__;
+             return saved == __func__ ? __func__ : 0;
+         }",
+    )
+    .unwrap();
+
+    assert_eq!(unit.strings.len(), 2);
+    let predefined = &unit.strings[0];
+    assert_eq!(
+        predefined.code_units,
+        b"capture\0"
+            .iter()
+            .copied()
+            .map(u32::from)
+            .collect::<Vec<_>>()
+    );
+    let TypeKind::Array(array) = unit.types.kind(predefined.ty.ty) else {
+        panic!("the predefined function name should have array type")
+    };
+    assert_eq!(array.length, ArrayLength::Constant(8));
+    assert_eq!(array.element.ty, TypeId::CHAR);
+    assert_eq!(array.element.qualifiers, TypeQualifiers::CONST);
+    assert!(unit.strings[1].code_units == predefined.code_units);
+    assert!(unit.strings[1].ty != predefined.ty);
+
+    let dump = dump_frontend_typed_ast(&unit);
+    assert_eq!(
+        dump.matches("PredefinedFunctionName(StringId(0))").count(),
+        3,
+        "{dump}"
+    );
+    assert!(dump.contains("array[8] of const char Lvalue"), "{dump}");
+}
+
+#[test]
+fn predefined_function_names_preserve_identifier_encoding_and_scope_rules() {
+    let unit = analyze_source("const char *caf\\u00e9(void) { return __func__; }").unwrap();
+    assert_eq!(
+        unit.strings[0].code_units,
+        vec![
+            u32::from(b'c'),
+            u32::from(b'a'),
+            u32::from(b'f'),
+            0xc3,
+            0xa9,
+            0
+        ]
+    );
+
+    assert!(analyze_source("int f(void) { __func__[0] = 'x'; return 0; }").is_err());
+    assert!(analyze_source("int f(void) { char copy[] = __func__; return 0; }").is_err());
+    assert!(analyze_source("int f(void) { int __func__; return 0; }").is_err());
+    assert!(analyze_source("int f(void) { { int __func__ = 3; return __func__; } }").is_ok());
+}
+
+#[test]
 fn ordinary_strings_initialize_all_character_array_types() {
     let unit =
         analyze_source("unsigned char bytes[] = \"xy\"; signed char signed_bytes[] = \"z\";")
@@ -2178,6 +2557,128 @@ fn pack_zero_restores_native_alignment() {
 }
 
 #[test]
+fn packed_attributes_and_flexible_array_members_use_the_target_layout() {
+    let unit = analyze_source(
+        "struct __attribute__((packed)) Packed { char tag; int value; };
+         struct __attribute__((__packed__)) PackedAlias { char tag; int value; };
+         struct Packet { unsigned length; int values[]; };
+         static const int first = 1, __attribute__((deprecated)) second = 2;
+         int read(struct Packet *packet, int index) { return packet->values[index]; }",
+    )
+    .unwrap();
+    let config = EffectiveCompilationConfig::default();
+    let record_types = unit
+        .external_items
+        .iter()
+        .filter_map(|item| match item {
+            FullTypedExternalItem::TypeDeclaration { ty, .. } => Some(*ty),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(record_types.len(), 3);
+    for ty in &record_types[..2] {
+        let layout = unit.types.layout_of(*ty, &config).unwrap();
+        assert_eq!(layout.size, 5);
+        let ccc_types::LayoutShape::Record(layout) = layout.shape else {
+            panic!("packed type is a record")
+        };
+        assert_eq!(layout.fields[1].offset, 1);
+    }
+    let flexible = unit.types.layout_of(record_types[2], &config).unwrap();
+    assert_eq!(flexible.size, 4);
+    let ccc_types::LayoutShape::Record(flexible) = flexible.shape else {
+        panic!("flexible type is a record")
+    };
+    assert_eq!(flexible.fields[1].offset, 4);
+    assert_eq!(flexible.fields[1].size, 0);
+
+    for source in [
+        "union Invalid { int tag; int values[]; };",
+        "struct Invalid { int values[]; int tail; };",
+        "struct Invalid { int values[]; };",
+    ] {
+        assert_eq!(diagnostic_codes(source), vec!["CCC2370"]);
+    }
+    assert_eq!(
+        diagnostic_codes(
+            "struct Packet { int length; int values[]; };
+             struct Packet packet = { 1, { 2 } };"
+        ),
+        vec!["CCC2431"]
+    );
+    for source in [
+        "struct Native { char tag; int value __attribute__((packed)); };",
+        "int object __attribute__((packed));",
+        "enum __attribute__((packed)) Invalid { value };",
+    ] {
+        assert_eq!(diagnostic_codes(source), vec!["CCC2432"]);
+    }
+}
+
+#[test]
+fn flexible_array_members_follow_containment_and_anonymous_member_constraints() {
+    analyze_source(
+        "struct WithAnonymousStruct {
+             struct { int promoted; };
+             int values[];
+         };
+         struct WithAnonymousUnion {
+             union { int first; long second; };
+             int values[];
+         };
+         struct Packet { int length; int values[]; };
+         union PacketHolder { struct Packet packet; long alignment; };",
+    )
+    .unwrap();
+
+    for source in [
+        "struct Packet { int length; int values[]; };
+         struct Invalid { struct Packet packet; };",
+        "struct Packet { int length; int values[]; };
+         union PacketHolder { struct Packet packet; long alignment; };
+         struct Invalid { union PacketHolder holder; };",
+        "struct Packet { int length; int values[]; };
+         union PacketHolder { struct Packet packet; long alignment; };
+         union NestedHolder { union PacketHolder holder; long alignment; };
+         struct Invalid { union NestedHolder holder; };",
+        "struct Packet { int length; int values[]; };
+         struct Packet packets[2];",
+        "struct Packet { int length; int values[]; };
+         void consume(struct Packet packets[2]);",
+        "struct Packet { int length; int values[]; };
+         typedef struct Packet PacketArray[2];",
+    ] {
+        assert_eq!(diagnostic_codes(source), vec!["CCC2370"], "{source}");
+    }
+}
+
+#[test]
+fn leading_attributes_on_later_declarators_affect_their_types() {
+    analyze_source(
+        "int first, __attribute__((mode(word))) second;
+         _Static_assert(sizeof second == sizeof(void *), \"file mode\");
+         int check(void) {
+             int first, __attribute__((mode(word))) second;
+             _Static_assert(sizeof second == sizeof(void *), \"block mode\");
+             return sizeof first == sizeof second;
+         }",
+    )
+    .unwrap();
+}
+
+#[test]
+fn no_argument_attributes_reject_argument_lists() {
+    for source in [
+        "struct __attribute__((packed(8))) Invalid { char tag; int value; };",
+        "struct __attribute__((__packed__(8))) Invalid { char tag; int value; };",
+        "int value __attribute__((unused(1)));",
+        "int value __attribute__((__unused__(1)));",
+    ] {
+        assert_eq!(diagnostic_codes(source), vec!["CCC2435"], "{source}");
+    }
+}
+
+#[test]
 fn rejects_unsupported_semantics_and_storage_but_allows_long_double_layout() {
     assert!(
         diagnostic_codes("int f(int n) { int values[n]; return 0; }")
@@ -2217,10 +2718,6 @@ fn rejects_unsupported_semantics_and_storage_but_allows_long_double_layout() {
             .any(|diagnostic| diagnostic.code == "CCC2346")
     );
     assert!(diagnostic_codes("__thread int value;").contains(&"CCC2374".to_owned()));
-    assert!(
-        diagnostic_codes("struct Packet { unsigned long length; char bytes[]; };")
-            .contains(&"CCC2370".to_owned())
-    );
 }
 
 #[test]

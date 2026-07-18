@@ -342,6 +342,10 @@ pub enum FullInstructionKind {
         left: ValueId,
         right: ValueId,
     },
+    IntegerIntrinsic {
+        operation: IntegerIntrinsicOperation,
+        operand: ValueId,
+    },
     DirectCall {
         function: FullFunctionId,
         signature: TypeId,
@@ -355,6 +359,26 @@ pub enum FullInstructionKind {
         arguments: Vec<ValueId>,
         variadic_boundary: usize,
         effects: CallEffects,
+    },
+    AtomicReadModifyWrite {
+        operation: AtomicReadModifyWriteOperation,
+        address: ValueId,
+        operand: ValueId,
+        object: QualifiedType,
+        return_new: bool,
+        order: MemoryOrder,
+    },
+    AtomicCompareExchange {
+        address: ValueId,
+        expected: ValueId,
+        replacement: ValueId,
+        object: QualifiedType,
+        order: MemoryOrder,
+    },
+    Prefetch {
+        address: ValueId,
+        write: bool,
+        locality: u8,
     },
     MemoryFence {
         order: MemoryOrder,
@@ -402,6 +426,24 @@ pub struct MemoryAccess {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MemoryOrder {
     SequentiallyConsistent,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AtomicReadModifyWriteOperation {
+    Add,
+    Subtract,
+    Exchange,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IntegerIntrinsicOperation {
+    ByteSwap64,
+    CountLeadingZerosInt,
+    CountLeadingZerosLong,
+    CountLeadingZerosLongLong,
+    CountTrailingZerosLongLong,
+    PopulationCountInt,
+    PopulationCountLongLong,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

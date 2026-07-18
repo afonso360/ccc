@@ -185,7 +185,7 @@ fn execution_cases() -> &'static [ExecutionExpectation] {
     &EXECUTION_CASES
 }
 
-static EXECUTION_CASES: [ExecutionExpectation; 43] = [
+static EXECUTION_CASES: [ExecutionExpectation; 49] = [
     exit_status("return_constant.c", 42),
     exit_status("arithmetic_precedence.c", 14),
     exit_status("unary_arithmetic.c", 3),
@@ -222,6 +222,12 @@ static EXECUTION_CASES: [ExecutionExpectation; 43] = [
     exit_status("integer_to_pointer.c", 55),
     exit_status("scalar_builtins.c", 56),
     exit_status("computed_goto.c", 57),
+    exit_status("compound_literals.c", 58),
+    exit_status("flexible_array_members.c", 59),
+    exit_status("sync_atomic_builtins.c", 60),
+    exit_status("sync_atomic_pthreads.c", 64),
+    exit_status("integer_intrinsics.c", 61),
+    exit_status("predefined_function_name.c", 62),
     exit_status("combined_language_features.c", 53),
     exit_status("semantic_regressions.c", 54),
     exit_status("aggregate_calls.c", 63),

@@ -426,6 +426,66 @@ fn golden_covers_data_strings_places_and_cfg() {
 }
 
 #[test]
+fn predefined_function_names_use_unique_string_storage_and_existing_relocations() {
+    let module = lower_source(
+        "const char *direct(void) { return __func__; }
+         const char *saved(void) {
+             static const char *pointer = __func__;
+             return pointer;
+         }",
+    );
+    verify_frontend(&module).unwrap();
+
+    assert_eq!(module.strings.len(), 2);
+    assert_eq!(
+        module.strings[0].code_units,
+        b"direct\0"
+            .iter()
+            .copied()
+            .map(u32::from)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        module.strings[1].code_units,
+        b"saved\0"
+            .iter()
+            .copied()
+            .map(u32::from)
+            .collect::<Vec<_>>()
+    );
+    for string in &module.strings {
+        let ccc_types::TypeKind::Array(array) = module.types.kind(string.ty.ty) else {
+            panic!("predefined function name should have array type")
+        };
+        assert_eq!(array.element.ty, TypeId::CHAR);
+        assert!(
+            array
+                .element
+                .qualifiers
+                .contains(ccc_types::TypeQualifiers::CONST)
+        );
+    }
+
+    assert!(module.functions[0].blocks.iter().any(|block| {
+        block.instructions.iter().any(|instruction| {
+            matches!(
+                instruction.kind,
+                FullInstructionKind::AddressOfString { string } if string.0 == 0
+            )
+        })
+    }));
+    let initializer = module.globals[0].initializer.as_ref().unwrap();
+    assert!(matches!(
+        initializer.nodes[initializer.root.0 as usize].kind,
+        InitializerNodeKind::Relocation {
+            target: RelocationTarget::String(string),
+            kind: RelocationKind::StringAddress,
+            ..
+        } if string.0 == 1
+    ));
+}
+
+#[test]
 fn aggregate_rvalues_are_owned_and_project_field_index_paths() {
     let module = lower_source(
         "struct Matrix { int items[2][3]; };\n\
@@ -715,6 +775,301 @@ fn lowers_sync_synchronize_to_a_sequentially_consistent_memory_fence() {
 }
 
 #[test]
+fn lowers_legacy_sync_operations_to_explicit_sequentially_consistent_atomics() {
+    let module = lower_source(
+        "int value;\n\
+         void *pointer;\n\
+         int protected_side_effect(void);\n\
+         int update(int delta) {\n\
+             int old = __sync_fetch_and_add(&value, delta);\n\
+             int now = __sync_add_and_fetch(&value, delta, protected_side_effect());\n\
+             int after = __sync_sub_and_fetch(&value, delta, __sync_synchronize);\n\
+             int changed = __sync_bool_compare_and_swap(&value, old, now);\n\
+             int seen = __sync_val_compare_and_swap(&value, now, after);\n\
+             pointer = __sync_lock_test_and_set(&pointer, (void *)0);\n\
+             pointer = __sync_add_and_fetch(&pointer, 1);\n\
+             return old + now + after + changed + seen;\n\
+         }",
+    );
+    verify_frontend(&module).unwrap();
+    let function = module
+        .functions
+        .iter()
+        .find(|function| function.name == "update")
+        .unwrap();
+    let instructions = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .collect::<Vec<_>>();
+    let rmw = instructions
+        .iter()
+        .filter_map(|instruction| match instruction.kind {
+            FullInstructionKind::AtomicReadModifyWrite {
+                operation,
+                return_new,
+                order,
+                ..
+            } => Some((operation, return_new, order)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rmw,
+        [
+            (
+                AtomicReadModifyWriteOperation::Add,
+                false,
+                MemoryOrder::SequentiallyConsistent,
+            ),
+            (
+                AtomicReadModifyWriteOperation::Add,
+                true,
+                MemoryOrder::SequentiallyConsistent,
+            ),
+            (
+                AtomicReadModifyWriteOperation::Subtract,
+                true,
+                MemoryOrder::SequentiallyConsistent,
+            ),
+            (
+                AtomicReadModifyWriteOperation::Exchange,
+                false,
+                MemoryOrder::SequentiallyConsistent,
+            ),
+            (
+                AtomicReadModifyWriteOperation::Add,
+                true,
+                MemoryOrder::SequentiallyConsistent,
+            ),
+        ]
+    );
+    let compare_exchange = instructions
+        .iter()
+        .filter_map(|instruction| match instruction.kind {
+            FullInstructionKind::AtomicCompareExchange { order, .. } => Some(order),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        compare_exchange,
+        [
+            MemoryOrder::SequentiallyConsistent,
+            MemoryOrder::SequentiallyConsistent,
+        ]
+    );
+    assert!(instructions.iter().all(|instruction| !matches!(
+        instruction.kind,
+        FullInstructionKind::DirectCall { .. } | FullInstructionKind::IndirectCall { .. }
+    )));
+    let dump = dump_frontend_ir(&module);
+    assert_eq!(dump.matches("atomic.rmw operation=").count(), 5, "{dump}");
+    assert_eq!(dump.matches("return-new=true").count(), 3, "{dump}");
+    assert_eq!(dump.matches("atomic.cmpxchg").count(), 2, "{dump}");
+    assert_eq!(
+        dump.matches("order=SequentiallyConsistent").count(),
+        7,
+        "{dump}"
+    );
+}
+
+#[test]
+fn verifier_rejects_inconsistent_atomic_rmw_value_types() {
+    let mut module = lower_source(
+        "int value; int update(int delta) { return __sync_fetch_and_add(&value, delta); }",
+    );
+    let mut changed = false;
+    for block in &mut module.functions[0].blocks {
+        for instruction in &mut block.instructions {
+            if let FullInstructionKind::AtomicReadModifyWrite {
+                address, operand, ..
+            } = &mut instruction.kind
+            {
+                *operand = *address;
+                changed = true;
+                break;
+            }
+        }
+    }
+    assert!(changed);
+    let error = verify_frontend(&module).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("atomic RMW operand type disagrees with its object"),
+        "{error}"
+    );
+}
+
+#[test]
+fn verifier_rejects_return_new_atomic_exchange() {
+    let mut module = lower_source(
+        "void *pointer; void *exchange(void *value) {\n\
+             return __sync_lock_test_and_set(&pointer, value);\n\
+         }",
+    );
+    let changed = module.functions[0]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match &mut instruction.kind {
+            FullInstructionKind::AtomicReadModifyWrite { return_new, .. } => Some(return_new),
+            _ => None,
+        })
+        .unwrap();
+    *changed = true;
+    let error = verify_frontend(&module).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("atomic exchange cannot return a derived replacement value"),
+        "{error}"
+    );
+}
+
+#[test]
+fn lowers_integer_intrinsics_and_nonfaulting_prefetch_effects_explicitly() {
+    let module = lower_source(
+        "void *next_address(void);\n\
+         int protected_side_effect(void);\n\
+         unsigned long swap(unsigned long value) { return __builtin_bswap64(value); }\n\
+         int bits(unsigned int word, unsigned long wide, unsigned long long widest) {\n\
+             return __builtin_clz(word) + __builtin_clzl(wide) +\n\
+                 __builtin_clzll(widest) + __builtin_ctzll(widest) +\n\
+                 __builtin_popcount(word) + __builtin_popcountll(widest);\n\
+         }\n\
+         void hints(void) {\n\
+             __builtin_prefetch(\n\
+                 next_address(),\n\
+                 1 ? 0 : protected_side_effect(),\n\
+                 1 ? 3 : protected_side_effect());\n\
+             __builtin_prefetch((void *)1, 1, 0);\n\
+         }",
+    );
+    verify_frontend(&module).unwrap();
+
+    let operations = module
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.kind {
+            FullInstructionKind::IntegerIntrinsic { operation, .. } => Some(operation),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        operations,
+        [
+            IntegerIntrinsicOperation::ByteSwap64,
+            IntegerIntrinsicOperation::CountLeadingZerosInt,
+            IntegerIntrinsicOperation::CountLeadingZerosLong,
+            IntegerIntrinsicOperation::CountLeadingZerosLongLong,
+            IntegerIntrinsicOperation::CountTrailingZerosLongLong,
+            IntegerIntrinsicOperation::PopulationCountInt,
+            IntegerIntrinsicOperation::PopulationCountLongLong,
+        ]
+    );
+
+    let hints = module
+        .functions
+        .iter()
+        .find(|function| function.name == "hints")
+        .unwrap();
+    let instructions = hints
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .collect::<Vec<_>>();
+    let prefetches = instructions
+        .iter()
+        .filter_map(|instruction| match instruction.kind {
+            FullInstructionKind::Prefetch {
+                write, locality, ..
+            } => Some((write, locality)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(prefetches, [(false, 3), (true, 0)]);
+    assert_eq!(
+        instructions
+            .iter()
+            .filter(|instruction| matches!(
+                instruction.kind,
+                FullInstructionKind::DirectCall { .. }
+            ))
+            .count(),
+        1,
+        "the prefetch address expression must be evaluated exactly once"
+    );
+
+    let dump = dump_frontend_ir(&module);
+    for operation in [
+        "ByteSwap64",
+        "CountLeadingZerosInt",
+        "CountLeadingZerosLong",
+        "CountLeadingZerosLongLong",
+        "CountTrailingZerosLongLong",
+        "PopulationCountInt",
+        "PopulationCountLongLong",
+    ] {
+        assert!(
+            dump.contains(&format!("integer.intrinsic operation={operation}")),
+            "{dump}"
+        );
+    }
+    assert!(dump.contains("prefetch v"), "{dump}");
+    assert!(dump.contains("write=false locality=3"), "{dump}");
+    assert!(dump.contains("write=true locality=0"), "{dump}");
+}
+
+#[test]
+fn verifier_rejects_corrupt_integer_intrinsic_and_prefetch_contracts() {
+    let mut module = lower_source(
+        "int count(unsigned int word, unsigned long long wide) {\n\
+             return __builtin_clz(word) + (int)wide;\n\
+         }",
+    );
+    let wrong_operand = module.functions[0].parameters[1].incoming.unwrap();
+    let intrinsic = module.functions[0]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match &mut instruction.kind {
+            FullInstructionKind::IntegerIntrinsic { operand, .. } => Some(operand),
+            _ => None,
+        })
+        .unwrap();
+    *intrinsic = wrong_operand;
+    let error = verify_frontend(&module).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("integer intrinsic operand has the wrong exact type"),
+        "{error}"
+    );
+
+    let mut module = lower_source("void hint(void *pointer) { __builtin_prefetch(pointer); }");
+    let locality = module.functions[0]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match &mut instruction.kind {
+            FullInstructionKind::Prefetch { locality, .. } => Some(locality),
+            _ => None,
+        })
+        .unwrap();
+    *locality = 4;
+    let error = verify_frontend(&module).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("prefetch locality is outside the supported range"),
+        "{error}"
+    );
+}
+
+#[test]
 fn lowers_scalar_builtins_to_value_preserving_ir_without_calls() {
     let module = lower_source(
         "long choose(int value) {\n\
@@ -750,6 +1105,67 @@ fn lowers_scalar_builtins_to_value_preserving_ir_without_calls() {
             "}\n",
         )
     );
+}
+
+#[test]
+fn lowers_block_scope_compound_literals_at_their_evaluation_point() {
+    let module = lower_source(
+        "struct Pair { int left; int right; };
+         int read(void) {
+             struct Pair *pair = &(struct Pair){ .left = 19, .right = 23 };
+             return pair->left + pair->right;
+         }",
+    );
+    verify_frontend(&module).unwrap();
+    assert_eq!(
+        dump_frontend_ir(&module),
+        concat!(
+            "function f0 @read() -> int [signature=int () linkage=External visibility=Default inline=false noreturn=false] {\n",
+            "  storage m0 l1 %<compound-literal-1>: struct Pair [Automatic; AddressTaken,Aggregate]\n",
+            "  b0():\n",
+            "    i0: v0: pointer to struct Pair = const null\n",
+            "    i1: v1: pointer to struct Pair = address.storage m0\n",
+            "    i2: initialize.zero v1 object=struct Pair\n",
+            "    i3: v2: pointer to int = project.field v1 struct Pair .left#0\n",
+            "    i4: v3: int = const signed:19\n",
+            "    i5: store v3 -> v2 object=int [plain]\n",
+            "    i6: v4: pointer to int = project.field v1 struct Pair .right#1\n",
+            "    i7: v5: int = const signed:23\n",
+            "    i8: store v5 -> v4 object=int [plain]\n",
+            "    i9: v6: pointer to struct Pair = convert.pointer-conversion v1 pointer to struct Pair -> pointer to struct Pair\n",
+            "    i10: v7: pointer to int = project.field v6 struct Pair .left#0\n",
+            "    i11: v8: int = load v7 object=int [plain]\n",
+            "    i12: v9: pointer to int = project.field v6 struct Pair .right#1\n",
+            "    i13: v10: int = load v9 object=int [plain]\n",
+            "    i14: v11: int = add v8, v10\n",
+            "    return v11\n",
+            "}\n",
+        )
+    );
+}
+
+#[test]
+fn compound_literal_qualification_reaches_initializer_and_later_accesses() {
+    let module = lower_source(
+        "int read(void) {
+             volatile int *value = &(volatile int){ 1 };
+             *value = 2;
+             return *value;
+         }",
+    );
+    verify_frontend(&module).unwrap();
+    let accesses = module.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.kind {
+            FullInstructionKind::Load { access, .. }
+            | FullInstructionKind::Store { access, .. } => Some(access),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(accesses.len(), 3);
+    assert!(accesses.iter().all(|access| access.volatile));
 }
 
 #[test]

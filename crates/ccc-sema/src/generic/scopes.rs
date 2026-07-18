@@ -13,6 +13,7 @@ pub(super) enum OrdinarySymbol {
     Function(FullFunctionId, TypeId),
     Local(FullLocalId, QualifiedType),
     TemporaryParameter(FullLocalId, QualifiedType, bool),
+    PredefinedFunctionName,
     Typedef(TypedefId, QualifiedType),
     Enumerator(i128, QualifiedType),
 }

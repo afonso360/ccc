@@ -195,6 +195,8 @@ impl CapabilityRegistry {
             "__nonnull__",
             "warn_unused_result",
             "__warn_unused_result__",
+            "unused",
+            "__unused__",
             "deprecated",
             "__deprecated__",
             "noinline",
@@ -212,6 +214,8 @@ impl CapabilityRegistry {
         for name in [
             "noreturn",
             "__noreturn__",
+            "packed",
+            "__packed__",
             "mode",
             "__mode__",
             "aligned",
@@ -271,6 +275,28 @@ impl CapabilityRegistry {
             "the certified empty narrow string-literal form produces a canonical target binary32 quiet NaN",
         );
         for name in [
+            "__builtin_bswap64",
+            "__builtin_clz",
+            "__builtin_clzl",
+            "__builtin_clzll",
+            "__builtin_ctzll",
+            "__builtin_popcount",
+            "__builtin_popcountll",
+        ] {
+            registry.insert_with_rationale(
+                CapabilityKind::Builtin,
+                name,
+                CapabilityState::Implemented,
+                "the exact integer signature is typed by the frontend and lowered to a native Cranelift integer intrinsic",
+            );
+        }
+        registry.insert_with_rationale(
+            CapabilityKind::Builtin,
+            "__builtin_prefetch",
+            CapabilityState::BehaviorCompatibleNoOp,
+            "the address expression is evaluated exactly once and validated constant hints are discarded without introducing a faulting access",
+        );
+        for name in [
             "__builtin_va_start",
             "__builtin_va_arg",
             "__builtin_va_copy",
@@ -289,6 +315,21 @@ impl CapabilityRegistry {
             CapabilityState::Implemented,
             "the operator is typed and lowered as a sequentially consistent full memory fence",
         );
+        for name in [
+            "__sync_add_and_fetch",
+            "__sync_fetch_and_add",
+            "__sync_sub_and_fetch",
+            "__sync_bool_compare_and_swap",
+            "__sync_val_compare_and_swap",
+            "__sync_lock_test_and_set",
+        ] {
+            registry.insert_with_rationale(
+                CapabilityKind::Builtin,
+                name,
+                CapabilityState::Implemented,
+                "the operator is typed and lowered as a native sequentially consistent atomic read-modify-write",
+            );
+        }
 
         registry
     }
@@ -409,6 +450,8 @@ mod tests {
             "__format__",
             "__nonnull__",
             "__warn_unused_result__",
+            "unused",
+            "__unused__",
             "__deprecated__",
             "noinline",
             "__noinline__",
@@ -424,6 +467,8 @@ mod tests {
         }
         for name in [
             "__noreturn__",
+            "packed",
+            "__packed__",
             "__mode__",
             "__aligned__",
             "weak",
@@ -451,10 +496,23 @@ mod tests {
             "__builtin_huge_val",
             "__builtin_inff",
             "__builtin_nanf",
+            "__builtin_bswap64",
+            "__builtin_clz",
+            "__builtin_clzl",
+            "__builtin_clzll",
+            "__builtin_ctzll",
+            "__builtin_popcount",
+            "__builtin_popcountll",
             "__builtin_va_start",
             "__builtin_va_arg",
             "__builtin_va_copy",
             "__builtin_va_end",
+            "__sync_add_and_fetch",
+            "__sync_fetch_and_add",
+            "__sync_sub_and_fetch",
+            "__sync_bool_compare_and_swap",
+            "__sync_val_compare_and_swap",
+            "__sync_lock_test_and_set",
             "__sync_synchronize",
         ] {
             assert_eq!(
@@ -463,6 +521,16 @@ mod tests {
             );
             assert!(registry.is_available(CapabilityKind::Builtin, name));
         }
+        assert_eq!(
+            registry.state(CapabilityKind::Builtin, "__builtin_prefetch"),
+            CapabilityState::BehaviorCompatibleNoOp
+        );
+        assert!(registry.is_available(CapabilityKind::Builtin, "__builtin_prefetch"));
+        assert_eq!(
+            registry.state(CapabilityKind::Builtin, "__builtin_bswap32"),
+            CapabilityState::Unsupported
+        );
+        assert!(!registry.is_available(CapabilityKind::Builtin, "__builtin_bswap32"));
     }
 
     #[test]

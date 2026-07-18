@@ -820,6 +820,97 @@ impl FunctionState<'_> {
                         result,
                     )?))
                 }
+                I::IntegerIntrinsic { operation, operand } => {
+                    let operand = self.value(*operand)?;
+                    let value = match operation {
+                        gir::IntegerIntrinsicOperation::ByteSwap64 => builder.ins().bswap(operand),
+                        gir::IntegerIntrinsicOperation::CountLeadingZerosInt
+                        | gir::IntegerIntrinsicOperation::CountLeadingZerosLong
+                        | gir::IntegerIntrinsicOperation::CountLeadingZerosLongLong => {
+                            builder.ins().clz(operand)
+                        }
+                        gir::IntegerIntrinsicOperation::CountTrailingZerosLongLong => {
+                            builder.ins().ctz(operand)
+                        }
+                        gir::IntegerIntrinsicOperation::PopulationCountInt
+                        | gir::IntegerIntrinsicOperation::PopulationCountLongLong => {
+                            builder.ins().popcnt(operand)
+                        }
+                    };
+                    let source = builder.func.dfg.value_type(value);
+                    let destination = scalar_type(
+                        &self.module.types,
+                        result_ty.ok_or_else(|| error("integer intrinsic has no result"))?,
+                        self.config,
+                    )?;
+                    Ok(Some(coerce_integer(
+                        builder,
+                        value,
+                        source,
+                        destination,
+                        false,
+                    )))
+                }
+                I::AtomicReadModifyWrite {
+                    operation,
+                    address,
+                    operand,
+                    object,
+                    return_new,
+                    order: gir::MemoryOrder::SequentiallyConsistent,
+                } => {
+                    let ty = atomic_scalar_type(&self.module.types, *object, self.config)?;
+                    let operation = match operation {
+                        gir::AtomicReadModifyWriteOperation::Add => ir::AtomicRmwOp::Add,
+                        gir::AtomicReadModifyWriteOperation::Subtract => ir::AtomicRmwOp::Sub,
+                        gir::AtomicReadModifyWriteOperation::Exchange => ir::AtomicRmwOp::Xchg,
+                    };
+                    let operand = self.value(*operand)?;
+                    let old = builder.ins().atomic_rmw(
+                        ty,
+                        MemFlags::new(),
+                        operation,
+                        self.value(*address)?,
+                        operand,
+                    );
+                    let result = if *return_new {
+                        match operation {
+                            ir::AtomicRmwOp::Add => builder.ins().iadd(old, operand),
+                            ir::AtomicRmwOp::Sub => builder.ins().isub(old, operand),
+                            _ => {
+                                return Err(error(
+                                    "atomic exchange cannot return a derived replacement value",
+                                ));
+                            }
+                        }
+                    } else {
+                        old
+                    };
+                    Ok(Some(result))
+                }
+                I::AtomicCompareExchange {
+                    address,
+                    expected,
+                    replacement,
+                    object,
+                    order: gir::MemoryOrder::SequentiallyConsistent,
+                } => {
+                    let _ = atomic_scalar_type(&self.module.types, *object, self.config)?;
+                    Ok(Some(builder.ins().atomic_cas(
+                        MemFlags::new(),
+                        self.value(*address)?,
+                        self.value(*expected)?,
+                        self.value(*replacement)?,
+                    )))
+                }
+                I::Prefetch {
+                    address,
+                    write: _,
+                    locality: _,
+                } => {
+                    let _ = self.value(*address)?;
+                    Ok(None)
+                }
                 I::DirectCall {
                     function,
                     signature,
@@ -2319,6 +2410,26 @@ fn validate_access(access: gir::MemoryAccess) -> Result<(), CodegenError> {
         });
     }
     Ok(())
+}
+
+fn atomic_scalar_type(
+    types: &TypeStore,
+    object: QualifiedType,
+    config: &EffectiveCompilationConfig,
+) -> Result<ir::Type, CodegenError> {
+    let ty = scalar_type(types, object, config)?;
+    if ty.is_int() && matches!(ty.bits(), 8 | 16 | 32 | 64) {
+        Ok(ty)
+    } else {
+        Err(CodegenError {
+            code: ATOMIC_ERROR,
+            message: format!(
+                "atomic operation requires a native 1, 2, 4, or 8-byte integer representation, not `{}`",
+                types.display_qualified(object)
+            ),
+            span: None,
+        })
+    }
 }
 
 fn lower_load(

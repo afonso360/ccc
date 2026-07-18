@@ -691,6 +691,51 @@ fn encode_instruction(encoder: &mut Encoder, instruction: &gir::FullInstructionK
             encoder.tag(27);
             encoder.tag(*order as u8);
         }
+        I::AtomicReadModifyWrite {
+            operation,
+            address,
+            operand,
+            object,
+            return_new,
+            order,
+        } => {
+            encoder.tag(28);
+            encoder.tag(*operation as u8);
+            encoder.u32(address.0);
+            encoder.u32(operand.0);
+            encoder.qualified(*object);
+            encoder.bool(*return_new);
+            encoder.tag(*order as u8);
+        }
+        I::AtomicCompareExchange {
+            address,
+            expected,
+            replacement,
+            object,
+            order,
+        } => {
+            encoder.tag(29);
+            encoder.u32(address.0);
+            encoder.u32(expected.0);
+            encoder.u32(replacement.0);
+            encoder.qualified(*object);
+            encoder.tag(*order as u8);
+        }
+        I::IntegerIntrinsic { operation, operand } => {
+            encoder.tag(30);
+            encoder.tag(*operation as u8);
+            encoder.u32(operand.0);
+        }
+        I::Prefetch {
+            address,
+            write,
+            locality,
+        } => {
+            encoder.tag(31);
+            encoder.u32(address.0);
+            encoder.bool(*write);
+            encoder.tag(*locality);
+        }
     }
 }
 

@@ -475,6 +475,14 @@ fn dump_expression(
             );
             dump_expression(output, unit, base, indent + 1);
         }
+        FullTypedExpressionKind::CompoundLiteral { local, initializer } => {
+            line(
+                output,
+                indent,
+                format_args!("compound-literal l{}{suffix}", local.0),
+            );
+            dump_initializer(output, unit, initializer, indent + 1);
+        }
         FullTypedExpressionKind::Assignment {
             operator,
             target,
@@ -556,6 +564,65 @@ fn dump_expression(
             line(output, indent, format_args!("builtin-expect{suffix}"));
             dump_expression(output, unit, value, indent + 1);
             dump_expression(output, unit, expected, indent + 1);
+        }
+        FullTypedExpressionKind::IntegerIntrinsic { operation, operand } => {
+            line(
+                output,
+                indent,
+                format_args!("integer-intrinsic {operation:?}{suffix}"),
+            );
+            dump_expression(output, unit, operand, indent + 1);
+        }
+        FullTypedExpressionKind::Prefetch {
+            address,
+            write,
+            locality,
+        } => {
+            line(
+                output,
+                indent,
+                format_args!("prefetch write={write} locality={locality}{suffix}"),
+            );
+            dump_expression(output, unit, address, indent + 1);
+        }
+        FullTypedExpressionKind::AtomicReadModifyWrite {
+            operation,
+            pointer,
+            operand,
+            object,
+            return_new,
+            order,
+        } => {
+            line(
+                output,
+                indent,
+                format_args!(
+                    "atomic-rmw {operation:?} object={} return-new={return_new} order={order:?}{suffix}",
+                    unit.types.display_qualified(*object)
+                ),
+            );
+            dump_expression(output, unit, pointer, indent + 1);
+            dump_expression(output, unit, operand, indent + 1);
+        }
+        FullTypedExpressionKind::AtomicCompareExchange {
+            pointer,
+            expected,
+            replacement,
+            object,
+            return_boolean,
+            order,
+        } => {
+            line(
+                output,
+                indent,
+                format_args!(
+                    "atomic-cmpxchg object={} return-boolean={return_boolean} order={order:?}{suffix}",
+                    unit.types.display_qualified(*object)
+                ),
+            );
+            dump_expression(output, unit, pointer, indent + 1);
+            dump_expression(output, unit, expected, indent + 1);
+            dump_expression(output, unit, replacement, indent + 1);
         }
         FullTypedExpressionKind::Sizeof { operand_ty, size } => line(
             output,

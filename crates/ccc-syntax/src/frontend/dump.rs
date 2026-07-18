@@ -164,6 +164,9 @@ impl AstDumper {
         if let Some(enumerators) = &enumeration.enumerators {
             for enumerator in enumerators {
                 self.line(indent + 1, &format!("enumerator {}", enumerator.name.name));
+                for attribute in &enumerator.attributes {
+                    self.attribute(attribute, indent + 2);
+                }
                 if let Some(value) = &enumerator.value {
                     self.expression(value, indent + 2);
                 }
@@ -382,6 +385,25 @@ impl AstDumper {
             ExpressionKind::BuiltinNanF { payload } => {
                 self.line(indent, "builtin-nanf");
                 self.expression(payload, indent + 1);
+            }
+            ExpressionKind::BuiltinIntegerIntrinsic { operation, operand } => {
+                self.line(indent, operation.spelling());
+                self.expression(operand, indent + 1);
+            }
+            ExpressionKind::BuiltinPrefetch { arguments } => {
+                self.line(indent, "builtin-prefetch");
+                for argument in arguments {
+                    self.expression(argument, indent + 1);
+                }
+            }
+            ExpressionKind::BuiltinSyncOperation {
+                operation,
+                arguments,
+            } => {
+                self.line(indent, operation.spelling());
+                for argument in arguments {
+                    self.expression(argument, indent + 1);
+                }
             }
             ExpressionKind::BuiltinSyncSynchronize => {
                 self.line(indent, "builtin-sync-synchronize");

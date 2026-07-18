@@ -472,6 +472,9 @@ fn display_instruction(module: &FullModule, kind: &FullInstructionKind) -> Strin
             left,
             right,
         } => format!("{} v{}, v{}", binary_name(*operator), left.0, right.0),
+        FullInstructionKind::IntegerIntrinsic { operation, operand } => {
+            format!("integer.intrinsic operation={operation:?} v{}", operand.0)
+        }
         FullInstructionKind::DirectCall {
             function,
             signature,
@@ -500,6 +503,37 @@ fn display_instruction(module: &FullModule, kind: &FullInstructionKind) -> Strin
             variadic_boundary,
             display_call_effects(*effects)
         ),
+        FullInstructionKind::AtomicReadModifyWrite {
+            operation,
+            address,
+            operand,
+            object,
+            return_new,
+            order,
+        } => format!(
+            "atomic.rmw operation={operation:?} v{}, v{} object={} return-new={return_new} order={order:?}",
+            address.0,
+            operand.0,
+            module.types.display_qualified(*object)
+        ),
+        FullInstructionKind::AtomicCompareExchange {
+            address,
+            expected,
+            replacement,
+            object,
+            order,
+        } => format!(
+            "atomic.cmpxchg v{}, expected=v{}, replacement=v{} object={} order={order:?}",
+            address.0,
+            expected.0,
+            replacement.0,
+            module.types.display_qualified(*object)
+        ),
+        FullInstructionKind::Prefetch {
+            address,
+            write,
+            locality,
+        } => format!("prefetch v{} write={write} locality={locality}", address.0),
         FullInstructionKind::MemoryFence { order } => {
             format!("memory.fence order={order:?}")
         }

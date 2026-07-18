@@ -1,7 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
 use ccc_diag::Diagnostic;
-use ccc_pp::{CharacterConstantPrefix, FloatingConstantSuffix, PragmaEvent, StringLiteralPrefix};
+use ccc_pp::{
+    CharacterConstantPrefix, FloatingConstantSuffix, PragmaEvent, StringLiteralPrefix,
+    canonicalize_identifier,
+};
 use ccc_session::Span;
 use ccc_syntax::frontend as syntax;
 use ccc_target::{
@@ -109,6 +112,8 @@ struct SwitchState {
 struct FunctionState {
     id: FullFunctionId,
     name: String,
+    predefined_name_code_units: Vec<u32>,
+    predefined_name_string: Option<StringId>,
     return_ty: QualifiedType,
     next_local: u32,
     unaddressable_locals: HashSet<FullLocalId>,
@@ -256,6 +261,7 @@ impl<'a> Analyzer<'a> {
         declaration: &syntax::Declaration,
     ) -> AnalysisResult<()> {
         let info = self.resolve_declaration_specifiers(&declaration.specifiers)?;
+        self.reject_packed_attribute(&info.attributes, declaration.span)?;
         if declaration.declarators.is_empty() {
             self.reject_weak_attribute(&info.attributes, declaration.span, "a type declaration")?;
             self.external_items
@@ -278,6 +284,7 @@ impl<'a> Analyzer<'a> {
             let mut attributes = info.attributes.clone();
             attributes.extend(resolved.attributes.clone());
             attributes.extend(self.validate_attributes(&init.attributes)?);
+            self.reject_packed_attribute(&attributes, init.span)?;
             if info.storage == Some(syntax::StorageClass::Typedef) {
                 if init.initializer.is_some() || init.asm_label.is_some() {
                     return self.fail(
@@ -336,6 +343,7 @@ impl<'a> Analyzer<'a> {
         definition: &syntax::FunctionDefinition,
     ) -> AnalysisResult<()> {
         let info = self.resolve_declaration_specifiers(&definition.specifiers)?;
+        self.reject_packed_attribute(&info.attributes, definition.specifiers.span)?;
         if info.storage == Some(syntax::StorageClass::Typedef) {
             return self.fail(
                 "CCC2204",
@@ -373,6 +381,7 @@ impl<'a> Analyzer<'a> {
         };
         let mut attributes = info.attributes;
         attributes.extend(resolved.attributes);
+        self.reject_packed_attribute(&attributes, definition.declarator.span)?;
         let id = self.declare_function(
             name.clone(),
             resolved.ty.ty,
@@ -399,10 +408,19 @@ impl<'a> Analyzer<'a> {
             );
         }
 
+        let mut predefined_name_code_units = canonicalize_identifier(&name)
+            .expect("the lexer validates universal character names in identifiers")
+            .into_bytes()
+            .into_iter()
+            .map(u32::from)
+            .collect::<Vec<_>>();
+        predefined_name_code_units.push(0);
         let return_ty = signature.result;
         self.function = Some(FunctionState {
             id,
             name: name.clone(),
+            predefined_name_code_units,
+            predefined_name_string: None,
             return_ty,
             next_local: 0,
             unaddressable_locals: HashSet::new(),
@@ -469,6 +487,19 @@ impl<'a> Analyzer<'a> {
                 .as_mut()
                 .expect("parameter analysis occurs inside a function")
                 .last_named_parameter_restriction = parameter.va_start_restriction;
+        }
+
+        if self
+            .bind_current(
+                "__func__".to_owned(),
+                OrdinarySymbol::PredefinedFunctionName,
+                resolved.name_span,
+            )
+            .is_err()
+        {
+            self.pop_scope();
+            self.function = None;
+            return Err(());
         }
 
         let body = self.analyze_function_body(&definition.body);
@@ -733,6 +764,7 @@ impl<'a> Analyzer<'a> {
         type_name: &syntax::TypeName,
     ) -> AnalysisResult<(QualifiedType, Vec<FullTypedVariableLengthBound>)> {
         let info = self.resolve_declaration_specifiers(&type_name.specifiers)?;
+        self.reject_packed_attribute(&info.attributes, type_name.specifiers.span)?;
         if info.storage.is_some() || info.properties != FunctionProperties::default() {
             return self.fail(
                 "CCC2219",
@@ -779,6 +811,7 @@ impl<'a> Analyzer<'a> {
             let pointer_ty = self.types.pointer(ty);
             ty = QualifiedType::new(pointer_ty, qualifiers(&pointer.qualifiers));
         }
+        self.reject_packed_attribute(&attributes, declarator.span)?;
         let mut context = DeclaratorContext::new(prototype_parameter);
         let (name, name_span, ty) =
             self.resolve_direct_declarator(ty, &declarator.direct, &mut context)?;
@@ -835,6 +868,13 @@ impl<'a> Analyzer<'a> {
                 }
                 if ty.ty == TypeId::VOID {
                     return self.fail("CCC2222", *span, "an array element cannot have void type");
+                }
+                if self.type_contains_flexible_array_member(ty.ty) {
+                    return self.fail(
+                        "CCC2370",
+                        *span,
+                        "an array element cannot contain a flexible array member",
+                    );
                 }
                 let length = match size {
                     syntax::ArraySize::Unspecified => ArrayLength::Incomplete,
@@ -1010,6 +1050,7 @@ impl<'a> Analyzer<'a> {
     ) -> AnalysisResult<ResolvedParameter> {
         let info = self.resolve_declaration_specifiers(&parameter.specifiers)?;
         self.reject_weak_attribute(&info.attributes, parameter.span, "a parameter")?;
+        self.reject_packed_attribute(&info.attributes, parameter.span)?;
         if !matches!(info.storage, None | Some(syntax::StorageClass::Register)) {
             return self.fail(
                 "CCC2227",
@@ -1033,6 +1074,15 @@ impl<'a> Analyzer<'a> {
                 (None, info.base, Vec::new(), parameter.span)
             };
         let declared_kind = self.types.try_kind(ty.ty).cloned();
+        if matches!(&declared_kind, Some(TypeKind::Array(_)))
+            && self.type_contains_flexible_array_member(ty.ty)
+        {
+            return self.fail(
+                "CCC2370",
+                parameter.span,
+                "an array parameter element cannot contain a flexible array member",
+            );
+        }
         let va_start_restriction = if register {
             Some("it has `register` storage class")
         } else {
@@ -1136,7 +1186,7 @@ impl<'a> Analyzer<'a> {
 
         let applied_packing = if record_attributes
             .iter()
-            .any(|attribute| attribute.name == "packed")
+            .any(|attribute| attribute_has_name(attribute, "packed"))
         {
             self.packing.current.combine(PackingPolicy::PACKED)
         } else {
@@ -1144,6 +1194,7 @@ impl<'a> Analyzer<'a> {
         };
         let mut fields = Vec::new();
         let mut field_names = HashSet::new();
+        let mut flexible_members = Vec::new();
         for item in items {
             match item {
                 syntax::RecordItem::Pragma(pragma) => self.handle_pragma(pragma)?,
@@ -1157,6 +1208,7 @@ impl<'a> Analyzer<'a> {
                         declaration.span,
                         "a record member",
                     )?;
+                    self.reject_packed_attribute(&info.attributes, declaration.span)?;
                     if info.storage.is_some() || info.properties != FunctionProperties::default() {
                         return self.fail(
                             "CCC2232",
@@ -1182,6 +1234,7 @@ impl<'a> Analyzer<'a> {
                             member.span,
                             "a record member",
                         )?;
+                        self.reject_packed_attribute(&member_attributes, member.span)?;
                         let (name, field_ty, has_variable_length_bounds) =
                             if let Some(declarator) = &member.declarator {
                                 let resolved = self.resolve_declarator(info.base, declarator)?;
@@ -1223,17 +1276,20 @@ impl<'a> Analyzer<'a> {
                                 "a record member cannot have variably modified type",
                             );
                         }
-                        if matches!(
+                        let flexible = matches!(
                             self.types.try_kind(field_ty.ty),
                             Some(TypeKind::Array(ArrayType {
                                 length: ArrayLength::Incomplete,
                                 ..
                             }))
-                        ) {
+                        );
+                        if kind == RecordKind::Struct
+                            && self.type_contains_flexible_array_member(field_ty.ty)
+                        {
                             return self.fail(
                                 "CCC2370",
                                 member.span,
-                                "flexible array members are not supported",
+                                "a structure member cannot contain a flexible array member",
                             );
                         }
                         let field = if let Some(width) = &member.bit_width {
@@ -1256,9 +1312,28 @@ impl<'a> Analyzer<'a> {
                         } else {
                             Field::new(name, field_ty)
                         };
+                        if flexible {
+                            flexible_members.push((fields.len(), member.span));
+                        }
                         fields.push(field);
                     }
                 }
+            }
+        }
+        for (index, span) in flexible_members {
+            let field = &fields[index];
+            if kind != RecordKind::Struct
+                || index + 1 != fields.len()
+                || field.name.is_none()
+                || !fields[..index]
+                    .iter()
+                    .any(|field| self.field_contributes_named_member(field))
+            {
+                return self.fail(
+                    "CCC2370",
+                    span,
+                    "a flexible array must be the named final member of a structure with another named member",
+                );
             }
         }
         self.types
@@ -1322,6 +1397,7 @@ impl<'a> Analyzer<'a> {
         };
         let enum_attributes = self.validate_attributes(&specifier.attributes)?;
         self.reject_weak_attribute(&enum_attributes, specifier.span, "an enum type")?;
+        self.reject_packed_attribute(&enum_attributes, specifier.span)?;
         let Some(enumerators) = &specifier.enumerators else {
             return Ok(ty);
         };
@@ -1341,6 +1417,7 @@ impl<'a> Analyzer<'a> {
         for enumerator in enumerators {
             let enumerator_attributes = self.validate_attributes(&enumerator.attributes)?;
             self.reject_weak_attribute(&enumerator_attributes, enumerator.span, "an enumerator")?;
+            self.reject_packed_attribute(&enumerator_attributes, enumerator.span)?;
             let value = if let Some(expression) = &enumerator.value {
                 self.evaluate_integer_constant(expression)?
             } else {
@@ -1386,6 +1463,15 @@ impl<'a> Analyzer<'a> {
         span: Span,
     ) -> AnalysisResult<TypedefId> {
         self.reject_weak_attribute(&attributes, span, "a typedef")?;
+        if matches!(self.types.try_kind(ty.ty), Some(TypeKind::Array(_)))
+            && self.type_contains_flexible_array_member(ty.ty)
+        {
+            return self.fail(
+                "CCC2370",
+                span,
+                "an array element cannot contain a flexible array member",
+            );
+        }
         if let Some(existing) = self.scopes.current_ordinary(&name).cloned() {
             if let OrdinarySymbol::Typedef(id, existing_ty) = existing
                 && self.types_compatible(existing_ty, ty)
@@ -1750,6 +1836,7 @@ impl<'a> Analyzer<'a> {
         declaration: &syntax::Declaration,
     ) -> AnalysisResult<Vec<FullTypedBlockItem>> {
         let info = self.resolve_declaration_specifiers(&declaration.specifiers)?;
+        self.reject_packed_attribute(&info.attributes, declaration.span)?;
         let mut output = Vec::new();
         for init in &declaration.declarators {
             let resolved = self.resolve_declarator(info.base, &init.declarator)?;
@@ -1763,6 +1850,7 @@ impl<'a> Analyzer<'a> {
             let mut attributes = info.attributes.clone();
             attributes.extend(resolved.attributes);
             attributes.extend(self.validate_attributes(&init.attributes)?);
+            self.reject_packed_attribute(&attributes, init.span)?;
             if info.storage == Some(syntax::StorageClass::Typedef) {
                 self.reject_weak_attribute(&attributes, init.span, "a typedef")?;
                 if init.initializer.is_some() || init.asm_label.is_some() {
@@ -1988,6 +2076,7 @@ impl<'a> Analyzer<'a> {
                 } => {
                     let attributes = self.validate_attributes(attributes)?;
                     self.reject_weak_attribute(&attributes, statement.span, "a statement label")?;
+                    self.reject_packed_attribute(&attributes, statement.span)?;
                     let id = {
                         let labels = &mut self
                             .function
@@ -2414,11 +2503,9 @@ impl<'a> Analyzer<'a> {
             E::PostfixDecrement(operand) => {
                 self.analyze_increment(operand, true, true, expression.span)
             }
-            E::CompoundLiteral { .. } => self.fail(
-                "CCC2271",
-                expression.span,
-                "compound literals are parsed but are not semantically supported",
-            ),
+            E::CompoundLiteral { ty, initializer } => {
+                self.analyze_compound_literal(ty, initializer, expression.span)
+            }
             E::Unary { operator, operand } => {
                 self.analyze_unary(*operator, operand, expression.span)
             }
@@ -2520,8 +2607,49 @@ impl<'a> Analyzer<'a> {
             E::BuiltinHugeVal => self.analyze_builtin_huge_val(expression.span),
             E::BuiltinInfF => self.analyze_builtin_inff(expression.span),
             E::BuiltinNanF { payload } => self.analyze_builtin_nanf(payload, expression.span),
+            E::BuiltinIntegerIntrinsic { operation, operand } => {
+                self.analyze_integer_intrinsic(*operation, operand, expression.span)
+            }
+            E::BuiltinPrefetch { arguments } => {
+                self.analyze_builtin_prefetch(arguments, expression.span)
+            }
+            E::BuiltinSyncOperation {
+                operation,
+                arguments,
+            } => self.analyze_sync_operation(*operation, arguments, expression.span),
             E::BuiltinSyncSynchronize => self.analyze_sync_synchronize(expression.span),
         }
+    }
+
+    fn analyze_compound_literal(
+        &mut self,
+        type_name: &syntax::TypeName,
+        initializer: &syntax::Initializer,
+        span: Span,
+    ) -> AnalysisResult<FullTypedExpression> {
+        if self.function.is_none() {
+            return self.fail(
+                "CCC2430",
+                span,
+                "file-scope compound literals are not yet supported",
+            );
+        }
+        let declared_ty = self.resolve_type_name(type_name)?;
+        let (initializer, completed_ty) = self.analyze_initializer(declared_ty, initializer)?;
+        self.validate_object_type(completed_ty, span, true)?;
+        let local = self.fresh_local();
+        Ok(FullTypedExpression {
+            kind: FullTypedExpressionKind::CompoundLiteral {
+                local,
+                initializer: Box::new(initializer),
+            },
+            ty: completed_ty,
+            category: ValueCategory::Lvalue,
+            place: Some(self.object_place(PlaceBase::CompoundLiteral(local), completed_ty, true)),
+            constant: None,
+            constant_expression_kind: ConstantExpressionKind::Invalid,
+            span,
+        })
     }
 
     fn analyze_builtin_expect(
@@ -2623,6 +2751,385 @@ impl<'a> Analyzer<'a> {
             constant_expression_kind: ConstantExpressionKind::Invalid,
             span,
         })
+    }
+
+    fn analyze_integer_intrinsic(
+        &mut self,
+        operation: syntax::IntegerBuiltinOperation,
+        operand: &syntax::Expression,
+        span: Span,
+    ) -> AnalysisResult<FullTypedExpression> {
+        self.require_builtin(operation.spelling(), span)?;
+        let (operation, input_ty, result_ty) = match operation {
+            syntax::IntegerBuiltinOperation::ByteSwap64 => (
+                IntegerIntrinsicOperation::ByteSwap64,
+                TypeId::UNSIGNED_LONG,
+                TypeId::UNSIGNED_LONG,
+            ),
+            syntax::IntegerBuiltinOperation::CountLeadingZerosInt => (
+                IntegerIntrinsicOperation::CountLeadingZerosInt,
+                TypeId::UNSIGNED_INT,
+                TypeId::INT,
+            ),
+            syntax::IntegerBuiltinOperation::CountLeadingZerosLong => (
+                IntegerIntrinsicOperation::CountLeadingZerosLong,
+                TypeId::UNSIGNED_LONG,
+                TypeId::INT,
+            ),
+            syntax::IntegerBuiltinOperation::CountLeadingZerosLongLong => (
+                IntegerIntrinsicOperation::CountLeadingZerosLongLong,
+                TypeId::UNSIGNED_LONG_LONG,
+                TypeId::INT,
+            ),
+            syntax::IntegerBuiltinOperation::CountTrailingZerosLongLong => (
+                IntegerIntrinsicOperation::CountTrailingZerosLongLong,
+                TypeId::UNSIGNED_LONG_LONG,
+                TypeId::INT,
+            ),
+            syntax::IntegerBuiltinOperation::PopulationCountInt => (
+                IntegerIntrinsicOperation::PopulationCountInt,
+                TypeId::UNSIGNED_INT,
+                TypeId::INT,
+            ),
+            syntax::IntegerBuiltinOperation::PopulationCountLongLong => (
+                IntegerIntrinsicOperation::PopulationCountLongLong,
+                TypeId::UNSIGNED_LONG_LONG,
+                TypeId::INT,
+            ),
+        };
+        let operand = self.analyze_expression(operand)?;
+        let operand_span = operand.span;
+        let operand = self.assignment_conversion(
+            operand,
+            QualifiedType::unqualified(input_ty),
+            operand_span,
+        )?;
+        let constant = if operand.constant_expression_kind == ConstantExpressionKind::Integer {
+            self.fold_integer_intrinsic(operation, &operand)
+        } else {
+            None
+        };
+        let constant_expression_kind = if constant.is_some() {
+            ConstantExpressionKind::Integer
+        } else {
+            ConstantExpressionKind::Invalid
+        };
+        Ok(FullTypedExpression {
+            kind: FullTypedExpressionKind::IntegerIntrinsic {
+                operation,
+                operand: Box::new(operand),
+            },
+            ty: QualifiedType::unqualified(result_ty),
+            category: ValueCategory::Value,
+            place: None,
+            constant,
+            constant_expression_kind,
+            span,
+        })
+    }
+
+    fn fold_integer_intrinsic(
+        &self,
+        operation: IntegerIntrinsicOperation,
+        operand: &FullTypedExpression,
+    ) -> Option<ConstantValue> {
+        let raw = match operand.constant? {
+            ConstantValue::Signed(value) => value as u128,
+            ConstantValue::Unsigned(value) => value,
+            ConstantValue::Floating(_) | ConstantValue::NullPointer | ConstantValue::Address(_) => {
+                return None;
+            }
+        };
+        let input = match operation {
+            IntegerIntrinsicOperation::CountLeadingZerosInt
+            | IntegerIntrinsicOperation::PopulationCountInt => BuiltinType::UnsignedInt,
+            IntegerIntrinsicOperation::ByteSwap64
+            | IntegerIntrinsicOperation::CountLeadingZerosLong => BuiltinType::UnsignedLong,
+            IntegerIntrinsicOperation::CountLeadingZerosLongLong
+            | IntegerIntrinsicOperation::CountTrailingZerosLongLong
+            | IntegerIntrinsicOperation::PopulationCountLongLong => BuiltinType::UnsignedLongLong,
+        };
+        let width = self.integer_width(input);
+        let raw = truncate_to_width(raw, width);
+        match operation {
+            IntegerIntrinsicOperation::ByteSwap64 => {
+                Some(ConstantValue::Unsigned((raw as u64).swap_bytes().into()))
+            }
+            IntegerIntrinsicOperation::CountLeadingZerosInt
+            | IntegerIntrinsicOperation::CountLeadingZerosLong
+            | IntegerIntrinsicOperation::CountLeadingZerosLongLong => {
+                if raw == 0 {
+                    return None;
+                }
+                let leading = raw.leading_zeros() - (u128::BITS - u32::from(width));
+                Some(ConstantValue::Signed(i128::from(leading)))
+            }
+            IntegerIntrinsicOperation::CountTrailingZerosLongLong => {
+                if raw == 0 {
+                    return None;
+                }
+                Some(ConstantValue::Signed(i128::from(raw.trailing_zeros())))
+            }
+            IntegerIntrinsicOperation::PopulationCountInt
+            | IntegerIntrinsicOperation::PopulationCountLongLong => {
+                Some(ConstantValue::Signed(i128::from(raw.count_ones())))
+            }
+        }
+    }
+
+    fn analyze_builtin_prefetch(
+        &mut self,
+        arguments: &[syntax::Expression],
+        span: Span,
+    ) -> AnalysisResult<FullTypedExpression> {
+        self.require_builtin("__builtin_prefetch", span)?;
+        debug_assert!((1..=3).contains(&arguments.len()));
+        let address = self.analyze_expression(&arguments[0])?;
+        let const_void = QualifiedType::new(TypeId::VOID, TypeQualifiers::CONST);
+        let target = QualifiedType::unqualified(self.types.pointer(const_void));
+        let address = self.assignment_conversion(address, target, arguments[0].span)?;
+        let write = if let Some(argument) = arguments.get(1) {
+            self.analyze_prefetch_hint(argument, "read/write", 0, 1)? != 0
+        } else {
+            false
+        };
+        let locality = if let Some(argument) = arguments.get(2) {
+            self.analyze_prefetch_hint(argument, "locality", 0, 3)? as u8
+        } else {
+            3
+        };
+        Ok(FullTypedExpression {
+            kind: FullTypedExpressionKind::Prefetch {
+                address: Box::new(address),
+                write,
+                locality,
+            },
+            ty: QualifiedType::unqualified(TypeId::VOID),
+            category: ValueCategory::Value,
+            place: None,
+            constant: None,
+            constant_expression_kind: ConstantExpressionKind::Invalid,
+            span,
+        })
+    }
+
+    fn analyze_prefetch_hint(
+        &mut self,
+        argument: &syntax::Expression,
+        name: &str,
+        minimum: i128,
+        maximum: i128,
+    ) -> AnalysisResult<i128> {
+        let value = self.analyze_expression(argument)?;
+        if !self.types.is_integer(value.ty.ty) {
+            return self.fail(
+                "CCC2436",
+                argument.span,
+                format!(
+                    "the `__builtin_prefetch` {name} hint must be an integer constant from {minimum} through {maximum}"
+                ),
+            );
+        }
+        let value = self.assignment_conversion(
+            value,
+            QualifiedType::unqualified(TypeId::INT),
+            argument.span,
+        )?;
+        let constant = value.constant.and_then(ConstantValue::as_i128);
+        let Some(constant) = constant.filter(|value| (minimum..=maximum).contains(value)) else {
+            return self.fail(
+                "CCC2436",
+                argument.span,
+                format!(
+                    "the `__builtin_prefetch` {name} hint must be an integer constant from {minimum} through {maximum}"
+                ),
+            );
+        };
+        if !builtin_expect_folded_constant(&value) {
+            return self.fail(
+                "CCC2436",
+                argument.span,
+                format!(
+                    "the `__builtin_prefetch` {name} hint must be an integer constant from {minimum} through {maximum}"
+                ),
+            );
+        }
+        Ok(constant)
+    }
+
+    fn analyze_sync_operation(
+        &mut self,
+        operation: syntax::SyncBuiltinOperation,
+        arguments: &[syntax::Expression],
+        span: Span,
+    ) -> AnalysisResult<FullTypedExpression> {
+        self.require_builtin(operation.spelling(), span)?;
+        debug_assert!(arguments.len() >= operation.fixed_arity());
+
+        for protected in &arguments[operation.fixed_arity()..] {
+            if matches!(
+                &protected.kind,
+                syntax::ExpressionKind::Identifier(identifier)
+                    if identifier.name == "__sync_synchronize"
+            ) {
+                self.require_builtin("__sync_synchronize", protected.span)?;
+            } else {
+                // GCC accepts this historical operand list but does not evaluate
+                // it. Analyze names and types for source diagnostics, then omit
+                // the expressions from the typed operation.
+                let _ = self.analyze_expression(protected)?;
+            }
+        }
+
+        let pointer = self.analyze_expression(&arguments[0])?;
+        let pointer = self.value_conversion(pointer)?;
+        let Some(object) = self.pointer_pointee(pointer.ty.ty) else {
+            return self.fail(
+                "CCC2433",
+                arguments[0].span,
+                format!(
+                    "the first argument to `{}` must point to a modifiable integer or pointer object",
+                    operation.spelling()
+                ),
+            );
+        };
+        if object.qualifiers.contains(TypeQualifiers::CONST) {
+            return self.fail(
+                "CCC2433",
+                arguments[0].span,
+                format!(
+                    "the first argument to `{}` points to a const-qualified object",
+                    operation.spelling()
+                ),
+            );
+        }
+        let integer = self.types.is_integer(object.ty)
+            && self.types.builtin_type(object.ty) != Some(BuiltinType::Bool);
+        let pointer_object = self.pointer_pointee(object.ty).is_some();
+        let supported_size = self
+            .types
+            .layout_of(object.ty, self.config)
+            .is_ok_and(|layout| matches!(layout.size, 1 | 2 | 4 | 8));
+        if !(integer || pointer_object) || !supported_size {
+            return self.fail(
+                "CCC2434",
+                arguments[0].span,
+                format!(
+                    "`{}` requires a 1, 2, 4, or 8-byte integer or pointer object",
+                    operation.spelling()
+                ),
+            );
+        }
+
+        let value_ty = QualifiedType::unqualified(object.ty);
+        let first = self.analyze_expression(&arguments[1])?;
+        let first = self.sync_operand_conversion(first, value_ty, arguments[1].span)?;
+        let order = MemoryOrder::SequentiallyConsistent;
+        let (kind, ty) = match operation {
+            syntax::SyncBuiltinOperation::AddAndFetch => (
+                FullTypedExpressionKind::AtomicReadModifyWrite {
+                    operation: AtomicReadModifyWriteOperation::Add,
+                    pointer: Box::new(pointer),
+                    operand: Box::new(first),
+                    object,
+                    return_new: true,
+                    order,
+                },
+                value_ty,
+            ),
+            syntax::SyncBuiltinOperation::FetchAndAdd => (
+                FullTypedExpressionKind::AtomicReadModifyWrite {
+                    operation: AtomicReadModifyWriteOperation::Add,
+                    pointer: Box::new(pointer),
+                    operand: Box::new(first),
+                    object,
+                    return_new: false,
+                    order,
+                },
+                value_ty,
+            ),
+            syntax::SyncBuiltinOperation::SubAndFetch => (
+                FullTypedExpressionKind::AtomicReadModifyWrite {
+                    operation: AtomicReadModifyWriteOperation::Subtract,
+                    pointer: Box::new(pointer),
+                    operand: Box::new(first),
+                    object,
+                    return_new: true,
+                    order,
+                },
+                value_ty,
+            ),
+            syntax::SyncBuiltinOperation::LockTestAndSet => (
+                FullTypedExpressionKind::AtomicReadModifyWrite {
+                    operation: AtomicReadModifyWriteOperation::Exchange,
+                    pointer: Box::new(pointer),
+                    operand: Box::new(first),
+                    object,
+                    return_new: false,
+                    order,
+                },
+                value_ty,
+            ),
+            syntax::SyncBuiltinOperation::BoolCompareAndSwap
+            | syntax::SyncBuiltinOperation::ValCompareAndSwap => {
+                let replacement = self.analyze_expression(&arguments[2])?;
+                let replacement =
+                    self.sync_operand_conversion(replacement, value_ty, arguments[2].span)?;
+                let return_boolean = operation == syntax::SyncBuiltinOperation::BoolCompareAndSwap;
+                (
+                    FullTypedExpressionKind::AtomicCompareExchange {
+                        pointer: Box::new(pointer),
+                        expected: Box::new(first),
+                        replacement: Box::new(replacement),
+                        object,
+                        return_boolean,
+                        order,
+                    },
+                    if return_boolean {
+                        QualifiedType::unqualified(TypeId::BOOL)
+                    } else {
+                        value_ty
+                    },
+                )
+            }
+        };
+        Ok(FullTypedExpression {
+            kind,
+            ty,
+            category: ValueCategory::Value,
+            place: None,
+            constant: None,
+            constant_expression_kind: ConstantExpressionKind::Invalid,
+            span,
+        })
+    }
+
+    fn sync_operand_conversion(
+        &mut self,
+        expression: FullTypedExpression,
+        target: QualifiedType,
+        span: Span,
+    ) -> AnalysisResult<FullTypedExpression> {
+        let expression = self.value_conversion(expression)?;
+        let target_pointer = self.pointer_pointee(target.ty).is_some();
+        let source_pointer = self.pointer_pointee(expression.ty.ty).is_some();
+        if (target_pointer && (source_pointer || self.types.is_integer(expression.ty.ty)))
+            || (self.types.is_integer(target.ty) && source_pointer)
+        {
+            let constant =
+                if target_pointer && expression.constant.is_some_and(ConstantValue::is_zero) {
+                    Some(ConstantValue::NullPointer)
+                } else {
+                    expression.constant
+                };
+            return Ok(self.conversion(
+                ConversionKind::PointerConversion,
+                expression,
+                QualifiedType::unqualified(target.ty),
+                constant,
+            ));
+        }
+        self.assignment_conversion(expression, target, span)
     }
 
     fn analyze_va_start(
@@ -2810,8 +3317,7 @@ impl<'a> Analyzer<'a> {
         if self
             .config
             .capabilities
-            .state(CapabilityKind::Builtin, name)
-            == CapabilityState::Implemented
+            .is_available(CapabilityKind::Builtin, name)
         {
             Ok(())
         } else {
@@ -2954,6 +3460,20 @@ impl<'a> Analyzer<'a> {
                 Some(self.object_place(PlaceBase::Local(id), ty, addressable)),
                 None,
             ),
+            OrdinarySymbol::PredefinedFunctionName => {
+                let (string, ty) = self.predefined_function_name_string();
+                (
+                    SymbolReference::PredefinedFunctionName(string),
+                    ty,
+                    ValueCategory::Lvalue,
+                    Some(self.object_place(PlaceBase::String(string), ty, true)),
+                    Some(ConstantValue::Address(RelocatableAddress {
+                        base: RelocatableBase::String(string),
+                        addend: 0,
+                        one_past: false,
+                    })),
+                )
+            }
             OrdinarySymbol::Enumerator(value, ty) => {
                 let constant = if self.is_signed_integer(ty.ty) {
                     ConstantValue::Signed(value)
@@ -2990,6 +3510,46 @@ impl<'a> Analyzer<'a> {
             constant_expression_kind,
             span: identifier.span,
         })
+    }
+
+    fn predefined_function_name_string(&mut self) -> (StringId, QualifiedType) {
+        if let Some(string) = self
+            .function
+            .as_ref()
+            .expect("the predefined function name is only visible inside a definition")
+            .predefined_name_string
+        {
+            return (string, self.strings[string.0 as usize].ty);
+        }
+        let code_units = self
+            .function
+            .as_ref()
+            .expect("the predefined function name is only visible inside a definition")
+            .predefined_name_code_units
+            .clone();
+        let element = QualifiedType::new(TypeId::CHAR, TypeQualifiers::CONST);
+        let ty = QualifiedType::unqualified(
+            self.types.array(ArrayType {
+                element,
+                length: ArrayLength::Constant(
+                    u64::try_from(code_units.len())
+                        .expect("predefined function name length exceeds the C type model"),
+                ),
+            }),
+        );
+        let string =
+            StringId(u32::try_from(self.strings.len()).expect("string identifier space exhausted"));
+        self.strings.push(FullTypedString {
+            id: string,
+            prefix: StringLiteralPrefix::None,
+            code_units,
+            ty,
+        });
+        self.function
+            .as_mut()
+            .expect("the predefined function name is only visible inside a definition")
+            .predefined_name_string = Some(string);
+        (string, ty)
     }
 
     fn analyze_label_address(
@@ -4497,6 +5057,19 @@ impl<'a> Analyzer<'a> {
                 cursor = index + 1;
                 (path, target_ty, index)
             };
+            if matches!(
+                self.types.try_kind(fields[selected_field].ty.ty),
+                Some(TypeKind::Array(ArrayType {
+                    length: ArrayLength::Incomplete,
+                    ..
+                }))
+            ) {
+                return self.fail(
+                    "CCC2431",
+                    entry.span,
+                    "a flexible array member cannot be initialized",
+                );
+            }
             if record.kind == RecordKind::Union {
                 if initialized_union_member.is_some_and(|previous| previous != selected_field) {
                     return self.fail(
@@ -4891,7 +5464,7 @@ impl<'a> Analyzer<'a> {
                 "pointer assignment uses incompatible types",
             );
         }
-        if self.types_compatible(target, expression.ty) {
+        if self.type_ids_compatible(target.ty, expression.ty.ty) {
             return Ok(expression);
         }
         self.fail(
@@ -5615,6 +6188,74 @@ impl<'a> Analyzer<'a> {
         })
     }
 
+    fn type_contains_flexible_array_member(&self, ty: TypeId) -> bool {
+        fn contains(
+            types: &ccc_types::TypeStore,
+            ty: TypeId,
+            active: &mut HashSet<TypeId>,
+        ) -> bool {
+            if !active.insert(ty) {
+                return false;
+            }
+            let result = match types.try_kind(ty) {
+                Some(TypeKind::Array(array)) => contains(types, array.element.ty, active),
+                Some(TypeKind::Record(record_id)) => types
+                    .record(*record_id)
+                    .and_then(|record| record.fields.as_ref())
+                    .is_some_and(|fields| {
+                        fields.iter().any(|field| {
+                            matches!(
+                                types.try_kind(field.ty.ty),
+                                Some(TypeKind::Array(ArrayType {
+                                    length: ArrayLength::Incomplete,
+                                    ..
+                                }))
+                            ) || contains(types, field.ty.ty, active)
+                        })
+                    }),
+                Some(
+                    TypeKind::Builtin(_)
+                    | TypeKind::Pointer(_)
+                    | TypeKind::Function(_)
+                    | TypeKind::Enum(_),
+                )
+                | None => false,
+            };
+            active.remove(&ty);
+            result
+        }
+
+        contains(&self.types, ty, &mut HashSet::new())
+    }
+
+    fn field_contributes_named_member(&self, field: &Field) -> bool {
+        fn record_has_named_member(
+            types: &ccc_types::TypeStore,
+            ty: TypeId,
+            active: &mut HashSet<TypeId>,
+        ) -> bool {
+            let Some(TypeKind::Record(record_id)) = types.try_kind(ty) else {
+                return false;
+            };
+            if !active.insert(ty) {
+                return false;
+            }
+            let result = types
+                .record(*record_id)
+                .and_then(|record| record.fields.as_ref())
+                .is_some_and(|fields| {
+                    fields.iter().any(|field| {
+                        field.name.is_some() || record_has_named_member(types, field.ty.ty, active)
+                    })
+                });
+            active.remove(&ty);
+            result
+        }
+
+        field.name.is_some()
+            || record_has_named_member(&self.types, field.ty.ty, &mut HashSet::new())
+    }
+
     fn validate_object_type(
         &mut self,
         ty: QualifiedType,
@@ -5623,6 +6264,15 @@ impl<'a> Analyzer<'a> {
     ) -> AnalysisResult<()> {
         if ty.ty == TypeId::VOID || self.types.function_signature(ty.ty).is_some() {
             return self.fail("CCC2341", span, "an object must have object type");
+        }
+        if matches!(self.types.try_kind(ty.ty), Some(TypeKind::Array(_)))
+            && self.type_contains_flexible_array_member(ty.ty)
+        {
+            return self.fail(
+                "CCC2370",
+                span,
+                "an array element cannot contain a flexible array member",
+            );
         }
         match self.types.layout_of(ty.ty, self.config) {
             Ok(_) => Ok(()),
@@ -5930,6 +6580,13 @@ impl<'a> Analyzer<'a> {
                 "implemented `weak` does not accept arguments",
             );
         }
+        if matches!(canonical_name, "packed" | "unused") && !attribute.arguments.is_empty() {
+            return self.fail(
+                "CCC2435",
+                attribute.span,
+                format!("implemented `{canonical_name}` does not accept arguments"),
+            );
+        }
         Ok(FullTypedAttribute {
             introducer: attribute.introducer.clone(),
             name: attribute.name.name.clone(),
@@ -5956,6 +6613,24 @@ impl<'a> Analyzer<'a> {
                 "CCC2423",
                 span,
                 format!("implemented `weak` cannot be applied to {placement}"),
+            );
+        }
+        Ok(())
+    }
+
+    fn reject_packed_attribute(
+        &mut self,
+        attributes: &[FullTypedAttribute],
+        span: Span,
+    ) -> AnalysisResult<()> {
+        if attributes
+            .iter()
+            .any(|attribute| attribute_has_name(attribute, "packed"))
+        {
+            return self.fail(
+                "CCC2432",
+                span,
+                "implemented `packed` is supported only on record specifiers",
             );
         }
         Ok(())
@@ -6647,6 +7322,7 @@ fn builtin_expect_folded_constant(expression: &FullTypedExpression) -> bool {
         E::Dereference(_)
         | E::Subscript { .. }
         | E::Member { .. }
+        | E::CompoundLiteral { .. }
         | E::Assignment { .. }
         | E::Increment { .. }
         | E::Call { .. }
@@ -6654,6 +7330,10 @@ fn builtin_expect_folded_constant(expression: &FullTypedExpression) -> bool {
         | E::VaArg { .. }
         | E::VaCopy { .. }
         | E::VaEnd { .. }
+        | E::IntegerIntrinsic { .. }
+        | E::Prefetch { .. }
+        | E::AtomicReadModifyWrite { .. }
+        | E::AtomicCompareExchange { .. }
         | E::MemoryFence { .. } => false,
     }
 }

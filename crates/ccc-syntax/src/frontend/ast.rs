@@ -369,7 +369,73 @@ pub enum ExpressionKind {
     BuiltinNanF {
         payload: Box<Expression>,
     },
+    BuiltinIntegerIntrinsic {
+        operation: IntegerBuiltinOperation,
+        operand: Box<Expression>,
+    },
+    BuiltinPrefetch {
+        arguments: Vec<Expression>,
+    },
+    BuiltinSyncOperation {
+        operation: SyncBuiltinOperation,
+        arguments: Vec<Expression>,
+    },
     BuiltinSyncSynchronize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IntegerBuiltinOperation {
+    ByteSwap64,
+    CountLeadingZerosInt,
+    CountLeadingZerosLong,
+    CountLeadingZerosLongLong,
+    CountTrailingZerosLongLong,
+    PopulationCountInt,
+    PopulationCountLongLong,
+}
+
+impl IntegerBuiltinOperation {
+    pub const fn spelling(self) -> &'static str {
+        match self {
+            Self::ByteSwap64 => "__builtin_bswap64",
+            Self::CountLeadingZerosInt => "__builtin_clz",
+            Self::CountLeadingZerosLong => "__builtin_clzl",
+            Self::CountLeadingZerosLongLong => "__builtin_clzll",
+            Self::CountTrailingZerosLongLong => "__builtin_ctzll",
+            Self::PopulationCountInt => "__builtin_popcount",
+            Self::PopulationCountLongLong => "__builtin_popcountll",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyncBuiltinOperation {
+    AddAndFetch,
+    FetchAndAdd,
+    SubAndFetch,
+    BoolCompareAndSwap,
+    ValCompareAndSwap,
+    LockTestAndSet,
+}
+
+impl SyncBuiltinOperation {
+    pub const fn spelling(self) -> &'static str {
+        match self {
+            Self::AddAndFetch => "__sync_add_and_fetch",
+            Self::FetchAndAdd => "__sync_fetch_and_add",
+            Self::SubAndFetch => "__sync_sub_and_fetch",
+            Self::BoolCompareAndSwap => "__sync_bool_compare_and_swap",
+            Self::ValCompareAndSwap => "__sync_val_compare_and_swap",
+            Self::LockTestAndSet => "__sync_lock_test_and_set",
+        }
+    }
+
+    pub const fn fixed_arity(self) -> usize {
+        match self {
+            Self::BoolCompareAndSwap | Self::ValCompareAndSwap => 3,
+            Self::AddAndFetch | Self::FetchAndAdd | Self::SubAndFetch | Self::LockTestAndSet => 2,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

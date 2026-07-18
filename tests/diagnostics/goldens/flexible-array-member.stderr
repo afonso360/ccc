@@ -1,4 +1,4 @@
-ccc: error[CCC2370]: flexible array members are not supported
+ccc: error[CCC2370]: a flexible array must be the named final member of a structure with another named member
  --> tests/diagnostics/cases/flexible-array-member.c:3:9
    |
  3 |     int values[];

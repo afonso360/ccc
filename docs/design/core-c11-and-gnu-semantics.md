@@ -78,9 +78,26 @@ surface under CCC's identity:
 | `VDBE_PROFILE`, `SQLITE_PERFORMANCE_TRACE`, or `SQLITE_ENABLE_STMT_SCANSTATUS` | None is enabled by the pinned test adapter, so `src/hwtime.h` contributes no inline assembly.                                                  |
 | glibc `<math.h>` constants in the SQLite command-line shell                    | `NAN` and `INFINITY` select `__builtin_nanf("")` and `__builtin_inff()`; CCC folds them to canonical binary32 constants.                       |
 
-The builtin registry admits `__sync_synchronize` independently and does not
-infer support for any other `__sync_*`, `__atomic_*`, byte-swap, overflow, or
-bit-count spelling. If a later adapter selects the hardware-timing header, the
+The Redis source inventory is likewise preprocessed under CCC's effective
+GNU 4.2.1 identity. The adapter mirrors every real translation and requires
+exactly one nonempty preprocessing capture for each of its 178 pinned inputs.
+Within the selected integer and prefetch subset, the expanded counts are
+exactly `__builtin_bswap64` (35), `__builtin_clz` (168), `__builtin_clzl`
+(85), `__builtin_clzll` (83), `__builtin_ctzll` (1), `__builtin_popcount`
+(154), `__builtin_popcountll` (4), and `__builtin_prefetch` (1). The prefetch
+occurrence supplies a pointer followed by the constant hints 0 and 3.
+`__builtin_expect` and the legacy sync operations described below also
+expand. No `bswap32`, `ctz`, `ctzl`, `popcountl`, unreachable, overflow, or
+CPU-support builtin is selected. These results do not admit neighboring
+family spellings.
+
+The builtin registry admits `__sync_synchronize` and the exact implemented
+legacy operation set (`__sync_add_and_fetch`, `__sync_fetch_and_add`,
+`__sync_sub_and_fetch`, both compare-and-swap result forms, and
+`__sync_lock_test_and_set`) independently. That atomic surface does not infer
+support for any other `__sync_*` or `__atomic_*` spelling. The Redis inventory
+requires each listed operation to occur in the captured source. If a later
+adapter selects the hardware-timing header, the
 first candidate to certify is the x86-64 volatile `rdtsc` form with `=a` and
 `=d` outputs. No general inline-assembly certifier is built merely in
 anticipation of that change.
@@ -131,13 +148,14 @@ statement-expression result modeling.
 
 ### Compound literals
 
-A compound literal creates one unnamed object with the specified type and
-initializer. File-scope occurrences have static storage duration; block-scope
-occurrences have automatic storage duration associated with the enclosing
-block. The expression is an lvalue designating that object. Initializer
-checking, zero-fill, relocations, qualifiers, volatile access, and aggregate
-copy reuse the ordinary object-initialization and place rules. Array bound
-completion and nested designators are tested explicitly.
+A block-scope compound literal creates one unnamed object with automatic
+storage duration associated with the enclosing block. The expression is an
+lvalue designating that object, and repeated evaluation of the same occurrence
+reinitializes and designates the same object. Initializer checking, zero-fill,
+qualifiers, volatile access, aggregate copy, array-bound completion, and nested
+designators reuse the ordinary object-initialization and place rules.
+File-scope compound literals require static-object lowering and are rejected
+with `CCC2430` until that path is implemented.
 
 ### Flexible array members
 
@@ -277,6 +295,43 @@ empty-literal `__builtin_nanf("")`/`__builtin_nanf(u8"")`. They fold to positive
 binary32 infinity and quiet-NaN bits `0x7fc00000`, respectively, without a
 runtime helper. Nonliteral, wide, and nonempty NaN payloads are diagnosed; CCC
 does not silently discard a payload whose GNU encoding it has not implemented.
+
+The selected integer builtins have exact GNU signatures. Byte-swap takes and
+returns target `uint64_t`, represented as `unsigned long` by the x86-64 GNU
+profile. The `clz` and `popcount` forms take `unsigned
+int`, `clzl` takes `unsigned long`, and the `clzll`, `ctzll`, and `popcountll`
+forms take `unsigned long long`; every count form returns `int`. CCC applies
+the ordinary argument conversion and lowers the operation to Cranelift's
+native `bswap`, `clz`, `ctz`, or `popcnt` instruction. A zero input to `clz` or
+`ctz` remains undefined, as in GNU C, rather than acquiring a CCC-specific
+value.
+All seven forms fold valid integer constant-expression operands. A zero
+operand to `clz` or `ctz` remains outside that fold.
+
+The prefetch form accepts one to three arguments. Its address is converted to
+`const void *` and evaluated exactly once. Optional read/write and locality
+hints are converted to `int` and must then be constants in 0 through 1 and 0 through 3;
+they default to 0 and 3 and have no runtime evaluation. The implementation
+then emits no cache hint or memory access, so even an invalid non-null address
+does not introduce a fault. This is advertised as behavior-compatible rather
+than as an optimization promise.
+
+The implemented legacy `__sync_*` update operations accept modifiable 1, 2, 4,
+or 8-byte integer and pointer objects. CCC-IR records native sequentially
+consistent RMW or compare-exchange effects, and the backend maps them directly
+to Cranelift atomics without libcalls. Pointer representations are updated as
+unscaled integers. Integer and pointer value operands convert in either
+direction through those raw representations, including `void *` null values
+used with function-pointer objects. CCC-IR records old-versus-new RMW results
+directly, avoiding pointer-typed binary arithmetic. GNU's optional trailing
+protected-variable list is checked
+for valid source expressions but has no runtime evaluation; the barrier covers
+globally accessible memory. Boolean compare-and-swap has exact C type `_Bool`.
+Each result form is represented explicitly so fetch-before-update,
+update-before-fetch, observed-value CAS, Boolean CAS, and exchange semantics
+cannot be conflated. CCC currently uses sequentially consistent ordering for
+every form; that is an intentional strengthening of GNU's acquire-only minimum
+guarantee for `__sync_lock_test_and_set`.
 
 Inline assembly is retained losslessly through parsing: template, operands,
 constraints and alternatives, ties, early-clobber markers, clobbers,

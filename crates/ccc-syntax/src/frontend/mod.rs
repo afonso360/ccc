@@ -203,6 +203,22 @@ mod tests {
     }
 
     #[test]
+    fn parses_postfix_operators_after_compound_literals() {
+        let unit = parse_source(
+            "struct Pair { int left; int right; };\n\
+             int read(void) {\n\
+                 return (struct Pair){.left = 1, .right = 2}.right\n\
+                     + (int[]){3, 4}[1];\n\
+             }",
+        )
+        .unwrap();
+        let dump = dump_ast(&unit);
+        assert_eq!(dump.matches("compound-literal").count(), 2, "{dump}");
+        assert!(dump.contains("member right"), "{dump}");
+        assert!(dump.contains("subscript"), "{dump}");
+    }
+
+    #[test]
     fn parses_computed_goto_and_label_addresses_exactly_in_gnu_mode() {
         let source = "int dispatch(int opcode) {\n\
              static const void *const table[2] = {&&zero, &&one};\n\
@@ -289,6 +305,39 @@ mod tests {
     }
 
     #[test]
+    fn predefined_function_name_hides_a_file_scope_typedef() {
+        let unit =
+            parse_source("typedef int __func__; int named(void) { return sizeof(__func__); }")
+                .unwrap();
+        let ExternalItem::FunctionDefinition(function) = &unit.items[1] else {
+            panic!("expected a function definition");
+        };
+        let StatementKind::Compound(items) = &function.body.kind else {
+            panic!("expected a compound body");
+        };
+        let BlockItem::Statement(statement) = &items[0] else {
+            panic!("expected a return statement");
+        };
+        let StatementKind::Return(Some(expression)) = &statement.kind else {
+            panic!("expected a return expression");
+        };
+        assert!(matches!(
+            expression.kind,
+            ExpressionKind::SizeofExpression(_)
+        ));
+        assert!(unit.scope_events.iter().any(|event| {
+            event.depth == 1
+                && matches!(
+                    &event.kind,
+                    ScopeEventKind::Bind {
+                        name,
+                        class: NameClass::Ordinary,
+                    } if name == "__func__"
+                )
+        }));
+    }
+
+    #[test]
     fn name_class_transactions_restore_bindings_and_events() {
         let mut sources = SourceMap::new();
         let file = sources.add_file("scope.c", "T");
@@ -323,6 +372,75 @@ mod tests {
         );
         assert_eq!(init.attributes[0].introducer, "__attribute__");
         assert_eq!(init.attributes[0].name.name, "__nothrow__");
+    }
+
+    #[test]
+    fn parses_enumerator_attributes_before_and_after_the_enumerator() {
+        let unit = parse_source(
+            "enum State {
+                 __attribute__((deprecated)) old_state = 1,
+                 current_state __attribute__((deprecated)) = 2
+             };",
+        )
+        .unwrap();
+        let dump = dump_ast(&unit);
+        assert_eq!(
+            dump.matches("attribute __attribute__ deprecated").count(),
+            2
+        );
+        assert!(dump.contains("enumerator old_state"), "{dump}");
+        assert!(dump.contains("enumerator current_state"), "{dump}");
+
+        let ExternalItem::Declaration(declaration) = &unit.items[0] else {
+            panic!("expected an enum declaration")
+        };
+        let enumeration = declaration
+            .specifiers
+            .items
+            .iter()
+            .find_map(|specifier| match specifier {
+                DeclarationSpecifier::Type(TypeSpecifier::Enum(enumeration)) => Some(enumeration),
+                _ => None,
+            })
+            .unwrap();
+        let enumerators = enumeration.enumerators.as_ref().unwrap();
+        assert_eq!(
+            enumerators[0].span.start,
+            enumerators[0].attributes[0].span.start
+        );
+        assert_eq!(
+            enumerators[0].span.end,
+            enumerators[0].value.as_ref().unwrap().span.end
+        );
+        assert_eq!(
+            enumerators[1].span.end,
+            enumerators[1].value.as_ref().unwrap().span.end
+        );
+    }
+
+    #[test]
+    fn parses_attributes_before_later_init_declarators() {
+        let unit = parse_source(
+            "static const int first = 1,
+                 __attribute__((deprecated)) second = 2,
+                 third = 3;",
+        )
+        .unwrap();
+        let dump = dump_ast(&unit);
+        assert!(dump.contains("declarator first"), "{dump}");
+        assert!(dump.contains("declarator third"), "{dump}");
+
+        let ExternalItem::Declaration(declaration) = &unit.items[0] else {
+            panic!("expected a declaration")
+        };
+        let second = &declaration.declarators[1];
+        assert_eq!(second.declarator.attributes.len(), 1);
+        assert_eq!(second.declarator.attributes[0].name.name, "deprecated");
+        assert!(second.attributes.is_empty());
+        assert_eq!(
+            second.declarator.span.start,
+            second.declarator.attributes[0].span.start
+        );
     }
 
     #[test]
@@ -398,6 +516,96 @@ mod tests {
                 error.message.contains("__sync_synchronize"),
                 "{source}: {error}"
             );
+        }
+    }
+
+    #[test]
+    fn parses_legacy_sync_operations_and_optional_protected_operands() {
+        let unit = parse_source(
+            "int value; void *pointer;\n\
+             int update(int delta) {\n\
+                 int old = __sync_fetch_and_add(&value, delta);\n\
+                 int now = __sync_add_and_fetch(&value, delta, __sync_synchronize);\n\
+                 int after = __sync_sub_and_fetch(&value, delta, &value);\n\
+                 int changed = __sync_bool_compare_and_swap(&value, old, now);\n\
+                 int seen = __sync_val_compare_and_swap(&value, now, after);\n\
+                 pointer = __sync_lock_test_and_set(&pointer, (void *)0);\n\
+                 return old + changed + seen;\n\
+             }",
+        )
+        .unwrap();
+        let dump = dump_ast(&unit);
+        for spelling in [
+            "__sync_fetch_and_add",
+            "__sync_add_and_fetch",
+            "__sync_sub_and_fetch",
+            "__sync_bool_compare_and_swap",
+            "__sync_val_compare_and_swap",
+            "__sync_lock_test_and_set",
+        ] {
+            assert!(dump.contains(spelling), "{dump}");
+        }
+        assert!(dump.contains("name __sync_synchronize"), "{dump}");
+
+        for source in [
+            "int x; int f(void) { return __sync_fetch_and_add(&x); }",
+            "int x; int f(void) { return __sync_bool_compare_and_swap(&x, 1); }",
+            "int x; int f(void) { return __sync_lock_test_and_set(); }",
+        ] {
+            let error = parse_source(source).unwrap_err();
+            assert!(
+                error.message.contains("requires at least"),
+                "{source}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_the_exact_integer_intrinsic_and_prefetch_surface() {
+        let unit = parse_source(
+            "unsigned long long swap(unsigned long long value) {\n\
+                 return __builtin_bswap64(value);\n\
+             }\n\
+             int bits(unsigned int word, unsigned long wide, unsigned long long widest) {\n\
+                 return __builtin_clz(word) + __builtin_clzl(wide) +\n\
+                     __builtin_clzll(widest) + __builtin_ctzll(widest) +\n\
+                     __builtin_popcount(word) + __builtin_popcountll(widest);\n\
+             }\n\
+             void hints(void *address) {\n\
+                 __builtin_prefetch(address);\n\
+                 __builtin_prefetch(address, 1);\n\
+                 __builtin_prefetch(address, 0, 3);\n\
+             }",
+        )
+        .unwrap();
+        let dump = dump_ast(&unit);
+        for spelling in [
+            "__builtin_bswap64",
+            "__builtin_clz",
+            "__builtin_clzl",
+            "__builtin_clzll",
+            "__builtin_ctzll",
+            "__builtin_popcount",
+            "__builtin_popcountll",
+        ] {
+            assert!(dump.contains(spelling), "{dump}");
+        }
+        assert_eq!(dump.matches("builtin-prefetch").count(), 3, "{dump}");
+
+        for source in [
+            "int f(void) { return __builtin_clz(); }",
+            "int f(void) { return __builtin_clz(1, 2); }",
+        ] {
+            let error = parse_source(source).unwrap_err();
+            assert!(error.message.contains("exactly one argument"), "{error}");
+        }
+        for source in [
+            "void f(void) { __builtin_prefetch(); }",
+            "void f(void *p) { __builtin_prefetch(p, 0, 1, 2); }",
+            "void f(void *p) { __builtin_prefetch(p,); }",
+        ] {
+            let error = parse_source(source).unwrap_err();
+            assert!(error.message.contains("__builtin_prefetch"), "{error}");
         }
     }
 

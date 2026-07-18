@@ -802,6 +802,159 @@ fn sync_synchronize_is_one_native_full_fence_without_an_external_symbol() {
 }
 
 #[test]
+fn legacy_sync_operations_are_native_atomics_without_external_symbols() {
+    let output = emit_source(
+        "int value;\n\
+         void *pointer;\n\
+         int protected_side_effect(void);\n\
+         int update(int delta) {\n\
+             int old = __sync_fetch_and_add(&value, delta);\n\
+             int now = __sync_add_and_fetch(&value, delta, protected_side_effect());\n\
+             int after = __sync_sub_and_fetch(&value, delta, __sync_synchronize);\n\
+             int changed = __sync_bool_compare_and_swap(&value, old, now);\n\
+             int seen = __sync_val_compare_and_swap(&value, now, after);\n\
+             pointer = __sync_lock_test_and_set(&pointer, (void *)0);\n\
+             pointer = __sync_add_and_fetch(&pointer, 1);\n\
+             return old + now + after + changed + seen;\n\
+         }",
+    );
+    let clif = function_clif(&output.clif, "update");
+    assert_eq!(clif.matches("atomic_rmw").count(), 5, "{clif}");
+    assert_eq!(clif.matches("atomic_cas").count(), 2, "{clif}");
+    assert!(clif.contains("atomic_rmw.i32 add"), "{clif}");
+    assert!(clif.contains("atomic_rmw.i32 sub"), "{clif}");
+    assert!(clif.contains("atomic_rmw.i64 xchg"), "{clif}");
+
+    let machine = symbol_bytes(&output.object, "update");
+    assert!(
+        machine.iter().filter(|byte| **byte == 0xf0).count() >= 6,
+        "the integer RMW and compare-exchange operations must use locked x86 instructions"
+    );
+
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    for symbol in [
+        "__sync_add_and_fetch",
+        "__sync_fetch_and_add",
+        "__sync_sub_and_fetch",
+        "__sync_bool_compare_and_swap",
+        "__sync_val_compare_and_swap",
+        "__sync_lock_test_and_set",
+    ] {
+        assert!(
+            object
+                .symbols()
+                .filter(|candidate| candidate.is_undefined())
+                .all(|candidate| candidate.name() != Ok(symbol)),
+            "unexpected external reference to {symbol}"
+        );
+    }
+    assert!(
+        object
+            .sections()
+            .flat_map(|section| section.relocations())
+            .all(|(_, relocation)| {
+                let RelocationTarget::Symbol(index) = relocation.target() else {
+                    return true;
+                };
+                object.symbol_by_index(index).unwrap().name() != Ok("protected_side_effect")
+            }),
+        "the ignored protected operand must not produce a call relocation"
+    );
+}
+
+#[test]
+fn pointer_add_and_fetch_derives_the_raw_new_representation_in_clif() {
+    let output =
+        emit_source("void *advance(void **slot) { return __sync_add_and_fetch(slot, 1); }");
+    let clif = function_clif(&output.clif, "advance");
+    assert!(clif.contains("atomic_rmw.i64 add"), "{clif}");
+    assert!(clif.lines().any(|line| line.contains(" = iadd ")), "{clif}");
+}
+
+#[test]
+fn integer_intrinsics_are_native_clif_operations_without_external_symbols() {
+    let output = emit_source(
+        "unsigned long swap(unsigned long value) { return __builtin_bswap64(value); }\n\
+         int clz_int(unsigned int value) { return __builtin_clz(value); }\n\
+         int clz_long(unsigned long value) { return __builtin_clzl(value); }\n\
+         int clz_long_long(unsigned long long value) { return __builtin_clzll(value); }\n\
+         int ctz_long_long(unsigned long long value) { return __builtin_ctzll(value); }\n\
+         int popcount_int(unsigned int value) { return __builtin_popcount(value); }\n\
+         int popcount_long_long(unsigned long long value) { return __builtin_popcountll(value); }",
+    );
+    for (operation, expected) in [("bswap", 1), ("clz", 3), ("ctz", 1), ("popcnt", 2)] {
+        assert_eq!(
+            output
+                .clif
+                .lines()
+                .filter(|line| line.contains(&format!(" = {operation} ")))
+                .count(),
+            expected,
+            "{}",
+            output.clif
+        );
+    }
+
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    for symbol in [
+        "__builtin_bswap64",
+        "__builtin_clz",
+        "__builtin_clzl",
+        "__builtin_clzll",
+        "__builtin_ctzll",
+        "__builtin_popcount",
+        "__builtin_popcountll",
+    ] {
+        assert!(
+            object
+                .symbols()
+                .filter(|candidate| candidate.is_undefined())
+                .all(|candidate| candidate.name() != Ok(symbol)),
+            "unexpected external reference to {symbol}"
+        );
+    }
+}
+
+#[test]
+fn prefetch_evaluates_its_address_once_without_a_faulting_access_or_symbol() {
+    let output = emit_source(
+        "void *next_address(void);\n\
+         int protected_side_effect(void);\n\
+         void hints(void) {\n\
+             __builtin_prefetch(\n\
+                 next_address(),\n\
+                 1 ? 0 : protected_side_effect(),\n\
+                 1 ? 3 : protected_side_effect());\n\
+             __builtin_prefetch((void *)1, 1, 0);\n\
+         }",
+    );
+    let clif = function_clif(&output.clif, "hints");
+    assert_eq!(clif.matches("call fn").count(), 1, "{clif}");
+    assert!(!clif.contains("load"), "{clif}");
+    assert!(!clif.contains("store"), "{clif}");
+
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    assert!(object.symbol_by_name("__builtin_prefetch").is_none());
+    assert!(
+        object
+            .symbol_by_name("next_address")
+            .is_some_and(|symbol| symbol.is_undefined())
+    );
+    assert!(
+        object
+            .sections()
+            .flat_map(|section| section.relocations())
+            .all(|(_, relocation)| {
+                let RelocationTarget::Symbol(index) = relocation.target() else {
+                    return true;
+                };
+                object.symbol_by_index(index).unwrap().name() != Ok("protected_side_effect")
+            }),
+        "the accepted constant hints must not produce a call relocation"
+    );
+}
+
+#[test]
 fn discarded_volatile_scalar_and_aggregate_reads_remain_explicit() {
     let scalar = emit_source("volatile int observed; void consume(void) { observed; }");
     let scalar = function_clif(&scalar.clif, "consume");
