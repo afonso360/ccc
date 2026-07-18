@@ -299,6 +299,32 @@ fn an_invalid_computed_goto_target_traps() {
 
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
+fn runtime_sized_aggregate_return_is_materialized_before_cleanup() {
+    let directory = test_directory("runtime-sized-aggregate-return");
+    let executable = directory.join("program");
+    let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+        .arg(fixture("runtime_sized_storage_reuse.c"))
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .unwrap();
+    assert!(
+        compilation.status.success(),
+        "ccc failed: {}",
+        String::from_utf8_lossy(&compilation.stderr)
+    );
+    let execution = Command::new(&executable).output().unwrap();
+    assert_eq!(
+        execution.status.code(),
+        Some(66),
+        "runtime-sized aggregate return failed: {}",
+        String::from_utf8_lossy(&execution.stderr)
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
 fn invalid_runtime_sized_storage_extents_trap() {
     use std::os::unix::process::ExitStatusExt as _;
 

@@ -1951,7 +1951,6 @@ impl FunctionState<'_> {
         builder: &mut FunctionBuilder<'_>,
         value: Option<gir::ValueId>,
     ) -> Result<(), CodegenError> {
-        self.release_runtime_storage(builder)?;
         match self.definition_plan {
             DefinitionAbi::Native(plan) => self.lower_native_return(builder, value, plan),
             DefinitionAbi::Variadic(plan) => self.lower_variadic_return(builder, value, plan),
@@ -2148,10 +2147,13 @@ impl FunctionState<'_> {
     ) -> Result<(), CodegenError> {
         match (&plan.result, value) {
             (ccc_abi::NativeResultPlan::Void, None) => {
+                self.release_runtime_storage(builder)?;
                 builder.ins().return_(&[]);
             }
             (ccc_abi::NativeResultPlan::Scalar { .. }, Some(value)) => {
-                builder.ins().return_(&[self.value(value)?]);
+                let value = self.value(value)?;
+                self.release_runtime_storage(builder)?;
+                builder.ins().return_(&[value]);
             }
             (ccc_abi::NativeResultPlan::RegisterAggregate { classified, .. }, Some(value)) => {
                 let padded = align_up_u64(classified.size, 8)?;
@@ -2175,6 +2177,7 @@ impl FunctionState<'_> {
                         0,
                     ));
                 }
+                self.release_runtime_storage(builder)?;
                 builder.ins().return_(&results);
             }
             (ccc_abi::NativeResultPlan::Indirect { classified, .. }, Some(value)) => {
@@ -2189,6 +2192,7 @@ impl FunctionState<'_> {
                     gir::MemoryAccess::default(),
                     gir::MemoryAccess::default(),
                 )?;
+                self.release_runtime_storage(builder)?;
                 builder.ins().return_(&[]);
             }
             _ => {
@@ -2256,6 +2260,7 @@ impl FunctionState<'_> {
                 ));
             }
         }
+        self.release_runtime_storage(builder)?;
         builder.ins().return_(&[]);
         Ok(())
     }
