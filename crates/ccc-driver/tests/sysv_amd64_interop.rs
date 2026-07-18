@@ -52,9 +52,15 @@ struct wide_bits global_bits = {
     .high = 0x123456789abcU,
 };
 
+#if defined(CCC_REFERENCE_CLANG_I128_SHADOWS_R9)
+u128 fixed_pressure(long a, long b, long c, long d, long e, u128 value) {
+    return value ^ (u128)(a + b + c + d + e);
+}
+#else
 u128 fixed_pressure(long a, long b, long c, long d, long e, u128 value, long tail) {
     return value ^ (u128)(a + b + c + d + e + tail);
 }
+#endif
 
 u128 fixed_sse(double head, u128 value, double tail) {
     return value ^ (u128)((long)head + (long)tail);
@@ -166,7 +172,11 @@ struct wide_register { u128 value; };
 struct wide_memory { u128 value; long tail; };
 extern struct wide_bits global_bits;
 
+#if defined(CCC_REFERENCE_CLANG_I128_SHADOWS_R9)
+u128 fixed_pressure(long, long, long, long, long, u128);
+#else
 u128 fixed_pressure(long, long, long, long, long, u128, long);
+#endif
 u128 fixed_sse(double, u128, double);
 u128 tls_roundtrip(u128);
 struct wide_register register_wrapper(struct wide_register);
@@ -215,13 +225,21 @@ int main(void) {
     struct wide_memory memory_value = { value, 37 };
     i128 signed_value = -(((i128)1 << 100) + 12345);
     u128 unsigned_value = ((u128)1 << 100) + 12345;
+#if defined(CCC_REFERENCE_CLANG_I128_SHADOWS_R9)
+    u128 (*pressure_call)(long, long, long, long, long, u128) = fixed_pressure;
+#else
     u128 (*pressure_call)(long, long, long, long, long, u128, long) = fixed_pressure;
+#endif
 
     if (global_max != ~(u128)0) return 1;
     if (global_high != (i128)(((u128)1 << 127) - 1)) return 2;
     if (global_bits.low != (wide(0x000000000000abcdULL, 0xefffffffffefdcbaULL) & mask80)) return 3;
     if (global_bits.high != (u128)0x123456789abcULL) return 4;
+#if defined(CCC_REFERENCE_CLANG_I128_SHADOWS_R9)
+    if (pressure_call(1, 2, 3, 4, 5, value) != (value ^ (u128)15)) return 5;
+#else
     if (pressure_call(1, 2, 3, 4, 5, value, 6) != (value ^ (u128)21)) return 5;
+#endif
     if (fixed_sse(12.0, value, 34.0) != (value ^ (u128)46)) return 18;
     if (tls_wide != wide(0x123456789abcdef0ULL, 0x0fedcba987654321ULL)) return 19;
     if (tls_roundtrip(value) != value || tls_wide != value) return 20;
@@ -252,21 +270,46 @@ int main(void) {
         let directory = test_directory("wide-integers", compiler, optimization);
         let callee = write(&directory, "callee.c", CALLEE);
         let caller = write(&directory, "caller.c", CALLER);
+        let compatibility_flags = reference_compatibility_flags(compiler);
 
         let ccc_callee = directory.join("ccc-callee.o");
         let reference_caller = directory.join("reference-caller.o");
-        compile_ccc_optimized(compiler, optimization, &callee, &ccc_callee);
+        compile_ccc_optimized_with_args(
+            compiler,
+            optimization,
+            &callee,
+            &ccc_callee,
+            &compatibility_flags,
+        );
         let ccc_bytes = fs::read(&ccc_callee).unwrap();
         let ccc_object = object::File::parse(ccc_bytes.as_slice()).unwrap();
         let weak = ccc_object.symbol_by_name("weak_wide").unwrap();
         assert!(weak.is_weak(), "CCC bridge entry lost weak binding");
-        compile_reference(compiler, optimization, &caller, &reference_caller);
+        compile_reference_with_args(
+            compiler,
+            optimization,
+            &caller,
+            &reference_caller,
+            &compatibility_flags,
+        );
         link_and_run(compiler, &directory, &[&ccc_callee, &reference_caller]);
 
         let reference_callee = directory.join("reference-callee.o");
         let ccc_caller = directory.join("ccc-caller.o");
-        compile_reference(compiler, optimization, &callee, &reference_callee);
-        compile_ccc_optimized(compiler, optimization, &caller, &ccc_caller);
+        compile_reference_with_args(
+            compiler,
+            optimization,
+            &callee,
+            &reference_callee,
+            &compatibility_flags,
+        );
+        compile_ccc_optimized_with_args(
+            compiler,
+            optimization,
+            &caller,
+            &ccc_caller,
+            &compatibility_flags,
+        );
         link_and_run(compiler, &directory, &[&reference_callee, &ccc_caller]);
 
         fs::remove_dir_all(directory).unwrap();
@@ -346,6 +389,34 @@ fn reference_configurations() -> impl Iterator<Item = (&'static str, &'static st
     })
 }
 
+fn reference_compatibility_flags(compiler: &str) -> Vec<&'static str> {
+    if compiler != "clang" {
+        return Vec::new();
+    }
+
+    let output = run(Command::new(compiler).args(["-dM", "-E", "-x", "c", "-"]));
+    let predefined = String::from_utf8(output.stdout).unwrap();
+    let major = predefined
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("#define __clang_major__ ")
+                .and_then(|value| value.parse::<u32>().ok())
+        })
+        .expect("Clang did not advertise __clang_major__");
+
+    // LLVM 18 and 19 keep R9 reserved after atomically spilling an i128
+    // argument. LLVM #123935 documents that this disagrees with the psABI;
+    // LLVM 20 fixed the allocator to leave R9 available for the trailing
+    // scalar. Keep all wide-value stack interop coverage on older Clang while
+    // the exact conforming trailing-register placement remains locked by the
+    // ABI dump below and exercised with GCC and current Clang.
+    if major < 20 {
+        vec!["-DCCC_REFERENCE_CLANG_I128_SHADOWS_R9=1"]
+    } else {
+        Vec::new()
+    }
+}
+
 fn compile_ccc(compiler: &str, source: &Path, object: &Path) {
     let staging_directory = object.parent().unwrap().join(format!(
         "ccc-stage-{}",
@@ -363,7 +434,13 @@ fn compile_ccc(compiler: &str, source: &Path, object: &Path) {
     fs::remove_dir_all(&staging_directory).unwrap();
 }
 
-fn compile_ccc_optimized(compiler: &str, optimization: &str, source: &Path, object: &Path) {
+fn compile_ccc_optimized_with_args(
+    compiler: &str,
+    optimization: &str,
+    source: &Path,
+    object: &Path,
+    extra_arguments: &[&str],
+) {
     let staging_directory = object.parent().unwrap().join(format!(
         "ccc-stage-{}",
         TEST_ID.fetch_add(1, Ordering::Relaxed)
@@ -373,6 +450,7 @@ fn compile_ccc_optimized(compiler: &str, optimization: &str, source: &Path, obje
     run(Command::new(env!("CARGO_BIN_EXE_ccc"))
         .env("CCC_CC", compiler)
         .arg(optimization)
+        .args(extra_arguments)
         .arg("-c")
         .arg(source)
         .arg("-o")
@@ -382,6 +460,16 @@ fn compile_ccc_optimized(compiler: &str, optimization: &str, source: &Path, obje
 }
 
 fn compile_reference(compiler: &str, optimization: &str, source: &Path, object: &Path) {
+    compile_reference_with_args(compiler, optimization, source, object, &[]);
+}
+
+fn compile_reference_with_args(
+    compiler: &str,
+    optimization: &str,
+    source: &Path,
+    object: &Path,
+    extra_arguments: &[&str],
+) {
     run(Command::new(compiler)
         .args([
             "-std=c11",
@@ -391,6 +479,7 @@ fn compile_reference(compiler: &str, optimization: &str, source: &Path, object: 
             "-Werror",
             "-c",
         ])
+        .args(extra_arguments)
         .arg(source)
         .arg("-o")
         .arg(object));
