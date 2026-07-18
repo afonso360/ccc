@@ -7,7 +7,31 @@ source "$script_directory/../adapter-environment.sh"
 
 : "${CCC:?set CCC to the ccc executable}"
 : "${CCC_RESOURCE_DIR:?set CCC_RESOURCE_DIR to the shipped resource directory}"
-: "${CCC_LINK_CC:=gcc}"
+: "${CCC_LINK_CC:?set CCC_LINK_CC to the selected target link driver}"
+: "${CCC_BZIP2_TARGET:?set CCC_BZIP2_TARGET to the selected target triple}"
+
+case "$CCC_BZIP2_TARGET" in
+  x86_64-unknown-linux-gnu | aarch64-unknown-linux-gnu | \
+    riscv64-unknown-linux-gnu)
+    : "${CCC_BZIP2_SYSROOT:?set CCC_BZIP2_SYSROOT to the compiler sysroot}"
+    [[ -d "$CCC_BZIP2_SYSROOT" ]] || {
+      echo "ccc-cc: compiler sysroot does not exist: $CCC_BZIP2_SYSROOT" >&2
+      exit 2
+    }
+    ;;
+  aarch64-apple-darwin)
+    : "${CCC_BZIP2_SDKROOT:?set CCC_BZIP2_SDKROOT to the macOS SDK}"
+    : "${CCC_BZIP2_DEPLOYMENT_TARGET:?set CCC_BZIP2_DEPLOYMENT_TARGET}"
+    [[ -d "$CCC_BZIP2_SDKROOT" ]] || {
+      echo "ccc-cc: macOS SDK does not exist: $CCC_BZIP2_SDKROOT" >&2
+      exit 2
+    }
+    ;;
+  *)
+    echo "ccc-cc: unsupported target: $CCC_BZIP2_TARGET" >&2
+    exit 2
+    ;;
+esac
 
 export CCC_CC="$CCC_LINK_CC"
 
@@ -60,13 +84,33 @@ record_source() {
 }
 
 run_ccc() {
-  log_command ccc "$CCC" -resource-dir "$CCC_RESOURCE_DIR" "$@"
-  "$CCC" -resource-dir "$CCC_RESOURCE_DIR" "$@"
+  local target_arguments=("--target=$CCC_BZIP2_TARGET")
+  if [[ "$CCC_BZIP2_TARGET" == aarch64-apple-darwin ]]; then
+    target_arguments+=(
+      -isysroot "$CCC_BZIP2_SDKROOT"
+      "-mmacosx-version-min=$CCC_BZIP2_DEPLOYMENT_TARGET"
+    )
+  else
+    target_arguments+=("--sysroot=$CCC_BZIP2_SYSROOT")
+  fi
+  log_command ccc "$CCC" -resource-dir "$CCC_RESOURCE_DIR" \
+    "${target_arguments[@]}" "$@"
+  "$CCC" -resource-dir "$CCC_RESOURCE_DIR" \
+    "${target_arguments[@]}" "$@"
 }
 
 run_linker() {
-  log_command link "$CCC_LINK_CC" "$@"
-  "$CCC_LINK_CC" "$@"
+  local target_arguments=()
+  if [[ "$CCC_BZIP2_TARGET" == aarch64-apple-darwin ]]; then
+    target_arguments+=(
+      -isysroot "$CCC_BZIP2_SDKROOT"
+      "-mmacosx-version-min=$CCC_BZIP2_DEPLOYMENT_TARGET"
+    )
+  else
+    target_arguments+=("--sysroot=$CCC_BZIP2_SYSROOT")
+  fi
+  log_command link "$CCC_LINK_CC" "${target_arguments[@]}" "$@"
+  "$CCC_LINK_CC" "${target_arguments[@]}" "$@"
 }
 
 arguments=("$@")
