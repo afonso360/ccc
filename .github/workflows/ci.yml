@@ -10,11 +10,17 @@ permissions:
 
 jobs:
   test:
-    runs-on: [self-hosted, Linux, X64, homelab]
+    runs-on: ubuntu-24.04
     env:
       CCC_REQUIRE_SYSV_ABI_TESTS: "1"
     steps:
       - uses: actions/checkout@v7
+      - name: Install native ABI and corpus prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            binutils clang coreutils curl g++ gcc gdb make openssl patch \
+            pkg-config tcl-dev zlib1g-dev
       - name: Verify runner prerequisites
         shell: bash
         run: |
@@ -104,7 +110,7 @@ jobs:
           if-no-files-found: error
 
   target-oracle-linux:
-    runs-on: [self-hosted, Linux, X64, homelab]
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
