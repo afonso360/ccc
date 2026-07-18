@@ -241,6 +241,15 @@ pub struct ArrayType {
     pub length: ArrayLength,
 }
 
+/// A GNU typedef alignment adjustment applied to an otherwise ordinary scalar
+/// type. The wrapper is layout-bearing but does not introduce a distinct C
+/// type for compatibility or arithmetic-conversion purposes.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct AlignmentAdjustedType {
+    pub underlying: TypeId,
+    pub alignment: u64,
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum FunctionParameters {
     Unspecified,
@@ -413,4 +422,5 @@ pub enum TypeKind {
     Function(FunctionType),
     Enum(EnumId),
     Record(RecordId),
+    AlignmentAdjusted(AlignmentAdjustedType),
 }

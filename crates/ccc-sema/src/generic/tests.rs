@@ -570,6 +570,93 @@ fn aligned_attribute_preserves_object_and_private_typedef_alignment() {
 }
 
 #[test]
+fn aligned_integer_typedefs_preserve_layout_and_ordinary_integer_semantics() {
+    let unit = analyze_source(
+        "typedef __attribute__((aligned(1))) unsigned short unalign16;\n\
+         typedef __attribute__((aligned(1))) unsigned int unalign32;\n\
+         typedef __attribute__((aligned(1))) unsigned long unalign64;\n\
+         typedef unalign32 __attribute__((aligned(2))) realign32;\n\
+         struct Wire { char tag; unalign32 value; };\n\
+         _Static_assert(sizeof(unalign32) == 4, \"size\");\n\
+         _Static_assert(_Alignof(unalign32) == 1, \"alignment\");\n\
+         _Static_assert(sizeof(struct Wire) == 5, \"record size\");\n\
+         _Static_assert(__builtin_offsetof(struct Wire, value) == 1, \"offset\");\n\
+         void compatible(unsigned int *pointer);\n\
+         void compatible(unalign32 *pointer);\n\
+         unalign32 read32(const void *pointer) { return *(const unalign32 *)pointer; }\n\
+         void write32(void *pointer, unsigned int value) { *(unalign32 *)pointer = value; }\n\
+         int pointers(void) { unalign32 *adjusted = 0; unsigned int *ordinary = adjusted; adjusted = ordinary; return adjusted == ordinary; }\n\
+         unsigned long arithmetic(unalign16 a, unalign32 b, unalign64 c) { return a + b + c; }",
+    )
+    .unwrap();
+
+    let adjusted = unit
+        .typedefs
+        .iter()
+        .find(|typedef| typedef.name == "unalign32")
+        .unwrap()
+        .ty
+        .ty;
+    assert_ne!(adjusted, TypeId::UNSIGNED_INT);
+    assert_eq!(
+        unit.types
+            .layout_of(adjusted, &EffectiveCompilationConfig::default())
+            .unwrap()
+            .align,
+        1
+    );
+    let realigned = unit
+        .typedefs
+        .iter()
+        .find(|typedef| typedef.name == "realign32")
+        .unwrap()
+        .ty
+        .ty;
+    assert_eq!(
+        unit.types
+            .layout_of(realigned, &EffectiveCompilationConfig::default())
+            .unwrap()
+            .align,
+        2
+    );
+    let dump = dump_frontend_typed_ast(&unit);
+    assert!(
+        dump.contains("typedef !1 unalign32 : aligned(1) unsigned int"),
+        "{dump}"
+    );
+    assert!(dump.contains("LvalueToValue"), "{dump}");
+}
+
+#[test]
+fn weakened_integer_typedef_alignment_is_rejected_for_atomic_types() {
+    for source in [
+        "typedef unsigned int unalign32 __attribute__((aligned(1))); _Atomic(unalign32) value;",
+        "typedef _Atomic unsigned int atomic_u32 __attribute__((aligned(1)));",
+    ] {
+        assert_eq!(diagnostic_codes(source), ["CCC2453"], "{source}");
+    }
+
+    analyze_source(
+        "typedef unsigned char aligned_char __attribute__((aligned(1)));\n\
+         typedef unsigned int over_aligned_int __attribute__((aligned(8)));\n\
+         _Atomic(aligned_char) byte;\n\
+         _Atomic(over_aligned_int) word;",
+    )
+    .unwrap();
+}
+
+#[test]
+fn arrays_reject_integer_typedef_alignment_larger_than_element_size() {
+    for source in [
+        "typedef int over_aligned __attribute__((aligned(8))); over_aligned values[2];",
+        "typedef int over_aligned __attribute__((aligned(8))); extern over_aligned values[];",
+        "typedef int over_aligned __attribute__((aligned(8))); void f(int n) { over_aligned values[n]; }",
+    ] {
+        assert_eq!(diagnostic_codes(source), ["CCC2342"], "{source}");
+    }
+}
+
+#[test]
 fn alignment_specifiers_reach_members_static_objects_and_automatic_storage() {
     let unit = analyze_source(
         "_Alignas(64) int global_value;\n\

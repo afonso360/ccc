@@ -5,6 +5,16 @@
 #include <features.h>
 #include <assert.h>
 
+#if defined(MEM_FORCE_MEMORY_ACCESS) || defined(XXH_FORCE_MEMORY_ACCESS)
+selected_memory_access_configuration=forced
+#else
+selected_memory_access_configuration=upstream-defaults
+#endif
+
+#include "mem.h"
+#define XXH_IMPLEMENTATION
+#include "xxhash.h"
+
 #if __GNUC__ == 4 && __GNUC_MINOR__ == 2 && __GNUC_PATCHLEVEL__ == 1
 gnu_compatibility_tuple=4.2.1
 #else
@@ -52,14 +62,14 @@ selected_count_bits=gnu-builtins
 
 selected_prefetch=compiler-builtin
 
-#if MEM_FORCE_MEMORY_ACCESS == 0
-selected_zstd_unaligned_access=memcpy
+#if MEM_FORCE_MEMORY_ACCESS == 1
+selected_zstd_unaligned_access=aligned-1-scalar-typedefs
 #else
 selected_zstd_unaligned_access=unexpected
 #endif
 
-#if XXH_FORCE_MEMORY_ACCESS == 0
-selected_xxhash_unaligned_access=memcpy
+#if XXH_FORCE_MEMORY_ACCESS == 1
+selected_xxhash_unaligned_access=aligned-1-scalar-typedefs
 #else
 selected_xxhash_unaligned_access=unexpected
 #endif

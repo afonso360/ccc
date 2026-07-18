@@ -73,6 +73,12 @@ pub enum LayoutError {
     RecursiveType(TypeId),
     InvalidPacking(PackingPolicy),
     InvalidAlignment(u64),
+    ArrayElementSizeNotMultipleOfAlignment {
+        array: TypeId,
+        element: TypeId,
+        size: u64,
+        align: u64,
+    },
     NonIntegerBitfield {
         record: RecordId,
         field: usize,
@@ -118,6 +124,16 @@ impl fmt::Display for LayoutError {
                 policy.maximum_field_alignment, policy.minimum_record_alignment
             ),
             Self::InvalidAlignment(align) => write!(formatter, "invalid alignment {align}"),
+            Self::ArrayElementSizeNotMultipleOfAlignment {
+                array,
+                element,
+                size,
+                align,
+            } => write!(
+                formatter,
+                "array type {} has element type {} with size {size} that is not a multiple of alignment {align}",
+                array.0, element.0
+            ),
             Self::NonIntegerBitfield { record, field, ty } => write!(
                 formatter,
                 "field {field} of record {} uses non-integer bitfield type {}",
@@ -218,6 +234,12 @@ impl LayoutEngine<'_> {
             TypeKind::Function(_) => Err(LayoutError::UnsizedType(id)),
             TypeKind::Enum(enum_id) => self.enum_layout(enum_id),
             TypeKind::Record(record_id) => self.record_layout(id, record_id),
+            TypeKind::AlignmentAdjusted(adjusted) => {
+                self.validate_alignment(adjusted.alignment)?;
+                let mut layout = self.layout(adjusted.underlying)?;
+                layout.align = adjusted.alignment;
+                Ok(layout)
+            }
         }
     }
 
@@ -246,6 +268,15 @@ impl LayoutEngine<'_> {
     }
 
     fn array_layout(&mut self, id: TypeId, array: ArrayType) -> Result<TypeLayout, LayoutError> {
+        let element = self.layout(array.element.ty)?;
+        if !element.size.is_multiple_of(element.align) {
+            return Err(LayoutError::ArrayElementSizeNotMultipleOfAlignment {
+                array: id,
+                element: array.element.ty,
+                size: element.size,
+                align: element.align,
+            });
+        }
         let length = match array.length {
             ArrayLength::Incomplete => return Err(LayoutError::IncompleteArray(id)),
             ArrayLength::Variable(bound) | ArrayLength::UnspecifiedVariable(bound) => {
@@ -253,7 +284,6 @@ impl LayoutEngine<'_> {
             }
             ArrayLength::Constant(length) => length,
         };
-        let element = self.layout(array.element.ty)?;
         let size = element
             .size
             .checked_mul(length)

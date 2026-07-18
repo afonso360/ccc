@@ -6,7 +6,7 @@ use ccc_types::{
     TypeKind, TypeStore,
 };
 
-use crate::{AbiError, model::*};
+use crate::{AbiError, boundary_value_alignment, model::*};
 
 const MAX_ARGUMENT_REGISTERS: u8 = 8;
 const MAX_RESULT_REGISTERS: usize = 8;
@@ -188,7 +188,7 @@ pub(crate) fn plan_va_arg(
     let overflow_align = if indirect {
         8
     } else {
-        classified.align.clamp(8, 16)
+        boundary_value_alignment(types, &classified, config)?.clamp(8, 16)
     };
     let payload_size = if indirect { 8 } else { classified.size };
     let overflow_size = align_up(payload_size, 8)?;
@@ -570,6 +570,7 @@ fn plan_bridge(
         };
         allocate_bridge_argument(
             &classified,
+            boundary_value_alignment(types, &classified, config)?,
             source_index as u32,
             extension,
             source_index >= variadic_boundary,
@@ -618,6 +619,7 @@ fn plan_bridge(
 #[allow(clippy::too_many_arguments)]
 fn allocate_bridge_argument(
     classified: &ClassifiedType,
+    boundary_alignment: u64,
     source_index: u32,
     extension: IntegerExtension,
     unnamed: bool,
@@ -655,6 +657,7 @@ fn allocate_bridge_argument(
     if darwin_stack_only {
         return allocate_whole_on_stack(
             classified,
+            boundary_alignment,
             source_index,
             extension,
             abi,
@@ -684,6 +687,7 @@ fn allocate_bridge_argument(
         *fp_used = MAX_ARGUMENT_REGISTERS;
         return allocate_whole_on_stack(
             classified,
+            boundary_alignment,
             source_index,
             extension,
             abi,
@@ -694,7 +698,7 @@ fn allocate_bridge_argument(
     }
 
     if abi == AbiIdentity::Aapcs64Lp64
-        && classified.align >= 16
+        && boundary_alignment >= 16
         && *gp_used < MAX_ARGUMENT_REGISTERS
         && !gp_used.is_multiple_of(2)
     {
@@ -719,6 +723,7 @@ fn allocate_bridge_argument(
     *gp_used = MAX_ARGUMENT_REGISTERS;
     allocate_whole_on_stack(
         classified,
+        boundary_alignment,
         source_index,
         extension,
         abi,
@@ -728,8 +733,10 @@ fn allocate_bridge_argument(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn allocate_whole_on_stack(
     classified: &ClassifiedType,
+    boundary_alignment: u64,
     source_index: u32,
     extension: IntegerExtension,
     abi: AbiIdentity,
@@ -738,9 +745,9 @@ fn allocate_whole_on_stack(
     pieces: &mut Vec<BridgePiecePlan>,
 ) -> Result<(), AbiError> {
     let alignment = if abi == AbiIdentity::DarwinArm64 && darwin_unnamed {
-        classified.align.clamp(8, 16)
+        boundary_alignment.clamp(8, 16)
     } else {
-        classified.align.clamp(1, 16)
+        boundary_alignment.clamp(1, 16)
     };
     *stack_size = align_up(*stack_size, alignment)?;
     let base = *stack_size;
@@ -1150,6 +1157,36 @@ fn boundary_scalar(
                 | BuiltinType::Int
                 | BuiltinType::Long
                 | BuiltinType::LongLong => true,
+                _ => false,
+            };
+            Ok(if signed {
+                AbiScalar::SignedInteger { bits }
+            } else {
+                AbiScalar::UnsignedInteger { bits }
+            })
+        }
+        Some(TypeKind::AlignmentAdjusted(_)) => {
+            let builtin = types.builtin_type(ty).ok_or_else(|| {
+                AbiError::new(
+                    "CCC3508",
+                    format!(
+                        "type `{}` has no scalar ABI representation",
+                        types.display(ty)
+                    ),
+                )
+            })?;
+            let layout = types.layout_of(ty, config).map_err(|error| {
+                AbiError::new("CCC3502", format!("integer has no ABI layout: {error}"))
+            })?;
+            let bits = (layout.size * 8) as u8;
+            let signed = match builtin {
+                BuiltinType::Char => config.target.data_layout.char_is_signed,
+                BuiltinType::SignedChar
+                | BuiltinType::Short
+                | BuiltinType::Int
+                | BuiltinType::Long
+                | BuiltinType::LongLong
+                | BuiltinType::Int128 => true,
                 _ => false,
             };
             Ok(if signed {

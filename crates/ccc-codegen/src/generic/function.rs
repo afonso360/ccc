@@ -1567,10 +1567,7 @@ impl FunctionState<'_> {
         let vr_offset = builder
             .ins()
             .load(ir::types::I32, MemFlags::new(), vr_offset_address, 0);
-        if !plan.indirect
-            && plan.gp_slots != 0
-            && plan.sse_slots == 0
-            && plan.classified.align >= 16
+        if !plan.indirect && plan.gp_slots != 0 && plan.sse_slots == 0 && plan.overflow_align >= 16
         {
             let advanced = builder.ins().iadd_imm(gr_offset, 15);
             gr_offset = builder.ins().band_imm(advanced, -16);
@@ -3113,6 +3110,11 @@ pub(super) fn scalar_type(
                 .underlying;
             scalar_type(types, QualifiedType::unqualified(underlying), config)
         }
+        Some(TypeKind::AlignmentAdjusted(adjusted)) => scalar_type(
+            types,
+            QualifiedType::new(adjusted.underlying, ty.qualifiers),
+            config,
+        ),
         Some(TypeKind::Pointer(_)) => Ok(ir::types::I64),
         Some(TypeKind::Array(_) | TypeKind::Record(_)) => Err(CodegenError {
             code: "CCC3508",
@@ -3181,6 +3183,11 @@ fn is_signed(
                 .underlying;
             is_signed(types, QualifiedType::unqualified(underlying), config)
         }
+        Some(TypeKind::AlignmentAdjusted(adjusted)) => is_signed(
+            types,
+            QualifiedType::new(adjusted.underlying, ty.qualifiers),
+            config,
+        ),
         Some(TypeKind::Pointer(_)) => Ok(false),
         _ => Err(error(format!(
             "type `{}` has no integer signedness",

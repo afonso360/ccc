@@ -2,7 +2,7 @@ use ccc_target::{EffectiveCompilationConfig, PackingPolicy};
 use ccc_types::{
     ArrayLength, ArrayType, BitfieldLayout, BuiltinType, Enumerator, Field, FunctionType,
     LayoutError, LayoutShape, QualifiedType, RecordKind, TypeId, TypeLayout, TypeQualifiers,
-    TypeStore,
+    TypeStore, VariableLengthId,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -143,6 +143,74 @@ fn arrays_report_static_incomplete_and_runtime_shapes() {
             bound
         })
     );
+}
+
+#[test]
+fn alignment_adjusted_integer_layout_controls_objects_fields_and_arrays() {
+    let mut types = TypeStore::default();
+    let unaligned = types.alignment_adjusted(TypeId::UNSIGNED_INT, 1);
+    let scalar = types.layout_of(unaligned, &config()).unwrap();
+    assert_eq!(scalar.size_align(), SizeAlign { size: 4, align: 1 });
+    assert_eq!(scalar.shape, LayoutShape::Builtin(BuiltinType::UnsignedInt));
+
+    let (record_id, record) = types.declare_record(RecordKind::Struct, None);
+    types
+        .complete_record(
+            record_id,
+            vec![
+                Field::named("tag", TypeId::CHAR),
+                Field::named("value", unaligned),
+            ],
+        )
+        .unwrap();
+    assert_eq!(
+        types.layout_of(record, &config()).unwrap().size_align(),
+        SizeAlign { size: 5, align: 1 }
+    );
+    assert_eq!(
+        record_fields(&types, record),
+        vec![(0, 1, 1, None), (1, 4, 1, None)]
+    );
+
+    let array = types.array(ArrayType {
+        element: unaligned.into(),
+        length: ArrayLength::Constant(2),
+    });
+    let layout = types.layout_of(array, &config()).unwrap();
+    assert_eq!(layout.size_align(), SizeAlign { size: 8, align: 1 });
+    assert_eq!(
+        layout.shape,
+        LayoutShape::Array {
+            length: 2,
+            stride: 4,
+        }
+    );
+}
+
+#[test]
+fn every_array_shape_rejects_scalar_alignment_larger_than_the_element_size() {
+    let mut types = TypeStore::default();
+    let over_aligned = types.alignment_adjusted(TypeId::INT, 8);
+    for length in [
+        ArrayLength::Constant(2),
+        ArrayLength::Incomplete,
+        ArrayLength::Variable(VariableLengthId(0)),
+        ArrayLength::UnspecifiedVariable(VariableLengthId(1)),
+    ] {
+        let array = types.array(ArrayType {
+            element: over_aligned.into(),
+            length,
+        });
+        assert_eq!(
+            types.layout_of(array, &config()),
+            Err(LayoutError::ArrayElementSizeNotMultipleOfAlignment {
+                array,
+                element: over_aligned,
+                size: 4,
+                align: 8,
+            })
+        );
+    }
 }
 
 #[test]

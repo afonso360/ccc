@@ -371,6 +371,11 @@ fn encode_types(encoder: &mut Encoder, types: &TypeStore) -> Result<(), AbiError
                     }
                 }
             }
+            TypeKind::AlignmentAdjusted(adjusted) => {
+                encoder.tag(6);
+                encoder.type_id(adjusted.underlying);
+                encoder.u64(adjusted.alignment);
+            }
         }
         count += 1;
     }
@@ -1231,5 +1236,26 @@ mod tests {
             crate::hex(&translation_unit.0),
             "403fcbbf0155eff8563cc1ae9cdc4adc7791a1ced4a6301e40555e7f6ed9b77d"
         );
+    }
+
+    #[test]
+    fn alignment_adjustments_are_part_of_the_ir_shape_digest() {
+        let module = |alignment| {
+            let mut types = TypeStore::default();
+            types.alignment_adjusted(ccc_types::TypeId::UNSIGNED_INT, alignment);
+            gir::FullModule {
+                types,
+                globals: Vec::new(),
+                strings: Vec::new(),
+                functions: Vec::new(),
+            }
+        };
+        let key = abi_config_key(&EffectiveCompilationConfig::x86_64_unknown_linux_gnu()).unwrap();
+        let first = ir_shape_digest(&module(1), &key).unwrap();
+        let repeated = ir_shape_digest(&module(1), &key).unwrap();
+        let different_alignment = ir_shape_digest(&module(2), &key).unwrap();
+
+        assert_eq!(first, repeated);
+        assert_ne!(first, different_alignment);
     }
 }

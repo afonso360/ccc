@@ -86,6 +86,8 @@ grep -Fxq "$source_directory/lib/a.c" "$CCC_ZSTD_SOURCE_LOG"
 grep '^ccc ' "$CCC_ZSTD_COMMAND_LOG" | grep -Fq -- ' -MMD -MP -MF'
 grep '^ccc ' "$CCC_ZSTD_COMMAND_LOG" | grep -Fq -- ' -MT dependency-target.o'
 ! grep '^ccc ' "$CCC_ZSTD_COMMAND_LOG" | grep -q -- ' -std='
+! grep '^ccc ' "$CCC_ZSTD_COMMAND_LOG" | \
+  grep -Eq 'MEM_FORCE_MEMORY_ACCESS|XXH_FORCE_MEMORY_ACCESS'
 
 : >"$TRACE"
 : >"$CCC_ZSTD_COMMAND_LOG"

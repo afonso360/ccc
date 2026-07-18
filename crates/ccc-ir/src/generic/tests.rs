@@ -6,7 +6,7 @@ use ccc_sema::generic::{
 use ccc_session::SourceMap;
 use ccc_syntax::frontend as syntax;
 use ccc_target::EffectiveCompilationConfig;
-use ccc_types::{ArrayLength, ArrayType, QualifiedType, RecordKind, TypeId};
+use ccc_types::{ArrayLength, ArrayType, QualifiedType, RecordKind, TypeId, TypeKind};
 
 use super::*;
 
@@ -69,6 +69,51 @@ fn lowers_runtime_sized_objects_and_dynamic_pointer_strides_explicitly() {
     let dump = dump_frontend_ir(&module);
     assert!(dump.contains("runtime.allocate"), "{dump}");
     assert!(dump.contains("pointer.offset.runtime"), "{dump}");
+}
+
+#[test]
+fn aligned_integer_pointer_accesses_keep_the_layout_bearing_object_type() {
+    let module = lower_source(
+        "typedef __attribute__((aligned(1))) unsigned int unalign32;\n\
+         unalign32 read32(const void *pointer) { return *(const unalign32 *)pointer; }\n\
+         void write32(void *pointer, unalign32 value) { *(unalign32 *)pointer = value; }",
+    );
+    verify_frontend(&module).unwrap();
+
+    let mut loads = Vec::new();
+    let mut stores = Vec::new();
+    for function in &module.functions {
+        for block in &function.blocks {
+            for instruction in &block.instructions {
+                match &instruction.kind {
+                    FullInstructionKind::Load { object, .. } => loads.push(*object),
+                    FullInstructionKind::Store { object, .. } => stores.push(*object),
+                    _ => {}
+                }
+            }
+        }
+    }
+    let adjusted = loads
+        .iter()
+        .chain(&stores)
+        .find(|object| {
+            matches!(
+                module.types.try_kind(object.ty),
+                Some(TypeKind::AlignmentAdjusted(_))
+            )
+        })
+        .copied()
+        .expect("an aligned scalar load or store");
+    assert_eq!(
+        module
+            .types
+            .layout_of(adjusted.ty, &EffectiveCompilationConfig::default())
+            .unwrap()
+            .align,
+        1
+    );
+    assert!(loads.iter().any(|object| object.ty == adjusted.ty));
+    assert!(stores.iter().any(|object| object.ty == adjusted.ty));
 }
 
 #[test]

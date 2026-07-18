@@ -273,13 +273,21 @@ a standard AST node does not acquire a stronger contract than its registry key.
 | State                     | Exact keys and rationale                                                                                                                                                                                                                   |
 | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | Implemented               | `noreturn`, `__noreturn__`, record-specifier `packed` and `__packed__`, `mode`, `__mode__`, `aligned`, `__aligned__`, `weak`, `__weak__`, `visibility`, `tls_model`, `__tls_model__`, and the all-pointer inline-anonymous-typedef subset of `transparent_union` and `__transparent_union__`; their control-flow, type, layout, binding, visibility, TLS relocation, or calling effects are retained through the applicable compiler stages. Other `packed` placements receive `CCC2432`; unsupported transparent-union forms receive `CCC2439`; applying `tls_model` to an object without thread storage duration receives `CCC2441`. |
-| Behavior-compatible no-op | `nothrow`, `__nothrow__`, `pure`, `__pure__`, `const`, `__const__`, `malloc`, `__malloc__`, `format`, `__format__`, `nonnull`, `__nonnull__`, `warn_unused_result`, `__warn_unused_result__`, `unused`, `__unused__`, `deprecated`, `__deprecated__`, `noinline`, `__noinline__`, `always_inline`, `__always_inline__`, `may_alias`, `__may_alias__`, `alloc_size`, `__alloc_size__`; CCC emits no TBAA metadata or allocation-size optimization, so omitting those optimizer contracts does not change generated behavior. The `aligned(1), may_alias` scalar-typedef idiom is accepted narrowly because scalar memory operations are unaligned-safe; it does not advertise general alignment-bearing scalar typedefs. |
+| Behavior-compatible no-op | `nothrow`, `__nothrow__`, `pure`, `__pure__`, `const`, `__const__`, `malloc`, `__malloc__`, `format`, `__format__`, `nonnull`, `__nonnull__`, `warn_unused_result`, `__warn_unused_result__`, `unused`, `__unused__`, `deprecated`, `__deprecated__`, `noinline`, `__noinline__`, `always_inline`, `__always_inline__`, `may_alias`, `__may_alias__`, `alloc_size`, `__alloc_size__`; CCC emits no TBAA metadata or allocation-size optimization, so omitting those optimizer contracts does not change generated behavior. |
 | Parse-only                | `gnu_inline`, `__gnu_inline__`; these have an observable semantic or emission effect that the default configuration does not advertise                                                                                                                                                                                                                             |
 | Unsupported               | Every other attribute name, including empty or unknown names                                                                                                                                                                               |
 
 Semantic analysis rejects parse-only and unknown attributes with `CCC2345`;
 retaining balanced argument tokens in the AST is not permission to ignore
 them.
+
+On builtin integer typedefs, `aligned` records the exact requested object
+alignment while preserving the underlying integer's size, compatibility,
+promotions, and ABI scalar carrier. Record fields and scalar memory accesses
+use the adjusted layout. Arrays whose element size is not a multiple of the
+requested alignment and atomic types with weaker-than-native alignment are
+rejected. `may_alias` remains an independent behavior-compatible no-op because
+CCC emits no type-based alias metadata.
 
 ### Builtins, features, and pragmas
 

@@ -6,7 +6,7 @@ use ccc_types::{
     TypeKind, TypeStore,
 };
 
-use crate::{AbiError, model::*};
+use crate::{AbiError, boundary_value_alignment, model::*};
 
 const ARGUMENT_REGISTERS: u8 = 8;
 
@@ -172,7 +172,9 @@ pub(crate) fn plan_va_arg(
         overflow_align: if indirect {
             8
         } else {
-            classified.align.clamp(8, 16)
+            // GCC's RISC-V ABI treats a scalar typedef's alignment attribute
+            // as object layout rather than variadic transport alignment.
+            boundary_value_alignment(types, &classified, config)?.clamp(8, 16)
         },
         gp_slots: if indirect {
             1
@@ -496,6 +498,7 @@ fn plan_bridge(
         };
         allocate_bridge_argument(
             &classified,
+            boundary_value_alignment(types, &classified, config)?,
             source_index as u32,
             extension,
             source_index >= variadic_boundary,
@@ -545,6 +548,7 @@ fn plan_bridge(
 #[allow(clippy::too_many_arguments)]
 fn allocate_bridge_argument(
     classified: &ClassifiedType,
+    boundary_alignment: u64,
     source_index: u32,
     extension: IntegerExtension,
     unnamed: bool,
@@ -634,9 +638,14 @@ fn allocate_bridge_argument(
         integer_aggregate_classification(classified)
     };
     let slot_count = integer.size.div_ceil(8).max(1) as u8;
+    let slot_alignment = if classified.passing == PassingMode::Scalar {
+        boundary_alignment
+    } else {
+        integer.align
+    };
     let locations = allocate_integer_slot(
         slot_count,
-        integer.align,
+        slot_alignment,
         unnamed,
         gp_used,
         stack_size,
@@ -867,6 +876,16 @@ fn flatten_aggregate(
                 class: AbiClass::Integer,
             }]))
         }
+        Some(TypeKind::AlignmentAdjusted(_)) => {
+            let layout = types.layout_of(ty, config).map_err(|error| {
+                AbiError::new("CCC3502", format!("integer has no ABI layout: {error}"))
+            })?;
+            Ok(Some(vec![FlattenedLeaf {
+                offset: base,
+                size: layout.size as u8,
+                class: AbiClass::Integer,
+            }]))
+        }
         Some(TypeKind::Pointer(_)) => Ok(Some(vec![FlattenedLeaf {
             offset: base,
             size: 8,
@@ -1020,6 +1039,36 @@ fn boundary_scalar(
                 | BuiltinType::Int
                 | BuiltinType::Long
                 | BuiltinType::LongLong => true,
+                _ => false,
+            };
+            Ok(if signed {
+                AbiScalar::SignedInteger { bits }
+            } else {
+                AbiScalar::UnsignedInteger { bits }
+            })
+        }
+        Some(TypeKind::AlignmentAdjusted(_)) => {
+            let builtin = types.builtin_type(ty).ok_or_else(|| {
+                AbiError::new(
+                    "CCC3508",
+                    format!(
+                        "type `{}` has no scalar ABI representation",
+                        types.display(ty)
+                    ),
+                )
+            })?;
+            let layout = types.layout_of(ty, config).map_err(|error| {
+                AbiError::new("CCC3502", format!("integer has no ABI layout: {error}"))
+            })?;
+            let bits = (layout.size * 8) as u8;
+            let signed = match builtin {
+                BuiltinType::Char => config.target.data_layout.char_is_signed,
+                BuiltinType::SignedChar
+                | BuiltinType::Short
+                | BuiltinType::Int
+                | BuiltinType::Long
+                | BuiltinType::LongLong
+                | BuiltinType::Int128 => true,
                 _ => false,
             };
             Ok(if signed {

@@ -7,9 +7,9 @@ use ccc_target::{
 };
 
 use crate::{
-    ArrayLength, ArrayType, BuiltinType, EnumBody, EnumDefinition, EnumId, Enumerator, Field,
-    FunctionParameters, FunctionType, LayoutError, QualifiedType, RecordDefinition, RecordId,
-    RecordKind, TypeId, TypeKind, TypeLayout, VariableLengthId,
+    AlignmentAdjustedType, ArrayLength, ArrayType, BuiltinType, EnumBody, EnumDefinition, EnumId,
+    Enumerator, Field, FunctionParameters, FunctionType, LayoutError, QualifiedType,
+    RecordDefinition, RecordId, RecordKind, TypeId, TypeKind, TypeLayout, VariableLengthId,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -148,10 +148,38 @@ impl TypeStore {
     }
 
     pub fn builtin_type(&self, id: TypeId) -> Option<BuiltinType> {
-        match self.try_kind(id)? {
-            TypeKind::Builtin(kind) => Some(*kind),
-            _ => None,
+        let mut current = id;
+        loop {
+            match self.try_kind(current)? {
+                TypeKind::Builtin(kind) => return Some(*kind),
+                TypeKind::AlignmentAdjusted(adjusted) => current = adjusted.underlying,
+                _ => return None,
+            }
         }
+    }
+
+    /// Returns the C type identity beneath any typedef alignment adjustment.
+    pub fn without_alignment_adjustment(&self, id: TypeId) -> TypeId {
+        let mut current = id;
+        while let Some(TypeKind::AlignmentAdjusted(adjusted)) = self.try_kind(current) {
+            current = adjusted.underlying;
+        }
+        current
+    }
+
+    /// Interns an exact GNU typedef alignment adjustment. A later aligned
+    /// typedef replaces, rather than compounds with, an earlier adjustment.
+    pub fn alignment_adjusted(&mut self, underlying: TypeId, alignment: u64) -> TypeId {
+        let underlying = self.without_alignment_adjustment(underlying);
+        assert!(
+            self.builtin_type(underlying)
+                .is_some_and(BuiltinType::is_integer),
+            "only builtin integer types may carry a typedef alignment adjustment"
+        );
+        self.intern(TypeKind::AlignmentAdjusted(AlignmentAdjustedType {
+            underlying,
+            alignment,
+        }))
     }
 
     pub fn is_integer(&self, id: TypeId) -> bool {
@@ -353,10 +381,10 @@ impl TypeStore {
         underlying: TypeId,
         enumerators: Vec<Enumerator>,
     ) -> Result<(), DefinitionError> {
-        if !self
-            .builtin_type(underlying)
-            .is_some_and(BuiltinType::is_integer)
-        {
+        if !matches!(
+            self.try_kind(underlying),
+            Some(TypeKind::Builtin(kind)) if kind.is_integer()
+        ) {
             return Err(DefinitionError::InvalidEnumUnderlying(underlying));
         }
         let definition = self
@@ -400,6 +428,11 @@ impl TypeStore {
             TypeKind::Function(signature) => self.display_function(signature),
             TypeKind::Enum(id) => self.display_enum(*id),
             TypeKind::Record(id) => self.display_record(*id),
+            TypeKind::AlignmentAdjusted(adjusted) => format!(
+                "aligned({}) {}",
+                adjusted.alignment,
+                self.display(adjusted.underlying)
+            ),
         }
     }
 

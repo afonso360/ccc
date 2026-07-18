@@ -680,6 +680,7 @@ impl<'a> Analyzer<'a> {
                 "atomic 128-bit integers and aggregates containing them are not enabled",
             );
         }
+        self.reject_weakened_atomic_alignment(base, specifiers.span)?;
         let mut requested_alignment = None;
         for specifier in &alignment_specifiers {
             if let Some(alignment) = self.resolve_alignment_specifier(specifier, specifiers.span)? {
@@ -1291,22 +1292,17 @@ impl<'a> Analyzer<'a> {
         }
         let va_start_restriction = if register {
             Some("it has `register` storage class")
+        } else if matches!(
+            &declared_kind,
+            Some(TypeKind::Array(_) | TypeKind::Function(_))
+        ) {
+            Some("it is declared with array or function type")
+        } else if self.types.builtin_type(ty.ty) == Some(BuiltinType::Float)
+            || self.types.is_integer(ty.ty) && self.integer_promotion_changes_type(ty.ty)
+        {
+            Some("its type is changed by the default argument promotions")
         } else {
-            match &declared_kind {
-                Some(TypeKind::Array(_) | TypeKind::Function(_)) => {
-                    Some("it is declared with array or function type")
-                }
-                Some(TypeKind::Builtin(BuiltinType::Float)) => {
-                    Some("its type is changed by the default argument promotions")
-                }
-                Some(TypeKind::Builtin(kind)) if kind.is_integer() => self
-                    .integer_promotion_changes_type(ty.ty)
-                    .then_some("its type is changed by the default argument promotions"),
-                Some(TypeKind::Enum(_)) => self
-                    .integer_promotion_changes_type(ty.ty)
-                    .then_some("its type is changed by the default argument promotions"),
-                _ => None,
-            }
+            None
         };
         ty = match declared_kind {
             Some(TypeKind::Array(array)) => {
@@ -3714,7 +3710,16 @@ impl<'a> Analyzer<'a> {
         let supported_size = self
             .types
             .layout_of(object.ty, self.config)
-            .is_ok_and(|layout| matches!(layout.size, 1 | 2 | 4 | 8));
+            .is_ok_and(|layout| {
+                let adjusted_alignment_is_native = match self.types.try_kind(object.ty) {
+                    Some(TypeKind::AlignmentAdjusted(adjusted)) => self
+                        .types
+                        .layout_of(adjusted.underlying, self.config)
+                        .is_ok_and(|underlying| layout.align >= underlying.align),
+                    _ => true,
+                };
+                matches!(layout.size, 1 | 2 | 4 | 8) && adjusted_alignment_is_native
+            });
         if !(integer || pointer_object) || !supported_size {
             return self.fail(
                 "CCC2434",
@@ -6750,7 +6755,7 @@ impl<'a> Analyzer<'a> {
                 .enumeration(*id)
                 .and_then(|enumeration| enumeration.body.as_ref())
                 .is_none_or(|body| body.underlying != promoted),
-            _ => promoted != ty,
+            _ => !self.type_ids_compatible(promoted, ty),
         }
     }
 
@@ -6959,6 +6964,11 @@ impl<'a> Analyzer<'a> {
         if left == right {
             return true;
         }
+        let left = self.types.without_alignment_adjustment(left);
+        let right = self.types.without_alignment_adjustment(right);
+        if left == right {
+            return true;
+        }
         match (self.types.try_kind(left), self.types.try_kind(right)) {
             (Some(TypeKind::Pointer(left)), Some(TypeKind::Pointer(right))) => {
                 self.types_compatible(left.pointee, right.pointee)
@@ -7023,6 +7033,12 @@ impl<'a> Analyzer<'a> {
     fn composite_type_id(&mut self, left: TypeId, right: TypeId) -> Option<TypeId> {
         if left == right {
             return Some(left);
+        }
+
+        if self.types.without_alignment_adjustment(left)
+            == self.types.without_alignment_adjustment(right)
+        {
+            return Some(right);
         }
 
         if let (Some(left_signature), Some(right_signature)) = (
@@ -7121,7 +7137,7 @@ impl<'a> Analyzer<'a> {
             match self.types.builtin_type(parameter.ty) {
                 Some(BuiltinType::Float) => false,
                 Some(kind) if kind.is_integer() => {
-                    self.promoted_integer_type(parameter.ty) == parameter.ty
+                    self.type_ids_compatible(self.promoted_integer_type(parameter.ty), parameter.ty)
                 }
                 _ => !matches!(self.types.try_kind(parameter.ty), Some(TypeKind::Enum(_))),
             }
@@ -7157,7 +7173,8 @@ impl<'a> Analyzer<'a> {
                     TypeKind::Builtin(_)
                     | TypeKind::Pointer(_)
                     | TypeKind::Function(_)
-                    | TypeKind::Enum(_),
+                    | TypeKind::Enum(_)
+                    | TypeKind::AlignmentAdjusted(_),
                 )
                 | None => false,
             };
@@ -7497,16 +7514,15 @@ impl<'a> Analyzer<'a> {
         let Some(alignment) = requested else {
             return Ok(ty);
         };
-        if alignment == 1
-            && self.types.is_integer(ty.ty)
-            && attributes
-                .iter()
-                .any(|attribute| attribute_has_name(attribute, "may_alias"))
+        if self
+            .types
+            .builtin_type(ty.ty)
+            .is_some_and(BuiltinType::is_integer)
         {
-            // CCC does not attach TBAA metadata, and its scalar load/store
-            // paths are explicitly unaligned-safe. Preserve the ordinary
-            // scalar type for this narrow GNU unaligned-access idiom.
-            return Ok(ty);
+            let adjusted = self.types.alignment_adjusted(ty.ty, alignment);
+            let adjusted = QualifiedType::new(adjusted, ty.qualifiers);
+            self.reject_weakened_atomic_alignment(adjusted, span)?;
+            return Ok(adjusted);
         }
         if !defines_private_record {
             return self.fail(
@@ -7544,6 +7560,37 @@ impl<'a> Analyzer<'a> {
             .complete_record_with_packing(aligned_record, fields, packing)
             .expect("a newly declared aligned record is incomplete");
         Ok(QualifiedType::new(aligned_ty, ty.qualifiers))
+    }
+
+    fn reject_weakened_atomic_alignment(
+        &mut self,
+        ty: QualifiedType,
+        span: Span,
+    ) -> AnalysisResult<()> {
+        if !ty.qualifiers.contains(TypeQualifiers::ATOMIC) {
+            return Ok(());
+        }
+        let Some(TypeKind::AlignmentAdjusted(adjusted)) = self.types.try_kind(ty.ty).cloned()
+        else {
+            return Ok(());
+        };
+        let natural = self
+            .types
+            .layout_of(adjusted.underlying, self.config)
+            .map_err(|error| self.emit("CCC2453", span, error.to_string()))?
+            .align;
+        if adjusted.alignment < natural {
+            return self.fail(
+                "CCC2453",
+                span,
+                format!(
+                    "atomic type `{}` has {}-byte alignment, weaker than its native {natural}-byte alignment",
+                    self.types.display_qualified(ty),
+                    adjusted.alignment
+                ),
+            );
+        }
+        Ok(())
     }
 
     fn apply_file_typedef_attributes(

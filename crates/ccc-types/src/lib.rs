@@ -8,9 +8,10 @@ mod store;
 
 pub use layout::{BitfieldLayout, FieldLayout, LayoutError, LayoutShape, RecordLayout, TypeLayout};
 pub use model::{
-    ArrayLength, ArrayType, Bitfield, BuiltinType, EnumBody, EnumDefinition, EnumId, Enumerator,
-    Field, FunctionParameters, FunctionType, PointerType, QualType, QualifiedType,
-    RecordDefinition, RecordId, RecordKind, TypeId, TypeKind, TypeQualifiers, VariableLengthId,
+    AlignmentAdjustedType, ArrayLength, ArrayType, Bitfield, BuiltinType, EnumBody, EnumDefinition,
+    EnumId, Enumerator, Field, FunctionParameters, FunctionType, PointerType, QualType,
+    QualifiedType, RecordDefinition, RecordId, RecordKind, TypeId, TypeKind, TypeQualifiers,
+    VariableLengthId,
 };
 pub use store::{DefinitionError, TargetBuiltinTypeError, TypeStore};
 
@@ -87,6 +88,51 @@ mod tests {
         ));
         assert_ne!(variadic, first);
         assert!(matches!(types.kind(variadic), TypeKind::Function(_)));
+    }
+
+    #[test]
+    fn interns_alignment_adjustments_without_erasing_the_underlying_type() {
+        let mut types = TypeStore::default();
+        let first = types.alignment_adjusted(TypeId::UNSIGNED_INT, 1);
+        let second = types.alignment_adjusted(TypeId::UNSIGNED_INT, 1);
+        let replaced = types.alignment_adjusted(first, 2);
+
+        assert_eq!(first, second);
+        assert_ne!(first, TypeId::UNSIGNED_INT);
+        assert_eq!(
+            types.without_alignment_adjustment(first),
+            TypeId::UNSIGNED_INT
+        );
+        assert_eq!(
+            types.without_alignment_adjustment(replaced),
+            TypeId::UNSIGNED_INT
+        );
+        assert_eq!(types.builtin_type(first), Some(BuiltinType::UnsignedInt));
+        assert_eq!(types.display(first), "aligned(1) unsigned int");
+        assert!(matches!(
+            types.kind(replaced),
+            TypeKind::AlignmentAdjusted(AlignmentAdjustedType {
+                underlying: TypeId::UNSIGNED_INT,
+                alignment: 2,
+            })
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "only builtin integer types")]
+    fn rejects_alignment_adjustments_on_non_integer_types() {
+        TypeStore::default().alignment_adjusted(TypeId::DOUBLE, 1);
+    }
+
+    #[test]
+    fn rejects_alignment_adjustments_as_enum_representations() {
+        let mut types = TypeStore::default();
+        let adjusted = types.alignment_adjusted(TypeId::UNSIGNED_INT, 1);
+        let (enumeration, _) = types.declare_enum(None);
+        assert_eq!(
+            types.complete_enum(enumeration, adjusted, Vec::new()),
+            Err(DefinitionError::InvalidEnumUnderlying(adjusted))
+        );
     }
 
     #[test]

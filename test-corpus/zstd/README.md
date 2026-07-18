@@ -28,20 +28,24 @@ links are part of the expected command multiset. The temporary probe programs
 are not part of the retained product binaries.
 
 The selected configuration enables pthread support and legacy decoding while
-disabling optional zlib, liblzma, and liblz4 format wrappers. It sets zstd's
-`MEM_FORCE_MEMORY_ACCESS=0` and embedded xxHash's
-`XXH_FORCE_MEMORY_ACCESS=0`, selecting their upstream portable `memcpy`
-implementations for unaligned loads and stores. Plain alignment-bearing scalar
-typedefs remain a tracked type-system gap: treating them as ordinary integers
-would give incorrect `_Alignof`, array stride, and object layout. These
-upstream controls avoid that approximation without changing source or format. The
-configuration makes the tested feature set
-independent of development libraries installed on the host. Ambient GNU Make
-injection, build flags, platform overrides, test binary overrides, and helper
-command overrides are cleared. The debug level, C locale, UTC timezone, and
-creation mask are pinned. The resolved native link driver must
-identify as GCC for an x86-64 Linux GNU target; its identity and predefined
-macros are retained.
+disabling optional zlib, liblzma, and liblz4 format wrappers. It leaves zstd's
+`MEM_FORCE_MEMORY_ACCESS` and embedded xxHash's `XXH_FORCE_MEMORY_ACCESS`
+unset. Their exact upstream headers default both controls to `1` under CCC's
+advertised GNU identity. Zstd consequently uses its file-scope
+`aligned(1)` scalar typedefs for 16-, 32-, 64-bit, and word-sized unaligned
+loads and stores; xxHash uses its block-scope `aligned(1)` 32- and 64-bit
+scalar typedefs. The capability probe preprocesses the pinned headers and
+requires those defaults, while build-command auditing rejects any forced
+definition or undefinition of either control. This exercises the upstream
+alignment-bearing types without changing those headers or injecting a
+compatibility flag.
+
+The configuration makes the tested feature set independent of development
+libraries installed on the host. Ambient GNU Make injection, build flags,
+platform overrides, test binary overrides, and helper command overrides are
+cleared. The debug level, C locale, UTC timezone, and creation mask are pinned.
+The resolved native link driver must identify as GCC for an x86-64 Linux GNU
+target; its identity and predefined macros are retained.
 
 CCC emits position-independent objects, and the native GCC links use their
 platform defaults without an adapter-supplied relocation option. The adapter
@@ -69,8 +73,8 @@ retained with each run. Any release drift or non-exact hunk match fails before
 compilation.
 
 The capability probe requires CCC's own GNU 4.2.1 and LP64 x86-64 identity,
-the exact relevant builtin-registry profile, the native count-bit and `memcpy`
-unaligned-access paths, and disabled assembly. CCC advertises
+the exact relevant builtin-registry profile, the native count-bit and upstream
+`aligned(1)` scalar unaligned-access paths, and disabled assembly. CCC advertises
 `__builtin_bswap64` and a behavior-compatible no-op `__builtin_prefetch`;
 zstd's version predicates exclude the former and use the latter. Build-command
 auditing requires the no-assembly decision on every C translation.

@@ -342,6 +342,27 @@ fn reject_float16_type(types: &TypeStore, ty: TypeId, boundary: &str) -> Result<
     Ok(())
 }
 
+pub(crate) fn boundary_value_alignment(
+    types: &TypeStore,
+    classified: &ClassifiedType,
+    config: &EffectiveCompilationConfig,
+) -> Result<u64, AbiError> {
+    if classified.passing == PassingMode::Scalar
+        && let Some(TypeKind::AlignmentAdjusted(adjusted)) = types.try_kind(classified.ty)
+    {
+        return types
+            .layout_of(adjusted.underlying, config)
+            .map(|layout| layout.align)
+            .map_err(|error| {
+                AbiError::new(
+                    "CCC3502",
+                    format!("scalar has no underlying ABI layout: {error}"),
+                )
+            });
+    }
+    Ok(classified.align)
+}
+
 pub(crate) fn validate_target(config: &EffectiveCompilationConfig) -> Result<(), AbiError> {
     match config.target.abi {
         AbiIdentity::SysvAmd64Lp64 => sysv_amd64::validate_target(config),
@@ -442,6 +463,179 @@ mod float16_tests {
                 let error = plan_va_arg(&types, ty, &config).unwrap_err();
                 assert_eq!(error.code, "CCC3518", "{}", config.target.triple);
                 assert!(error.message.contains("_Float16"), "{error}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod alignment_adjusted_tests {
+    use ccc_target::{AbiIdentity, EffectiveCompilationConfig};
+    use ccc_types::{
+        Field, FunctionParameters, FunctionType, QualifiedType, RecordKind, TypeId, TypeStore,
+    };
+
+    use super::{
+        AbiClass, BridgeLocation, PassingMode, RegisterSlot, classify_type, plan_unprototyped_call,
+        plan_va_arg,
+    };
+
+    #[test]
+    fn integer_alignment_adjustments_preserve_scalar_carriers_on_every_target() {
+        let mut types = TypeStore::default();
+        let adjusted = types.alignment_adjusted(TypeId::UNSIGNED_INT, 1);
+        let (record_id, record) = types.declare_record(RecordKind::Struct, None);
+        types
+            .complete_record(
+                record_id,
+                vec![
+                    Field::named("tag", TypeId::CHAR),
+                    Field::named("value", adjusted),
+                ],
+            )
+            .unwrap();
+
+        for config in [
+            EffectiveCompilationConfig::default(),
+            EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+            EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
+            EffectiveCompilationConfig::aarch64_apple_darwin(),
+        ] {
+            let scalar = classify_type(&types, adjusted, &config).unwrap();
+            assert_eq!(
+                (scalar.size, scalar.align),
+                (4, 1),
+                "{}",
+                config.target.triple
+            );
+            assert_eq!(
+                scalar.passing,
+                PassingMode::Scalar,
+                "{}",
+                config.target.triple
+            );
+            assert_eq!(
+                scalar.classes,
+                [AbiClass::Integer],
+                "{}",
+                config.target.triple
+            );
+
+            let aggregate = classify_type(&types, record, &config).unwrap();
+            assert_eq!(
+                (aggregate.size, aggregate.align),
+                (5, 1),
+                "{}",
+                config.target.triple
+            );
+            if config.target.abi == AbiIdentity::SysvAmd64Lp64 {
+                assert_eq!(
+                    aggregate.passing,
+                    PassingMode::Memory,
+                    "{}",
+                    config.target.triple
+                );
+            } else {
+                assert_ne!(
+                    aggregate.passing,
+                    PassingMode::Memory,
+                    "{}",
+                    config.target.triple
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_boundary_and_variadic_alignment_follow_each_target_abi() {
+        let mut types = TypeStore::default();
+        let under_aligned = types.alignment_adjusted(TypeId::UNSIGNED_INT, 1);
+        let over_aligned = types.alignment_adjusted(TypeId::UNSIGNED_INT, 16);
+        let signature = types.function_type(FunctionType {
+            result: QualifiedType::unqualified(TypeId::VOID),
+            parameters: FunctionParameters::Unspecified,
+            variadic: false,
+        });
+
+        for (config, register_capacity, overflow_align, stack_offset, register) in [
+            (EffectiveCompilationConfig::default(), 6usize, 8, 8, Some(1)),
+            (
+                EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+                8,
+                8,
+                8,
+                Some(1),
+            ),
+            (
+                EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
+                8,
+                8,
+                8,
+                Some(1),
+            ),
+            (
+                EffectiveCompilationConfig::aarch64_apple_darwin(),
+                0,
+                8,
+                8,
+                None,
+            ),
+        ] {
+            let va_arg = plan_va_arg(&types, under_aligned, &config).unwrap();
+            assert_eq!(va_arg.result_align, 1, "{}", config.target.triple);
+            assert_eq!(va_arg.overflow_align, 8, "{}", config.target.triple);
+            let va_arg = plan_va_arg(&types, over_aligned, &config).unwrap();
+            assert_eq!(va_arg.result_align, 16, "{}", config.target.triple);
+            assert_eq!(
+                va_arg.overflow_align, overflow_align,
+                "{}",
+                config.target.triple
+            );
+
+            let mut actual = vec![TypeId::UNSIGNED_INT; register_capacity + 2];
+            actual[register_capacity + 1] = over_aligned;
+            let plan = plan_unprototyped_call(&types, signature, &actual, &config).unwrap();
+            let location = |source_index| {
+                plan.parameter_pieces
+                    .iter()
+                    .find(|piece| piece.source_index == Some(source_index as u32))
+                    .unwrap()
+                    .location
+            };
+            assert_eq!(
+                location(register_capacity),
+                BridgeLocation::Stack { offset: 0 },
+                "{}",
+                config.target.triple
+            );
+            assert_eq!(
+                location(register_capacity + 1),
+                BridgeLocation::Stack {
+                    offset: stack_offset,
+                },
+                "{}",
+                config.target.triple
+            );
+
+            if let Some(register) = register {
+                let plan = plan_unprototyped_call(
+                    &types,
+                    signature,
+                    &[TypeId::UNSIGNED_INT, over_aligned],
+                    &config,
+                )
+                .unwrap();
+                let adjusted = plan
+                    .parameter_pieces
+                    .iter()
+                    .find(|piece| piece.source_index == Some(1))
+                    .unwrap();
+                assert_eq!(
+                    adjusted.location,
+                    BridgeLocation::Register(RegisterSlot::integer(register)),
+                    "{}",
+                    config.target.triple
+                );
             }
         }
     }

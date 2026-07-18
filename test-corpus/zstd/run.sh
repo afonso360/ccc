@@ -240,11 +240,11 @@ unset TESTFLAGS UNAME ZSTD_BIN isTerminal size
 
 : >"$CCC_ZSTD_COMMAND_LOG"
 "$script_directory/ccc-cc" -DZSTD_DISABLE_ASM \
-  -DMEM_FORCE_MEMORY_ACCESS=0 -DXXH_FORCE_MEMORY_ACCESS=0 \
+  -I"$source_directory/lib/common" \
   -dM -E "$script_directory/predicate-probe.c" \
   >"$work_directory/effective-macros.txt"
 "$script_directory/ccc-cc" -DZSTD_DISABLE_ASM \
-  -DMEM_FORCE_MEMORY_ACCESS=0 -DXXH_FORCE_MEMORY_ACCESS=0 \
+  -I"$source_directory/lib/common" \
   -P -E "$script_directory/predicate-probe.c" \
   >"$work_directory/predicate-probe.txt"
 
@@ -255,8 +255,8 @@ for macro in \
   '#define __x86_64__ 1' \
   '#define __LP64__ 1' \
   '#define ZSTD_DISABLE_ASM 1' \
-  '#define MEM_FORCE_MEMORY_ACCESS 0' \
-  '#define XXH_FORCE_MEMORY_ACCESS 0' \
+  '#define MEM_FORCE_MEMORY_ACCESS 1' \
+  '#define XXH_FORCE_MEMORY_ACCESS 1' \
   '#define _GNU_SOURCE' \
   '#define __USE_GNU 1' \
   '#define __USE_MISC 1' \
@@ -274,10 +274,11 @@ for selection in \
   'count_bit_builtin_registry=clz-clzll-ctz-ctzll' \
   'additional_builtin_registry=bswap64-prefetch-only' \
   'selected_assembly=disabled' \
+  'selected_memory_access_configuration=upstream-defaults' \
   'selected_count_bits=gnu-builtins' \
   'selected_prefetch=compiler-builtin' \
-  'selected_zstd_unaligned_access=memcpy' \
-  'selected_xxhash_unaligned_access=memcpy' \
+  'selected_zstd_unaligned_access=aligned-1-scalar-typedefs' \
+  'selected_xxhash_unaligned_access=aligned-1-scalar-typedefs' \
   'selected_memory_dependencies=compiler-builtins' \
   'selected_assert=system-gnu-macro' \
   'selected_host_features=glibc-gnu'; do
@@ -292,7 +293,7 @@ done
     'optional_format_library=lzma-disabled' \
     'optional_format_library=lz4-disabled' \
     'threading=pthread-enabled' \
-    'unaligned_memory_access=upstream-memcpy-fallbacks' \
+    'unaligned_memory_access=upstream-aligned-1-scalar-typedefs' \
     'memory_dependencies=compiler-builtins' \
     'advertised_but_unselected_builtin=__builtin_bswap64' \
     'unavailable_source_spelling=__builtin_altivec_vmuleuw' \
@@ -357,7 +358,6 @@ make -C "$source_directory" -j"$jobs" check \
   HAVE_LZMA=0 \
   HAVE_LZ4=0 \
   ALIGN_LOOP= \
-  MOREFLAGS="-DMEM_FORCE_MEMORY_ACCESS=0 -DXXH_FORCE_MEMORY_ACCESS=0" \
   2>&1 | tee "$work_directory/build-test.log"
 
 grep -Fq "$success_marker" "$work_directory/build-test.log" ||
@@ -395,13 +395,15 @@ explicit_standard_translations=$(grep '^ccc ' "$CCC_ZSTD_COMMAND_LOG" | \
 [[ "$explicit_standard_translations" == 0 ]] ||
   die "zstd C translations unexpectedly overrode CCC's default GNU language mode"
 for option in \
-  ' -DZSTD_DISABLE_ASM' \
-  ' -DMEM_FORCE_MEMORY_ACCESS=0' \
-  ' -DXXH_FORCE_MEMORY_ACCESS=0'; do
+  ' -DZSTD_DISABLE_ASM'; do
   matches=$(grep '^ccc ' "$CCC_ZSTD_COMMAND_LOG" | grep -c -- "$option" || true)
   [[ "$matches" == "$expected_translation_occurrences" ]] ||
     die "zstd C translations did not all retain the pinned option:$option"
 done
+if grep '^ccc ' "$CCC_ZSTD_COMMAND_LOG" | \
+  grep -Eq 'MEM_FORCE_MEMORY_ACCESS|XXH_FORCE_MEMORY_ACCESS'; then
+  die "zstd C translations forced an upstream memory-access selection"
+fi
 if grep '^ccc ' "$CCC_ZSTD_COMMAND_LOG" | grep -q -- ' -U__GNUC__'; then
   die "zstd C translations suppressed CCC's advertised compiler identity"
 fi

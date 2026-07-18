@@ -7,7 +7,7 @@ use ccc_types::{
     TypeStore,
 };
 
-use crate::{AbiError, model::*};
+use crate::{AbiError, boundary_value_alignment, model::*};
 
 pub fn plan_function_type(
     types: &TypeStore,
@@ -207,7 +207,7 @@ pub fn plan_va_arg(
         .iter()
         .filter(|piece| matches!(piece.class, AbiClass::Sse | AbiClass::SseUp))
         .count() as u8;
-    let overflow_align = classified.align.max(8);
+    let overflow_align = boundary_value_alignment(types, &classified, config)?.max(8);
     if overflow_align > 16 {
         return Err(AbiError::new(
             "CCC3513",
@@ -579,6 +579,7 @@ fn plan_bridge(
         };
         allocate_bridge_argument(
             &classified,
+            boundary_value_alignment(types, &classified, config)?,
             source_index as u32,
             extension,
             &mut gp_used,
@@ -624,8 +625,10 @@ fn plan_bridge(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn allocate_bridge_argument(
     classified: &ClassifiedType,
+    boundary_alignment: u64,
     source_index: u32,
     extension: IntegerExtension,
     gp_used: &mut u8,
@@ -663,7 +666,7 @@ fn allocate_bridge_argument(
         return Ok(());
     }
 
-    *stack_size = align_up(*stack_size, classified.align.max(8))?;
+    *stack_size = align_up(*stack_size, boundary_alignment.max(8))?;
     for piece in memory_pieces(classified) {
         let piece_offset = u32::try_from(*stack_size + piece.offset)
             .map_err(|_| AbiError::new("CCC3503", "bridge stack offset overflow"))?;
@@ -915,6 +918,29 @@ fn classify_at(
                 }
             }
         }
+        TypeKind::AlignmentAdjusted(adjusted) => {
+            if !types
+                .builtin_type(adjusted.underlying)
+                .is_some_and(BuiltinType::is_integer)
+            {
+                return Err(AbiError::new(
+                    "CCC3508",
+                    format!(
+                        "alignment-adjusted type `{}` has no scalar ABI representation",
+                        types.display(ty)
+                    ),
+                ));
+            }
+            let underlying = target_layout(types, adjusted.underlying, config)?;
+            if underlying.align > 1 && !offset.is_multiple_of(underlying.align) {
+                // The SysV aggregate classifier's unaligned-field rule uses
+                // the scalar's natural ABI alignment. A typedef may lower the
+                // C object alignment without making a containing aggregate
+                // register-passable at that offset.
+                return Ok(true);
+            }
+            mark_range(classes, offset, layout.size, AbiClass::Integer);
+        }
         TypeKind::Function(_) => {
             return Err(AbiError::new(
                 "CCC3501",
@@ -1059,8 +1085,10 @@ fn boundary_scalar(
     config: &EffectiveCompilationConfig,
     boundary: &str,
 ) -> Result<AbiScalar, AbiError> {
+    if let Some(builtin) = types.builtin_type(ty) {
+        return builtin_scalar(types, ty, builtin, config, boundary);
+    }
     match types.try_kind(ty) {
-        Some(TypeKind::Builtin(builtin)) => builtin_scalar(types, ty, *builtin, config, boundary),
         Some(TypeKind::Pointer(_)) => Ok(AbiScalar::Pointer { bits: 64 }),
         Some(TypeKind::Enum(id)) => {
             let underlying = types
