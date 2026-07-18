@@ -21,3 +21,27 @@ expected_files = [
     "glibc-like/sys/cdefs.h",
     "glibc-like/sys/types.h",
 ]
+
+[target_applicability."x86_64-unknown-linux-gnu"]
+status = "applicable"
+evidence_kind = "parse-only"
+entrypoint = "glibc-like/probe.c"
+reason = "The original fixture certifies preprocessing and parsing only and does not depend on target layout, linking, or execution."
+
+[target_applicability."aarch64-unknown-linux-gnu"]
+status = "applicable"
+evidence_kind = "parse-only"
+entrypoint = "glibc-like/probe.c"
+reason = "The original fixture certifies preprocessing and parsing only and does not depend on target layout, linking, or execution."
+
+[target_applicability."riscv64-unknown-linux-gnu"]
+status = "applicable"
+evidence_kind = "parse-only"
+entrypoint = "glibc-like/probe.c"
+reason = "The original fixture certifies preprocessing and parsing only and does not depend on target layout, linking, or execution."
+
+[target_applicability."aarch64-apple-darwin"]
+status = "applicable"
+evidence_kind = "parse-only"
+entrypoint = "glibc-like/probe.c"
+reason = "The original fixture certifies preprocessing and parsing only and does not depend on target layout, linking, or execution."

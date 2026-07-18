@@ -124,3 +124,21 @@ retain = [
     "upstream-test.log",
     "version.log",
 ]
+
+[target_applicability."x86_64-unknown-linux-gnu"]
+status = "applicable"
+evidence_kind = "execution"
+runner = "run.sh"
+reason = "The adapter has an audited native x86-64 GNU link path, ELF PIE checks, upstream checks, and an extended execution profile."
+
+[target_applicability."aarch64-unknown-linux-gnu"]
+status = "inapplicable"
+reason = "The adapter currently requires an x86-64 native GCC driver and has no AArch64 cross-link, QEMU execution, or target-specific artifact audit path."
+
+[target_applicability."riscv64-unknown-linux-gnu"]
+status = "inapplicable"
+reason = "The adapter currently requires an x86-64 native GCC driver and has no RISC-V cross-link, QEMU execution, or target-specific artifact audit path."
+
+[target_applicability."aarch64-apple-darwin"]
+status = "inapplicable"
+reason = "The adapter and extended tests require a GNU/Linux build environment, GCC linking, and ELF inspection rather than Apple Clang and Mach-O inspection."

@@ -6,6 +6,7 @@ script_directory=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 tests=(
   "$script_directory/test-adapter-environment.sh"
+  "$script_directory/report-target-applicability.py"
   "$script_directory/sqlite/test-ccc-cc.sh"
   "$script_directory/sqlite/test-run.sh"
   "$script_directory/lua/test-ccc-cc.sh"
