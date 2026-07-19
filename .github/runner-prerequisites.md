@@ -62,3 +62,9 @@ build, SDK version, Apple Clang version and target, linker and `nmedit`
 identities, and deployment target. The recorded identities are compared with
 the Darwin evidence manifest before tests run. A non-arm64 host or a missing
 native tool is a hard failure for the required job.
+
+The native Darwin Csmith profile additionally requires Homebrew GNU GCC,
+GNU `timeout`, CMake, M4, and an OpenSSL implementation with SHA3-256. It uses
+GNU GCC and Apple Clang as the reference consensus, applies one explicit SDK
+and deployment target to all generated-program translations and links, and
+uses the same `nmedit` contract as the Darwin target runner.

@@ -11,7 +11,7 @@ usage() {
   cat >&2 <<EOF
 usage: $0 [OPTIONS]
 
-Run reproducible Csmith programs through CCC and a GCC/Clang reference matrix.
+Run reproducible Csmith programs through CCC and a native GCC/Clang reference matrix.
 
   --cases COUNT                 admissible differential cases (default: ${default_cases})
   --start-seed SEED             first attempted seed (default: ${default_start_seed})
@@ -27,9 +27,12 @@ Run reproducible Csmith programs through CCC and a GCC/Clang reference matrix.
   --allow-unverified-csmith     permit the developer-supplied generator override
   --ccc PATH                    CCC executable (default: target/debug/ccc)
   --resource-dir PATH           CCC resource directory (default: resource-dir)
-  --gcc PATH                    native reference GCC (default: gcc)
-  --clang PATH                  native reference Clang (default: clang)
-  --objcopy PATH                object copier used by CCC (default: objcopy)
+  --gcc PATH                    native reference GCC (Darwin default: Homebrew GCC)
+  --clang PATH                  native reference Clang (Darwin default: /usr/bin/clang)
+  --objcopy PATH                ELF object copier used by CCC (Linux default: objcopy)
+  --nmedit PATH                 Mach-O symbol editor used by CCC (Darwin default: xcrun nmedit)
+  --sdk-root PATH               macOS SDK root (Darwin default: active macOS SDK)
+  --deployment-target VERSION   minimum macOS version (Darwin default: 11.0)
   --cxx PATH                    C++ compiler used to build Csmith (default: g++)
   -h, --help                    show this help
 EOF
@@ -91,20 +94,75 @@ validate_path_argument() {
 
 verify_native_target() {
   local label=$1
-  local target=$2
-  [[ "$target" =~ ^x86_64(-[[:alnum:]_.]+)?-linux-gnu$ ]] ||
-    die "$label target is $target rather than x86-64 Linux GNU"
+  local reported_target=$2
+  case "$target" in
+    x86_64-unknown-linux-gnu)
+      [[ "$reported_target" =~ ^x86_64(-[[:alnum:]_.]+)?-linux-gnu$ ]] ||
+        die "$label target is $reported_target rather than x86-64 Linux GNU"
+      ;;
+    aarch64-apple-darwin)
+      [[ "$reported_target" =~ ^(aarch64|arm64)-apple-(darwin|macosx)[0-9.]*$ ]] ||
+        die "$label target is $reported_target rather than Darwin arm64"
+      ;;
+    *)
+      die "unsupported Csmith target profile: $target"
+      ;;
+  esac
 }
 
-verify_lp64_x86_64_macros() {
+verify_lp64_target_macros() {
   local label=$1
   local macros=$2
-  grep -Eq '^#define __x86_64__[[:space:]]+1$' "$macros" &&
-    grep -Eq '^#define __SIZEOF_POINTER__[[:space:]]+8$' "$macros" &&
+  grep -Eq '^#define __SIZEOF_POINTER__[[:space:]]+8$' "$macros" &&
     grep -Eq '^#define __SIZEOF_LONG__[[:space:]]+8$' "$macros" &&
     grep -Eq '^#define __LP64__[[:space:]]+1$' "$macros" &&
     grep -Eq '^#define __BYTE_ORDER__[[:space:]]+__ORDER_LITTLE_ENDIAN__$' "$macros" ||
-    die "$label does not expose the required little-endian x86-64 LP64 ABI"
+    die "$label does not expose the required little-endian LP64 ABI"
+  case "$target" in
+    x86_64-unknown-linux-gnu)
+      grep -Eq '^#define __x86_64__[[:space:]]+1$' "$macros" ||
+        die "$label does not expose the required x86-64 target identity"
+      ;;
+    aarch64-apple-darwin)
+      grep -Eq '^#define (__aarch64__|__arm64__)[[:space:]]+1$' "$macros" &&
+        grep -Eq '^#define __APPLE__[[:space:]]+1$' "$macros" &&
+        grep -Eq '^#define __MACH__[[:space:]]+1$' "$macros" ||
+        die "$label does not expose the required Darwin arm64 target identity"
+      ;;
+  esac
+}
+
+record_darwin_gcc_driver() {
+  local label=$1
+  local driver=$2
+  local identity_artifact=$3
+  local macro_artifact=$4
+  local reported_target version version_output version_lower
+
+  reported_target=$(LC_ALL=C "$driver" -dumpmachine) ||
+    die "$label native driver did not report its target"
+  version=$(LC_ALL=C "$driver" -dumpfullversion -dumpversion) ||
+    die "$label native driver did not report its version"
+  version_output=$(LC_ALL=C "$driver" --version) ||
+    die "$label native driver did not report its identity"
+  LC_ALL=C "$driver" -dM -E -x c /dev/null >"$macro_artifact" ||
+    die "$label native driver did not report its predefined macros"
+  version_lower=$(printf '%s\n' "$version_output" | tr '[:upper:]' '[:lower:]')
+  [[ "$version_lower" != *clang* ]] ||
+    die "$label native driver must be GCC rather than Clang"
+  [[ "$version_lower" == *gcc* ||
+    "$version_lower" == *"gnu compiler collection"* ]] ||
+    die "$label native driver is not GCC"
+  grep -Eq '^#define __GNUC__[[:space:]]+[0-9]+$' "$macro_artifact" ||
+    die "$label native driver does not expose GCC identity macros"
+  verify_native_target "$label native GCC" "$reported_target"
+  verify_lp64_target_macros "$label native GCC" "$macro_artifact"
+  {
+    printf 'executable=%s\n' "$driver"
+    printf 'target=%s\n' "$reported_target"
+    printf 'version=%s\n' "$version"
+    printf '%s\n' '--version:' "$version_output"
+  } >"$identity_artifact"
 }
 
 record_command() {
@@ -229,7 +287,9 @@ run_case() {
     "$directory/gcc.syntax.stderr" \
     "$command_log" \
     "$gcc_syntax_status" \
-    "$reference_gcc" -std=c11 -pedantic-errors -fsyntax-only \
+    "$reference_gcc" \
+    ${reference_target_arguments[@]+"${reference_target_arguments[@]}"} \
+    -std=c11 -pedantic-errors -fsyntax-only \
     -I "$csmith_runtime" "$source_file"
   run_timed \
     "$compile_timeout" \
@@ -237,7 +297,9 @@ run_case() {
     "$directory/clang.syntax.stderr" \
     "$command_log" \
     "$clang_syntax_status" \
-    "$reference_clang" -std=c11 -pedantic-errors -fsyntax-only \
+    "$reference_clang" \
+    ${reference_target_arguments[@]+"${reference_target_arguments[@]}"} \
+    -std=c11 -pedantic-errors -fsyntax-only \
     -I "$csmith_runtime" "$source_file"
 
   if status_is_timeout "$gcc_syntax_status" ||
@@ -287,7 +349,9 @@ run_case() {
       "$directory/reference-${label}.compile.stderr" \
       "$command_log" \
       "$compile_status" \
-      "$compiler" -std=c11 "$optimization" \
+      "$compiler" \
+      ${reference_target_arguments[@]+"${reference_target_arguments[@]}"} \
+      -std=c11 "$optimization" \
       -I "$csmith_runtime" "$source_file" -o "$executable" -lm
     if ! status_is_zero "$compile_status"; then
       write_result "$directory" reference-compile-failure \
@@ -356,7 +420,8 @@ run_case() {
     "$directory/ccc.compile.stderr" \
     "$command_log" \
     "$directory/ccc.compile.status" \
-    "$ccc" -resource-dir "$ccc_resource_dir" -std=c11 -c \
+    "$ccc" -resource-dir "$ccc_resource_dir" \
+    ${ccc_target_arguments[@]+"${ccc_target_arguments[@]}"} -std=c11 -c \
     -I "$csmith_runtime" "$source_file" -o "$ccc_object"
   if ! status_is_zero "$directory/ccc.compile.status"; then
     write_result "$directory" ccc-compile-failure \
@@ -370,10 +435,12 @@ run_case() {
     "$directory/ccc.link.stderr" \
     "$command_log" \
     "$directory/ccc.link.status" \
-    "$reference_gcc" "$ccc_object" -o "$ccc_executable" -lm
+    "$native_link_driver" \
+    ${reference_target_arguments[@]+"${reference_target_arguments[@]}"} \
+    "$ccc_object" -o "$ccc_executable" -lm
   if ! status_is_zero "$directory/ccc.link.status"; then
     write_result "$directory" ccc-link-failure \
-      "GCC failed or timed out while linking CCC's object for seed $seed" 1 1 1
+      "the native driver failed or timed out while linking CCC's object for seed $seed" 1 1 1
     return
   fi
 
@@ -424,6 +491,7 @@ prepare_csmith() {
   local install_directory="$work_directory/csmith-install"
   local partial_archive cache_directory cache_root
   local csmith_cxx_target csmith_cxx_version
+  local cmake_arguments=()
 
   for tool in cmake m4 tar; do
     require_tool "$tool"
@@ -437,7 +505,7 @@ prepare_csmith() {
   LC_ALL=C "$csmith_cxx" -dM -E -x c++ /dev/null \
     >"$work_directory/tool-identities/csmith-cxx-macros.txt" ||
     die "Csmith C++ compiler did not report predefined macros"
-  verify_lp64_x86_64_macros "Csmith C++ compiler" \
+  verify_lp64_target_macros "Csmith C++ compiler" \
     "$work_directory/tool-identities/csmith-cxx-macros.txt"
   {
     printf 'executable=%s\n' "$csmith_cxx"
@@ -483,6 +551,12 @@ prepare_csmith() {
   grep -Fq 'Redistribution and use in source and binary forms' \
     "$source_directory/COPYING" || die "Csmith source license is missing"
 
+  if [[ "$target" == aarch64-apple-darwin ]]; then
+    cmake_arguments+=(
+      "-DCMAKE_OSX_SYSROOT=$sdk_root"
+      "-DCMAKE_OSX_DEPLOYMENT_TARGET=$deployment_target"
+    )
+  fi
   cmake \
     -S "$source_directory" \
     -B "$build_directory" \
@@ -490,6 +564,7 @@ prepare_csmith() {
     -DCMAKE_INSTALL_PREFIX="$install_directory" \
     -DCMAKE_C_COMPILER="$reference_gcc" \
     -DCMAKE_CXX_COMPILER="$csmith_cxx" \
+    ${cmake_arguments[@]+"${cmake_arguments[@]}"} \
     >"$work_directory/csmith-configure.log" 2>&1
   cmake --build "$build_directory" --parallel "$build_jobs" \
     >"$work_directory/csmith-build.log" 2>&1
@@ -513,9 +588,12 @@ csmith=${CSMITH:-}
 csmith_runtime=${CSMITH_RUNTIME:-}
 ccc=${CCC:-$repository/target/debug/ccc}
 ccc_resource_dir=${CCC_RESOURCE_DIR:-$repository/resource-dir}
-reference_gcc=${CSMITH_GCC:-gcc}
-reference_clang=${CSMITH_CLANG:-clang}
-object_copier=${CSMITH_OBJCOPY:-objcopy}
+reference_gcc=${CSMITH_GCC:-}
+reference_clang=${CSMITH_CLANG:-}
+object_copier=${CSMITH_OBJCOPY:-}
+symbol_editor=${CSMITH_NMEDIT:-}
+sdk_root=${CSMITH_SDKROOT:-}
+deployment_target=${CSMITH_DEPLOYMENT_TARGET:-}
 csmith_cxx=${CSMITH_CXX:-g++}
 allow_unverified_csmith=0
 
@@ -523,7 +601,8 @@ while (($#)); do
   case "$1" in
     --cases|--start-seed|--max-attempts|--build-jobs|--generator-timeout|\
       --compile-timeout|--run-timeout|--work-dir|--archive|--csmith|\
-      --csmith-runtime|--ccc|--resource-dir|--gcc|--clang|--objcopy|--cxx)
+      --csmith-runtime|--ccc|--resource-dir|--gcc|--clang|--objcopy|--nmedit|\
+      --sdk-root|--deployment-target|--cxx)
       (($# >= 2)) || usage_error "missing value for $1"
       option=$1
       value=$2
@@ -544,6 +623,9 @@ while (($#)); do
         --gcc) reference_gcc=$value ;;
         --clang) reference_clang=$value ;;
         --objcopy) object_copier=$value ;;
+        --nmedit) symbol_editor=$value ;;
+        --sdk-root) sdk_root=$value ;;
+        --deployment-target) deployment_target=$value ;;
         --cxx) csmith_cxx=$value ;;
       esac
       shift 2
@@ -601,6 +683,9 @@ for path_entry in \
   "GCC executable:$reference_gcc" \
   "Clang executable:$reference_clang" \
   "object copier:$object_copier" \
+  "Mach-O symbol editor:$symbol_editor" \
+  "macOS SDK root:$sdk_root" \
+  "macOS deployment target:$deployment_target" \
   "C++ executable:$csmith_cxx"; do
   validate_path_argument "${path_entry%%:*}" "${path_entry#*:}"
 done
@@ -616,8 +701,59 @@ elif ((allow_unverified_csmith == 1)); then
   usage_error "--allow-unverified-csmith requires --csmith and --csmith-runtime"
 fi
 
-[[ "$(uname -s)" == Linux && "$(uname -m)" == x86_64 ]] ||
-  die "Csmith differential execution requires x86-64 Linux"
+host_os=$(uname -s)
+host_arch=$(uname -m)
+reference_target_arguments=()
+ccc_target_arguments=()
+case "$host_os:$host_arch" in
+  Linux:x86_64)
+    target=x86_64-unknown-linux-gnu
+    : "${reference_gcc:=gcc}"
+    : "${reference_clang:=clang}"
+    : "${object_copier:=objcopy}"
+    [[ -z "$symbol_editor" ]] ||
+      usage_error "--nmedit is valid only for the Darwin arm64 profile"
+    [[ -z "$sdk_root" ]] ||
+      usage_error "--sdk-root is valid only for the Darwin arm64 profile"
+    [[ -z "$deployment_target" ]] ||
+      usage_error "--deployment-target is valid only for the Darwin arm64 profile"
+    ;;
+  Darwin:arm64 | Darwin:aarch64)
+    target=aarch64-apple-darwin
+    require_tool xcrun
+    : "${reference_clang:=/usr/bin/clang}"
+    if [[ -z "$reference_gcc" ]]; then
+      for candidate in gcc-16 gcc-15 gcc-14 gcc-13 gcc-12 gcc-11; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+          reference_gcc=$candidate
+          break
+        fi
+      done
+      [[ -n "$reference_gcc" ]] ||
+        die "native Darwin Csmith execution requires Homebrew GCC; install gcc or pass --gcc"
+    fi
+    [[ -z "$object_copier" ]] ||
+      usage_error "--objcopy is valid only for the Linux profile"
+    : "${symbol_editor:=$(xcrun --find nmedit)}"
+    : "${sdk_root:=$(xcrun --sdk macosx --show-sdk-path)}"
+    : "${deployment_target:=11.0}"
+    [[ "$deployment_target" =~ ^[0-9]+([.][0-9]+){1,2}$ ]] ||
+      usage_error "invalid macOS deployment target: $deployment_target"
+    sdk_root=$(absolute_directory "$sdk_root")
+    reference_target_arguments=(
+      -isysroot "$sdk_root"
+      "-mmacosx-version-min=$deployment_target"
+    )
+    ccc_target_arguments=(
+      --target=aarch64-apple-darwin
+      -isysroot "$sdk_root"
+      "-mmacosx-version-min=$deployment_target"
+    )
+    ;;
+  *)
+    die "Csmith differential execution requires x86-64 Linux or native arm64 macOS"
+    ;;
+esac
 
 for tool in awk basename cat cmp cp dirname env find grep mkdir mktemp mv openssl rm \
   sed sort timeout tr uname wc; do
@@ -641,21 +777,31 @@ unset CMAKE_C_LINKER_LAUNCHER CMAKE_CXX_LINKER_LAUNCHER
 unset CMAKE_PROJECT_INCLUDE CMAKE_PROJECT_INCLUDE_BEFORE
 unset CMAKE_PROJECT_TOP_LEVEL_INCLUDES CMAKE_USER_MAKE_RULES_OVERRIDE
 unset CMAKE_USER_MAKE_RULES_OVERRIDE_C CMAKE_USER_MAKE_RULES_OVERRIDE_CXX
-unset OBJCOPY
+unset OBJCOPY CCC_OBJCOPY CCC_NMEDIT
 unset LD_PRELOAD LD_LIBRARY_PATH
 clear_ambient_make_injection
 
 reference_gcc=$(resolve_executable "$reference_gcc")
 reference_clang=$(resolve_executable "$reference_clang")
-object_copier=$(resolve_executable "$object_copier")
 ccc=$(resolve_executable "$ccc")
 ccc_resource_dir=$(absolute_directory "$ccc_resource_dir")
 [[ "$reference_gcc" != *[[:space:]]* ]] ||
   die "GCC executable path cannot contain whitespace because CCC_CC is a command entry"
-[[ "$object_copier" != *[[:space:]]* ]] ||
-  die "objcopy path cannot contain whitespace because CCC_OBJCOPY is a command entry"
-export CCC_CC="$reference_gcc"
-export CCC_OBJCOPY="$object_copier"
+if [[ "$target" == x86_64-unknown-linux-gnu ]]; then
+  object_copier=$(resolve_executable "$object_copier")
+  [[ "$object_copier" != *[[:space:]]* ]] ||
+    die "objcopy path cannot contain whitespace because CCC_OBJCOPY is a command entry"
+  native_link_driver=$reference_gcc
+  export CCC_CC="$native_link_driver"
+  export CCC_OBJCOPY="$object_copier"
+else
+  symbol_editor=$(resolve_executable "$symbol_editor")
+  [[ "$symbol_editor" != *[[:space:]]* ]] ||
+    die "nmedit path cannot contain whitespace because CCC_NMEDIT is a command entry"
+  native_link_driver=$reference_clang
+  export CCC_CC="$native_link_driver"
+  export CCC_NMEDIT="$symbol_editor"
+fi
 
 if [[ -z "$work_directory" ]]; then
   work_directory=$(mktemp -d "${TMPDIR:-/tmp}/ccc-csmith.XXXXXX")
@@ -673,15 +819,22 @@ work_directory=$(absolute_directory "$work_directory")
 mkdir -p -- "$work_directory/cases" "$work_directory/tool-identities"
 echo "Csmith artifacts: $work_directory"
 
-record_native_gcc_driver \
-  Csmith "$reference_gcc" \
-  "$work_directory/tool-identities/gcc.txt" \
-  "$work_directory/tool-identities/gcc-macros.txt"
+if [[ "$target" == x86_64-unknown-linux-gnu ]]; then
+  record_native_gcc_driver \
+    Csmith "$reference_gcc" \
+    "$work_directory/tool-identities/gcc.txt" \
+    "$work_directory/tool-identities/gcc-macros.txt"
+else
+  record_darwin_gcc_driver \
+    Csmith "$reference_gcc" \
+    "$work_directory/tool-identities/gcc.txt" \
+    "$work_directory/tool-identities/gcc-macros.txt"
+fi
 openssl dgst -sha256 "$reference_gcc" \
   >>"$work_directory/tool-identities/gcc.txt"
 gcc_target=$(sed -n 's/^target=//p' "$work_directory/tool-identities/gcc.txt")
 verify_native_target "Csmith GCC reference" "$gcc_target"
-verify_lp64_x86_64_macros "Csmith GCC reference" \
+verify_lp64_target_macros "Csmith GCC reference" \
   "$work_directory/tool-identities/gcc-macros.txt"
 
 clang_target=$(LC_ALL=C "$reference_clang" --print-target-triple) ||
@@ -697,7 +850,7 @@ verify_native_target "Csmith Clang reference" "$clang_target"
 grep -Eq '^#define __clang__[[:space:]]+1$' \
   "$work_directory/tool-identities/clang-macros.txt" ||
   die "Csmith Clang reference does not expose Clang identity macros"
-verify_lp64_x86_64_macros "Csmith Clang reference" \
+verify_lp64_target_macros "Csmith Clang reference" \
   "$work_directory/tool-identities/clang-macros.txt"
 {
   printf 'executable=%s\n' "$reference_clang"
@@ -706,16 +859,26 @@ verify_lp64_x86_64_macros "Csmith Clang reference" \
   printf '%s\n' '--version:' "$clang_version"
 } >"$work_directory/tool-identities/clang.txt"
 
-object_copier_version=$(LC_ALL=C "$object_copier" --version) ||
-  die "CCC object copier did not report its identity"
-[[ "$(printf '%s\n' "$object_copier_version" |
-  tr '[:upper:]' '[:lower:]')" == *objcopy* ]] ||
-  die "CCC object copier does not identify itself as objcopy"
-{
-  printf 'executable=%s\n' "$object_copier"
-  openssl dgst -sha256 "$object_copier"
-  printf '%s\n' '--version:' "$object_copier_version"
-} >"$work_directory/tool-identities/objcopy.txt"
+if [[ "$target" == x86_64-unknown-linux-gnu ]]; then
+  object_copier_version=$(LC_ALL=C "$object_copier" --version) ||
+    die "CCC object copier did not report its identity"
+  [[ "$(printf '%s\n' "$object_copier_version" |
+    tr '[:upper:]' '[:lower:]')" == *objcopy* ]] ||
+    die "CCC object copier does not identify itself as objcopy"
+  {
+    printf 'executable=%s\n' "$object_copier"
+    openssl dgst -sha256 "$object_copier"
+    printf '%s\n' '--version:' "$object_copier_version"
+  } >"$work_directory/tool-identities/objcopy.txt"
+else
+  {
+    printf 'executable=%s\n' "$symbol_editor"
+    openssl dgst -sha256 "$symbol_editor"
+    printf 'sdk_root=%s\n' "$sdk_root"
+    printf 'sdk_version=%s\n' "$(xcrun --sdk macosx --show-sdk-version)"
+    printf 'deployment_target=%s\n' "$deployment_target"
+  } >"$work_directory/tool-identities/nmedit.txt"
+fi
 
 if [[ -z "$csmith" ]]; then
   prepare_csmith "$archive"
@@ -741,7 +904,9 @@ for compiler_entry in "gcc:$reference_gcc" "clang:$reference_clang"; do
     "$work_directory/tool-identities/csmith-runtime-$compiler_label.stderr" \
     "$runtime_probe_commands" \
     "$work_directory/tool-identities/csmith-runtime-$compiler_label.status" \
-    "$compiler_path" -std=c11 -pedantic-errors -fsyntax-only \
+    "$compiler_path" \
+    ${reference_target_arguments[@]+"${reference_target_arguments[@]}"} \
+    -std=c11 -pedantic-errors -fsyntax-only \
     -I "$csmith_runtime" "$runtime_probe"
   status_is_zero \
     "$work_directory/tool-identities/csmith-runtime-$compiler_label.status" ||
@@ -768,7 +933,13 @@ fi
 {
   printf 'executable=%s\n' "$ccc"
   printf 'native_driver=%s\n' "$CCC_CC"
-  printf 'object_copier=%s\n' "$CCC_OBJCOPY"
+  if [[ "$target" == x86_64-unknown-linux-gnu ]]; then
+    printf 'symbol_localizer=objcopy\n'
+    printf 'symbol_localizer_executable=%s\n' "$CCC_OBJCOPY"
+  else
+    printf 'symbol_localizer=nmedit\n'
+    printf 'symbol_localizer_executable=%s\n' "$CCC_NMEDIT"
+  fi
   openssl dgst -sha256 "$ccc"
   git -C "$repository" rev-parse HEAD 2>/dev/null || true
   git -C "$repository" status --short 2>/dev/null || true
@@ -809,7 +980,7 @@ if ((allow_unverified_csmith == 1)); then
   generator_revision=unverified
 fi
 {
-  printf 'target=x86_64-unknown-linux-gnu\n'
+  printf 'target=%s\n' "$target"
   printf 'language_mode=c11\n'
   printf 'csmith_version=%s\n' "$csmith_version"
   printf 'generator_revision=%s\n' "$generator_revision"
@@ -820,7 +991,15 @@ fi
   printf 'last_possible_seed=%s\n' "$last_possible_seed"
   printf 'generator_source=%s\n' "$generator_source"
   printf 'ccc_native_driver=%s\n' "$CCC_CC"
-  printf 'ccc_object_copier=%s\n' "$CCC_OBJCOPY"
+  if [[ "$target" == x86_64-unknown-linux-gnu ]]; then
+    printf 'ccc_symbol_localizer=objcopy\n'
+    printf 'ccc_symbol_localizer_executable=%s\n' "$CCC_OBJCOPY"
+  else
+    printf 'ccc_symbol_localizer=nmedit\n'
+    printf 'ccc_symbol_localizer_executable=%s\n' "$CCC_NMEDIT"
+    printf 'sdk_root=%s\n' "$sdk_root"
+    printf 'deployment_target=%s\n' "$deployment_target"
+  fi
   printf 'pinned_archive_sha256=%s\n' "$csmith_archive_sha256"
   printf 'pinned_archive_sha3_256=%s\n' "$csmith_archive_sha3_256"
   printf 'generator_timeout_seconds=%s\n' "$generator_timeout"
