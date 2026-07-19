@@ -1,55 +1,99 @@
 # CCC
 
-CCC is the Cranelift C Compiler. It compiles a pragmatic C11 and GNU C subset
-through a fully typed AST, a target-independent CCC-IR control-flow graph,
-explicit per-target ABI plans, and Cranelift. Enabled profiles cover x86-64,
-AArch64, and RISC-V64 Linux ELF plus AArch64 Darwin Mach-O. Implemented
-behavior includes scalar and aggregate types and calls, variadic functions,
-thread-local storage, position-independent code, runtime-sized automatic
-arrays, native-width integer and pointer atomics, nonlocal control transfer,
-and source-level DWARF. Type widths, plain-`char` signedness, layout, packing,
-conversions, relocation model, and volatile accesses come from the effective
-target configuration.
+CCC is a C compiler written in Rust. It implements a practical subset of C11
+and GNU C with its own preprocessor, frontend, intermediate representation, and
+ABI handling. Machine-code generation uses
+[Cranelift](https://cranelift.dev/).
 
-The C11 preprocessing pipeline supports object-like, function-like, and
-variadic macros; stringization and token pasting; conditional directives;
-quoted, system, computed, and next-header includes; forced inputs; line
-control; feature predicates; common GCC pragmas; reproducible predefined
-macros; and Make dependency output. Source files are UTF-8 and may begin with a
-byte-order mark. The default language mode is `gnu11`; `-std=c11` selects the
-strict preprocessing rules.
+Unsupported constructs are diagnosed rather than silently compiled with
+different semantics.
 
-The hosted GNU compatibility profile includes selected declaration attributes,
-assembly labels, statement expressions, computed goto, 128-bit integers,
-builtins, and exact inventory-derived inline-assembly forms. Unsupported GNU
-forms remain represented long enough to produce a precise diagnostic and fail
-before object emission. Installed system headers use the discovered target
-include search; the compiler-owned resource directory supplies headers such as
-`<stddef.h>`, `<stdarg.h>`, and the supported scalar subset of `<stdatomic.h>`.
+## Build and use
 
-Unavailable behavior is diagnosed rather than approximated. Current hard
-boundaries include complex arithmetic and ABI transport, Linux binary128
-`long double` value operations, non-native atomic representations, general
-unclassified inline assembly, and GNU attributes whose observable semantics
-are not implemented. X86-64 f80 arithmetic and ABI transport use localized x87
-support and generated System V bridges; Darwin `long double` uses its native
-binary64 representation.
+CCC requires Rust 1.96 and a GCC- or Clang-compatible toolchain for the target
+platform. The external toolchain supplies system headers, the assembler,
+linker, and platform runtime libraries.
 
 ```sh
-cargo run -p ccc-driver -- -c program.c
-cargo run -p ccc-driver -- -E -P -I include program.c
-cargo run -p ccc-driver -- -MMD -MF program.d -c program.c
-cargo run -p ccc-driver -- --dump-pp-tokens program.c
-cargo run -p ccc-driver -- --dump-ast program.c
-cargo run -p ccc-driver -- --dump-typed-ast program.c
-cargo run -p ccc-driver -- --dump-ir program.c
-cargo run -p ccc-driver -- --dump-abi program.c
-cargo run -p ccc-driver -- --emit=clif program.c
+cargo build --release
+./target/release/ccc hello.c -o hello
+./hello
 ```
 
-The driver discovers and fingerprints the matching target compiler, include
-tree, sysroot or SDK, assembler, linker, and object tools. It accepts ordered C,
-assembly, object, archive, and library inputs; emits default PIE executables or
-explicit shared objects; and exposes replayable phase plans and effective
-configuration queries for build systems. Native and cross-target execution
-coverage is recorded in the testing design and corpus applicability matrix.
+To compile without linking or inspect preprocessed output:
+
+```sh
+./target/release/ccc -c hello.c
+./target/release/ccc -E hello.c
+```
+
+The default language mode is `gnu11`. Use `-std=c11` for strict C11
+preprocessing and language rules.
+
+## Current status
+
+Supported targets:
+
+| Target | Notes |
+| --- | --- |
+| `x86_64-unknown-linux-gnu` | Most complete target; includes x87 `long double`, `__int128`, and ELF thread-local storage |
+| `aarch64-unknown-linux-gnu` | AAPCS64; binary128 `long double` layout is available, but value operations and thread-local storage are not |
+| `riscv64-unknown-linux-gnu` | RV64GC/LP64D; binary128 `long double` layout is available, but value operations and thread-local storage are not |
+| `aarch64-apple-darwin` | Apple arm64 ABI; `long double` uses the platform's binary64 representation; thread-local storage is not supported |
+
+Currently supported:
+
+- C preprocessing, including macros, includes, conditional directives,
+  pragmas, and Make dependency output.
+- Integer, pointer, `float`, and `double` operations; arrays, structures,
+  unions, enums, bit-fields, initializers, and flexible array members.
+- Fixed and variadic function calls, aggregates passed by value, function
+  pointers, and `setjmp`/`longjmp`-style control flow.
+- Block-scope compound literals, `_Static_assert`, `_Alignas`, `_Noreturn`, and
+  a subset of runtime-sized automatic arrays.
+- Selected GNU extensions, including statement expressions, computed goto,
+  declaration assembly labels, attributes, builtins, and certified x86-64
+  inline-assembly forms.
+- Naturally aligned 1-, 2-, 4-, and 8-byte integer and pointer atomics.
+- Ordered source, assembly, object, archive, and library inputs; PIC and PIE;
+  shared libraries; static linking; response files; and common build-system
+  queries.
+- DWARF debug information and Darwin `.dSYM` generation.
+
+Not currently supported:
+
+- `_Generic`, `_Complex`, `_Imaginary`, or value operations on `_Float16`.
+- File-scope compound literals or the complete set of variably modified type
+  contexts, including runtime `sizeof` on variable-length arrays.
+- Binary128 `long double` arithmetic or ABI transport on AArch64 and RISC-V
+  Linux.
+- Thread-local storage outside x86-64 Linux.
+- Aggregate, floating-point, 128-bit, or known-misaligned atomics.
+- General GNU `typeof`, arbitrary GNU attributes, arbitrary inline assembly,
+  or `asm goto`.
+- C++, Objective-C, Windows, 32-bit or big-endian targets, LTO, sanitizers, or
+  profiling instrumentation.
+- Compiler-generated assembly output through `-S`.
+
+The detailed contracts are documented in
+[Architecture](docs/ARCHITECTURE.md),
+[Conformance](docs/design/conformance.md),
+[Frontend capabilities](docs/design/frontend-capabilities.md), and
+[Targets](docs/design/targets.md).
+
+## Testing
+
+Run the Rust test suite locally with:
+
+```sh
+cargo test --workspace --all-targets
+```
+
+Hosted CI runs the Rust test suite natively on x86-64 Linux, AArch64 Linux, and
+AArch64 macOS. The RISC-V Rust tests are cross-compiled and run under QEMU.
+A separate x86-64 Linux job builds and runs the bounded SQLite, Lua, bzip2,
+zlib, Redis, and zstd corpus profiles.
+
+## License
+
+CCC is licensed under [Apache-2.0 WITH LLVM-exception](LICENSE).

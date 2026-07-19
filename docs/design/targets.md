@@ -19,6 +19,11 @@ target tools, and rejects contradictory or unknown values before preprocessing.
 `generic` is CCC's own fixed feature baseline: it is not forwarded to another
 driver whose interpretation of that spelling could differ.
 
+Rust names its standard RV64GC Linux host
+`riscv64gc-unknown-linux-gnu`. Native-host discovery accepts that spelling and
+normalizes it to CCC's `riscv64-unknown-linux-gnu` profile; the user-facing CCC
+target spelling remains unchanged.
+
 The compiler-owned ABI identities are `sysv-amd64-lp64`, `aapcs64-lp64`,
 `riscv-lp64d`, and `darwin-arm64`. Backend calling-convention enums are derived
 from these identities and are never used as classifier or digest keys. The

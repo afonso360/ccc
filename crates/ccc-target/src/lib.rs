@@ -1066,7 +1066,9 @@ impl EffectiveCompilationConfig {
                 Environment::Gnu,
             ) => AARCH64_UNKNOWN_LINUX_GNU,
             (
-                Architecture::Riscv64(Riscv64Architecture::Riscv64),
+                Architecture::Riscv64(
+                    Riscv64Architecture::Riscv64 | Riscv64Architecture::Riscv64gc,
+                ),
                 _,
                 OperatingSystem::Linux,
                 Environment::Gnu,
@@ -1547,6 +1549,7 @@ mod tests {
             ("x86_64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"),
             ("aarch64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"),
             ("riscv64-unknown-linux-gnu", "riscv64-unknown-linux-gnu"),
+            ("riscv64gc-unknown-linux-gnu", "riscv64-unknown-linux-gnu"),
             ("aarch64-apple-darwin25.5.0", "aarch64-apple-darwin"),
             ("aarch64-apple-macosx15.0.0", "aarch64-apple-darwin"),
         ] {

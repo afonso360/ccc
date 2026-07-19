@@ -7,7 +7,7 @@ macros, GNU attributes, diagnostic pragmas, nested system includes, alternative
 keyword spellings, `typeof`, restricted pointers, and declaration assembly
 labels.
 
-The fixture is available under the repository's Apache-2.0 OR MIT license. Its
+The fixture is available under the repository's Apache-2.0 WITH LLVM-exception license. Its
 shape is pinned in the repository so deterministic preprocessing output can be
 reviewed independently from the mutable libc installed on a CI runner.
 `manifest.toml` records its origin, license, revision, entry point, compatibility

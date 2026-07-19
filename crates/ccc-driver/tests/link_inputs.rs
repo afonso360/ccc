@@ -363,6 +363,8 @@ fn termination_signal_removes_temporaries_and_preserves_the_destination() {
     let executable = directory.join("program");
     let compiler = directory.join("blocking-cc");
     let marker = directory.join("linker.pid");
+    let real_compiler =
+        std::env::var_os("CCC_CC").unwrap_or_else(|| std::ffi::OsString::from("cc"));
     fs::write(
         &main,
         "extern int answer(const char *, ...);\n\
@@ -384,7 +386,7 @@ fn termination_signal_removes_temporaries_and_preserves_the_destination() {
                  *.o) echo $$ > '{}'; exec sleep 30 ;;\n\
                esac\n\
              done\n\
-             exec cc \"$@\"\n",
+             exec \"$CCC_TEST_REAL_CC\" \"$@\"\n",
             marker.display()
         ),
     )
@@ -399,6 +401,7 @@ fn termination_signal_removes_temporaries_and_preserves_the_destination() {
         .arg("-o")
         .arg(&executable)
         .env("CCC_CC", &compiler)
+        .env("CCC_TEST_REAL_CC", real_compiler)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()

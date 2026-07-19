@@ -112,7 +112,7 @@ bits and floating-point exception flags across 894,816 weighted boundary and
 random cases at each of `-O0` and `-O2`. Exact NaN payload matching remains off
 because TestFloat documents that option as valid only when the subject's NaN
 selection policy matches SoftFloat; quietness and required invalid exceptions
-are still checked. A reported discrepancy is a hard CI failure that requires
+are still checked. A reported discrepancy is an oracle failure that requires
 case-level interpretation, not an automatic claim about which implementation
 is wrong.
 Driver tests require ABI-changing `long double` mode options to fail before
@@ -130,15 +130,16 @@ binding after packaging.
 
 Planner, IR, digest, renderer, fake-command, and manifest tests run on every
 host. Native `x86_64-unknown-linux-gnu` execution and object suites compile only
-on Linux x86-64. The required CI feature rejects the wrong host at compile time,
+on Linux x86-64. The opt-in x86 feature rejects the wrong host at compile time,
 preflights every reference and packaging tool, and invokes each named native
 test binary explicitly. A missing tool or zero-test configuration is a hard
 failure, never an implicit skip.
 
-The enabled non-x86 profiles use the same fail-closed rule. AArch64 Linux and
-RISC-V Linux run two-way CCC/reference-compiler fixed and variadic calls at
-`-O0` and `-O2` under QEMU, inspect the resulting ELF objects, exercise static
-CFI through `_Unwind_Backtrace`, and attach `gdb-multiarch` to a QEMU gdbstub.
+The standalone target-oracle harness uses the same fail-closed rule. AArch64
+Linux and RISC-V Linux run two-way CCC/reference-compiler fixed and variadic
+calls at `-O0` and `-O2` under QEMU, inspect the resulting ELF objects, exercise
+static CFI through `_Unwind_Backtrace`, and attach `gdb-multiarch` to a QEMU
+gdbstub.
 Both optimization profiles also execute returns-twice control flow and native
 1-, 2-, 4-, and 8-byte scalar atomics; the atomic object must not import a
 generic `__atomic_*` or `__sync_*` library entry point.
@@ -148,7 +149,7 @@ SDK, emulator/debugger, deployment target, and linker identities. Header and
 predefined-macro sentinels must agree with the selected profile. The corpus
 harness reports an explicit applicable, inapplicable-with-reason, or failed
 result for every case; an empty applicable set, absent runner, or missing tool
-fails the required job.
+fails the harness invocation.
 
 ## Runtime-sized automatic storage
 
@@ -252,12 +253,17 @@ Differential tests compare only outputs whose relevant behavior is defined for t
 
 ## Target execution matrix
 
-- x86-64 Linux GNU and musl run natively in matching environments;
-- AArch64 Linux and RISC-V64 Linux run natively where available and under matching QEMU user/system environments for cross coverage;
-- Darwin arm64 runs on native macOS CI with the selected SDK/deployment target;
-- compile-only object inspection supplements execution but never substitutes for a claimed runnable target.
+Hosted CI runs the Rust workspace test suite on native x86-64 Linux, AArch64
+Linux, and AArch64 macOS runners. The RISC-V64 workspace tests are
+cross-compiled with Rust's `riscv64gc-unknown-linux-gnu` target and executed
+through QEMU user mode with the matching GNU sysroot. The same Rust suite is
+the only required CI command on every matrix row.
 
-Every enabled target has a required matrix entry. A target without an execution environment is labeled compile-only and cannot be advertised as execution-tested.
+The standalone ABI, target-oracle, differential, and exhaustive real-code
+corpus harnesses remain available for focused local qualification. A separate
+x86-64 Linux job runs the bounded SQLite, Lua, bzip2, zlib, Redis, and zstd
+profiles. Compile-only object inspection supplements execution but never
+substitutes for a claimed runnable target.
 
 ## Real-code corpus
 
@@ -421,9 +427,13 @@ the supported constructs.
 ## Licensing, pinning, and supply-chain policy
 
 - Csmith uses its BSD-style license; C-Reduce uses the University of Illinois/NCSA-style license; GCC tests are governed by the applicable GCC GPL terms. Each corpus/tool is recorded individually instead of being grouped under one license label.
-- Only compatible, small fixtures are vendored. External corpora are fetched by immutable revision and cryptographic hash into a CI cache or project-controlled mirror.
+- Only compatible, small fixtures are vendored. External corpora are fetched by immutable revision and cryptographic hash into a local cache or project-controlled mirror.
 - Fetch scripts verify hashes and licenses before use; a network outage cannot silently select a different revision.
 - Minimized fixtures derived from third-party tests retain the source license and provenance when the license requires it.
 - External GPL tools may be executed without being linked into CCC; source-copying and distribution decisions are handled separately from tool execution.
 
-Fast unit/snapshot/execution tiers run per change. Fuzzing, differential matrices, full corpora, QEMU, native Darwin, and exhaustive ABI shapes run on scheduled and release CI, with failures retained as reproducible seeds/artifacts.
+Hosted CI runs the workspace Rust tests on every supported host profile, using
+QEMU for RISC-V64, plus the bounded x86-64 real-code corpus job. Fuzzing,
+differential matrices, full corpus modes, target oracles, and exhaustive ABI
+shapes are explicit local qualification commands; their harnesses retain
+failures as reproducible seeds and artifacts.

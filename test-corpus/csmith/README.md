@@ -54,9 +54,8 @@ list. Defaults can also be set with `CSMITH_CASES`, `CSMITH_START_SEED`,
 `CSMITH_COMPILE_TIMEOUT`, `CSMITH_RUN_TIMEOUT`, `CSMITH_WORK_DIR`,
 `CSMITH_ARCHIVE`, `CSMITH`, `CSMITH_RUNTIME`, `CSMITH_GCC`, `CSMITH_CLANG`,
 `CSMITH_OBJCOPY`, `CSMITH_CXX`, `CCC`, and `CCC_RESOURCE_DIR`; command-line values take
-precedence. The **Csmith differential tests** workflow exposes the eligible
-case count and first attempted seed through a manual dispatch; it does not run
-for pushes or pull requests.
+precedence. `--cases` selects the eligible case count and `--start-seed`
+selects the first attempted seed.
 
 ## Results and reproduction
 

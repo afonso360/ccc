@@ -2484,7 +2484,11 @@ mod tests {
         .unwrap()
         .stdout;
         assert!(abi.contains("abi-plan schema=ccc-abi-config-v3"));
-        assert!(abi.contains(&format!("target={}", ccc_target::Triple::host())));
+        let host_target = ccc_target::EffectiveCompilationConfig::host()
+            .unwrap()
+            .target
+            .triple;
+        assert!(abi.contains(&format!("target={host_target}")));
         assert!(abi.contains("definition function=0"));
         assert!(!abi.contains(std::env::temp_dir().to_string_lossy().as_ref()));
         let clif = run(["--emit=clif".to_owned(), "-nostdinc".to_owned(), input])
