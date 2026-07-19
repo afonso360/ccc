@@ -10,5 +10,8 @@ ccc-target = { path = "../ccc-target" }
 object.workspace = true
 sha2.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+signal-hook.workspace = true
+
 [lints]
 workspace = true

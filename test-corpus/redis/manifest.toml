@@ -24,8 +24,7 @@ target_compiler = "ccc"
 link_driver = "gcc"
 native_link_commands = 2
 link_mode = "platform-default-pie-executable"
-execution_status = "blocked-native-f80"
-required_unavailable_capability = "x86-64-f80-arithmetic-and-boundary-transport"
+execution_status = "ready"
 
 allocator = "libc"
 tls = false
@@ -38,19 +37,9 @@ ndebug = false
 assertions = "enabled-with-system-hosted-header"
 selected_atomic_backend = "legacy-sync-builtins"
 
-source_adjustment_patch = "source-adjustment.patch"
-source_adjustment_sha256 = "36e91cff18d151d6e9be236554f66aafef01b47ff5fd302e43644b176a84087e"
-source_adjustment_hashes = "source-adjustment-hashes.txt"
-source_adjustment_hashes_sha256 = "cb0e562e336e04a62b1183e44f78ae79f729f8e19ab7136760ff4f7ab154d7a5"
-source_adjustment_targets = 2
-source_adjustment_statement_expressions_removed = 0
-source_adjustment_inline_assembly_statements_removed = 6
-source_adjustment_xxhash_ccc_noop_definitions = 1
-source_adjustment_xxhash_guard_call_sites = 9
-source_adjustment_xxhash_clang_neon_guard_call_sites = 3
-source_adjustment_xxhash_selected_guard_expansions = 1
-source_adjustment_classification_calls_rewritten = 0
-source_adjustment_rationale = "replace bundled histogram x86 assembly with equivalent sequentially consistent legacy atomic builtins and select a behavior-compatible standard-C no-op for xxHash's compiler guard under CCC instead of its GNU inline-assembly guard"
+expanded_inline_assembly_statements = 7
+expanded_inline_assembly_hdr_statements = 6
+expanded_inline_assembly_xxhash_guards = 1
 
 test_profile = "focused-server-cli-smoke"
 test_transport = "private-unix-domain-socket"
@@ -114,8 +103,13 @@ gnu_attributes = ["aligned", "deprecated-declarator", "format", "noinline", "pac
 gnu_operators = ["compound-literal", "statement-expression"]
 statement_expression_uses = ["atomicCompareExchange-sync-cas"]
 adjusted_statement_expression_uses = []
-inline_assembly_forms = []
-adjusted_inline_assembly_forms = ["hdr-histogram-x86-atomic-operations"]
+inline_assembly_forms = [
+    "compiler-memory-barrier",
+    "empty-read-write-register-guard",
+    "x86-locked-exchange",
+    "x86-locked-exchange-with-result",
+    "x86-locked-compare-exchange",
+]
 unselected_builtin_families = ["__atomic", "__builtin_cpu_supports"]
 expanded_builtin_absent = [
     "__builtin_add_overflow",
@@ -157,32 +151,28 @@ retain = [
     "inline-assembly-inventory.txt",
     "link-driver-identity.txt",
     "link-driver-macros.txt",
-    "patch-identity.txt",
     "predicate-probe.txt",
     "preprocessed-source-inputs.txt",
     "server.log",
     "smoke.log",
-    "source-adjustment-apply.log",
-    "source-adjustment-audit.txt",
-    "source-adjustment-hashes.txt",
-    "source-adjustment-reapply.log",
-    "source-adjustment.patch",
-    "source-adjustment.txt",
+    "source-surface-audit.txt",
     "source-inputs.txt",
     "version.log",
 ]
 
 [target_applicability."x86_64-unknown-linux-gnu"]
-status = "inapplicable"
-reason = "The audited build path is retained, but execution is blocked because the selected Redis source requires native x86-64 f80 arithmetic and boundary transport that CCC does not provide."
+status = "applicable"
+evidence_kind = "execution"
+runner = "run.sh"
+reason = "The adapter audits the unmodified x86-64 source surface, CCC translations, x87 f80 bridges, selected inline assembly, native GCC links, ELF PIE artifacts, and the focused server/CLI execution profile."
 
 [target_applicability."aarch64-unknown-linux-gnu"]
 status = "inapplicable"
-reason = "The adapter requires a native x86-64 GCC driver and its pinned inventory and source-adjustment audit have not been recertified for AArch64 or QEMU execution."
+reason = "The adapter requires a native x86-64 GCC driver and its pinned builtin and inline-assembly inventory have not been recertified for AArch64 or QEMU execution."
 
 [target_applicability."riscv64-unknown-linux-gnu"]
 status = "inapplicable"
-reason = "The adapter requires a native x86-64 GCC driver and its pinned inventory and source-adjustment audit have not been recertified for RISC-V or QEMU execution."
+reason = "The adapter requires a native x86-64 GCC driver and its pinned builtin and inline-assembly inventory have not been recertified for RISC-V or QEMU execution."
 
 [target_applicability."aarch64-apple-darwin"]
 status = "inapplicable"

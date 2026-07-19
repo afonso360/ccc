@@ -144,6 +144,9 @@ pub type FunctionPlan = NativeBoundaryPlan;
 pub enum RegisterBank {
     Integer,
     Float,
+    /// The x87 return stack. Generated System V AMD64 bridges are the only
+    /// consumers; this is never exposed as a Cranelift carrier.
+    X87,
 }
 
 /// A register slot in an ABI-defined argument or result bank.
@@ -169,6 +172,13 @@ impl RegisterSlot {
         Self {
             bank: RegisterBank::Float,
             index,
+        }
+    }
+
+    pub const fn x87() -> Self {
+        Self {
+            bank: RegisterBank::X87,
+            index: 0,
         }
     }
 }
@@ -314,6 +324,21 @@ pub struct TlsAccessorArtifactPlan {
     pub source_defined: bool,
 }
 
+/// One translation-unit-local x87 operation dispatcher. Its only public ABI
+/// is `void(frame*)`; all f80 values remain address-backed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct F80SupportArtifactPlan {
+    pub helper_symbol: String,
+}
+
+/// Translation-unit-local helper functions for the closed x86 instruction
+/// forms retained in generic IR.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InlineAsmSupportArtifactPlan {
+    pub cpuid_symbol: Option<String>,
+    pub rdtsc_symbol: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackagingPlan {
     pub generated_assembly_units: u32,
@@ -330,6 +355,8 @@ pub struct BridgeArtifactPlan {
     pub call_bridge: Option<CallBridgeArtifactPlan>,
     pub bridge_entries: BTreeMap<FullFunctionId, BridgeEntryArtifactPlan>,
     pub tls_accessors: BTreeMap<DataId, TlsAccessorArtifactPlan>,
+    pub f80_support: Option<F80SupportArtifactPlan>,
+    pub inline_asm_support: Option<InlineAsmSupportArtifactPlan>,
     pub packaging: PackagingPlan,
 }
 

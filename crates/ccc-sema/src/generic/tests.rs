@@ -501,6 +501,50 @@ fn gnu_noreturn_attribute_updates_function_control_flow_properties() {
 }
 
 #[test]
+fn returns_twice_functions_are_classified_from_attributes_and_hosted_names() {
+    let unit = analyze_source(
+        "extern int checkpoint(void *) __attribute__((__returns_twice__));\n\
+         extern int setjmp(void *);\n\
+         static int local_setjmp(void *);",
+    )
+    .unwrap();
+
+    let checkpoint = unit
+        .functions
+        .iter()
+        .find(|function| function.name == "checkpoint")
+        .unwrap();
+    assert!(checkpoint.properties.returns_twice);
+    assert_eq!(
+        checkpoint
+            .attributes
+            .iter()
+            .find(|attribute| attribute.name == "__returns_twice__")
+            .unwrap()
+            .capability,
+        CapabilityState::Implemented
+    );
+
+    assert!(
+        unit.functions
+            .iter()
+            .find(|function| function.name == "setjmp")
+            .unwrap()
+            .properties
+            .returns_twice
+    );
+    assert!(
+        !unit
+            .functions
+            .iter()
+            .find(|function| function.name == "local_setjmp")
+            .unwrap()
+            .properties
+            .returns_twice
+    );
+}
+
+#[test]
 fn word_mode_uses_the_target_pointer_width_and_preserves_signedness() {
     let unit = analyze_source(
         "typedef int register_t __attribute__((__mode__(__word__)));\n\
@@ -951,7 +995,7 @@ fn types_legacy_sync_operations_with_native_scalar_and_pointer_contracts() {
         "{dump}"
     );
     assert!(
-        dump.contains("atomic-cmpxchg object=int return-boolean=true order=SequentiallyConsistent : _Bool Value"),
+        dump.contains("atomic-cmpxchg object=int return-boolean=true expected-pointer=false order=SequentiallyConsistent : _Bool Value"),
         "{dump}"
     );
     assert!(
@@ -1016,6 +1060,202 @@ fn types_legacy_sync_operations_with_native_scalar_and_pointer_contracts() {
         8,
         "{dump}"
     );
+}
+
+#[test]
+fn types_scalar_atomic_header_and_gnu_operations_with_fail_closed_boundaries() {
+    let unit = analyze_resource_source(
+        "#include <stdatomic.h>\n\
+         #if !__has_builtin(__atomic_load_n) || \
+             !__has_builtin(__atomic_compare_exchange_n)\n\
+         #error missing atomic builtin\n\
+         #endif\n\
+         atomic_int value = ATOMIC_VAR_INIT(1);\n\
+         int update(int operand, int *expected) {\n\
+             int old = atomic_load_explicit(&value, memory_order_relaxed);\n\
+             atomic_store_explicit(&value, operand, memory_order_release);\n\
+             old ^= atomic_fetch_or(&value, 4);\n\
+             old ^= __atomic_xor_fetch(&value, 3, __ATOMIC_ACQUIRE);\n\
+             old ^= atomic_compare_exchange_weak_explicit(\n\
+                 &value, expected, old, memory_order_relaxed,\n\
+                 memory_order_relaxed);\n\
+             atomic_thread_fence(memory_order_acquire);\n\
+             atomic_signal_fence(memory_order_release);\n\
+             return old;\n\
+         }",
+    )
+    .unwrap();
+    let dump = dump_frontend_typed_ast(&unit);
+    assert!(
+        dump.contains("typedef !1 atomic_bool : _Atomic _Bool"),
+        "{dump}"
+    );
+    assert!(
+        dump.contains("atomic-load object=_Atomic int order=SequentiallyConsistent"),
+        "{dump}"
+    );
+    assert!(
+        dump.contains("atomic-store object=_Atomic int order=SequentiallyConsistent"),
+        "{dump}"
+    );
+    assert!(dump.contains("atomic-rmw BitwiseOr"), "{dump}");
+    assert!(dump.contains("atomic-rmw BitwiseXor"), "{dump}");
+    assert!(
+        dump.contains("return-boolean=true expected-pointer=true order=SequentiallyConsistent"),
+        "{dump}"
+    );
+    assert_eq!(
+        dump.matches("memory-fence SequentiallyConsistent").count(),
+        2
+    );
+
+    for source in [
+        "float value; int f(void) { return __atomic_load_n(&value, 0); }",
+        "struct Pair { int x; } value; int f(void) { return __atomic_load_n(&value, 0).x; }",
+        "const int value = 0; void f(void) { __atomic_store_n(&value, 1, 0); }",
+        "int value; _Atomic int expected; int f(void) { return __atomic_compare_exchange_n(&value, &expected, 1, 0, 0, 0); }",
+        "int *value; int *f(void) { return __atomic_fetch_add(&value, 1, 0); }",
+        "int value; int f(void) { return __atomic_load_n(&value, 3); }",
+        "int value; void f(void) { __atomic_store_n(&value, 1, 2); }",
+        "int value; int expected; int f(void) { return __atomic_compare_exchange_n(&value, &expected, 1, 0, 5, 3); }",
+        "int value; int expected; int f(void) { return __atomic_compare_exchange_n(&value, &expected, 1, 0, 0, 2); }",
+        "_Atomic int value; int f(void) { return value *= 2; }",
+        "_Atomic _Bool value; int f(void) { return ++value; }",
+        "_Atomic double value; int f(void) { return ++value != 0; }",
+    ] {
+        assert_eq!(diagnostic_codes(source), vec!["CCC2455"], "{source}");
+    }
+    assert_eq!(
+        diagnostic_codes("_Atomic(__int128) value;"),
+        vec!["CCC2443"]
+    );
+    for source in [
+        "struct __attribute__((packed)) Packed { _Atomic int value; };",
+        "struct Bits { _Atomic unsigned value : 1; };",
+    ] {
+        assert_eq!(diagnostic_codes(source), vec!["CCC2453"], "{source}");
+    }
+    analyze_source("struct __attribute__((packed)) Restored { _Alignas(4) _Atomic int value; };")
+        .unwrap();
+    let diagnostics = analyze_resource_source(
+        "#include <stdatomic.h>\n\
+         int values[2]; _Atomic(int *) pointer;\n\
+         int *advance(void) { return atomic_fetch_add(&pointer, 1); }",
+    )
+    .unwrap_err();
+    assert_eq!(diagnostics[0].code, "CCC2455");
+}
+
+#[test]
+fn scalar_atomic_builtins_reject_known_packed_addresses_but_allow_unknown_pointers() {
+    for source in [
+        "struct __attribute__((packed)) Packed { char tag; int value; };\n\
+         int load(struct Packed *object) { return __atomic_load_n(&object->value, 0); }",
+        "struct __attribute__((packed)) PackedArray { char tag; int values[2]; };\n\
+         int load(struct PackedArray *object, int index) {\n\
+             return __atomic_load_n(&object->values[index], 0);\n\
+         }",
+        "struct __attribute__((packed)) Packed { char tag; int value; };\n\
+         int update(struct Packed *object) {\n\
+             return __sync_fetch_and_add(&object->value, 1);\n\
+         }",
+    ] {
+        let diagnostics = analyze_source(source).unwrap_err();
+        assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:#?}");
+        assert!(
+            matches!(diagnostics[0].code.as_str(), "CCC2434" | "CCC2455"),
+            "{source}: {diagnostics:#?}"
+        );
+        assert!(
+            diagnostics[0].message.contains("packed-member alignment"),
+            "{source}: {diagnostics:#?}"
+        );
+    }
+
+    let diagnostics = analyze_resource_source(
+        "#include <stdatomic.h>\n\
+         struct __attribute__((packed)) Packed { char tag; int value; };\n\
+         int load(struct Packed *object) {\n\
+             return atomic_load_explicit(\n\
+                 (_Atomic int *)&object->value, memory_order_relaxed);\n\
+         }",
+    )
+    .unwrap_err();
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].code, "CCC2455");
+    assert!(diagnostics[0].message.contains("packed-member alignment"));
+
+    analyze_source(
+        "int load_unknown(int *object) { return __atomic_load_n(object, 0); }\n\
+         int update_unknown(int *object) { return __sync_fetch_and_add(object, 1); }\n\
+         struct __attribute__((packed)) Holder { char tag; int *pointer; };\n\
+         int load_indirect(struct Holder *holder) {\n\
+             return __atomic_load_n(holder->pointer, 0);\n\
+         }\n\
+         struct __attribute__((packed)) Restored {\n\
+             char tag; _Alignas(4) int value;\n\
+         };\n\
+         int load_restored(struct Restored *object) {\n\
+             return __atomic_load_n(&object->value, 0);\n\
+         }",
+    )
+    .unwrap();
+}
+
+#[test]
+fn atomic_alignment_provenance_keeps_weakened_conditional_alternatives() {
+    for (source, code) in [
+        (
+            "struct __attribute__((packed)) Packed { char tag; int value; };\n\
+             int load(struct Packed *packed, int *unknown, int select) {\n\
+                 return __atomic_load_n(select ? &packed->value : unknown, 0);\n\
+             }",
+            "CCC2455",
+        ),
+        (
+            "struct __attribute__((packed)) Packed { char tag; int value; };\n\
+             void store(struct Packed *packed, int *unknown, int select) {\n\
+                 __atomic_store_n(select ? unknown : &packed->value, 1, 0);\n\
+             }",
+            "CCC2455",
+        ),
+        (
+            "struct __attribute__((packed)) Packed { char tag; int value; };\n\
+             int update(struct Packed *packed, int *unknown, int select) {\n\
+                 return __sync_fetch_and_add(\n\
+                     select ? &packed->value : unknown, 1);\n\
+             }",
+            "CCC2434",
+        ),
+        (
+            "struct __attribute__((packed)) Packed { char tag; int value; };\n\
+             int compare(struct Packed *packed, int *unknown, int select) {\n\
+                 return __sync_bool_compare_and_swap(\n\
+                     select ? unknown : &packed->value, 1, 2);\n\
+             }",
+            "CCC2434",
+        ),
+    ] {
+        let diagnostics = analyze_source(source).unwrap_err();
+        assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:#?}");
+        assert_eq!(diagnostics[0].code, code, "{source}: {diagnostics:#?}");
+        assert!(
+            diagnostics[0].message.contains("packed-member alignment"),
+            "{source}: {diagnostics:#?}"
+        );
+    }
+
+    analyze_source(
+        "struct Aligned { int value; };\n\
+         int load(struct Aligned *aligned, int *unknown, int select) {\n\
+             return __atomic_load_n(select ? &aligned->value : unknown, 0);\n\
+         }\n\
+         int update(struct Aligned *aligned, int *unknown, int select) {\n\
+             return __sync_fetch_and_add(\n\
+                 select ? unknown : &aligned->value, 1);\n\
+         }",
+    )
+    .unwrap();
 }
 
 #[test]
@@ -3152,10 +3392,7 @@ fn accepts_automatic_variable_length_and_thread_local_objects() {
     );
     assert!(analyze_source("unsigned long size = sizeof(long double);").is_ok());
     assert!(analyze_source("unsigned long alignment = __alignof__(long double);").is_ok());
-    assert!(
-        diagnostic_codes("long double f(long double x) { return x + 1.0L; }")
-            .contains(&"CCC2343".to_owned())
-    );
+    assert!(analyze_source("long double f(long double x) { return x + 1.0L; }").is_ok());
 
     let parsed = parse_source("int value __attribute__((aligned(8))); ");
     let mut config = EffectiveCompilationConfig::default();
@@ -3317,6 +3554,105 @@ fn linux_binary128_operations_and_variadic_fetches_fail_explicitly() {
                 .any(|diagnostic| diagnostic.code == "CCC2404")
         );
     }
+}
+
+#[test]
+fn x87_literals_conversions_and_folds_preserve_extended_precision() {
+    let unit = analyze_source(
+        "static long double literal = 0x1.0000000000000002p0L;
+         static long double folded = 0x1p0L + 0x1p-63L;
+         static long double unsigned_max = 18446744073709551615UL;",
+    )
+    .unwrap();
+    let constants = unit
+        .globals
+        .iter()
+        .map(|global| {
+            let FullTypedInitializerKind::Scalar(expression) =
+                &global.initializer.as_ref().unwrap().kind
+            else {
+                panic!("{} has a scalar initializer", global.name)
+            };
+            let ConstantValue::LongDouble(value) = expression.constant.unwrap() else {
+                panic!("{} has an exact long-double constant", global.name)
+            };
+            assert_eq!(value.format, ccc_target::LongDoubleFormat::X87Extended);
+            assert_eq!(&value.bytes[10..], &[0; 6]);
+            (global.name.as_str(), value.bytes)
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let one_plus_ulp = [1, 0, 0, 0, 0, 0, 0, 128, 255, 63, 0, 0, 0, 0, 0, 0];
+    assert_eq!(constants["literal"], one_plus_ulp);
+    assert_eq!(constants["folded"], one_plus_ulp);
+    assert_eq!(
+        constants["unsigned_max"],
+        [
+            255, 255, 255, 255, 255, 255, 255, 255, 62, 64, 0, 0, 0, 0, 0, 0
+        ]
+    );
+}
+
+#[test]
+fn x87_and_128_bit_integer_conversions_are_typed_and_folded_exactly() {
+    let unit = analyze_source(
+        "long double from_signed(__int128 value) { return (long double)value; }
+         long double from_unsigned(unsigned __int128 value) { return (long double)value; }
+         __int128 to_signed(long double value) { return (__int128)value; }
+         unsigned __int128 to_unsigned(long double value) { return (unsigned __int128)value; }
+         static long double high = (unsigned __int128)1 << 100;
+         static __int128 truncated = (__int128)0x1.0000000000000002p100L;",
+    )
+    .unwrap();
+    assert_eq!(unit.functions.len(), 4);
+    assert!(unit.globals.iter().all(|global| {
+        global.initializer.as_ref().is_some_and(|initializer| {
+            matches!(
+                &initializer.kind,
+                FullTypedInitializerKind::Scalar(expression) if expression.constant.is_some()
+            )
+        })
+    }));
+}
+
+#[test]
+fn floating_literal_range_is_checked_after_suffix_selects_the_format() {
+    assert_eq!(diagnostic_codes("double value = 1e4000;"), vec!["CCC2444"]);
+    assert_eq!(diagnostic_codes("float value = 1e100f;"), vec!["CCC2444"]);
+    assert!(analyze_source("long double value = 1e4000L;").is_ok());
+}
+
+#[test]
+fn x87_constant_casts_comparisons_and_sign_changes_fold_exactly() {
+    let unit = analyze_source(
+        "static int truncated = (int)3.75L;
+         static int greater = 0x1.0000000000000002p0L > 1.0L;
+         static double demoted = (double)0x1.0000000000000002p0L;
+         static long double negative = -1.0L;",
+    )
+    .unwrap();
+    let constant = |name: &str| {
+        let global = unit
+            .globals
+            .iter()
+            .find(|global| global.name == name)
+            .unwrap();
+        let FullTypedInitializerKind::Scalar(expression) =
+            &global.initializer.as_ref().unwrap().kind
+        else {
+            panic!("{name} has a scalar initializer")
+        };
+        expression.constant.unwrap()
+    };
+    assert_eq!(constant("truncated"), ConstantValue::Signed(3));
+    assert_eq!(constant("greater"), ConstantValue::Signed(1));
+    assert_eq!(constant("demoted"), ConstantValue::Floating(1.0));
+    let ConstantValue::LongDouble(negative) = constant("negative") else {
+        panic!("negative has an exact long-double constant")
+    };
+    assert_eq!(
+        negative.bytes,
+        [0, 0, 0, 0, 0, 0, 0, 128, 255, 191, 0, 0, 0, 0, 0, 0]
+    );
 }
 
 #[test]
@@ -3610,5 +3946,86 @@ fn ordinary_character_constants_follow_target_char_signedness() {
     assert_eq!(
         unsigned_expression.constant,
         Some(ConstantValue::Unsigned(255))
+    );
+}
+
+#[test]
+fn classifies_the_certified_x86_64_inline_assembly_forms() {
+    let unit = analyze_source(
+        "typedef unsigned int U32;\n\
+         void forms(U32 index, U32 low, const unsigned char *backup,\n\
+                    void **pointer, void *pointer_value,\n\
+                    long *field, long *expected, long desired) {\n\
+             U32 eax, ebx, ecx, edx;\n\
+             const unsigned char *candidate = backup;\n\
+             long value = desired;\n\
+             long result;\n\
+             long original;\n\
+             asm(\"\");\n\
+             asm(\".p2align 6\");\n\
+             asm(\"nop\");\n\
+             asm(\"\" : \"+r\"(index));\n\
+             asm(\"cpuid\" : \"=a\"(eax) : \"a\"(0) : \"ebx\", \"ecx\", \"edx\");\n\
+             asm(\"cpuid\" : \"=a\"(eax), \"=c\"(ecx), \"=d\"(edx) : \"a\"(1) : \"ebx\");\n\
+             asm(\"cpuid\" : \"=a\"(eax), \"=b\"(ebx), \"=c\"(ecx) : \"a\"(7), \"c\"(0) : \"edx\");\n\
+             asm volatile(\"rdtsc\" : \"=a\"(eax), \"=d\"(edx));\n\
+             asm(\"cmp %1, %2\\ncmova %3, %0\\n\" : \"+r\"(candidate) : \"r\"(index), \"r\"(low), \"r\"(backup));\n\
+             asm volatile(\"\" ::: \"memory\");\n\
+             asm volatile(\"lock; xchgq %0, %1\" : \"+q\"(pointer_value), \"+m\"(*pointer));\n\
+             asm volatile(\"lock; xchgq %0, %1\" : \"+q\"(value), \"+m\"(*field));\n\
+             asm volatile(\"lock; xchgq %1, %2\" : \"=r\"(result), \"+q\"(value), \"+m\"(*field));\n\
+             asm volatile(\"lock; cmpxchgq %2, %1\" : \"=a\"(original), \"+m\"(*field) : \"q\"(desired), \"0\"(*expected));\n\
+         }",
+    )
+    .unwrap();
+    let dump = dump_frontend_typed_ast(&unit);
+    for kind in [
+        "compiler-barrier",
+        "code-align",
+        "layout-nop",
+        "opaque-scalar",
+        "x86-cpuid",
+        "x86-rdtsc",
+        "x86-conditional-move-above",
+        "x86-atomic-exchange",
+        "x86-atomic-compare-exchange",
+    ] {
+        assert!(dump.contains(&format!("inline-asm {kind}")), "{dump}");
+    }
+    assert_eq!(dump.matches("inline-asm x86-cpuid").count(), 3, "{dump}");
+    assert_eq!(
+        dump.matches("inline-asm x86-atomic-exchange").count(),
+        3,
+        "{dump}"
+    );
+}
+
+#[test]
+fn inline_assembly_classifier_rejects_near_misses() {
+    for source in [
+        "void f(void) { asm(\"pause\"); }",
+        "void f(void) { asm(\".p2align 7\"); }",
+        "void f(void) { asm volatile(\"\" ::: \"cc\"); }",
+        "void f(unsigned value) { asm(\"\" : \"=r\"(value)); }",
+        "void f(unsigned value) { asm(\"\" : \"+r\"(value) : \"r\"(value)); }",
+        "void f(unsigned value) { asm(\"cpuid\" : \"=a\"(value) : \"a\"(0) : \"ebx\", \"ecx\"); }",
+        "void f(unsigned value) { asm volatile(\"rdtsc\" : \"=a\"(value)); }",
+        "void f(long *field, int value) { asm volatile(\"lock; xchgq %0, %1\" : \"+q\"(value), \"+m\"(*field)); }",
+        "void f(void) { asm goto(\"\" :::: done); done: return; }",
+    ] {
+        assert_eq!(diagnostic_codes(source), ["CCC2454"], "{source}");
+    }
+
+    let diagnostics = analyze_source_with_config(
+        "void f(void) { asm(\"nop\"); }",
+        &EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code.as_str())
+            .collect::<Vec<_>>(),
+        ["CCC2454"]
     );
 }

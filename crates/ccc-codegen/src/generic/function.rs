@@ -1,6 +1,28 @@
 use super::data::{low_mask_u128, scalar_constant_bits, string_unit_bytes};
 use super::*;
 
+const F80_OP_ADD: i64 = 1;
+const F80_OP_SUBTRACT: i64 = 2;
+const F80_OP_MULTIPLY: i64 = 3;
+const F80_OP_DIVIDE: i64 = 4;
+const F80_OP_COMPARE_QUIET: i64 = 5;
+const F80_OP_NEGATE: i64 = 6;
+const F80_OP_FROM_I64: i64 = 7;
+const F80_OP_FROM_U64: i64 = 8;
+const F80_OP_FROM_F32: i64 = 9;
+const F80_OP_FROM_F64: i64 = 10;
+const F80_OP_TO_I64: i64 = 11;
+const F80_OP_TO_U64: i64 = 12;
+const F80_OP_TO_F32: i64 = 13;
+const F80_OP_TO_F64: i64 = 14;
+const F80_OP_VOLATILE_LOAD: i64 = 15;
+const F80_OP_VOLATILE_STORE: i64 = 16;
+const F80_OP_FROM_I128: i64 = 17;
+const F80_OP_FROM_U128: i64 = 18;
+const F80_OP_TO_I128: i64 = 19;
+const F80_OP_TO_U128: i64 = 20;
+const F80_OP_COMPARE_SIGNALING: i64 = 21;
+
 pub(super) struct FunctionReferences {
     functions: HashMap<u32, FunctionReference>,
     globals: HashMap<u32, DataReference>,
@@ -9,6 +31,9 @@ pub(super) struct FunctionReferences {
     runtime_realloc: Option<ir::FuncRef>,
     runtime_free: Option<ir::FuncRef>,
     runtime_helpers: HashMap<&'static str, ir::FuncRef>,
+    f80_support: Option<ir::FuncRef>,
+    inline_cpuid_support: Option<ir::FuncRef>,
+    inline_rdtsc_support: Option<ir::FuncRef>,
 }
 
 #[derive(Clone, Copy)]
@@ -33,6 +58,15 @@ struct DataReference {
 struct StackStorage {
     slot: StackSlot,
     dynamic_alignment: Option<u64>,
+}
+
+/// Machine-stack identities retained for source-level debug locations.
+///
+/// Runtime-sized arena objects and dynamically realigned slots deliberately
+/// have no entry: their address is computed at run time and cannot be
+/// described by one fixed frame-relative expression.
+pub(super) struct FunctionDebugLayout {
+    pub(super) storage_slots: HashMap<u32, StackSlot>,
 }
 
 pub(super) fn declare_function_references(
@@ -94,6 +128,15 @@ pub(super) fn declare_function_references(
         .iter()
         .map(|(symbol, id)| (*symbol, object_module.declare_func_in_func(*id, function)))
         .collect();
+    let f80_support = declarations
+        .f80_support
+        .map(|id| object_module.declare_func_in_func(id, function));
+    let inline_cpuid_support = declarations
+        .inline_cpuid_support
+        .map(|id| object_module.declare_func_in_func(id, function));
+    let inline_rdtsc_support = declarations
+        .inline_rdtsc_support
+        .map(|id| object_module.declare_func_in_func(id, function));
     FunctionReferences {
         functions,
         globals,
@@ -102,6 +145,9 @@ pub(super) fn declare_function_references(
         runtime_realloc,
         runtime_free,
         runtime_helpers,
+        f80_support,
+        inline_cpuid_support,
+        inline_rdtsc_support,
     }
 }
 
@@ -115,7 +161,8 @@ pub(super) fn lower_function(
     references: &FunctionReferences,
     frontend_config: isa::TargetFrontendConfig,
     clif_function: &mut ir::Function,
-) -> Result<(), CodegenError> {
+    mut debug_locations: Option<&mut super::debug::SourceLocationRegistry>,
+) -> Result<FunctionDebugLayout, CodegenError> {
     let entry = function.entry.ok_or_else(|| {
         error(format!(
             "function definition `{}` has no entry block",
@@ -255,11 +302,17 @@ pub(super) fn lower_function(
     for block in ordered_blocks {
         builder.switch_to_block(state.block(block.id.0)?);
         if block.id == entry {
+            if let Some(locations) = debug_locations.as_deref_mut() {
+                builder.set_srcloc(locations.intern(function.span)?);
+            }
             let entry_values = builder.block_params(state.block(entry.0)?).to_vec();
             state.initialize_runtime_storage(&mut builder);
             state.bind_entry_parameters(&mut builder, &entry_values)?;
         }
         for instruction in &block.instructions {
+            if let Some(locations) = debug_locations.as_deref_mut() {
+                builder.set_srcloc(locations.intern(instruction.span)?);
+            }
             let result = state.lower_instruction(&mut builder, instruction)?;
             match (instruction.result, result) {
                 (Some(id), Some(value)) => state.set_value(id, value)?,
@@ -286,9 +339,19 @@ pub(super) fn lower_function(
         })?;
         state.lower_terminator(&mut builder, terminator)?;
     }
+    let storage_slots = state
+        .storage
+        .iter()
+        .filter_map(|(id, storage)| {
+            storage
+                .dynamic_alignment
+                .is_none()
+                .then_some((*id, storage.slot))
+        })
+        .collect();
     builder.seal_all_blocks();
     builder.finalize();
-    Ok(())
+    Ok(FunctionDebugLayout { storage_slots })
 }
 
 struct FunctionState<'a> {
@@ -309,6 +372,285 @@ struct FunctionState<'a> {
 }
 
 impl FunctionState<'_> {
+    fn f80_support_call(
+        &self,
+        builder: &mut FunctionBuilder<'_>,
+        opcode: i64,
+        output: ir::Value,
+        left: ir::Value,
+        right: Option<ir::Value>,
+    ) -> Result<(), CodegenError> {
+        let helper = self
+            .references
+            .f80_support
+            .ok_or_else(|| error("x87 operation has no generated support helper"))?;
+        let frame = create_stack_backing(builder, 32, 16)?;
+        zero_memory(builder, frame, 32)?;
+        store_integer(builder, frame, 0, ir::types::I32, opcode)?;
+        store_value(builder, frame, 8, output)?;
+        store_value(builder, frame, 16, left)?;
+        if let Some(right) = right {
+            store_value(builder, frame, 24, right)?;
+        }
+        let call = builder.ins().call(helper, &[frame]);
+        if !builder.inst_results(call).is_empty() {
+            return Err(error(
+                "x87 support helper unexpectedly returned a CLIF value",
+            ));
+        }
+        Ok(())
+    }
+
+    fn lower_f80_binary(
+        &self,
+        builder: &mut FunctionBuilder<'_>,
+        operator: gir::BinaryOperation,
+        left: ir::Value,
+        right: ir::Value,
+        result_ty: QualifiedType,
+    ) -> Result<ir::Value, CodegenError> {
+        let comparison = matches!(
+            operator,
+            gir::BinaryOperation::Less
+                | gir::BinaryOperation::LessEqual
+                | gir::BinaryOperation::Greater
+                | gir::BinaryOperation::GreaterEqual
+                | gir::BinaryOperation::Equal
+                | gir::BinaryOperation::NotEqual
+        );
+        if comparison {
+            let slot = create_stack_backing(builder, 4, 4)?;
+            zero_memory(builder, slot, 4)?;
+            let opcode = match operator {
+                // C equality operators use a quiet comparison. Relational
+                // operators are signaling under the enabled Annex-F parity
+                // contract, including for a quiet NaN operand.
+                gir::BinaryOperation::Equal | gir::BinaryOperation::NotEqual => {
+                    F80_OP_COMPARE_QUIET
+                }
+                gir::BinaryOperation::Less
+                | gir::BinaryOperation::LessEqual
+                | gir::BinaryOperation::Greater
+                | gir::BinaryOperation::GreaterEqual => F80_OP_COMPARE_SIGNALING,
+                _ => unreachable!(),
+            };
+            self.f80_support_call(builder, opcode, slot, left, Some(right))?;
+            let ordering = builder.ins().load(ir::types::I32, MemFlags::new(), slot, 0);
+            let boolean = match operator {
+                gir::BinaryOperation::Less => builder.ins().icmp_imm(IntCC::Equal, ordering, -1),
+                gir::BinaryOperation::LessEqual => {
+                    builder
+                        .ins()
+                        .icmp_imm(IntCC::SignedLessThanOrEqual, ordering, 0)
+                }
+                gir::BinaryOperation::Greater => builder.ins().icmp_imm(IntCC::Equal, ordering, 1),
+                gir::BinaryOperation::GreaterEqual => {
+                    let nonnegative =
+                        builder
+                            .ins()
+                            .icmp_imm(IntCC::SignedGreaterThanOrEqual, ordering, 0);
+                    let ordered = builder.ins().icmp_imm(IntCC::NotEqual, ordering, 2);
+                    builder.ins().band(nonnegative, ordered)
+                }
+                gir::BinaryOperation::Equal => builder.ins().icmp_imm(IntCC::Equal, ordering, 0),
+                gir::BinaryOperation::NotEqual => {
+                    builder.ins().icmp_imm(IntCC::NotEqual, ordering, 0)
+                }
+                _ => unreachable!(),
+            };
+            let destination = scalar_type(&self.module.types, result_ty, self.config)?;
+            return Ok(coerce_integer(
+                builder,
+                boolean,
+                builder.func.dfg.value_type(boolean),
+                destination,
+                false,
+            ));
+        }
+        let opcode = match operator {
+            gir::BinaryOperation::Add => F80_OP_ADD,
+            gir::BinaryOperation::Subtract => F80_OP_SUBTRACT,
+            gir::BinaryOperation::Multiply => F80_OP_MULTIPLY,
+            gir::BinaryOperation::Divide => F80_OP_DIVIDE,
+            _ => {
+                return Err(error(format!(
+                    "operator {operator:?} is invalid for x87 long double"
+                )));
+            }
+        };
+        let result = create_stack_backing(builder, 16, 16)?;
+        zero_memory(builder, result, 16)?;
+        self.f80_support_call(builder, opcode, result, left, Some(right))?;
+        Ok(result)
+    }
+
+    fn lower_f80_unary(
+        &self,
+        builder: &mut FunctionBuilder<'_>,
+        operator: gir::UnaryOperation,
+        operand: ir::Value,
+        result_ty: QualifiedType,
+    ) -> Result<ir::Value, CodegenError> {
+        match operator {
+            gir::UnaryOperation::Plus => Ok(operand),
+            gir::UnaryOperation::Negate => {
+                let result = create_stack_backing(builder, 16, 16)?;
+                zero_memory(builder, result, 16)?;
+                self.f80_support_call(builder, F80_OP_NEGATE, result, operand, None)?;
+                Ok(result)
+            }
+            gir::UnaryOperation::LogicalNot => {
+                let zero = create_stack_backing(builder, 16, 16)?;
+                zero_memory(builder, zero, 16)?;
+                let slot = create_stack_backing(builder, 4, 4)?;
+                zero_memory(builder, slot, 4)?;
+                self.f80_support_call(builder, F80_OP_COMPARE_QUIET, slot, operand, Some(zero))?;
+                let ordering = builder.ins().load(ir::types::I32, MemFlags::new(), slot, 0);
+                let boolean = builder.ins().icmp_imm(IntCC::Equal, ordering, 0);
+                let destination = scalar_type(&self.module.types, result_ty, self.config)?;
+                Ok(coerce_integer(
+                    builder,
+                    boolean,
+                    builder.func.dfg.value_type(boolean),
+                    destination,
+                    false,
+                ))
+            }
+            gir::UnaryOperation::BitwiseNot => {
+                Err(error("bitwise complement cannot be applied to long double"))
+            }
+        }
+    }
+
+    fn lower_f80_conversion(
+        &self,
+        builder: &mut FunctionBuilder<'_>,
+        operand: ir::Value,
+        kind: gir::ScalarConversion,
+        from: QualifiedType,
+        to: QualifiedType,
+    ) -> Result<Option<ir::Value>, CodegenError> {
+        if kind == gir::ScalarConversion::ToVoid {
+            return Ok(None);
+        }
+        let from_f80 = is_x87_f80(&self.module.types, from, self.config);
+        let to_f80 = is_x87_f80(&self.module.types, to, self.config);
+        if from_f80 && to_f80 {
+            return Ok(Some(operand));
+        }
+        if from_f80
+            && (kind == gir::ScalarConversion::ToBoolean
+                || self.module.types.builtin_type(to.ty) == Some(BuiltinType::Bool))
+        {
+            let zero = create_stack_backing(builder, 16, 16)?;
+            zero_memory(builder, zero, 16)?;
+            let slot = create_stack_backing(builder, 4, 4)?;
+            zero_memory(builder, slot, 4)?;
+            self.f80_support_call(builder, F80_OP_COMPARE_QUIET, slot, operand, Some(zero))?;
+            let ordering = builder.ins().load(ir::types::I32, MemFlags::new(), slot, 0);
+            let boolean = builder.ins().icmp_imm(IntCC::NotEqual, ordering, 0);
+            let destination = scalar_type(&self.module.types, to, self.config)?;
+            return Ok(Some(coerce_integer(
+                builder,
+                boolean,
+                builder.func.dfg.value_type(boolean),
+                destination,
+                false,
+            )));
+        }
+        if to_f80 {
+            let source_type = self.module.types.builtin_type(from.ty);
+            let opcode = match source_type {
+                Some(BuiltinType::Float) => F80_OP_FROM_F32,
+                Some(BuiltinType::Double) => F80_OP_FROM_F64,
+                Some(BuiltinType::Int128) => F80_OP_FROM_I128,
+                Some(BuiltinType::UnsignedInt128) => F80_OP_FROM_U128,
+                Some(builtin) if builtin.is_integer() => {
+                    if is_signed(&self.module.types, from, self.config)? {
+                        F80_OP_FROM_I64
+                    } else {
+                        F80_OP_FROM_U64
+                    }
+                }
+                _ => return Err(error("invalid conversion to x87 long double")),
+            };
+            let source_ty = builder.func.dfg.value_type(operand);
+            let staged_ty = match opcode {
+                F80_OP_FROM_F32 => ir::types::F32,
+                F80_OP_FROM_F64 => ir::types::F64,
+                F80_OP_FROM_I128 | F80_OP_FROM_U128 => ir::types::I128,
+                _ => ir::types::I64,
+            };
+            let staged_value = if source_ty == staged_ty {
+                operand
+            } else if staged_ty == ir::types::I64 {
+                coerce_integer(
+                    builder,
+                    operand,
+                    source_ty,
+                    staged_ty,
+                    is_signed(&self.module.types, from, self.config)?,
+                )
+            } else {
+                return Err(error("invalid source carrier for x87 conversion"));
+            };
+            let source = create_stack_backing(
+                builder,
+                u64::from(staged_ty.bytes()),
+                if staged_ty == ir::types::I128 { 16 } else { 8 },
+            )?;
+            builder
+                .ins()
+                .store(MemFlags::new(), staged_value, source, 0);
+            let result = create_stack_backing(builder, 16, 16)?;
+            zero_memory(builder, result, 16)?;
+            self.f80_support_call(builder, opcode, result, source, None)?;
+            return Ok(Some(result));
+        }
+        if from_f80 {
+            let destination_builtin = self.module.types.builtin_type(to.ty);
+            let (opcode, stored_ty, stored_size) = match destination_builtin {
+                Some(BuiltinType::Float) => (F80_OP_TO_F32, ir::types::F32, 4),
+                Some(BuiltinType::Double) => (F80_OP_TO_F64, ir::types::F64, 8),
+                Some(BuiltinType::Int128) => (F80_OP_TO_I128, ir::types::I128, 16),
+                Some(BuiltinType::UnsignedInt128) => (F80_OP_TO_U128, ir::types::I128, 16),
+                Some(builtin) if builtin.is_integer() => {
+                    let opcode = if is_signed(&self.module.types, to, self.config)? {
+                        F80_OP_TO_I64
+                    } else {
+                        F80_OP_TO_U64
+                    };
+                    (opcode, ir::types::I64, 8)
+                }
+                _ => return Err(error("invalid conversion from x87 long double")),
+            };
+            let output = create_stack_backing(
+                builder,
+                stored_size,
+                if stored_ty == ir::types::I128 { 16 } else { 8 },
+            )?;
+            zero_memory(builder, output, stored_size)?;
+            self.f80_support_call(builder, opcode, output, operand, None)?;
+            let value = builder.ins().load(stored_ty, MemFlags::new(), output, 0);
+            let destination = scalar_type(&self.module.types, to, self.config)?;
+            let value = if stored_ty.is_int() && stored_ty != destination {
+                coerce_integer(
+                    builder,
+                    value,
+                    stored_ty,
+                    destination,
+                    is_signed(&self.module.types, to, self.config)?,
+                )
+            } else {
+                value
+            };
+            return Ok(Some(value));
+        }
+        Err(error(
+            "x87 conversion did not contain an x87 operand or result",
+        ))
+    }
+
     fn initialize_runtime_storage(&self, builder: &mut FunctionBuilder<'_>) {
         if self.runtime_storage.is_empty() {
             return;
@@ -512,7 +854,29 @@ impl FunctionState<'_> {
                 .iter()
                 .filter(|piece| piece.source_index == Some(source_index as u32))
                 .collect::<Vec<_>>();
-            let value = if classified.passing == ccc_abi::PassingMode::Scalar {
+            let value = if classified.passing == ccc_abi::PassingMode::Scalar
+                && is_x87_f80(
+                    &self.module.types,
+                    QualifiedType::unqualified(classified.ty),
+                    self.config,
+                ) {
+                let result = create_stack_backing(builder, 16, 16)?;
+                zero_memory(builder, result, 16)?;
+                for piece in pieces {
+                    let source =
+                        variadic_parameter_piece_address(builder, *frame, plan, piece.location)?;
+                    let destination = address_offset(builder, result, piece.piece.offset)?;
+                    copy_memory(
+                        builder,
+                        destination,
+                        source,
+                        u64::from(piece.piece.valid_bytes),
+                        gir::MemoryAccess::default(),
+                        gir::MemoryAccess::default(),
+                    )?;
+                }
+                result
+            } else if classified.passing == ccc_abi::PassingMode::Scalar {
                 let piece = pieces
                     .first()
                     .ok_or_else(|| error("variadic scalar parameter has no physical piece"))?;
@@ -808,18 +1172,81 @@ impl FunctionState<'_> {
                     address,
                     object,
                     access,
-                } => Ok(Some(lower_load(
-                    builder,
-                    self.value(*address)?,
-                    scalar_type(&self.module.types, *object, self.config)?,
-                    *access,
-                )?)),
+                } => {
+                    if is_x87_f80(&self.module.types, *object, self.config) {
+                        if access.atomic.is_some() {
+                            return Err(CodegenError {
+                                code: ATOMIC_ERROR,
+                                message: "atomic x87 extended-precision loads are not enabled"
+                                    .to_owned(),
+                                span: None,
+                            });
+                        }
+                        let result = create_stack_backing(builder, 16, 16)?;
+                        zero_memory(builder, result, 16)?;
+                        if access.volatile {
+                            self.f80_support_call(
+                                builder,
+                                F80_OP_VOLATILE_LOAD,
+                                result,
+                                self.value(*address)?,
+                                None,
+                            )?;
+                        } else {
+                            copy_memory(
+                                builder,
+                                result,
+                                self.value(*address)?,
+                                16,
+                                gir::MemoryAccess::default(),
+                                *access,
+                            )?;
+                        }
+                        Ok(Some(result))
+                    } else {
+                        Ok(Some(lower_load(
+                            builder,
+                            self.value(*address)?,
+                            scalar_type(&self.module.types, *object, self.config)?,
+                            *access,
+                        )?))
+                    }
+                }
                 I::Store {
                     address,
                     value,
                     object,
                     access,
                 } => {
+                    if is_x87_f80(&self.module.types, *object, self.config) {
+                        if access.atomic.is_some() {
+                            return Err(CodegenError {
+                                code: ATOMIC_ERROR,
+                                message: "atomic x87 extended-precision stores are not enabled"
+                                    .to_owned(),
+                                span: None,
+                            });
+                        }
+                        if access.volatile {
+                            self.f80_support_call(
+                                builder,
+                                F80_OP_VOLATILE_STORE,
+                                self.value(*address)?,
+                                self.value(*value)?,
+                                None,
+                            )?;
+                        } else {
+                            copy_memory(
+                                builder,
+                                self.value(*address)?,
+                                self.value(*value)?,
+                                16,
+                                *access,
+                                gir::MemoryAccess::default(),
+                            )?;
+                        }
+                        return Ok(None);
+                    }
                     let ty = scalar_type(&self.module.types, *object, self.config)?;
                     let value_ty = self.value_ty(*value)?;
                     let signed = if is_float(&self.module.types, value_ty) {
@@ -967,42 +1394,71 @@ impl FunctionState<'_> {
                     operand,
                     from,
                     to,
-                } => lower_conversion(
-                    builder,
-                    &self.module.types,
-                    self.value(*operand)?,
-                    *kind,
-                    *from,
-                    *to,
-                    self.config,
-                    &self.references.runtime_helpers,
-                ),
-                I::Unary { operator, operand } => Ok(Some(lower_unary(
-                    builder,
-                    &self.module.types,
-                    *operator,
-                    self.value(*operand)?,
-                    self.value_ty(*operand)?,
-                    result_ty.ok_or_else(|| error("unary instruction has no result"))?,
-                    self.config,
-                )?)),
+                } => {
+                    if is_x87_f80(&self.module.types, *from, self.config)
+                        || is_x87_f80(&self.module.types, *to, self.config)
+                    {
+                        self.lower_f80_conversion(builder, self.value(*operand)?, *kind, *from, *to)
+                    } else {
+                        lower_conversion(
+                            builder,
+                            &self.module.types,
+                            self.value(*operand)?,
+                            *kind,
+                            *from,
+                            *to,
+                            self.config,
+                            &self.references.runtime_helpers,
+                        )
+                    }
+                }
+                I::Unary { operator, operand } => {
+                    let operand_ty = self.value_ty(*operand)?;
+                    let result_ty =
+                        result_ty.ok_or_else(|| error("unary instruction has no result"))?;
+                    if is_x87_f80(&self.module.types, operand_ty, self.config) {
+                        Ok(Some(self.lower_f80_unary(
+                            builder,
+                            *operator,
+                            self.value(*operand)?,
+                            result_ty,
+                        )?))
+                    } else {
+                        Ok(Some(lower_unary(
+                            builder,
+                            &self.module.types,
+                            *operator,
+                            self.value(*operand)?,
+                            operand_ty,
+                            result_ty,
+                            self.config,
+                        )?))
+                    }
+                }
                 I::Binary {
                     operator,
                     left,
                     right,
                 } => {
                     let operand_ty = self.value_ty(*left)?;
+                    let result_ty =
+                        result_ty.ok_or_else(|| error("binary instruction has no result"))?;
+                    if is_x87_f80(&self.module.types, operand_ty, self.config) {
+                        return Ok(Some(self.lower_f80_binary(
+                            builder,
+                            *operator,
+                            self.value(*left)?,
+                            self.value(*right)?,
+                            result_ty,
+                        )?));
+                    }
                     let floating = is_float(&self.module.types, operand_ty);
                     let signed = if floating {
                         false
                     } else {
                         is_signed(&self.module.types, operand_ty, self.config)?
                     };
-                    let result = scalar_type(
-                        &self.module.types,
-                        result_ty.ok_or_else(|| error("binary instruction has no result"))?,
-                        self.config,
-                    )?;
+                    let result = scalar_type(&self.module.types, result_ty, self.config)?;
                     Ok(Some(lower_binary(
                         builder,
                         *operator,
@@ -1090,6 +1546,9 @@ impl FunctionState<'_> {
                     let operation = match operation {
                         gir::AtomicReadModifyWriteOperation::Add => ir::AtomicRmwOp::Add,
                         gir::AtomicReadModifyWriteOperation::Subtract => ir::AtomicRmwOp::Sub,
+                        gir::AtomicReadModifyWriteOperation::BitwiseAnd => ir::AtomicRmwOp::And,
+                        gir::AtomicReadModifyWriteOperation::BitwiseOr => ir::AtomicRmwOp::Or,
+                        gir::AtomicReadModifyWriteOperation::BitwiseXor => ir::AtomicRmwOp::Xor,
                         gir::AtomicReadModifyWriteOperation::Exchange => ir::AtomicRmwOp::Xchg,
                     };
                     let operand = self.value(*operand)?;
@@ -1104,6 +1563,9 @@ impl FunctionState<'_> {
                         match operation {
                             ir::AtomicRmwOp::Add => builder.ins().iadd(old, operand),
                             ir::AtomicRmwOp::Sub => builder.ins().isub(old, operand),
+                            ir::AtomicRmwOp::And => builder.ins().band(old, operand),
+                            ir::AtomicRmwOp::Or => builder.ins().bor(old, operand),
+                            ir::AtomicRmwOp::Xor => builder.ins().bxor(old, operand),
                             _ => {
                                 return Err(error(
                                     "atomic exchange cannot return a derived replacement value",
@@ -1170,6 +1632,66 @@ impl FunctionState<'_> {
                     order: gir::MemoryOrder::SequentiallyConsistent,
                 } => {
                     builder.ins().fence();
+                    Ok(None)
+                }
+                I::CompilerBarrier { memory } => {
+                    if *memory {
+                        // Cranelift does not expose a compiler-only memory
+                        // barrier. Its fence is stronger and preserves the
+                        // required ordering without weakening behavior.
+                        builder.ins().fence();
+                    }
+                    Ok(None)
+                }
+                I::OpaqueScalar { operand } => {
+                    // The retained IR operation prevents CCC-side folding.
+                    // A fence keeps surrounding operations ordered; native
+                    // helper materialization may later provide a stronger
+                    // backend optimization barrier without changing the IR.
+                    builder.ins().fence();
+                    Ok(Some(self.value(*operand)?))
+                }
+                I::CodeLayoutHint(_) => Ok(None),
+                I::X86Cpuid {
+                    leaf,
+                    subleaf,
+                    eax,
+                    ebx,
+                    ecx,
+                    edx,
+                } => {
+                    let helper = self.references.inline_cpuid_support.ok_or_else(|| {
+                        error("x86 CPUID operation has no generated native helper")
+                    })?;
+                    let subleaf = if let Some(subleaf) = subleaf {
+                        self.value(*subleaf)?
+                    } else {
+                        builder.ins().iconst(ir::types::I32, 0)
+                    };
+                    let null = builder.ins().iconst(ir::types::I64, 0);
+                    let output = |value: &Option<gir::ValueId>| -> Result<ir::Value, CodegenError> {
+                        value.map_or(Ok(null), |value| self.value(value))
+                    };
+                    builder.ins().call(
+                        helper,
+                        &[
+                            self.value(*leaf)?,
+                            subleaf,
+                            output(eax)?,
+                            output(ebx)?,
+                            output(ecx)?,
+                            output(edx)?,
+                        ],
+                    );
+                    Ok(None)
+                }
+                I::X86Rdtsc { low, high } => {
+                    let helper = self.references.inline_rdtsc_support.ok_or_else(|| {
+                        error("x86 RDTSC operation has no generated native helper")
+                    })?;
+                    builder
+                        .ins()
+                        .call(helper, &[self.value(*low)?, self.value(*high)?]);
                     Ok(None)
                 }
                 I::VaStart {
@@ -1445,7 +1967,16 @@ impl FunctionState<'_> {
         result: ir::Value,
         plan: &ccc_abi::VaArgPlan,
     ) -> Result<(), CodegenError> {
-        if plan.classified.passing == ccc_abi::PassingMode::Memory {
+        if plan.classified.passing == ccc_abi::PassingMode::Memory
+            || plan.classified.classes.iter().any(|class| {
+                matches!(
+                    class,
+                    ccc_abi::AbiClass::X87
+                        | ccc_abi::AbiClass::X87Up
+                        | ccc_abi::AbiClass::ComplexX87
+                )
+            })
+        {
             let overflow_address = address_offset(builder, list, 8)?;
             return self.va_arg_cursor(builder, overflow_address, result, plan);
         }
@@ -1969,17 +2500,7 @@ impl FunctionState<'_> {
             }
         }
         store_integer(builder, frame, 0, ir::types::I32, 0x4642_4343)?;
-        store_integer(
-            builder,
-            frame,
-            4,
-            ir::types::I16,
-            if plan.abi_identity == ccc_target::AbiIdentity::SysvAmd64Lp64 {
-                1
-            } else {
-                2
-            },
-        )?;
+        store_integer(builder, frame, 4, ir::types::I16, 2)?;
         store_integer(
             builder,
             frame,
@@ -2020,9 +2541,23 @@ impl FunctionState<'_> {
             .iter()
             .filter(|piece| piece.piece.class == ccc_abi::AbiClass::Integer)
             .count();
-        let xmm_results = plan.result_pieces.len().saturating_sub(gp_results);
+        let xmm_results = plan
+            .result_pieces
+            .iter()
+            .filter(|piece| {
+                matches!(
+                    piece.piece.class,
+                    ccc_abi::AbiClass::Sse | ccc_abi::AbiClass::SseUp
+                )
+            })
+            .count();
         store_integer(builder, frame, 27, ir::types::I8, gp_results as i64)?;
         store_integer(builder, frame, 28, ir::types::I8, xmm_results as i64)?;
+        let x87_result = plan
+            .result_pieces
+            .iter()
+            .any(|piece| piece.piece.class == ccc_abi::AbiClass::X87);
+        store_integer(builder, frame, 29, ir::types::I8, i64::from(x87_result))?;
 
         let result_storage = if plan.hidden_return {
             let result = create_stack_backing(builder, plan.result.size, plan.result.align)?;
@@ -2064,7 +2599,23 @@ impl FunctionState<'_> {
                 store_value(builder, destination, 0, stage)?;
                 continue;
             }
-            if classified.passing == ccc_abi::PassingMode::Scalar {
+            if classified.passing == ccc_abi::PassingMode::Scalar
+                && is_x87_f80(
+                    &self.module.types,
+                    QualifiedType::unqualified(classified.ty),
+                    self.config,
+                )
+            {
+                let source = address_offset(builder, self.value(argument_id)?, piece.piece.offset)?;
+                copy_memory(
+                    builder,
+                    destination,
+                    source,
+                    u64::from(piece.piece.valid_bytes),
+                    gir::MemoryAccess::default(),
+                    gir::MemoryAccess::default(),
+                )?;
+            } else if classified.passing == ccc_abi::PassingMode::Scalar {
                 let mut value = self.value(argument_id)?;
                 let value_type = builder.func.dfg.value_type(value);
                 if value_type == ir::types::I128 {
@@ -2125,16 +2676,34 @@ impl FunctionState<'_> {
                     .first()
                     .ok_or_else(|| error("variadic scalar result has no bridge piece"))?;
                 let source = bridge_result_piece_address(builder, frame, plan, piece.location)?;
-                Ok(Some(builder.ins().load(
-                    scalar_type(
-                        &self.module.types,
-                        QualifiedType::unqualified(plan.result.ty),
-                        self.config,
-                    )?,
-                    MemFlags::new(),
-                    source,
-                    0,
-                )))
+                if is_x87_f80(
+                    &self.module.types,
+                    QualifiedType::unqualified(plan.result.ty),
+                    self.config,
+                ) {
+                    let result = create_stack_backing(builder, 16, 16)?;
+                    zero_memory(builder, result, 16)?;
+                    copy_memory(
+                        builder,
+                        result,
+                        source,
+                        10,
+                        gir::MemoryAccess::default(),
+                        gir::MemoryAccess::default(),
+                    )?;
+                    Ok(Some(result))
+                } else {
+                    Ok(Some(builder.ins().load(
+                        scalar_type(
+                            &self.module.types,
+                            QualifiedType::unqualified(plan.result.ty),
+                            self.config,
+                        )?,
+                        MemFlags::new(),
+                        source,
+                        0,
+                    )))
+                }
             }
             ccc_abi::PassingMode::Registers => {
                 let result = create_stack_backing(builder, plan.result.size, plan.result.align)?;
@@ -2583,9 +3152,24 @@ impl FunctionState<'_> {
                     .ok_or_else(|| error("variadic scalar result has no bridge piece"))?;
                 let destination =
                     variadic_result_piece_address(builder, frame, plan, piece.location)?;
-                builder
-                    .ins()
-                    .store(MemFlags::new(), self.value(value)?, destination, 0);
+                if is_x87_f80(
+                    &self.module.types,
+                    QualifiedType::unqualified(plan.result.ty),
+                    self.config,
+                ) {
+                    copy_memory(
+                        builder,
+                        destination,
+                        self.value(value)?,
+                        10,
+                        gir::MemoryAccess::default(),
+                        gir::MemoryAccess::default(),
+                    )?;
+                } else {
+                    builder
+                        .ins()
+                        .store(MemFlags::new(), self.value(value)?, destination, 0);
+                }
             }
             (ccc_abi::PassingMode::Registers, Some(value)) => {
                 let source = self.value(value)?;
@@ -2830,6 +3414,7 @@ struct BridgeFrameLayout {
     entry_float_arguments: u64,
     integer_results: u64,
     float_results: u64,
+    x87_result: u64,
     indirect_result: u64,
     entry_indirect_result: u64,
 }
@@ -2837,13 +3422,14 @@ struct BridgeFrameLayout {
 fn bridge_frame_layout(abi: ccc_target::AbiIdentity) -> BridgeFrameLayout {
     match abi {
         ccc_target::AbiIdentity::SysvAmd64Lp64 => BridgeFrameLayout {
-            call_fixed_size: 256,
+            call_fixed_size: 272,
             call_integer_arguments: 32,
             call_float_arguments: 80,
             entry_integer_arguments: 32,
             entry_float_arguments: 80,
             integer_results: 208,
             float_results: 224,
+            x87_result: 256,
             indirect_result: 32,
             entry_indirect_result: 32,
         },
@@ -2856,6 +3442,7 @@ fn bridge_frame_layout(abi: ccc_target::AbiIdentity) -> BridgeFrameLayout {
                 entry_float_arguments: 112,
                 integer_results: 240,
                 float_results: 256,
+                x87_result: 0,
                 indirect_result: 32,
                 entry_indirect_result: 40,
             }
@@ -2871,6 +3458,7 @@ fn bridge_frame_layout(abi: ccc_target::AbiIdentity) -> BridgeFrameLayout {
             entry_float_arguments: 112,
             integer_results: 240,
             float_results: 256,
+            x87_result: 0,
             indirect_result: 48,
             entry_indirect_result: 448,
         },
@@ -2894,6 +3482,9 @@ fn variadic_parameter_piece_address(
                 }
                 ccc_abi::RegisterBank::Float => {
                     layout.entry_float_arguments + u64::from(register.index) * 16
+                }
+                ccc_abi::RegisterBank::X87 => {
+                    return Err(error("x87 is not an incoming register bank"));
                 }
             },
         ),
@@ -2925,6 +3516,7 @@ fn variadic_result_piece_address(
             if match register.bank {
                 ccc_abi::RegisterBank::Integer => register.index < 2,
                 ccc_abi::RegisterBank::Float => register.index < 4,
+                ccc_abi::RegisterBank::X87 => register.index == 0,
             } =>
         {
             register
@@ -2936,6 +3528,7 @@ fn variadic_result_piece_address(
     let offset = match register.bank {
         ccc_abi::RegisterBank::Integer => layout.integer_results + u64::from(register.index) * 8,
         ccc_abi::RegisterBank::Float => layout.float_results + u64::from(register.index) * 16,
+        ccc_abi::RegisterBank::X87 => layout.x87_result,
     };
     address_offset(builder, frame, offset)
 }
@@ -2954,6 +3547,9 @@ fn bridge_argument_piece_address(
             }
             ccc_abi::RegisterBank::Float => {
                 layout.call_float_arguments + u64::from(register.index) * 16
+            }
+            ccc_abi::RegisterBank::X87 => {
+                return Err(error("x87 is not an outgoing argument register bank"));
             }
         },
         ccc_abi::BridgeLocation::Stack { offset } => layout.call_fixed_size + u64::from(offset),
@@ -2997,10 +3593,12 @@ fn value_representation_type(
     ty: QualifiedType,
     config: &EffectiveCompilationConfig,
 ) -> Result<ir::Type, CodegenError> {
-    if matches!(
-        types.try_kind(ty.ty),
-        Some(TypeKind::Array(_) | TypeKind::Record(_))
-    ) {
+    if is_x87_f80(types, ty, config)
+        || matches!(
+            types.try_kind(ty.ty),
+            Some(TypeKind::Array(_) | TypeKind::Record(_))
+        )
+    {
         Ok(ir::types::I64)
     } else {
         scalar_type(types, ty, config)
@@ -3044,10 +3642,12 @@ fn va_arg_result(
     address: ir::Value,
     config: &EffectiveCompilationConfig,
 ) -> Result<ir::Value, CodegenError> {
-    if matches!(
-        types.try_kind(requested.ty),
-        Some(TypeKind::Array(_) | TypeKind::Record(_))
-    ) {
+    if is_x87_f80(types, requested, config)
+        || matches!(
+            types.try_kind(requested.ty),
+            Some(TypeKind::Array(_) | TypeKind::Record(_))
+        )
+    {
         Ok(address)
     } else {
         Ok(builder.ins().load(
@@ -3057,6 +3657,12 @@ fn va_arg_result(
             0,
         ))
     }
+}
+
+fn is_x87_f80(types: &TypeStore, ty: QualifiedType, config: &EffectiveCompilationConfig) -> bool {
+    config.target.abi == ccc_target::AbiIdentity::SysvAmd64Lp64
+        && config.target.data_layout.long_double_format == ccc_target::LongDoubleFormat::X87Extended
+        && types.builtin_type(ty.ty) == Some(BuiltinType::LongDouble)
 }
 
 pub(super) fn scalar_type(
@@ -3215,6 +3821,33 @@ fn lower_constant(
     constant: gir::ScalarConstant,
     config: &EffectiveCompilationConfig,
 ) -> Result<ir::Value, CodegenError> {
+    if let gir::ScalarConstant::LongDouble(value) = constant {
+        if !is_x87_f80(types, ty, config)
+            || value.format != ccc_target::LongDoubleFormat::X87Extended
+            || value.format != config.target.data_layout.long_double_format
+        {
+            return Err(CodegenError {
+                code: "CCC3509",
+                message: "long-double constant has no enabled target representation".to_owned(),
+                span: None,
+            });
+        }
+        let result = create_stack_backing(builder, 16, 16)?;
+        zero_memory(builder, result, 16)?;
+        let low = u64::from_le_bytes(
+            value.bytes[..8]
+                .try_into()
+                .expect("long-double low word has eight bytes"),
+        );
+        let high = u16::from_le_bytes(
+            value.bytes[8..10]
+                .try_into()
+                .expect("long-double exponent word has two bytes"),
+        );
+        store_integer(builder, result, 0, ir::types::I64, low as i64)?;
+        store_integer(builder, result, 8, ir::types::I16, i64::from(high))?;
+        return Ok(result);
+    }
     let clif_ty = scalar_type(types, ty, config)?;
     if types.builtin_type(ty.ty) == Some(BuiltinType::Bool) {
         let normalized = scalar_constant_bits(types, ty, constant, config)? as i64;
@@ -3236,6 +3869,7 @@ fn lower_constant(
             ir::types::F64 => Ok(builder.ins().f64const(Ieee64::with_bits(value.to_bits()))),
             _ => Err(error("floating constant has a non-floating result type")),
         },
+        gir::ScalarConstant::LongDouble(_) => unreachable!(),
         gir::ScalarConstant::NullPointer => {
             if !matches!(types.try_kind(ty.ty), Some(TypeKind::Pointer(_))) {
                 return Err(error("null pointer constant has a non-pointer result type"));
@@ -3304,12 +3938,14 @@ fn lower_load(
     ty: ir::Type,
     access: gir::MemoryAccess,
 ) -> Result<ir::Value, CodegenError> {
-    validate_access(access)?;
-    if access.volatile {
+    if access.atomic.is_some() {
+        validate_atomic_clif_type(ty)?;
+    }
+    if access.volatile || access.atomic.is_some() {
         builder.ins().fence();
     }
     let value = builder.ins().load(ty, MemFlags::new(), address, 0);
-    if access.volatile {
+    if access.volatile || access.atomic.is_some() {
         builder.ins().fence();
     }
     Ok(value)
@@ -3321,15 +3957,29 @@ fn lower_store(
     value: ir::Value,
     access: gir::MemoryAccess,
 ) -> Result<(), CodegenError> {
-    validate_access(access)?;
-    if access.volatile {
+    if access.atomic.is_some() {
+        validate_atomic_clif_type(builder.func.dfg.value_type(value))?;
+    }
+    if access.volatile || access.atomic.is_some() {
         builder.ins().fence();
     }
     builder.ins().store(MemFlags::new(), value, address, 0);
-    if access.volatile {
+    if access.volatile || access.atomic.is_some() {
         builder.ins().fence();
     }
     Ok(())
+}
+
+fn validate_atomic_clif_type(ty: ir::Type) -> Result<(), CodegenError> {
+    if ty.is_int() && matches!(ty.bits(), 8 | 16 | 32 | 64) {
+        Ok(())
+    } else {
+        Err(CodegenError {
+            code: ATOMIC_ERROR,
+            message: "atomic load or store requires a native 1, 2, 4, or 8-byte integer or pointer representation".to_owned(),
+            span: None,
+        })
+    }
 }
 
 fn address_offset(

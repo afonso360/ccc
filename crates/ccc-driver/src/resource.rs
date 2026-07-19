@@ -675,7 +675,36 @@ mod tests {
         let resources = ResourceDirectory::discover(None).unwrap();
         assert!(resources.root().ends_with("resource-dir"));
         assert!(resources.include().join("stdbool.h").is_file());
+        assert!(resources.include().join("stdatomic.h").is_file());
         assert!(resources.include().join("stddef.h").is_file());
+    }
+
+    #[test]
+    fn ships_the_scalar_atomic_header_contract() {
+        let resources = ResourceDirectory::discover(None).unwrap();
+        let manifest_source = fs::read_to_string(resources.root().join("manifest.toml")).unwrap();
+        let manifest = ResourceManifest::parse(&manifest_source).unwrap();
+        assert!(
+            manifest
+                .headers
+                .compiler_owned
+                .iter()
+                .any(|header| header == "stdatomic.h")
+        );
+
+        let header = fs::read_to_string(resources.include().join("stdatomic.h")).unwrap();
+        for contract in [
+            "typedef _Atomic(int) atomic_int;",
+            "#define ATOMIC_INT_LOCK_FREE 2",
+            "#define atomic_load_explicit(object, order)",
+            "#define atomic_compare_exchange_strong_explicit(",
+            "#define atomic_thread_fence(order)",
+        ] {
+            assert!(
+                header.contains(contract),
+                "stdatomic.h is missing contract {contract:?}"
+            );
+        }
     }
 
     #[test]

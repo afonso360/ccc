@@ -93,20 +93,16 @@ run_ccc() {
     esac
   done
 
-  # Only the generated amalgamation embeds src/hwtime.h.  When that one input
-  # is part of SQLite's fuzzcheck profile, define the exact upstream predicate
-  # that selects its no-assembly timing fallback.  Keep GNU C11 for every
-  # translation: fuzzcheck support code and Linux system headers use GNU
-  # syntax unrelated to hardware timing.
-  if [[ "${CCC_SQLITE_FUZZCHECK_HWTIME_FALLBACK:-0}" == 1 ]] &&
-    [[ "$profile" == fuzzcheck-support ]] &&
+  # Distinguish the generated fuzzcheck amalgamation for the audit without
+  # changing its compiler predicates. Its selected RDTSC form is compiled in
+  # the same GNU C11 mode as every other SQLite input.
+  if [[ "$profile" == fuzzcheck-support ]] &&
     [[ -n "${CCC_SQLITE_GENERATED_SOURCE_ROOT:-}" ]] &&
     [[ "$source" != unknown ]]; then
     source_parent=$(cd "$(dirname "$source")" && pwd -P)
     absolute_source="$source_parent/$(basename "$source")"
     generated_root=$(cd "$CCC_SQLITE_GENERATED_SOURCE_ROOT" && pwd -P)
     if [[ "$absolute_source" == "$generated_root/sqlite3.c" ]]; then
-      compiler_arguments+=(-D__STRICT_ANSI__=1)
       profile=fuzzcheck-amalgamation
     fi
   fi
@@ -125,21 +121,14 @@ run_ccc() {
     esac
   done
 
-  if [[ "${CCC_SQLITE_FUZZCHECK_HWTIME_FALLBACK:-0}" == 1 ]]; then
-    [[ "$effective_standard" == gnu11 ]] || {
-      echo "ccc-cc: every SQLite translation must use GNU C11, found -std=$effective_standard" >&2
-      exit 2
-    }
-    if [[ "$profile" == fuzzcheck-amalgamation ]]; then
-      [[ "$strict_ansi_state" == defined ]] || {
-        echo "ccc-cc: fuzzcheck sqlite3.c did not select the no-assembly hwtime predicate" >&2
-        exit 2
-      }
-    elif [[ "$strict_ansi_state" != absent ]]; then
-      echo "ccc-cc: __STRICT_ANSI__ override leaked outside fuzzcheck sqlite3.c" >&2
-      exit 2
-    fi
-  fi
+  [[ "$effective_standard" == gnu11 ]] || {
+    echo "ccc-cc: every SQLite translation must use GNU C11, found -std=$effective_standard" >&2
+    exit 2
+  }
+  [[ "$strict_ansi_state" == absent ]] || {
+    echo "ccc-cc: SQLite translations may not override __STRICT_ANSI__" >&2
+    exit 2
+  }
 
   if [[ -n "${CCC_SQLITE_LANGUAGE_MODE_LOG:-}" ]]; then
     printf '%s %s strict-ansi=%s %q\n' \

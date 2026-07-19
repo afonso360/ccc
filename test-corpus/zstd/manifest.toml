@@ -12,13 +12,6 @@ license = "BSD-3-Clause OR GPL-2.0-only"
 upstream_license_files = ["LICENSE", "COPYING"]
 fetched_not_vendored = true
 
-source_adjustment_patch = "no-asm-generic-paths.patch"
-source_adjustment_sha256 = "79f32fd5cf1224566822e2685cbcdad2ed3c92ffee292338a37e54a0303f11ae"
-source_adjustment_hashes = "no-asm-generic-paths.sha256"
-source_adjustment_hashes_sha256 = "2aade5f81a82661bb3789283a45d8e7203dda08129572e44fd410ec3302f0e15"
-source_adjustment_target_files = 6
-source_adjustment_rationale = "The upstream no-assembly configuration excludes stand-alone assembly but leaves performance-only GNU inline assembly selected by compiler identity. The adjustment extends that configuration to the existing generic C fallbacks without changing the compression format, public API, or tested behavior."
-
 target = "x86_64-unknown-linux-gnu"
 language_mode = "gnu11"
 language_mode_selection = "driver-default"
@@ -33,7 +26,8 @@ target_compiler = "ccc"
 link_driver = "gcc"
 link_mode = "platform-default-pie-executable"
 optional_format_libraries = "disabled"
-assembly = "disabled"
+assembly = "standalone-disabled-certified-inline-enabled"
+selected_inline_assembly_statements = 18
 threading = "enabled-pthread"
 unaligned_memory_access = "upstream-aligned-1-scalar-typedefs"
 zstd_memory_access_selection = "upstream-default-1"
@@ -67,7 +61,6 @@ required_tools = [
     "mktemp",
     "mv",
     "openssl",
-    "patch",
     "readelf",
     "rm",
     "sed",
@@ -120,7 +113,13 @@ gnu_attributes = [
     "visibility",
     "weak",
 ]
-inline_assembly_forms = []
+inline_assembly_forms = [
+    "basic-empty-compiler-barrier",
+    "x86-cpuid-three-certified-output-families",
+    "x86-conditional-move-above",
+    "p2align-3-through-6",
+    "nop",
+]
 wide_integer_uses = []
 variable_length_array_objects = []
 statement_expressions = []
@@ -144,10 +143,7 @@ retain = [
     "roundtrip-output.txt",
     "roundtrip-stream-output.txt",
     "roundtrip.log",
-    "source-adjustment-apply.log",
-    "source-adjustment-hashes.txt",
-    "source-adjustment.patch",
-    "source-adjustment.txt",
+    "inline-assembly-source-audit.txt",
     "source-inputs.txt",
     "version.log",
 ]
@@ -156,7 +152,7 @@ retain = [
 status = "applicable"
 evidence_kind = "execution"
 runner = "run.sh"
-reason = "The adapter audits the portable-C x86-64 Linux build, pinned capability inventory and adjustments, ELF PIE artifacts, and bounded upstream execution tests."
+reason = "The adapter audits the upstream x86-64 Linux C build, pinned capability and inline-assembly inventory, ELF PIE artifacts, and bounded upstream execution tests."
 
 [target_applicability."aarch64-unknown-linux-gnu"]
 status = "inapplicable"

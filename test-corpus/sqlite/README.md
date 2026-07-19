@@ -90,7 +90,7 @@ Select a checked upstream suite with `--suite`:
 | `veryquick` | `make -j1 tcltest` → `test/veryquick.test`      | The regular per-change subset, excluding malloc and I/O fault simulation.                                                                    |
 | `quick`     | `testfixture test/quick.test`                   | The quick Tcl suite, including the fault-simulation tests omitted by `veryquick`.                                                            |
 | `all`       | `make -j1 alltest` → `test/all.test`            | The full Tcl permutation matrix selected by the upstream Makefile.                                                                           |
-| `full`      | `make -j1 fulltest` → `alltest` plus `fuzztest` | The `all` matrix followed by SQLite's Makefile-owned fuzz targets; its amalgamation selects the no-assembly timing fallback described below. |
+| `full`      | `make -j1 fulltest` → `alltest` plus `fuzztest` | The `all` matrix followed by SQLite's Makefile-owned fuzz targets; its amalgamation exercises the certified RDTSC timing form described below. |
 
 The `all` and `full` Makefile targets also build SQLite's command-line shell.
 With glibc and CCC's pinned GNU compatibility identity, the shell's `NAN` and
@@ -159,31 +159,26 @@ owned by the non-root container user for the complete work directory.
 
 The checked-in expected inventory is evaluated under CCC's effective compiler
 identity, never under the host GCC or Clang identity. It selects the full
-barrier builtin `__sync_synchronize`, exposes the hosted binary32 constants
-required by the command-line shell, and selects no inline assembly.
-`testfixture` and the Tcl suites keep `VDBE_PROFILE`,
+barrier builtin `__sync_synchronize` and exposes the hosted binary32 constants
+required by the command-line shell. `testfixture` and the Tcl suites select no
+inline assembly because they keep `VDBE_PROFILE`,
 `SQLITE_PERFORMANCE_TRACE`, and `SQLITE_ENABLE_STMT_SCANSTATUS` absent.
 
 The upstream fuzzcheck profile deliberately enables
 `SQLITE_ENABLE_STMT_SCANSTATUS`. In GNU mode on x86-64, that feature includes
 `src/hwtime.h` from the generated `sqlite3.c` amalgamation and selects its
-`rdtsc` inline assembly. When the wrapper sees that exact generated input in a
-`SQLITE_OSS_FUZZ` command, it appends `-D__STRICT_ANSI__=1` to that one CCC
-translation while retaining GNU C11 mode. That exact upstream predicate selects
-the existing no-assembly timing implementation, which returns zero; SQLite
-documents the implementation as disabling only obscure profiling and analysis
-timing. In SQLite 3.47.2 the predicate's only other source-level effect is to
-suppress the `SQLITE_INLINE` optimization hint. The wrapper does not alter
-source, remove a fuzz input, or change `FUZZCHECK_OPT`: statement scan status
-and the rest of SQLite's fuzz feature profile remain enabled. The eight
-fuzzcheck support translation units, `alltest`, and `sessionfuzz` receive no
-predicate override, and every translation remains in GNU C11 mode.
+volatile `rdtsc` inline assembly with `=a` and `=d` unsigned-int outputs. CCC
+retains that exact operation explicitly and calls one deterministic hidden
+support routine that executes RDTSC once and stores both halves. The wrapper
+does not alter source predicates, remove a fuzz input, or change
+`FUZZCHECK_OPT`: statement scan status and the rest of SQLite's fuzz feature
+profile remain enabled. The eight fuzzcheck support translation units,
+`alltest`, and `sessionfuzz` remain in the same unmodified GNU C11 profile.
 
 The compiler wrapper audits the final effective `-std` option and
-`__STRICT_ANSI__` command-line state on every command. It requires the predicate
-override exactly for the generated fuzzcheck amalgamation and rejects it
-elsewhere. Thus an ambient or reordered flag cannot silently re-enable the
-inline-assembly branch or widen the override surface.
+`__STRICT_ANSI__` command-line state on every command. It requires GNU C11 and
+rejects a strict-ANSI override for every input. The language-mode log identifies
+the generated fuzzcheck amalgamation without changing its arguments.
 
 `effective-macros.txt` is CCC's complete predefined-macro dump for the run.
 `predicate-probe.txt` records the version and feature predicates that select
@@ -203,7 +198,7 @@ precompiled amalgamation followed that migration in 3.49.0.
 Failure artifacts retain separate configuration and target command logs, the
 expected and observed target source sets, effective identity, inventory, and
 complete test output named in the manifest. The per-translation language-mode
-log makes the full-suite capability adjustment independently auditable.
+log makes the full-suite assembly surface independently auditable.
 
 Release references:
 

@@ -390,6 +390,10 @@ pub enum ExpressionKind {
         arguments: Vec<Expression>,
     },
     BuiltinSyncSynchronize,
+    BuiltinAtomicOperation {
+        operation: AtomicBuiltinOperation,
+        arguments: Vec<Expression>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -462,6 +466,71 @@ impl SyncBuiltinOperation {
         match self {
             Self::BoolCompareAndSwap | Self::ValCompareAndSwap => 3,
             Self::AddAndFetch | Self::FetchAndAdd | Self::SubAndFetch | Self::LockTestAndSet => 2,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AtomicBuiltinOperation {
+    Load,
+    Store,
+    Exchange,
+    FetchAdd,
+    FetchSubtract,
+    FetchAnd,
+    FetchOr,
+    FetchXor,
+    AddFetch,
+    SubtractFetch,
+    AndFetch,
+    OrFetch,
+    XorFetch,
+    CompareExchange,
+    IsLockFree,
+    ThreadFence,
+    SignalFence,
+}
+
+impl AtomicBuiltinOperation {
+    pub const fn spelling(self) -> &'static str {
+        match self {
+            Self::Load => "__atomic_load_n",
+            Self::Store => "__atomic_store_n",
+            Self::Exchange => "__atomic_exchange_n",
+            Self::FetchAdd => "__atomic_fetch_add",
+            Self::FetchSubtract => "__atomic_fetch_sub",
+            Self::FetchAnd => "__atomic_fetch_and",
+            Self::FetchOr => "__atomic_fetch_or",
+            Self::FetchXor => "__atomic_fetch_xor",
+            Self::AddFetch => "__atomic_add_fetch",
+            Self::SubtractFetch => "__atomic_sub_fetch",
+            Self::AndFetch => "__atomic_and_fetch",
+            Self::OrFetch => "__atomic_or_fetch",
+            Self::XorFetch => "__atomic_xor_fetch",
+            Self::CompareExchange => "__atomic_compare_exchange_n",
+            Self::IsLockFree => "__ccc_atomic_is_lock_free",
+            Self::ThreadFence => "__atomic_thread_fence",
+            Self::SignalFence => "__atomic_signal_fence",
+        }
+    }
+
+    pub const fn arity(self) -> usize {
+        match self {
+            Self::Load => 2,
+            Self::Store
+            | Self::Exchange
+            | Self::FetchAdd
+            | Self::FetchSubtract
+            | Self::FetchAnd
+            | Self::FetchOr
+            | Self::FetchXor
+            | Self::AddFetch
+            | Self::SubtractFetch
+            | Self::AndFetch
+            | Self::OrFetch
+            | Self::XorFetch => 3,
+            Self::CompareExchange => 6,
+            Self::IsLockFree | Self::ThreadFence | Self::SignalFence => 1,
         }
     }
 }
@@ -573,9 +642,56 @@ pub enum StatementKind {
     },
     Goto(Identifier),
     ComputedGoto(Box<Expression>),
+    Asm(Box<AsmStatement>),
     Continue,
     Break,
     Return(Option<Box<Expression>>),
+}
+
+/// One GNU assembly statement. The parser retains the source spelling and the
+/// complete operand structure; target-specific semantic validation happens in
+/// the semantic analyzer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AsmStatement {
+    pub keyword_spelling: String,
+    pub qualifiers: Vec<AsmQualifier>,
+    pub template_spelling: String,
+    pub template: StringLiteral,
+    pub outputs: Vec<AsmOperand>,
+    pub inputs: Vec<AsmOperand>,
+    pub clobbers: Vec<AsmString>,
+    pub goto_labels: Vec<Identifier>,
+    pub colon_group_count: u8,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AsmQualifier {
+    pub kind: AsmQualifierKind,
+    pub spelling: String,
+    pub span: Span,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AsmQualifierKind {
+    Volatile,
+    Inline,
+    Goto,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AsmOperand {
+    pub symbolic_name: Option<Identifier>,
+    pub constraint: AsmString,
+    pub expression: Box<Expression>,
+    pub span: Span,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AsmString {
+    pub spelling: String,
+    pub literal: StringLiteral,
+    pub span: Span,
 }
 
 #[derive(Clone, Debug, PartialEq)]

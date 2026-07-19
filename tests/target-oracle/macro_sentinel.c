@@ -19,6 +19,13 @@
 #if !defined(__riscv_zicsr) || !defined(__riscv_zifencei)
 #error incomplete RV64GC compatibility identity
 #endif
+#elif defined(__x86_64__) && defined(__linux__)
+#if !defined(__amd64__) || __LDBL_MANT_DIG__ != 64
+#error unexpected x86-64 GNU data model
+#endif
+#if __SIZEOF_LONG_DOUBLE__ != 16
+#error unexpected x86-64 long-double object size
+#endif
 #elif defined(__APPLE__) && defined(__arm64__)
 #if __APPLE_CC__ != 6000 || __LDBL_MANT_DIG__ != 53
 #error unexpected Apple compiler or long-double profile

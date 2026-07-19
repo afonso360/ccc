@@ -10,20 +10,17 @@ The core archive does not contain Redis's separately distributed module
 bundle. This profile builds only `redis-server` and `redis-cli`; it does not
 silently fetch modules or optional dependencies.
 
-## Current compiler boundary
+## Native extended-precision boundary
 
-The adapter and its shell regressions are complete, but the pinned server is
-not yet an executable corpus pass. Redis uses native x86-64 `long double`
-unconditionally in core translation units, including arithmetic, conversions,
-internal calls and returns, `strtold`, and variadic `%Lf` formatting. CCC
-preserves the platform f80 representation and currently rejects those
-operations and boundaries with `CCC2343`/`CCC3509`; Redis has no upstream build
-switch that removes them. Consequently `run.sh` fails loudly during CCC
-translation and does not claim the server/CLI smoke artifacts described below.
-Raising the advertised GNU version does not affect this unconditional source
-surface. A passing unmodified run requires native f80 lowering and x87/libc ABI
-bridges; the adapter must not substitute `double`, inject an ABI-changing mode,
-or hide the boundary with another source adjustment.
+Redis uses native x86-64 `long double` unconditionally in core translation
+units, including arithmetic, conversions, internal calls and returns,
+`strtold`, and variadic `%Lf` formatting. CCC preserves the platform f80
+representation, lowers runtime operations through localized x87 helpers, and
+generates System V bridges for fixed, variadic, indirect, aggregate, and
+`va_arg` boundaries. Calls into libc therefore retain the native `long double`
+ABI rather than substituting `double` or injecting an ABI-changing mode. The
+adapter reaches this source surface unchanged and includes the resulting
+server/CLI execution in its gate.
 
 ## Build interface
 
@@ -108,45 +105,37 @@ checks pinned exact counts for the integer and prefetch group, and rejects the
 unselected atomic, byte-swap, bit-count, CPU-dispatch, overflow, alignment,
 return-address, and unreachable forms explicitly. The bulky preprocessed
 copies are then removed; their exact input list and compact count artifact are
-retained. The same mirror rejects any selected `asm`, `__asm`, or `__asm__`
-form and retains a zero-form inventory.
+retained. The same mirror records and classifies the seven selected GNU
+inline-assembly statements. Any additional statement or changed form fails the
+inventory gate.
 
 The build also exercises packed hiredis layout, flexible array members,
 compound literals, GNU attributes, and thread-local storage. TRE's configured
 sources do not define `TRE_USE_ALLOCA`, so this profile contains no
-variable-length array objects or dynamic stack allocation. The optional x86
-assembly selected by upstream HDR Histogram is handled by the bounded source
-adjustment described below; no assembly input or inline-assembly form reaches
-CCC.
+variable-length array objects or dynamic stack allocation. The selected HDR
+Histogram x86 operations and xxHash compiler guard reach CCC unchanged.
+Stand-alone assembly inputs remain outside this C-only profile.
 
-## Bounded source adjustment
+## Selected inline assembly
 
-One checked patch adjusts two files in the extracted disposable tree. The
-patch and its preimage/postimage hash list are themselves pinned by SHA-256.
-Application requires GNU patch, zero fuzz, and no offset; every resulting file
-must match its recorded postimage, and a second application must fail.
+The upstream source contains seven selected statements under CCC's effective
+identity:
 
-The two adjustments are deliberately narrow:
+- two empty volatile `memory` compiler barriers used after scalar loads;
+- two locked `xchgq` stores, one locked exchange that exposes the previous
+  value through both output operands, and one locked `cmpxchgq`; and
+- one empty read/write register guard selected by xxHash.
 
-- HDR Histogram's six x86 atomic assembly statements become the selected
-  legacy sync builtins. CCC's contract gives these operations sequentially
-  consistent ordering, which is at least as strong as the required load,
-  store, exchange, add, and compare/exchange behavior.
-- xxHash's compiler guard normally selects an empty GNU inline-assembly
-  statement from the advertised compatibility tuple. CCC does not implement
-  that source form or perform the vectorization the guard inhibits, so the
-  patch selects a behavior-compatible standard-C no-op under `__CCC__`. Its
-  compile-time marker lets the mirrored source prove the exact selected
-  expansion count without emitting data or code. All hashing code and target
-  selection remain unchanged.
-
-The runner records exact semantic occurrence counts after patching. In
-particular, it requires the upstream statement-expression CAS call to remain,
-all six HDR assembly statements to be absent, the xxHash header to retain its nine
+CCC classifies only those exact templates, constraints, clobbers, operand
+types, and target ABI. The barriers and atomic operations lower to explicit
+CCC-IR effects; the xxHash guard retains its scalar value while remaining an
+optimization barrier. Neighboring forms fail before object emission. The
+runner requires the upstream statement-expression CAS call to remain, all six
+HDR statements to remain unchanged, the xxHash header to retain its nine
 ordinary and three Clang-NEON guard call sites, exactly one ordinary guard to
-expand to the CCC no-op, no guard identifier to remain unexpanded, and exactly
-seven upstream math-classification calls to remain: one in hiredis, five in
-cjson, and one in cmsgpack. CCC's hosted `math.h` wrapper supplies
+expand, no guard identifier to remain unexpanded, and exactly seven upstream
+math-classification calls to remain: one in hiredis, five in cjson, and one in
+cmsgpack. CCC's hosted `math.h` wrapper supplies
 single-evaluation binary64-compatible definitions without changing these
 sources or adding a corpus-specific include path. The Solaris-only fallback
 macro definition left in cjson is neither selected nor counted as a call.
@@ -165,9 +154,8 @@ test suite. After the build and audit complete, the adapter:
 4. requests `SHUTDOWN NOSAVE` and requires a clean server exit.
 
 The private socket avoids opening a TCP port, and the work directory retains
-the server log, smoke transcript, compile/link commands, source audit,
-capability inventory, source-adjustment proof, native-driver identity, and ELF
-metadata.
+the server log, smoke transcript, compile/link commands, source and assembly
+inventories, capability inventory, native-driver identity, and ELF metadata.
 
 Run [`run.sh`](run.sh) as a non-root user on x86-64 Linux with `CCC` set to the
 compiler executable and `CCC_RESOURCE_DIR` set to the shipped headers. Pass an

@@ -18,6 +18,7 @@ use crate::artifact::{
     VerifiedArtifactBundle, canonical_symbol_name, parse_relocatable,
 };
 use crate::bridge::is_bridge_generated_symbol;
+use crate::temp_cleanup::RegisteredTemporaryDirectory;
 use crate::{
     LinkError, ProbeRequest, ProbeRunner, ProcessProbeRunner, ToolchainRequirements,
     ToolchainResolver, artifact_error,
@@ -838,8 +839,7 @@ fn write_file(path: &Path, contents: &[u8]) -> Result<(), LinkError> {
 }
 
 struct ArtifactWorkspace {
-    path: PathBuf,
-    published: bool,
+    temporary: RegisteredTemporaryDirectory,
 }
 
 impl ArtifactWorkspace {
@@ -852,13 +852,8 @@ impl ArtifactWorkspace {
         for _ in 0..100 {
             let id = WORKSPACE_ID.fetch_add(1, Ordering::Relaxed);
             let path = directory.join(format!(".{stem}.ccc-artifact-{}-{id}", std::process::id()));
-            match fs::create_dir(&path) {
-                Ok(()) => {
-                    return Ok(Self {
-                        path,
-                        published: false,
-                    });
-                }
+            match RegisteredTemporaryDirectory::create(path) {
+                Ok(temporary) => return Ok(Self { temporary }),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(error) => {
                     return Err(artifact_error(format!(
@@ -874,7 +869,7 @@ impl ArtifactWorkspace {
     }
 
     fn path(&self) -> &Path {
-        &self.path
+        self.temporary.path()
     }
 
     fn publish(mut self, source: &Path, destination: &Path) -> Result<(), LinkError> {
@@ -887,20 +882,11 @@ impl ArtifactWorkspace {
                 destination.display()
             ))
         })?;
-        self.published = true;
         // Publication is the commit point. A best-effort cleanup failure must
         // not turn a successfully replaced, fully verified destination into a
         // reported compilation failure.
-        let _ = fs::remove_dir_all(&self.path);
+        self.temporary.cleanup();
         Ok(())
-    }
-}
-
-impl Drop for ArtifactWorkspace {
-    fn drop(&mut self) {
-        if !self.published {
-            let _ = fs::remove_dir_all(&self.path);
-        }
     }
 }
 
@@ -1432,6 +1418,7 @@ mod tests {
                 overflow_arg_offset: 0,
                 gp_results: 1,
                 xmm_results: 0,
+                x87_result: false,
                 hidden_return: false,
                 logical_line: 1,
             };
@@ -1702,6 +1689,7 @@ mod tests {
             overflow_arg_offset: 0,
             gp_results: 0,
             xmm_results: 0,
+            x87_result: false,
             hidden_return: false,
             logical_line: 1,
         })

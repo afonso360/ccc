@@ -6,7 +6,7 @@ if [[ ${CCC_REQUIRE_TARGET_ORACLE:-} != 1 ]]; then
     exit 2
 fi
 if [[ $# -ne 1 ]]; then
-    echo "usage: $0 aarch64-linux|riscv64-linux|darwin-arm64" >&2
+    echo "usage: $0 x86_64-linux|aarch64-linux|riscv64-linux|darwin-arm64" >&2
     exit 2
 fi
 
@@ -61,9 +61,28 @@ triple=
 object_copier=
 macho_localizer=
 qemu_root=
+native_elf=0
 declare -a ccc_min ccc_full reference_cc runner
 
 case $target_name in
+    x86_64-linux)
+        platform=elf
+        triple=x86_64-unknown-linux-gnu
+        if [[ $(uname -s) != Linux || $(uname -m) != x86_64 ]]; then
+            echo "x86_64-linux evidence requires a native x86-64 Linux host" >&2
+            exit 3
+        fi
+        native_elf=1
+        reference_driver=${CCC_X86_64_CC:-gcc}
+        object_copier=${CCC_X86_64_OBJCOPY:-objcopy}
+        readelf_tool=${CCC_X86_64_READELF:-readelf}
+        nm_tool=${CCC_X86_64_NM:-nm}
+        objdump_tool=${CCC_X86_64_OBJDUMP:-objdump}
+        ccc_min=("$ccc_bin" "--target=$triple")
+        ccc_full=("$ccc_bin" "--target=$triple" -march=x86-64 -mcpu=generic -mabi=lp64)
+        reference_cc=("$reference_driver" -march=x86-64 -m64)
+        runner=()
+        ;;
     aarch64-linux)
         platform=elf
         triple=aarch64-unknown-linux-gnu
@@ -98,6 +117,7 @@ case $target_name in
     darwin-arm64)
         platform=macho
         triple=aarch64-apple-darwin
+        nm_tool=nm
         if [[ $(uname -s) != Darwin || $(uname -m) != arm64 ]]; then
             echo "darwin-arm64 evidence requires a native arm64 Darwin host" >&2
             exit 3
@@ -116,6 +136,11 @@ case $target_name in
             echo "CCC_NMEDIT does not resolve to nmedit: $macho_localizer" >&2
             exit 3
         fi
+        dsymutil_path=$(xcrun --find dsymutil)
+        if [[ -z $dsymutil_path || ! -x $dsymutil_path ]]; then
+            echo "the selected Darwin developer toolchain has no dsymutil" >&2
+            exit 3
+        fi
         ccc_min=("$ccc_bin" "--target=$triple" "--sdk-root=$sdk_root" -mmacosx-version-min=11.0)
         ccc_full=("$ccc_bin" "--target=$triple" -march=armv8-a -mcpu=generic -mabi=darwin "--sdk-root=$sdk_root" -mmacosx-version-min=11.0)
         reference_cc=("$reference_driver" -target arm64-apple-macos11 -isysroot "$sdk_root" -mmacosx-version-min=11.0)
@@ -130,14 +155,21 @@ require_tool "$reference_driver"
 
 if [[ $platform == elf ]]; then
     require_tool "$object_copier"
-    for tool in "$readelf_tool" "$nm_tool" "$objdump_tool" "$qemu_tool" gdb-multiarch timeout; do
+    for tool in "$readelf_tool" "$nm_tool" "$objdump_tool" timeout; do
         require_tool "$tool"
     done
-    if [[ ! -d $qemu_root ]]; then
-        echo "QEMU root does not exist: $qemu_root" >&2
-        exit 3
+    if (( native_elf )); then
+        require_tool gdb
+        runner=()
+    else
+        require_tool "$qemu_tool"
+        require_tool gdb-multiarch
+        if [[ ! -d $qemu_root ]]; then
+            echo "QEMU root does not exist: $qemu_root" >&2
+            exit 3
+        fi
+        runner=("$qemu_tool" -L "$qemu_root")
     fi
-    runner=("$qemu_tool" -L "$qemu_root")
 else
     runner=()
 fi
@@ -152,12 +184,19 @@ fi
         "$reference_driver" -dumpmachine
         "$reference_driver" -print-sysroot
         "$readelf_tool" --version
-        "$qemu_tool" --version
-        gdb-multiarch --version
-        echo "qemu_root=$qemu_root"
+        if (( native_elf )); then
+            gdb --version
+            echo "execution=native"
+        else
+            "$qemu_tool" --version
+            gdb-multiarch --version
+            echo "qemu_root=$qemu_root"
+        fi
     else
         echo "nmedit=$macho_localizer"
         shasum -a 256 "$macho_localizer"
+        echo "dsymutil=$dsymutil_path"
+        "$dsymutil_path" --version
         xcrun --show-sdk-version
         xcrun xcodebuild -version 2>/dev/null || true
         xcrun ld -version_details 2>/dev/null || xcrun ld -v
@@ -200,6 +239,16 @@ link_ref() {
 run_executable() {
     local executable=$1
     if [[ $platform == elf ]]; then
+        if (( native_elf )); then
+            local status
+            if "$executable"; then
+                return 0
+            else
+                status=$?
+                echo "native executable failed with status $status: $executable" >&2
+                return "$status"
+            fi
+        fi
         local interpreter status
         interpreter=$($readelf_tool -l "$executable" | awk '/Requesting program interpreter/ { value=$NF; gsub(/\]/, "", value); print value; exit }')
         if [[ -z $interpreter || ! -e $qemu_root$interpreter ]]; then
@@ -294,6 +343,20 @@ for optimization in -O0 -O2; do
     run_executable "$reference_header_executable"
     pass "$optimization reference installed hosted headers compile, link, and execute"
 
+    runtime_semantics_object=$artifact_dir/runtime-semantics-$suffix.o
+    runtime_semantics_executable=$artifact_dir/runtime-semantics-$suffix
+    compile_ccc runtime_semantics.c "$runtime_semantics_object" "$optimization"
+    link_ref "$runtime_semantics_executable" "$runtime_semantics_object"
+    "$nm_tool" -u "$runtime_semantics_object" \
+        > "$artifact_dir/runtime-semantics-$suffix.undefined-symbols.txt"
+    if grep -Eq '__atomic_|__sync_' \
+            "$artifact_dir/runtime-semantics-$suffix.undefined-symbols.txt"; then
+        echo "$optimization scalar atomics unexpectedly require a generic atomic library" >&2
+        exit 1
+    fi
+    run_executable "$runtime_semantics_executable"
+    pass "$optimization returns-twice control flow and native scalar atomics"
+
     ccc_unwind=$artifact_dir/ccc-unwind-$suffix.o
     ref_unwind=$artifact_dir/ref-unwind-$suffix.o
     ref_unwind_main=$artifact_dir/ref-unwind-main-$suffix.o
@@ -309,6 +372,30 @@ for optimization in -O0 -O2; do
     run_executable "$unwind_entry"
     run_executable "$unwind_helper"
     pass "$optimization unwind crosses fixed frames and both variadic bridges"
+
+    if [[ $target_name == x86_64-linux ]]; then
+        ccc_f80=$artifact_dir/ccc-f80-$suffix.o
+        ref_f80_caller=$artifact_dir/ref-calls-ccc-f80-$suffix.o
+        f80_forward=$artifact_dir/f80-ref-to-ccc-$suffix
+        compile_ccc ccc_f80_definitions.c "$ccc_f80" "$optimization" -nostdinc
+        $readelf_tool -sW "$ccc_f80" > "$artifact_dir/ccc-f80-$suffix.elf-symbols.txt"
+        for helper in __floattixf __floatuntixf __fixxfti __fixunsxfti; do
+            grep -Eq "UND +$helper$" "$artifact_dir/ccc-f80-$suffix.elf-symbols.txt"
+        done
+        compile_ref reference_calls_ccc_f80.c "$ref_f80_caller" "$optimization"
+        link_ref "$f80_forward" "$ref_f80_caller" "$ccc_f80" -lm
+        run_executable "$f80_forward"
+        pass "$optimization GCC caller to CCC x87 long-double boundaries and operations"
+
+        ref_f80=$artifact_dir/ref-f80-$suffix.o
+        ccc_f80_caller=$artifact_dir/ccc-calls-ref-f80-$suffix.o
+        f80_reverse=$artifact_dir/f80-ccc-to-ref-$suffix
+        compile_ref reference_f80_definitions.c "$ref_f80" "$optimization"
+        compile_ccc ccc_calls_reference_f80.c "$ccc_f80_caller" "$optimization" -nostdinc
+        link_ref "$f80_reverse" "$ccc_f80_caller" "$ref_f80" -lm
+        run_executable "$f80_reverse"
+        pass "$optimization CCC caller to GCC x87 long-double boundaries"
+    fi
 done
 
 macro_explicit=$artifact_dir/macro-explicit.o
@@ -320,6 +407,9 @@ pass "implicit and explicit normalized target options emit identical objects"
 
 declare -a macro_names
 case $target_name in
+    x86_64-linux)
+        macro_names=(__SIZEOF_POINTER__ __SIZEOF_LONG__ __x86_64__ __amd64__ __LDBL_MANT_DIG__ __SIZEOF_LONG_DOUBLE__)
+        ;;
     aarch64-linux)
         macro_names=(__SIZEOF_POINTER__ __SIZEOF_LONG__ __aarch64__ __ARM_ARCH __ARM_PCS_AAPCS64 __CHAR_UNSIGNED__ __LDBL_MANT_DIG__)
         ;;
@@ -361,38 +451,54 @@ compile_ccc darwin_symbol_contract.c "$symbol_object" -O0 -nostdinc
 if [[ $platform == elf ]]; then
     long_double_storage=$artifact_dir/long-double-storage.o
     compile_ccc long_double_storage.c "$long_double_storage" -O0 -nostdinc
-    $readelf_tool -sW "$long_double_storage" | grep -q 'binary128_storage'
-    pass "binary128 layout and uninitialized object storage remain available"
-    expect_ccc_failure long_double_initialization.c CCC2343
-    expect_ccc_failure long_double_conversion.c CCC2343
-    expect_ccc_failure long_double_arithmetic.c CCC2343
-    expect_ccc_failure long_double_boundary.c CCC2343
-    expect_ccc_failure long_double_aggregate_boundary.c CCC3509
-    expect_ccc_failure long_double_va_arg.c CCC2404
-    expect_ccc_failure long_double_tls.c CCC2441
+    $readelf_tool -sW "$long_double_storage" | grep -q 'native_long_double_storage'
+    if [[ $target_name == x86_64-linux ]]; then
+        pass "x87 layout and uninitialized long-double storage remain available"
+    else
+        pass "binary128 layout and uninitialized long-double storage remain available"
+        expect_ccc_failure long_double_initialization.c CCC2343
+        expect_ccc_failure long_double_conversion.c CCC2343
+        expect_ccc_failure long_double_arithmetic.c CCC2343
+        expect_ccc_failure long_double_boundary.c CCC2343
+        expect_ccc_failure long_double_aggregate_boundary.c CCC3509
+        expect_ccc_failure long_double_va_arg.c CCC2404
+        expect_ccc_failure long_double_tls.c CCC2441
+    fi
 
     $readelf_tool -h "$ccc_fixed" > "$artifact_dir/fixed.elf-header.txt"
     $readelf_tool -SW "$ccc_variadic" > "$artifact_dir/variadic.elf-sections.txt"
     $readelf_tool -rW "$ccc_variadic" > "$artifact_dir/variadic.elf-relocations.txt"
     $readelf_tool -sW "$ccc_variadic" > "$artifact_dir/variadic.elf-symbols.txt"
     grep -q 'ELF64' "$artifact_dir/fixed.elf-header.txt"
-    if [[ $target_name == aarch64-linux ]]; then
-        grep -q 'AArch64' "$artifact_dir/fixed.elf-header.txt"
-    else
-        grep -q 'RISC-V' "$artifact_dir/fixed.elf-header.txt"
-        grep -Eq 'Flags:.*0x5([^0-9a-f]|$)' "$artifact_dir/fixed.elf-header.txt"
-    fi
+    case $target_name in
+        x86_64-linux)
+            grep -q 'Advanced Micro Devices X86-64' "$artifact_dir/fixed.elf-header.txt"
+            ;;
+        aarch64-linux)
+            grep -q 'AArch64' "$artifact_dir/fixed.elf-header.txt"
+            ;;
+        riscv64-linux)
+            grep -q 'RISC-V' "$artifact_dir/fixed.elf-header.txt"
+            grep -Eq 'Flags:.*0x5([^0-9a-f]|$)' "$artifact_dir/fixed.elf-header.txt"
+            ;;
+    esac
     grep -q '\.eh_frame' "$artifact_dir/variadic.elf-sections.txt"
     grep -Eq '\.rela?\.eh_frame' "$artifact_dir/variadic.elf-relocations.txt"
     grep -q 'ccc_collect' "$artifact_dir/variadic.elf-symbols.txt"
     grep -q '__ccc_' "$artifact_dir/variadic.elf-symbols.txt"
     grep -q 'collect_copy' "$artifact_dir/variadic.elf-relocations.txt"
     grep -q '__ccc_variadic_body_' "$artifact_dir/variadic.elf-relocations.txt"
-    if [[ $target_name == aarch64-linux ]]; then
-        grep -q 'R_AARCH64_CALL26' "$artifact_dir/variadic.elf-relocations.txt"
-    else
-        grep -q 'R_RISCV_CALL_PLT' "$artifact_dir/variadic.elf-relocations.txt"
-    fi
+    case $target_name in
+        x86_64-linux)
+            grep -q 'R_X86_64_PLT32' "$artifact_dir/variadic.elf-relocations.txt"
+            ;;
+        aarch64-linux)
+            grep -q 'R_AARCH64_CALL26' "$artifact_dir/variadic.elf-relocations.txt"
+            ;;
+        riscv64-linux)
+            grep -q 'R_RISCV_CALL_PLT' "$artifact_dir/variadic.elf-relocations.txt"
+            ;;
+    esac
     grep -q '\.note.GNU-stack' "$artifact_dir/variadic.elf-sections.txt"
     if grep '\.note.GNU-stack' "$artifact_dir/variadic.elf-sections.txt" | grep -q ' X '; then
         echo "packaged object requests an executable stack" >&2
@@ -463,17 +569,27 @@ if [[ $platform == elf ]]; then
         exit 1
     fi
     port_base=${CCC_GDB_PORT_BASE:-$((30000 + ($$ % 1000) * 2))}
-    run_gdb_probe() (
-        local executable=$1 symbol=$2 port=$3 stem=$4
-        "$qemu_tool" -L "$qemu_root" -g "$port" "$executable" > "$artifact_dir/qemu-$stem.txt" 2>&1 &
-        local qemu_pid=$!
-        trap 'kill "$qemu_pid" 2>/dev/null || true' EXIT
-        timeout 30 gdb-multiarch -q -batch \
-            -ex "file $executable" -ex "target remote :$port" \
-            -ex "break $symbol" -ex continue -ex bt -ex detach \
-            > "$artifact_dir/gdb-$stem.txt" 2>&1
-        wait "$qemu_pid"
-    )
+    if (( native_elf )); then
+        run_gdb_probe() {
+            local executable=$1 symbol=$2 port=$3 stem=$4
+            : "$port"
+            timeout 30 gdb -q -batch \
+                -ex "file $executable" -ex "break $symbol" -ex run -ex bt \
+                > "$artifact_dir/gdb-$stem.txt" 2>&1
+        }
+    else
+        run_gdb_probe() (
+            local executable=$1 symbol=$2 port=$3 stem=$4
+            "$qemu_tool" -L "$qemu_root" -g "$port" "$executable" > "$artifact_dir/qemu-$stem.txt" 2>&1 &
+            local qemu_pid=$!
+            trap 'kill "$qemu_pid" 2>/dev/null || true' EXIT
+            timeout 30 gdb-multiarch -q -batch \
+                -ex "file $executable" -ex "target remote :$port" \
+                -ex "break $symbol" -ex continue -ex bt -ex detach \
+                > "$artifact_dir/gdb-$stem.txt" 2>&1
+            wait "$qemu_pid"
+        )
+    fi
     run_gdb_probe "$debugger_entry" ccc_unwind_variadic "$port_base" variadic-entry
     run_gdb_probe "$debugger_helper" "$helper_symbol" "$((port_base + 1))" call-helper
     grep -q 'ccc_unwind_variadic' "$artifact_dir/gdb-variadic-entry.txt"
@@ -524,13 +640,59 @@ else
     grep -q 'main' "$artifact_dir/lldb-variadic-entry.txt"
     grep -q "$helper_debugger_symbol" "$artifact_dir/lldb-call-helper.txt"
     grep -q 'main' "$artifact_dir/lldb-call-helper.txt"
+
+    source_debug_executable=$artifact_dir/source-debug-local
+    source_debug_bundle=$source_debug_executable.dSYM
+    run_ccc "${ccc_full[@]}" -O0 -g -nostdinc "$fixtures/debug_local.c" -o "$source_debug_executable"
+    require_file "$source_debug_bundle/Contents/Resources/DWARF/source-debug-local"
+    dwarfdump --uuid "$source_debug_executable" > "$artifact_dir/source-debug-executable.uuid.txt"
+    dwarfdump --uuid "$source_debug_bundle" > "$artifact_dir/source-debug-bundle.uuid.txt"
+    executable_uuid=$(awk '/UUID:/ { print $2; exit }' "$artifact_dir/source-debug-executable.uuid.txt")
+    bundle_uuid=$(awk '/UUID:/ { print $2; exit }' "$artifact_dir/source-debug-bundle.uuid.txt")
+    if [[ -z $executable_uuid || $executable_uuid != "$bundle_uuid" ]]; then
+        echo "executable and dSYM UUIDs differ: executable=$executable_uuid bundle=$bundle_uuid" >&2
+        exit 1
+    fi
+    source_log=$artifact_dir/lldb-source-debug.txt
+    source_timeout=$artifact_dir/lldb-source-debug.timeout
+    rm -f "$source_timeout"
+    lldb --batch -o "target create $source_debug_executable" \
+        -o "breakpoint set --file debug_local.c --line 4" \
+        -o run -o "frame variable ccc_debug_local" > "$source_log" 2>&1 &
+    source_lldb_pid=$!
+    (
+        sleep 30
+        if kill -0 "$source_lldb_pid" 2>/dev/null; then
+            : > "$source_timeout"
+            kill "$source_lldb_pid" 2>/dev/null || true
+            sleep 2
+            kill -9 "$source_lldb_pid" 2>/dev/null || true
+        fi
+    ) &
+    source_watchdog_pid=$!
+    if wait "$source_lldb_pid"; then source_status=0; else source_status=$?; fi
+    kill "$source_watchdog_pid" 2>/dev/null || true
+    wait "$source_watchdog_pid" 2>/dev/null || true
+    if [[ -f $source_timeout ]]; then
+        echo "LLDB timed out while probing source debug information" >> "$source_log"
+        exit 124
+    fi
+    if (( source_status != 0 )); then
+        echo "LLDB source debug probe failed with status $source_status" >&2
+        exit "$source_status"
+    fi
+    grep -q 'stop reason = breakpoint' "$source_log"
+    grep -Eq 'ccc_debug_local = 42' "$source_log"
+    pass "one-step debug links publish source lines and local values through dSYM"
 fi
 pass "debugger stops in the variadic entry and generated call helper with caller frames"
 
-if [[ $platform == elf ]]; then
-    expected_cases=28
+if [[ $target_name == x86_64-linux ]]; then
+    expected_cases=27
+elif [[ $platform == elf ]]; then
+    expected_cases=30
 else
-    expected_cases=21
+    expected_cases=24
 fi
 if (( case_count != expected_cases )); then
     echo "target oracle ran $case_count cases; expected exactly $expected_cases" >&2

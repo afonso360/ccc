@@ -11,19 +11,22 @@ committed to the repository.
 
 ## Build interface
 
-The adapter uses Lua's upstream `make linux` interface on x86-64 Linux. It
-overrides the default `gcc -std=gnu99` command with `ccc-cc`; CCC's documented
-driver default selects GNU C11 without an adapter flag. All 34 C translation
-units that produce `liblua.a`,
-`lua`, and `luac` are compiled by CCC. The native GCC driver receives only
-already-produced objects and archives for the two final links; the adapter
-never retries a failed translation with another compiler. A source-input log is
+The adapter uses Lua's upstream `make linux` interface on x86-64 Linux with
+`CC=ccc`. Replacing Lua's bundled `gcc -std=gnu99` command with CCC also
+replaces that command's language option, so the build uses CCC's documented
+GNU C default without an adapter-supplied `-std` flag. All 34 C translation
+units that produce `liblua.a`, `lua`, and `luac` are compiled by CCC, and CCC
+drives both final links through its resolved target toolchain. The adapter never
+retries a failed translation or link with another compiler. A source-input log is
 checked against every `.c` file in the pinned `src/` directory, so a duplicate,
 omitted, substituted, or native-compiled translation unit fails the run rather
-than being hidden by a command count.
+than being hidden by a command count. The corresponding 34 object outputs and
+the exact 32-member `liblua.a` inventory are checked independently. The two
+normalized upstream link commands must consume only `lua.o` or `luac.o`,
+`liblua.a`, and the upstream Linux libraries in their original order.
 
-CCC emits position-independent objects, and Lua's native GCC link steps use
-their normal executable defaults without an adapter-supplied relocation flag.
+CCC emits position-independent objects, and Lua's link steps use CCC's normal
+PIE executable default without an adapter-supplied relocation flag.
 After linking, the adapter requires both programs to be ELF `DYN` files with
 the `DF_1_PIE` dynamic flag and rejects `TEXTREL` dynamic tags. The retained
 ELF headers, dynamic tags, and exact link commands make this boundary
@@ -49,12 +52,11 @@ The run fails before the build if CCC's advertised GNU 4.2.1 identity would
 select a different surface. The Linux profile also selects `_setjmp` and
 `_longjmp` for protected calls. Ambient GNU Make injection through `MAKEFILES`
 or `GNUMAKEFLAGS` is cleared with the other build flags. Exact compiler and
-linker commands are retained in `compile-commands.txt`; logging is one complete append per command so
-parallel builds cannot splice records together. The run rejects any native link
-command containing a C source input, requires exactly the two upstream program
-links, and verifies that no C command injects a `-std=` override while every
-translation retains `LUA_USE_LINUX` without disabling compiler-selected
-builtins or jump tables.
+linker commands are extracted from the retained upstream build log. The run
+rejects any link command containing a C source input, requires exactly the two
+upstream program links, and verifies that every C translation retains the
+upstream optimization and `LUA_USE_LINUX` selections without adding a language
+override or disabling compiler-selected builtins or jump tables.
 
 ## Official test profiles
 
@@ -81,6 +83,7 @@ and further nonlocal-control coverage. Their sources remain covered by the
 separately pinned official test archive.
 
 Run [`run.sh`](run.sh) on x86-64 Linux with `CCC` set to the compiler binary.
+Set `CCC_CC` when its resolved target GCC driver is not available as `gcc`.
 Pass already-downloaded archives with `--source-archive` and `--test-archive`,
 or let the adapter populate its disposable cache. The work directory must be
 empty and is retained with the logs named in `manifest.toml`.

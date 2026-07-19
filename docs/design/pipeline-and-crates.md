@@ -67,7 +67,7 @@ hidden returns, extensions, variadic shaping, and packaging requirements. The
 plan remains separate from CCC-IR, is verified against a canonical IR digest,
 and is tested against the [ABI oracle](testing.md#abi-oracle).
 
-**Codegen (`ccc-codegen`).** Uses `cranelift-frontend`'s `FunctionBuilder`; eligible scalar locals become Cranelift `Variable`s while memory-resident objects follow the CCC-IR place/effect rules. It consumes the verified `ModuleAbiPlan`, checks backend capabilities, and emits CLIF or a hard diagnostic—never an ABI approximation. Provider-neutral runtime-sized automatic storage may lower to versioned local CLIF support definitions in the primary object; this is distinct from generated target assembly. `cranelift-object` emits the primary object; generated bridge/assembly inputs are owned by `ccc-link`.
+**Codegen (`ccc-codegen`).** Uses `cranelift-frontend`'s `FunctionBuilder`; eligible scalar locals become Cranelift `Variable`s while memory-resident objects follow the CCC-IR place/effect rules. It consumes the verified `ModuleAbiPlan`, checks backend capabilities, and emits CLIF or a hard diagnostic—never an ABI approximation. Provider-neutral runtime-sized automatic storage may lower to versioned local CLIF support definitions in the primary object; this is distinct from generated target assembly. With source debugging enabled, exact CCC spans become backend source identities and a separate gimli layer emits line, type, scope, variable, and relocation data after machine layout is known; System V call-frame information remains independently emitted. `cranelift-object` emits the primary object; generated bridge/assembly inputs are owned by `ccc-link`.
 
 ## Workspace layout
 

@@ -12,8 +12,8 @@ pub use compat::{
     CompatibilityScope, CompatibilityVersion, GnuCompatibilityProfile,
 };
 pub use layout::{
-    BitfieldLayoutPolicy, BitfieldOrder, ByteOrder, PackingPolicy, ScalarLayout, TargetDataLayout,
-    TargetScalarKind,
+    BitfieldLayoutPolicy, BitfieldOrder, ByteOrder, LongDoubleFormat, PackingPolicy, ScalarLayout,
+    TargetDataLayout, TargetScalarKind,
 };
 pub use target_lexicon::{
     Aarch64Architecture, Architecture, BinaryFormat, CallingConvention, Environment,
@@ -41,6 +41,11 @@ pub enum RuntimeHelperValue {
     UnsignedInt128,
     Float32,
     Float64,
+    /// System V AMD64 `XFmode`, transported through the native x87 ABI.
+    ///
+    /// Cranelift never sees this carrier. CCC's generated assembly support
+    /// unit is the caller or callee for every contract containing it.
+    Float80,
 }
 
 /// The link-time provider selected for target runtime helpers.
@@ -72,6 +77,7 @@ const I128: &[RuntimeHelperValue] = &[RuntimeHelperValue::SignedInt128];
 const U128: &[RuntimeHelperValue] = &[RuntimeHelperValue::UnsignedInt128];
 const F32: &[RuntimeHelperValue] = &[RuntimeHelperValue::Float32];
 const F64: &[RuntimeHelperValue] = &[RuntimeHelperValue::Float64];
+const F80: &[RuntimeHelperValue] = &[RuntimeHelperValue::Float80];
 
 /// Complete helper manifest for the x86-64 GNU wide-integer capability.
 pub const SYSV_AMD64_INT128_RUNTIME_HELPERS: &[RuntimeHelperContract] = &[
@@ -145,6 +151,30 @@ pub const SYSV_AMD64_INT128_RUNTIME_HELPERS: &[RuntimeHelperContract] = &[
         symbol: "__fixunsdfti",
         result: RuntimeHelperValue::UnsignedInt128,
         parameters: F64,
+        provider: RuntimeHelperProvider::CompilerBuiltins,
+    },
+    RuntimeHelperContract {
+        symbol: "__floattixf",
+        result: RuntimeHelperValue::Float80,
+        parameters: I128,
+        provider: RuntimeHelperProvider::CompilerBuiltins,
+    },
+    RuntimeHelperContract {
+        symbol: "__floatuntixf",
+        result: RuntimeHelperValue::Float80,
+        parameters: U128,
+        provider: RuntimeHelperProvider::CompilerBuiltins,
+    },
+    RuntimeHelperContract {
+        symbol: "__fixxfti",
+        result: RuntimeHelperValue::SignedInt128,
+        parameters: F80,
+        provider: RuntimeHelperProvider::CompilerBuiltins,
+    },
+    RuntimeHelperContract {
+        symbol: "__fixunsxfti",
+        result: RuntimeHelperValue::UnsignedInt128,
+        parameters: F80,
         provider: RuntimeHelperProvider::CompilerBuiltins,
     },
 ];
@@ -1298,6 +1328,7 @@ pub const X86_64_UNKNOWN_LINUX_GNU: TargetSpec = TargetSpec {
         double_align: 8,
         long_double_width: 128,
         long_double_align: 16,
+        long_double_format: LongDoubleFormat::X87Extended,
         wchar_width: 32,
         wchar_is_signed: true,
         wint_width: 32,
@@ -1363,6 +1394,7 @@ pub const AARCH64_APPLE_DARWIN: TargetSpec = TargetSpec {
         char_is_signed: true,
         long_double_width: 64,
         long_double_align: 8,
+        long_double_format: LongDoubleFormat::Binary64,
         wint_is_signed: true,
         ..LINUX_LP64_BINARY128_LAYOUT
     },
@@ -1391,6 +1423,7 @@ const LINUX_LP64_BINARY128_LAYOUT: TargetDataLayout = TargetDataLayout {
     double_align: 8,
     long_double_width: 128,
     long_double_align: 16,
+    long_double_format: LongDoubleFormat::IeeeBinary128,
     wchar_width: 32,
     wchar_is_signed: true,
     wint_width: 32,
@@ -1446,30 +1479,34 @@ mod tests {
 
     #[test]
     fn enabled_profiles_have_distinct_abi_identities_and_formats() {
-        for (spelling, abi, format, long_double_width) in [
+        for (spelling, abi, format, long_double_width, long_double_format) in [
             (
                 "x86_64-unknown-linux-gnu",
                 AbiIdentity::SysvAmd64Lp64,
                 BinaryFormat::Elf,
                 128,
+                LongDoubleFormat::X87Extended,
             ),
             (
                 "aarch64-unknown-linux-gnu",
                 AbiIdentity::Aapcs64Lp64,
                 BinaryFormat::Elf,
                 128,
+                LongDoubleFormat::IeeeBinary128,
             ),
             (
                 "riscv64-unknown-linux-gnu",
                 AbiIdentity::RiscvLp64d,
                 BinaryFormat::Elf,
                 128,
+                LongDoubleFormat::IeeeBinary128,
             ),
             (
                 "aarch64-apple-darwin",
                 AbiIdentity::DarwinArm64,
                 BinaryFormat::Macho,
                 64,
+                LongDoubleFormat::Binary64,
             ),
         ] {
             let triple = spelling.parse().unwrap();
@@ -1479,6 +1516,10 @@ mod tests {
             assert_eq!(
                 config.target.data_layout.long_double_width,
                 long_double_width
+            );
+            assert_eq!(
+                config.target.data_layout.long_double_format,
+                long_double_format
             );
         }
     }
@@ -1722,6 +1763,38 @@ mod tests {
         let mut explicit = config;
         explicit.language.trigraphs = TrigraphPolicy::Disabled;
         assert!(!explicit.language.trigraphs_enabled());
+    }
+
+    #[test]
+    fn x87_wide_conversion_runtime_contracts_use_native_xfmode_boundaries() {
+        let manifest = AbiIdentity::SysvAmd64Lp64.runtime_helper_manifest();
+        let contract = |symbol| {
+            manifest
+                .iter()
+                .find(|contract| contract.symbol == symbol)
+                .unwrap()
+        };
+        assert_eq!(contract("__floattixf").result, RuntimeHelperValue::Float80);
+        assert_eq!(
+            contract("__floattixf").parameters,
+            [RuntimeHelperValue::SignedInt128]
+        );
+        assert_eq!(
+            contract("__floatuntixf").parameters,
+            [RuntimeHelperValue::UnsignedInt128]
+        );
+        assert_eq!(
+            contract("__fixxfti").parameters,
+            [RuntimeHelperValue::Float80]
+        );
+        assert_eq!(
+            contract("__fixxfti").result,
+            RuntimeHelperValue::SignedInt128
+        );
+        assert_eq!(
+            contract("__fixunsxfti").result,
+            RuntimeHelperValue::UnsignedInt128
+        );
     }
 
     #[test]

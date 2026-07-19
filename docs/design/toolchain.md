@@ -41,6 +41,10 @@ the target `objcopy` for exact allowlist localization. Mach-O packaging uses
 Apple's `nmedit -R`; using a generic object copier for this step is outside the
 Darwin toolchain contract. `CCC_OBJCOPY` and `CCC_NMEDIT` select the respective
 tools explicitly when reproducible environments need to pin their paths.
+Darwin debug links query the selected compiler driver with
+`-print-prog-name=dsymutil` and invoke the reported tool before releasing link
+objects. This keeps the debug-artifact producer in the same selected developer
+toolchain instead of resolving an unrelated `dsymutil` from `PATH`.
 
 ## Runtime helper manifest
 
@@ -48,38 +52,57 @@ Every compiler-emitted helper has a manifest entry containing symbol, exact C/AB
 
 The System V AMD64 wide-integer contract reserves direct manifest entries for
 `__divti3`, `__udivti3`, `__modti3`, `__umodti3`, the signed and unsigned
-`ti`-to-`sf`/`df` conversion helpers, and the inverse `sf`/`df`-to-`ti`
-helpers. Cranelift's default libcall table does not contain those symbols in the
-pinned backend. Codegen therefore selects them per operation and carries their
-requirements through object emission, the link plan, and `-###` output.
+`ti`-to-`sf`/`df`/`xf` conversion helpers, and the inverse
+`sf`/`df`/`xf`-to-`ti` helpers. The x87-specific entries are `__floattixf`,
+`__floatuntixf`, `__fixxfti`, and `__fixunsxfti`; their ABI signatures carry
+f80 through the platform x87 convention even though CCC keeps source f80
+values address-backed. Their manifest signatures are respectively
+`long double (__int128)`, `long double (unsigned __int128)`,
+`__int128 (long double)`, and `unsigned __int128 (long double)`. Cranelift's
+default libcall table does not contain those symbols in the pinned backend.
+Codegen therefore selects them per operation and carries their requirements
+through object emission and the executable link plan.
 
-The final link scans the emitted object and selects only manifest entries that
-remain undefined. It asks the already resolved target driver for its exact
+The final link scans the resolved driver's fixed arguments and then the ordered
+relocatable objects, archives, resolved libraries, and supported linker state
+to select manifest entries that remain undefined
+after normal archive extraction. The model covers groups, forced undefined
+and symbolic-entry symbols, COMMON/weak/strong precedence, thin archives,
+directory-major `-L` and
+default search, dynamic visibility, `--as-needed`, and state push/pop. An
+unmodeled linker script, plugin member, response input, or suppressed startup
+set conservatively selects the complete provider; normal archive extraction
+still loads only genuinely
+needed members. CCC asks the already resolved target driver for its exact
 compiler-builtins archive, verifies that archive's symbol index contains every
-selected helper, and passes that canonical archive path to the linker after
-the object. The historical driver query may resolve GCC's libgcc or Clang's
-compiler-rt; CCC treats the reported archive as the provider only after the
-same verification. It never verifies one archive and then uses a generic
-`-lgcc` search that could select another archive through user `-L` ordering.
+selected helper, and passes that canonical archive path after user inputs under
+an isolated `--no-whole-archive` state. The historical driver query may resolve
+GCC's libgcc or Clang's compiler-rt; CCC treats the reported archive as the
+provider only after the same verification. It never verifies one archive and
+then uses a generic `-lgcc` search that could select another archive through
+user `-L` ordering.
 
-CCC runtime shims use a versioned symbol namespace except where an external ABI mandates a standard helper name. Runtime objects are selected by target and effective ABI options, including long-double mode, and incompatible CCC objects are diagnosed.
+CCC runtime shims use a versioned symbol namespace except where an external
+ABI mandates a standard helper name. Runtime objects are selected by target and
+the implemented effective ABI options. ABI-changing `long double` modes are
+rejected by the driver rather than producing objects with a private variant.
 
 The hosted automatic-storage provider selected by
-[ADR-0011](../adr/0011-arena-backed-runtime-sized-automatic-storage.md) uses
-deterministically named local CLIF support definitions in the primary object.
-Its logical `__ccc_auto_arena_v1_*` surface is versioned even though the emitted
-symbols have local binding. The external manifest entries are the exact hosted
-signatures for `malloc(size_t)`, `free(void *)`, and non-returning
-`abort(void)`. A compile-only object may retain those ordinary libc references,
-but enabling the provider requires a hosted link profile that resolves them.
-Runtime-sized automatic storage alone does not trigger generated assembly, a
-relocatable partial link, or object-copy tooling. A freestanding profile must
-select and test another allocator or leave the capability unavailable.
+[ADR-0011](../adr/0011-arena-backed-runtime-sized-automatic-storage.md) lowers
+directly into each affected function. Its external ABI is exactly
+`realloc(void *, size_t)` plus `free(void *)`; those ordinary libc imports are
+separate from the compiler-builtins helper manifest above. Invalid extents,
+size overflow, and allocation failure take an explicit backend trap. A
+compile-only object may retain the two libc references, but enabling the
+provider requires a hosted link profile that resolves them. Runtime-sized
+automatic storage alone does not trigger generated assembly, a relocatable
+partial link, or object-copy tooling. A freestanding profile must select and
+test another allocator or leave the capability unavailable.
 
-The link plan and `-###` output expose these provider requirements. An external
+The object and executable link plan expose these provider requirements. An external
 GCC- or Clang-compatible driver can link a CCC object directly because the
-arena support definitions are already local to that object and its remaining
-references are normal hosted-libc symbols. Mixed-link tests verify this path;
+arena lowering is already present in that object and its remaining references
+are normal hosted-libc symbols. Mixed-link tests verify this path;
 provider availability is never inferred merely from a successful native link.
 
 ## Rust project policy

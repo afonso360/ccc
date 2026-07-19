@@ -44,17 +44,176 @@ fn compile_ccc_with_options(source: &Path, output: &Path, options: &[&str]) {
 }
 
 #[test]
-fn debug_and_optimization_compatibility_options_preserve_baseline_object() {
+fn debug_levels_emit_source_types_variables_and_relocations() {
     let directory = test_directory("quality-options");
     let source = directory.join("quality-options.c");
+    let baseline = directory.join("baseline.o");
+    let disabled = directory.join("disabled.o");
+    let with_debug = directory.join("with-debug.o");
+    fs::write(
+        &source,
+        r#"
+struct Pair { int left; long right; };
+int global_value;
+
+int inspect(int *parameter) {
+    volatile struct Pair local = { 3, 5 };
+    int **addressable_parameter = &parameter;
+    global_value = local.left;
+    return **addressable_parameter + (int)local.right;
+}
+"#,
+    )
+    .unwrap();
+
+    compile_ccc(&source, &baseline);
+    compile_ccc_with_options(&source, &disabled, &["-g", "-g0", "-Oz"]);
+    compile_ccc_with_options(&source, &with_debug, &["-g3", "-Oz"]);
+
+    assert_eq!(fs::read(&baseline).unwrap(), fs::read(&disabled).unwrap());
+    let bytes = fs::read(&with_debug).unwrap();
+    assert_ne!(fs::read(&baseline).unwrap(), bytes);
+    for (index, level) in ["-g", "-g1", "-g2"].into_iter().enumerate() {
+        let output = directory.join(format!("debug-level-{index}.o"));
+        compile_ccc_with_options(&source, &output, &[level, "-Oz"]);
+        assert_eq!(fs::read(output).unwrap(), bytes, "{level} debug profile");
+    }
+    let file = object::File::parse(bytes.as_slice()).unwrap();
+    for section in [
+        ".debug_abbrev",
+        ".debug_info",
+        ".debug_line",
+        ".debug_ranges",
+        ".eh_frame",
+    ] {
+        assert!(file.section_by_name(section).is_some(), "missing {section}");
+    }
+    let debug_relocations = [".debug_info", ".debug_line", ".debug_ranges"]
+        .into_iter()
+        .flat_map(|name| file.section_by_name(name).unwrap().relocations())
+        .count();
+    assert!(
+        debug_relocations >= 5,
+        "expected relocation-bearing DWARF, found {debug_relocations} relocations"
+    );
+
+    let sections = gimli::DwarfSections::load(|id| {
+        Ok::<_, gimli::Error>(
+            file.section_by_name(id.name())
+                .and_then(|section| section.data().ok())
+                .unwrap_or_default()
+                .to_vec(),
+        )
+    })
+    .unwrap();
+    let dwarf = sections.borrow(|section| gimli::EndianSlice::new(section, gimli::LittleEndian));
+    let mut units = dwarf.units();
+    let header = units.next().unwrap().expect("debug compilation unit");
+    assert!(
+        units.next().unwrap().is_none(),
+        "one source should produce one unit"
+    );
+    let unit = dwarf.unit(header).unwrap();
+    let mut entries = unit.entries();
+    let mut tags = std::collections::HashMap::new();
+    let mut named = std::collections::BTreeSet::new();
+    let mut located_variables = 0;
+    while let Some(entry) = entries.next_dfs().unwrap() {
+        *tags.entry(entry.tag()).or_insert(0_usize) += 1;
+        if entry.tag() == gimli::DW_TAG_variable && entry.has_attr(gimli::DW_AT_location) {
+            located_variables += 1;
+        }
+        if let Some(attribute) = entry.attr(gimli::DW_AT_name)
+            && let Ok(name) = dwarf.attr_string(&unit, attribute.value())
+        {
+            named.insert(name.to_string_lossy().into_owned());
+        }
+    }
+    for tag in [
+        gimli::DW_TAG_compile_unit,
+        gimli::DW_TAG_subprogram,
+        gimli::DW_TAG_structure_type,
+        gimli::DW_TAG_member,
+        gimli::DW_TAG_formal_parameter,
+        gimli::DW_TAG_lexical_block,
+        gimli::DW_TAG_variable,
+        gimli::DW_TAG_base_type,
+    ] {
+        assert!(
+            tags.get(&tag).is_some_and(|count| *count > 0),
+            "missing {tag:?}"
+        );
+    }
+    for name in [
+        "Pair",
+        "left",
+        "right",
+        "inspect",
+        "parameter",
+        "local",
+        "global_value",
+    ] {
+        assert!(
+            named.contains(name),
+            "missing debug name `{name}`: {named:?}"
+        );
+    }
+    assert!(
+        located_variables >= 2,
+        "addressable variables need locations"
+    );
+
+    let mut rows = unit.line_program.clone().expect("line program").rows();
+    let mut source_rows = 0;
+    while let Some((_, row)) = rows.next_row().unwrap() {
+        if !row.end_sequence() && row.line().map(|line| line.get()).unwrap_or(0) > 0 {
+            source_rows += 1;
+        }
+    }
+    assert!(source_rows >= 3, "expected source-level line rows");
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn optimization_compatibility_options_preserve_baseline_object() {
+    let directory = test_directory("optimization-options");
+    let source = directory.join("optimization-options.c");
     let baseline = directory.join("baseline.o");
     let with_options = directory.join("with-options.o");
     fs::write(&source, "int answer(void) { return 42; }\n").unwrap();
 
     compile_ccc(&source, &baseline);
-    compile_ccc_with_options(&source, &with_options, &["-g3", "-Oz"]);
+    compile_ccc_with_options(&source, &with_options, &["-Oz"]);
 
     assert_eq!(fs::read(baseline).unwrap(), fs::read(with_options).unwrap());
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn debug_information_covers_data_only_translation_units() {
+    let directory = test_directory("debug-data-only");
+    let source = directory.join("debug-data-only.c");
+    let output = directory.join("debug-data-only.o");
+    fs::write(
+        &source,
+        "struct Item { int value; }; struct Item global_item;\n",
+    )
+    .unwrap();
+
+    compile_ccc_with_options(&source, &output, &["-g"]);
+    let bytes = fs::read(&output).unwrap();
+    let file = object::File::parse(bytes.as_slice()).unwrap();
+    assert!(file.section_by_name(".debug_info").is_some());
+    assert!(
+        file.section_by_name(".debug_info")
+            .unwrap()
+            .relocations()
+            .count()
+            >= 2,
+        "the compilation unit and global address must be relocatable"
+    );
+
     fs::remove_dir_all(directory).unwrap();
 }
 
@@ -165,7 +324,7 @@ int read_tls_models(void) {
 "#,
     )
     .unwrap();
-    compile_ccc(&source, &output);
+    compile_ccc_with_options(&source, &output, &["-g"]);
 
     let bytes = fs::read(&output).unwrap();
     let file = object::File::parse(bytes.as_slice()).unwrap();
@@ -221,6 +380,7 @@ int read_tls_models(void) {
         object::elf::R_X86_64_TLSGD,
         object::elf::R_X86_64_TLSLD,
         object::elf::R_X86_64_DTPOFF32,
+        object::elf::R_X86_64_DTPOFF64,
         object::elf::R_X86_64_GOTTPOFF,
         object::elf::R_X86_64_TPOFF32,
     ] {

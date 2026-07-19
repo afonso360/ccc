@@ -1151,6 +1151,9 @@ impl Parser<'_> {
         if let Some(keyword) = self.consume_keyword(Keyword::For) {
             return self.for_statement(keyword.span);
         }
+        if self.check_asm_keyword() {
+            return self.asm_statement();
+        }
         if let Some(keyword) = self.consume_keyword(Keyword::Goto) {
             if self.language_mode == LanguageMode::Gnu11
                 && self.consume_punctuator(Punctuator::Star).is_some()
@@ -1213,6 +1216,162 @@ impl Parser<'_> {
         Ok(Statement {
             span: span_through(expression.span, semicolon.span),
             kind: StatementKind::Expression(Some(Box::new(expression))),
+        })
+    }
+
+    fn asm_statement(&mut self) -> Result<Statement, ParseError> {
+        let keyword = self
+            .consume_asm_keyword()
+            .expect("caller checked the asm keyword");
+        let mut qualifiers = Vec::new();
+        loop {
+            let (kind, token) = if let Some(token) = self.consume_keyword(Keyword::Volatile) {
+                (AsmQualifierKind::Volatile, token)
+            } else if let Some(token) = self.consume_keyword(Keyword::Inline) {
+                (AsmQualifierKind::Inline, token)
+            } else if let Some(token) = self.consume_keyword(Keyword::Goto) {
+                (AsmQualifierKind::Goto, token)
+            } else {
+                break;
+            };
+            qualifiers.push(AsmQualifier {
+                kind,
+                spelling: token.spelling,
+                span: token.span,
+            });
+        }
+        self.expect_punctuator(Punctuator::LeftParen, "expected `(` after `asm`")?;
+        let template = self.asm_string("expected a string literal assembly template")?;
+        let mut outputs = Vec::new();
+        let mut inputs = Vec::new();
+        let mut clobbers = Vec::new();
+        let mut goto_labels = Vec::new();
+        let mut colon_group_count = 0_u8;
+        if self.consume_punctuator(Punctuator::Colon).is_some() {
+            colon_group_count = 1;
+            outputs = self.asm_operands()?;
+            if self.consume_punctuator(Punctuator::Colon).is_some() {
+                colon_group_count = 2;
+                inputs = self.asm_operands()?;
+                if self.consume_punctuator(Punctuator::Colon).is_some() {
+                    colon_group_count = 3;
+                    clobbers = self.asm_strings()?;
+                    if self.consume_punctuator(Punctuator::Colon).is_some() {
+                        colon_group_count = 4;
+                        goto_labels = self.asm_goto_labels()?;
+                    }
+                }
+            }
+        }
+        let right = self.expect_punctuator(
+            Punctuator::RightParen,
+            "expected `)` after assembly operands",
+        )?;
+        let semicolon = self.expect_punctuator(
+            Punctuator::Semicolon,
+            "expected `;` after assembly statement",
+        )?;
+        let asm = AsmStatement {
+            keyword_spelling: keyword.spelling,
+            qualifiers,
+            template_spelling: template.spelling.clone(),
+            template: template.literal,
+            outputs,
+            inputs,
+            clobbers,
+            goto_labels,
+            colon_group_count,
+            span: span_through(keyword.span, right.span),
+        };
+        Ok(Statement {
+            kind: StatementKind::Asm(Box::new(asm)),
+            span: span_through(keyword.span, semicolon.span),
+        })
+    }
+
+    fn asm_operands(&mut self) -> Result<Vec<AsmOperand>, ParseError> {
+        let mut operands = Vec::new();
+        if self.check_punctuator(Punctuator::Colon) || self.check_punctuator(Punctuator::RightParen)
+        {
+            return Ok(operands);
+        }
+        loop {
+            let start = self.current_span()?;
+            let symbolic_name = if self.consume_punctuator(Punctuator::LeftBracket).is_some() {
+                let name = self.identifier()?;
+                self.expect_punctuator(
+                    Punctuator::RightBracket,
+                    "expected `]` after symbolic assembly operand name",
+                )?;
+                Some(name)
+            } else {
+                None
+            };
+            let constraint = self.asm_string("expected an assembly operand constraint")?;
+            self.expect_punctuator(
+                Punctuator::LeftParen,
+                "expected `(` before assembly operand expression",
+            )?;
+            let expression = self.expression()?;
+            let right = self.expect_punctuator(
+                Punctuator::RightParen,
+                "expected `)` after assembly operand expression",
+            )?;
+            operands.push(AsmOperand {
+                symbolic_name,
+                constraint,
+                expression: Box::new(expression),
+                span: span_through(start, right.span),
+            });
+            if self.consume_punctuator(Punctuator::Comma).is_none() {
+                break;
+            }
+        }
+        Ok(operands)
+    }
+
+    fn asm_strings(&mut self) -> Result<Vec<AsmString>, ParseError> {
+        let mut strings = Vec::new();
+        if self.check_punctuator(Punctuator::Colon) || self.check_punctuator(Punctuator::RightParen)
+        {
+            return Ok(strings);
+        }
+        loop {
+            strings.push(self.asm_string("expected an assembly clobber string")?);
+            if self.consume_punctuator(Punctuator::Comma).is_none() {
+                break;
+            }
+        }
+        Ok(strings)
+    }
+
+    fn asm_goto_labels(&mut self) -> Result<Vec<Identifier>, ParseError> {
+        let mut labels = Vec::new();
+        if self.check_punctuator(Punctuator::RightParen) {
+            return Ok(labels);
+        }
+        loop {
+            labels.push(self.identifier()?);
+            if self.consume_punctuator(Punctuator::Comma).is_none() {
+                break;
+            }
+        }
+        Ok(labels)
+    }
+
+    fn asm_string(&mut self, message: &str) -> Result<AsmString, ParseError> {
+        let token = self
+            .current_token()
+            .ok_or_else(|| self.error_eof(message))?
+            .clone();
+        let TokenKind::String(literal) = token.kind else {
+            return Err(self.error_at(token.span, message));
+        };
+        self.position += 1;
+        Ok(AsmString {
+            spelling: token.spelling,
+            literal,
+            span: token.span,
         })
     }
 
@@ -1591,6 +1750,29 @@ impl Parser<'_> {
         }
         if token.spelling == "__sync_synchronize" {
             return self.builtin_sync_synchronize();
+        }
+        let atomic_operation = match token.spelling.as_str() {
+            "__atomic_load_n" => Some(AtomicBuiltinOperation::Load),
+            "__atomic_store_n" => Some(AtomicBuiltinOperation::Store),
+            "__atomic_exchange_n" => Some(AtomicBuiltinOperation::Exchange),
+            "__atomic_fetch_add" => Some(AtomicBuiltinOperation::FetchAdd),
+            "__atomic_fetch_sub" => Some(AtomicBuiltinOperation::FetchSubtract),
+            "__atomic_fetch_and" => Some(AtomicBuiltinOperation::FetchAnd),
+            "__atomic_fetch_or" => Some(AtomicBuiltinOperation::FetchOr),
+            "__atomic_fetch_xor" => Some(AtomicBuiltinOperation::FetchXor),
+            "__atomic_add_fetch" => Some(AtomicBuiltinOperation::AddFetch),
+            "__atomic_sub_fetch" => Some(AtomicBuiltinOperation::SubtractFetch),
+            "__atomic_and_fetch" => Some(AtomicBuiltinOperation::AndFetch),
+            "__atomic_or_fetch" => Some(AtomicBuiltinOperation::OrFetch),
+            "__atomic_xor_fetch" => Some(AtomicBuiltinOperation::XorFetch),
+            "__atomic_compare_exchange_n" => Some(AtomicBuiltinOperation::CompareExchange),
+            "__ccc_atomic_is_lock_free" => Some(AtomicBuiltinOperation::IsLockFree),
+            "__atomic_thread_fence" => Some(AtomicBuiltinOperation::ThreadFence),
+            "__atomic_signal_fence" => Some(AtomicBuiltinOperation::SignalFence),
+            _ => None,
+        };
+        if let Some(operation) = atomic_operation {
+            return self.builtin_atomic_operation(operation);
         }
         match token.kind {
             TokenKind::Identifier => {
@@ -2097,6 +2279,52 @@ impl Parser<'_> {
         )?;
         Ok(Expression {
             kind: ExpressionKind::BuiltinSyncOperation {
+                operation,
+                arguments,
+            },
+            span: span_through(builtin.span, right.span),
+        })
+    }
+
+    fn builtin_atomic_operation(
+        &mut self,
+        operation: AtomicBuiltinOperation,
+    ) -> Result<Expression, ParseError> {
+        let builtin = self
+            .current_token()
+            .expect("caller checked builtin")
+            .clone();
+        self.position += 1;
+        self.expect_punctuator(
+            Punctuator::LeftParen,
+            &format!("expected `(` after `{}`", operation.spelling()),
+        )?;
+        let mut arguments = Vec::new();
+        while !self.check_punctuator(Punctuator::RightParen) {
+            arguments.push(self.assignment_expression()?);
+            if self.consume_punctuator(Punctuator::Comma).is_none() {
+                break;
+            }
+            if self.check_punctuator(Punctuator::RightParen) {
+                return Err(self.error_current(&format!(
+                    "trailing `,` is not allowed in `{}` arguments",
+                    operation.spelling()
+                )));
+            }
+        }
+        if arguments.len() != operation.arity() {
+            return Err(self.error_current(&format!(
+                "`{}` requires exactly {} arguments",
+                operation.spelling(),
+                operation.arity()
+            )));
+        }
+        let right = self.expect_punctuator(
+            Punctuator::RightParen,
+            &format!("expected `)` after `{}` arguments", operation.spelling()),
+        )?;
+        Ok(Expression {
+            kind: ExpressionKind::BuiltinAtomicOperation {
                 operation,
                 arguments,
             },

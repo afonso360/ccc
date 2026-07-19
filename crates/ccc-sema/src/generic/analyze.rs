@@ -2,19 +2,21 @@ use std::collections::{HashMap, HashSet};
 
 use ccc_diag::Diagnostic;
 use ccc_pp::{
-    CharacterConstantPrefix, FloatingConstantSuffix, PragmaEvent, StringLiteralPrefix,
-    canonicalize_identifier,
+    CharacterConstantPrefix, FloatingConstant, FloatingConstantSuffix, PragmaEvent,
+    StringLiteralPrefix, canonicalize_identifier,
 };
 use ccc_session::Span;
 use ccc_syntax::frontend as syntax;
 use ccc_target::{
     AbiIdentity, CapabilityKind, CapabilityState, EffectiveCompilationConfig, LanguageMode,
-    PackingPolicy, TargetBuiltinType,
+    LongDoubleFormat, PackingPolicy, TargetBuiltinType,
 };
 use ccc_types::{
     ArrayLength, ArrayType, BuiltinType, Field, FunctionParameters, FunctionType, LayoutShape,
     QualifiedType, RecordKind, TypeId, TypeKind, TypeQualifiers,
 };
+use rustc_apfloat::ieee::{Double, Quad, Single, X87DoubleExtended};
+use rustc_apfloat::{Float, FloatConvert, Round, Status};
 
 use super::model::*;
 use super::scopes::{
@@ -119,6 +121,73 @@ struct VariablyModifiedGoto {
     label: LabelId,
     span: Span,
     source_path: Vec<FullLocalId>,
+}
+
+/// Alignment facts retained while an atomic-object address is still expressed
+/// directly in the typed tree.
+///
+/// `Mixed` keeps a statically known alternative alongside one or more
+/// alternatives whose provenance is unavailable. This distinction matters for
+/// conditionals: an arbitrary pointer remains subject to the caller's natural
+/// alignment contract, but it must not erase a reachable packed-member address
+/// whose alignment is already known to be too weak.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PointerAlignmentProvenance {
+    Unknown,
+    Known(u64),
+    Mixed { known_minimum: u64 },
+}
+
+impl PointerAlignmentProvenance {
+    fn known(alignment: u64) -> Self {
+        Self::Known(alignment)
+    }
+
+    fn known_minimum(self) -> Option<u64> {
+        match self {
+            Self::Unknown => None,
+            Self::Known(alignment) => Some(alignment),
+            Self::Mixed { known_minimum } => Some(known_minimum),
+        }
+    }
+
+    fn map_known(self, map: impl FnOnce(u64) -> u64) -> Self {
+        match self {
+            Self::Unknown => Self::Unknown,
+            Self::Known(alignment) => Self::Known(map(alignment)),
+            Self::Mixed { known_minimum } => Self::Mixed {
+                known_minimum: map(known_minimum),
+            },
+        }
+    }
+
+    fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Unknown, Self::Unknown) => Self::Unknown,
+            (Self::Known(alignment), Self::Unknown) | (Self::Unknown, Self::Known(alignment)) => {
+                Self::Mixed {
+                    known_minimum: alignment,
+                }
+            }
+            (Self::Mixed { known_minimum }, Self::Unknown)
+            | (Self::Unknown, Self::Mixed { known_minimum }) => Self::Mixed { known_minimum },
+            (Self::Known(left), Self::Known(right)) => Self::Known(left.min(right)),
+            (Self::Known(alignment), Self::Mixed { known_minimum })
+            | (Self::Mixed { known_minimum }, Self::Known(alignment)) => Self::Mixed {
+                known_minimum: alignment.min(known_minimum),
+            },
+            (
+                Self::Mixed {
+                    known_minimum: left,
+                },
+                Self::Mixed {
+                    known_minimum: right,
+                },
+            ) => Self::Mixed {
+                known_minimum: left.min(right),
+            },
+        }
+    }
 }
 
 struct FunctionState {
@@ -1526,6 +1595,13 @@ impl<'a> Analyzer<'a> {
                         alignment_attributes.extend(declarator_attributes);
                         alignment_attributes.extend(member_attributes);
                         let field = if let Some(width) = &member.bit_width {
+                            if field_ty.qualifiers.contains(TypeQualifiers::ATOMIC) {
+                                return self.fail(
+                                    "CCC2453",
+                                    member.span,
+                                    "atomic bit-fields are not enabled",
+                                );
+                            }
                             if info.has_alignment_specifier {
                                 return self.fail(
                                     "CCC2437",
@@ -1554,6 +1630,12 @@ impl<'a> Analyzer<'a> {
                                 field_ty,
                                 info.requested_alignment,
                                 &alignment_attributes,
+                                member.span,
+                            )?;
+                            self.reject_packed_atomic_field(
+                                field_ty,
+                                requested_alignment,
+                                applied_packing,
                                 member.span,
                             )?;
                             Field::new(name, field_ty).with_requested_alignment(requested_alignment)
@@ -1779,6 +1861,11 @@ impl<'a> Analyzer<'a> {
         properties.no_return |= attributes
             .iter()
             .any(|attribute| attribute_has_name(attribute, "noreturn"));
+        properties.returns_twice |= attributes
+            .iter()
+            .any(|attribute| attribute_has_name(attribute, "returns_twice"));
+        properties.returns_twice |=
+            storage != Some(syntax::StorageClass::Static) && is_known_returns_twice_function(&name);
         let declared_binding = attributes
             .iter()
             .any(|attribute| attribute_has_name(attribute, "weak"))
@@ -1839,6 +1926,7 @@ impl<'a> Analyzer<'a> {
                 function.signature = composite;
                 function.properties.inline |= properties.inline;
                 function.properties.no_return |= properties.no_return;
+                function.properties.returns_twice |= properties.returns_twice;
                 if let Some(binding) = declared_binding {
                     function.binding = binding;
                 }
@@ -2800,6 +2888,9 @@ impl<'a> Analyzer<'a> {
                         .push(statement.span);
                     FullTypedStatementKind::ComputedGoto(expression)
                 }
+                S::Asm(asm) => {
+                    FullTypedStatementKind::InlineAsm(Box::new(self.analyze_inline_asm(asm)?))
+                }
                 S::Continue => {
                     if self
                         .function
@@ -2862,6 +2953,451 @@ impl<'a> Analyzer<'a> {
         })
     }
 
+    fn analyze_inline_asm(
+        &mut self,
+        asm: &syntax::AsmStatement,
+    ) -> AnalysisResult<FullTypedInlineAsm> {
+        if self.config.target.abi != AbiIdentity::SysvAmd64Lp64 {
+            return self.fail(
+                "CCC2454",
+                asm.span,
+                "inline assembly is not certified for this target ABI",
+            );
+        }
+        if asm.qualifiers.iter().any(|qualifier| {
+            matches!(
+                qualifier.kind,
+                syntax::AsmQualifierKind::Inline | syntax::AsmQualifierKind::Goto
+            )
+        }) || !asm.goto_labels.is_empty()
+        {
+            return self.fail(
+                "CCC2454",
+                asm.span,
+                "asm inline and asm goto are outside the certified inline-assembly forms",
+            );
+        }
+        let volatile_count = asm
+            .qualifiers
+            .iter()
+            .filter(|qualifier| qualifier.kind == syntax::AsmQualifierKind::Volatile)
+            .count();
+        if volatile_count > 1 {
+            return self.fail(
+                "CCC2454",
+                asm.span,
+                "an inline assembly qualifier may not be repeated",
+            );
+        }
+        let volatile = volatile_count == 1 || asm.colon_group_count == 0;
+        let Some(template) = ordinary_asm_text(&asm.template) else {
+            return self.fail(
+                "CCC2454",
+                asm.span,
+                "an assembly template must be an ordinary narrow string without null code units",
+            );
+        };
+        let constraints = asm
+            .outputs
+            .iter()
+            .chain(&asm.inputs)
+            .map(|operand| ordinary_asm_text(&operand.constraint.literal))
+            .collect::<Option<Vec<_>>>();
+        let Some(constraints) = constraints else {
+            return self.fail(
+                "CCC2454",
+                asm.span,
+                "assembly constraints must be ordinary narrow strings without null code units",
+            );
+        };
+        let clobbers = asm
+            .clobbers
+            .iter()
+            .map(|clobber| ordinary_asm_text(&clobber.literal))
+            .collect::<Option<Vec<_>>>();
+        let Some(clobbers) = clobbers else {
+            return self.fail(
+                "CCC2454",
+                asm.span,
+                "assembly clobbers must be ordinary narrow strings without null code units",
+            );
+        };
+        if asm
+            .outputs
+            .iter()
+            .chain(&asm.inputs)
+            .any(|operand| operand.symbolic_name.is_some())
+        {
+            return self.fail(
+                "CCC2454",
+                asm.span,
+                "symbolic assembly operands are not part of a certified form",
+            );
+        }
+
+        let outputs = asm.outputs.len();
+        let inputs = asm.inputs.len();
+        let output_constraints = &constraints[..outputs];
+        let input_constraints = &constraints[outputs..];
+        let no_qualifiers = asm.qualifiers.is_empty();
+        let kind = if no_qualifiers
+            && asm.colon_group_count == 0
+            && outputs == 0
+            && inputs == 0
+            && clobbers.is_empty()
+        {
+            match template.as_str() {
+                "" => FullTypedInlineAsmKind::CompilerBarrier { memory: false },
+                "nop" => FullTypedInlineAsmKind::CodeLayoutHint(CodeLayoutHint::Nop),
+                ".p2align 3" => {
+                    FullTypedInlineAsmKind::CodeLayoutHint(CodeLayoutHint::AlignToPowerOfTwo(3))
+                }
+                ".p2align 4" => {
+                    FullTypedInlineAsmKind::CodeLayoutHint(CodeLayoutHint::AlignToPowerOfTwo(4))
+                }
+                ".p2align 5" => {
+                    FullTypedInlineAsmKind::CodeLayoutHint(CodeLayoutHint::AlignToPowerOfTwo(5))
+                }
+                ".p2align 6" => {
+                    FullTypedInlineAsmKind::CodeLayoutHint(CodeLayoutHint::AlignToPowerOfTwo(6))
+                }
+                _ => return self.unsupported_inline_asm(asm, &template),
+            }
+        } else if volatile_count == 1
+            && template.is_empty()
+            && asm.colon_group_count == 3
+            && outputs == 0
+            && inputs == 0
+            && clobbers == ["memory"]
+        {
+            FullTypedInlineAsmKind::CompilerBarrier { memory: true }
+        } else if no_qualifiers
+            && template.is_empty()
+            && asm.colon_group_count == 1
+            && output_constraints == ["+r"]
+            && inputs == 0
+            && clobbers.is_empty()
+        {
+            let target = self.analyze_asm_output(&asm.outputs[0], "opaque register operand")?;
+            self.require_asm_scalar(&target, false, "opaque register operand")?;
+            FullTypedInlineAsmKind::OpaqueScalar { target }
+        } else if no_qualifiers
+            && template == "cpuid"
+            && asm.colon_group_count == 3
+            && clobbers == ["ebx", "ecx", "edx"]
+            && output_constraints == ["=a"]
+            && input_constraints == ["a"]
+        {
+            self.analyze_cpuid(asm, &[X86CpuidRegister::Eax], false)?
+        } else if no_qualifiers
+            && template == "cpuid"
+            && asm.colon_group_count == 3
+            && clobbers == ["ebx"]
+            && output_constraints == ["=a", "=c", "=d"]
+            && input_constraints == ["a"]
+        {
+            self.analyze_cpuid(
+                asm,
+                &[
+                    X86CpuidRegister::Eax,
+                    X86CpuidRegister::Ecx,
+                    X86CpuidRegister::Edx,
+                ],
+                false,
+            )?
+        } else if no_qualifiers
+            && template == "cpuid"
+            && asm.colon_group_count == 3
+            && clobbers == ["edx"]
+            && output_constraints == ["=a", "=b", "=c"]
+            && input_constraints == ["a", "c"]
+        {
+            self.analyze_cpuid(
+                asm,
+                &[
+                    X86CpuidRegister::Eax,
+                    X86CpuidRegister::Ebx,
+                    X86CpuidRegister::Ecx,
+                ],
+                true,
+            )?
+        } else if volatile_count == 1
+            && template == "rdtsc"
+            && asm.colon_group_count == 1
+            && output_constraints == ["=a", "=d"]
+            && inputs == 0
+            && clobbers.is_empty()
+        {
+            let low = self.analyze_asm_u32_output(&asm.outputs[0], "RDTSC low output")?;
+            let high = self.analyze_asm_u32_output(&asm.outputs[1], "RDTSC high output")?;
+            FullTypedInlineAsmKind::X86Rdtsc { low, high }
+        } else if no_qualifiers
+            && template == "cmp %1, %2\ncmova %3, %0\n"
+            && asm.colon_group_count == 2
+            && output_constraints == ["+r"]
+            && input_constraints == ["r", "r", "r"]
+            && clobbers.is_empty()
+        {
+            self.analyze_conditional_move_above(asm)?
+        } else if volatile_count == 1
+            && template == "lock; xchgq %0, %1"
+            && asm.colon_group_count == 1
+            && output_constraints == ["+q", "+m"]
+            && inputs == 0
+            && clobbers.is_empty()
+        {
+            self.analyze_atomic_exchange(asm, None)?
+        } else if volatile_count == 1
+            && template == "lock; xchgq %1, %2"
+            && asm.colon_group_count == 1
+            && output_constraints == ["=r", "+q", "+m"]
+            && inputs == 0
+            && clobbers.is_empty()
+        {
+            self.analyze_atomic_exchange(asm, Some(0))?
+        } else if volatile_count == 1
+            && template == "lock; cmpxchgq %2, %1"
+            && asm.colon_group_count == 2
+            && output_constraints == ["=a", "+m"]
+            && input_constraints == ["q", "0"]
+            && clobbers.is_empty()
+        {
+            self.analyze_atomic_compare_exchange(asm)?
+        } else {
+            return self.unsupported_inline_asm(asm, &template);
+        };
+        Ok(FullTypedInlineAsm {
+            kind,
+            template,
+            volatile,
+        })
+    }
+
+    fn unsupported_inline_asm<T>(
+        &mut self,
+        asm: &syntax::AsmStatement,
+        template: &str,
+    ) -> AnalysisResult<T> {
+        self.fail(
+            "CCC2454",
+            asm.span,
+            format!(
+                "inline assembly form is not certified for this target (template `{}`)",
+                template.escape_debug()
+            ),
+        )
+    }
+
+    fn analyze_asm_output(
+        &mut self,
+        operand: &syntax::AsmOperand,
+        description: &str,
+    ) -> AnalysisResult<FullTypedExpression> {
+        let expression = self.analyze_expression(&operand.expression)?;
+        let Some(place) = expression.place.as_ref() else {
+            return self.fail(
+                "CCC2454",
+                operand.expression.span,
+                format!("{description} must be an lvalue"),
+            );
+        };
+        if !place.modifiable {
+            return self.fail(
+                "CCC2454",
+                operand.expression.span,
+                format!("{description} must be a modifiable lvalue"),
+            );
+        }
+        if place.bitfield.is_some() {
+            return self.fail(
+                "CCC2454",
+                operand.expression.span,
+                format!("{description} may not be a bit-field"),
+            );
+        }
+        Ok(expression)
+    }
+
+    fn analyze_asm_u32_output(
+        &mut self,
+        operand: &syntax::AsmOperand,
+        description: &str,
+    ) -> AnalysisResult<FullTypedExpression> {
+        let expression = self.analyze_asm_output(operand, description)?;
+        if expression.ty.ty != TypeId::UNSIGNED_INT {
+            return self.fail(
+                "CCC2454",
+                expression.span,
+                format!("{description} must have type `unsigned int`"),
+            );
+        }
+        Ok(expression)
+    }
+
+    fn analyze_asm_input_as(
+        &mut self,
+        operand: &syntax::AsmOperand,
+        target: QualifiedType,
+    ) -> AnalysisResult<FullTypedExpression> {
+        let expression = self.analyze_expression(&operand.expression)?;
+        self.assignment_conversion(expression, target, operand.expression.span)
+    }
+
+    fn analyze_cpuid(
+        &mut self,
+        asm: &syntax::AsmStatement,
+        registers: &[X86CpuidRegister],
+        has_subleaf: bool,
+    ) -> AnalysisResult<FullTypedInlineAsmKind> {
+        let mut outputs = Vec::with_capacity(registers.len());
+        for (operand, register) in asm.outputs.iter().zip(registers) {
+            outputs.push(X86CpuidOutput {
+                register: *register,
+                target: self.analyze_asm_u32_output(operand, "CPUID output")?,
+            });
+        }
+        let u32_ty = QualifiedType::unqualified(TypeId::UNSIGNED_INT);
+        let leaf = self.analyze_asm_input_as(&asm.inputs[0], u32_ty)?;
+        let subleaf = has_subleaf
+            .then(|| self.analyze_asm_input_as(&asm.inputs[1], u32_ty))
+            .transpose()?;
+        Ok(FullTypedInlineAsmKind::X86Cpuid {
+            leaf,
+            subleaf,
+            outputs,
+        })
+    }
+
+    fn analyze_conditional_move_above(
+        &mut self,
+        asm: &syntax::AsmStatement,
+    ) -> AnalysisResult<FullTypedInlineAsmKind> {
+        let target = self.analyze_asm_output(&asm.outputs[0], "conditional-move output")?;
+        if self.pointer_pointee(target.ty.ty).is_none() {
+            return self.fail(
+                "CCC2454",
+                target.span,
+                "the certified conditional-move output must have pointer type",
+            );
+        }
+        let u32_ty = QualifiedType::unqualified(TypeId::UNSIGNED_INT);
+        let index = self.analyze_asm_input_as(&asm.inputs[0], u32_ty)?;
+        let low_limit = self.analyze_asm_input_as(&asm.inputs[1], u32_ty)?;
+        let backup =
+            self.analyze_asm_input_as(&asm.inputs[2], QualifiedType::unqualified(target.ty.ty))?;
+        Ok(FullTypedInlineAsmKind::X86ConditionalMoveAbove {
+            target,
+            index,
+            low_limit,
+            backup,
+        })
+    }
+
+    fn analyze_atomic_exchange(
+        &mut self,
+        asm: &syntax::AsmStatement,
+        result_index: Option<usize>,
+    ) -> AnalysisResult<FullTypedInlineAsmKind> {
+        let value_index = usize::from(result_index.is_some());
+        let object_index = value_index + 1;
+        let value = self.analyze_asm_output(&asm.outputs[value_index], "exchange value operand")?;
+        let object =
+            self.analyze_asm_output(&asm.outputs[object_index], "exchange memory operand")?;
+        self.require_asm_atomic64_object(&object)?;
+        if value.ty.ty != object.ty.ty {
+            return self.fail(
+                "CCC2454",
+                value.span,
+                "exchange value and memory operands must have the same type",
+            );
+        }
+        let result = result_index
+            .map(|index| self.analyze_asm_output(&asm.outputs[index], "exchange result output"))
+            .transpose()?;
+        if result
+            .as_ref()
+            .is_some_and(|result| result.ty.ty != object.ty.ty)
+        {
+            return self.fail(
+                "CCC2454",
+                result.as_ref().unwrap().span,
+                "exchange result and memory operands must have the same type",
+            );
+        }
+        Ok(FullTypedInlineAsmKind::X86AtomicExchange {
+            object,
+            value,
+            result,
+        })
+    }
+
+    fn analyze_atomic_compare_exchange(
+        &mut self,
+        asm: &syntax::AsmStatement,
+    ) -> AnalysisResult<FullTypedInlineAsmKind> {
+        let original = self.analyze_asm_output(&asm.outputs[0], "compare-exchange output")?;
+        let object = self.analyze_asm_output(&asm.outputs[1], "compare-exchange memory operand")?;
+        self.require_asm_atomic64_object(&object)?;
+        if original.ty.ty != object.ty.ty {
+            return self.fail(
+                "CCC2454",
+                original.span,
+                "compare-exchange output and memory operands must have the same type",
+            );
+        }
+        let object_ty = QualifiedType::unqualified(object.ty.ty);
+        let desired = self.analyze_asm_input_as(&asm.inputs[0], object_ty)?;
+        let expected = self.analyze_asm_input_as(&asm.inputs[1], object_ty)?;
+        Ok(FullTypedInlineAsmKind::X86AtomicCompareExchange {
+            object,
+            expected,
+            desired,
+            original,
+        })
+    }
+
+    fn require_asm_scalar(
+        &mut self,
+        expression: &FullTypedExpression,
+        require_64_bits: bool,
+        description: &str,
+    ) -> AnalysisResult<()> {
+        let scalar = self.types.is_integer(expression.ty.ty)
+            || self.pointer_pointee(expression.ty.ty).is_some();
+        let size = self
+            .types
+            .layout_of(expression.ty.ty, self.config)
+            .map(|layout| layout.size)
+            .unwrap_or(0);
+        let valid_size = if require_64_bits {
+            size == 8
+        } else {
+            matches!(size, 1 | 2 | 4 | 8)
+        };
+        if !scalar || !valid_size {
+            return self.fail(
+                "CCC2454",
+                expression.span,
+                format!(
+                    "{description} requires a {} integer or pointer representation",
+                    if require_64_bits {
+                        "64-bit"
+                    } else {
+                        "1, 2, 4, or 8-byte"
+                    }
+                ),
+            );
+        }
+        Ok(())
+    }
+
+    fn require_asm_atomic64_object(
+        &mut self,
+        expression: &FullTypedExpression,
+    ) -> AnalysisResult<()> {
+        self.require_asm_scalar(expression, true, "locked assembly memory operand")
+    }
+
     fn analyze_function_body(
         &mut self,
         statement: &syntax::Statement,
@@ -2919,7 +3455,7 @@ impl<'a> Analyzer<'a> {
         let initializer = match initializer {
             syntax::ForInitializer::Empty => FullTypedForInitializer::Empty,
             syntax::ForInitializer::Expression(expression) => {
-                FullTypedForInitializer::Expression(self.analyze_expression(expression)?)
+                FullTypedForInitializer::Expression(Box::new(self.analyze_expression(expression)?))
             }
             syntax::ForInitializer::Declaration(declaration) => {
                 FullTypedForInitializer::Declarations(self.analyze_block_declaration(declaration)?)
@@ -2952,23 +3488,7 @@ impl<'a> Analyzer<'a> {
             E::Identifier(identifier) => self.analyze_identifier(identifier),
             E::LabelAddress(label) => self.analyze_label_address(label, expression.span),
             E::Integer(integer) => self.analyze_integer_literal(*integer, expression.span),
-            E::Floating(floating) => {
-                let ty = match floating.suffix {
-                    FloatingConstantSuffix::Float => TypeId::FLOAT,
-                    FloatingConstantSuffix::Double => TypeId::DOUBLE,
-                    FloatingConstantSuffix::LongDouble => TypeId::LONG_DOUBLE,
-                };
-                let value = if floating.suffix == FloatingConstantSuffix::Float {
-                    f64::from(floating.value as f32)
-                } else {
-                    floating.value
-                };
-                Ok(self.constant_expression(
-                    ConstantValue::Floating(value),
-                    QualifiedType::unqualified(ty),
-                    expression.span,
-                ))
-            }
+            E::Floating(floating) => self.analyze_floating_literal(floating, expression.span),
             E::Character(character) => {
                 let ty = match character.prefix {
                     CharacterConstantPrefix::None => TypeId::INT,
@@ -3139,6 +3659,10 @@ impl<'a> Analyzer<'a> {
                 arguments,
             } => self.analyze_sync_operation(*operation, arguments, expression.span),
             E::BuiltinSyncSynchronize => self.analyze_sync_synchronize(expression.span),
+            E::BuiltinAtomicOperation {
+                operation,
+                arguments,
+            } => self.analyze_atomic_operation(*operation, arguments, expression.span),
         }
     }
 
@@ -3472,9 +3996,10 @@ impl<'a> Analyzer<'a> {
         let raw = match operand.constant? {
             ConstantValue::Signed(value) => value as u128,
             ConstantValue::Unsigned(value) => value,
-            ConstantValue::Floating(_) | ConstantValue::NullPointer | ConstantValue::Address(_) => {
-                return None;
-            }
+            ConstantValue::Floating(_)
+            | ConstantValue::LongDouble(_)
+            | ConstantValue::NullPointer
+            | ConstantValue::Address(_) => return None,
         };
         let input = match operation {
             IntegerIntrinsicOperation::CountLeadingZerosInt
@@ -3707,25 +4232,29 @@ impl<'a> Analyzer<'a> {
         let integer = self.types.is_integer(object.ty)
             && self.types.builtin_type(object.ty) != Some(BuiltinType::Bool);
         let pointer_object = self.pointer_pointee(object.ty).is_some();
-        let supported_size = self
-            .types
-            .layout_of(object.ty, self.config)
-            .is_ok_and(|layout| {
-                let adjusted_alignment_is_native = match self.types.try_kind(object.ty) {
-                    Some(TypeKind::AlignmentAdjusted(adjusted)) => self
-                        .types
-                        .layout_of(adjusted.underlying, self.config)
-                        .is_ok_and(|underlying| layout.align >= underlying.align),
-                    _ => true,
-                };
-                matches!(layout.size, 1 | 2 | 4 | 8) && adjusted_alignment_is_native
-            });
-        if !(integer || pointer_object) || !supported_size {
+        let native_alignment = match self.native_atomic_object_alignment(object.ty) {
+            Some(alignment) if integer || pointer_object => alignment,
+            _ => {
+                return self.fail(
+                    "CCC2434",
+                    arguments[0].span,
+                    format!(
+                        "`{}` requires a 1, 2, 4, or 8-byte integer or pointer object",
+                        operation.spelling()
+                    ),
+                );
+            }
+        };
+        if self
+            .pointer_alignment_provenance(&pointer)
+            .known_minimum()
+            .is_some_and(|alignment| alignment < native_alignment)
+        {
             return self.fail(
                 "CCC2434",
                 arguments[0].span,
                 format!(
-                    "`{}` requires a 1, 2, 4, or 8-byte integer or pointer object",
+                    "`{}` cannot operate on an address with weakened packed-member alignment",
                     operation.spelling()
                 ),
             );
@@ -3793,6 +4322,7 @@ impl<'a> Analyzer<'a> {
                         replacement: Box::new(replacement),
                         object,
                         return_boolean,
+                        expected_is_pointer: false,
                         order,
                     },
                     if return_boolean {
@@ -3812,6 +4342,554 @@ impl<'a> Analyzer<'a> {
             constant_expression_kind: ConstantExpressionKind::Invalid,
             span,
         })
+    }
+
+    fn analyze_atomic_operation(
+        &mut self,
+        operation: syntax::AtomicBuiltinOperation,
+        arguments: &[syntax::Expression],
+        span: Span,
+    ) -> AnalysisResult<FullTypedExpression> {
+        self.require_builtin(operation.spelling(), span)?;
+        debug_assert_eq!(arguments.len(), operation.arity());
+
+        if matches!(
+            operation,
+            syntax::AtomicBuiltinOperation::ThreadFence
+                | syntax::AtomicBuiltinOperation::SignalFence
+        ) {
+            let order = self.analyze_atomic_control_argument(
+                &arguments[0],
+                operation.spelling(),
+                "memory order",
+            )?;
+            self.validate_atomic_order(operation.spelling(), &order, &[0, 1, 2, 3, 4, 5])?;
+            let result = FullTypedExpression {
+                // A hardware fence is a valid strengthening of a signal fence.
+                kind: FullTypedExpressionKind::MemoryFence {
+                    order: MemoryOrder::SequentiallyConsistent,
+                },
+                ty: QualifiedType::unqualified(TypeId::VOID),
+                category: ValueCategory::Value,
+                place: None,
+                constant: None,
+                constant_expression_kind: ConstantExpressionKind::Invalid,
+                span,
+            };
+            return Ok(self.sequence_atomic_controls(vec![order], result, span));
+        }
+
+        if operation == syntax::AtomicBuiltinOperation::IsLockFree {
+            let (pointer, _) =
+                self.analyze_atomic_pointer(operation.spelling(), &arguments[0], false)?;
+            let result = self.constant_expression(
+                ConstantValue::Signed(1),
+                QualifiedType::unqualified(TypeId::BOOL),
+                span,
+            );
+            return Ok(self.sequence_atomic_controls(vec![pointer], result, span));
+        }
+
+        let modifies = !matches!(operation, syntax::AtomicBuiltinOperation::Load);
+        let (pointer, object) =
+            self.analyze_atomic_pointer(operation.spelling(), &arguments[0], modifies)?;
+        let value_ty = QualifiedType::unqualified(object.ty);
+        let sequentially_consistent = MemoryOrder::SequentiallyConsistent;
+
+        match operation {
+            syntax::AtomicBuiltinOperation::Load => {
+                let order = self.analyze_atomic_control_argument(
+                    &arguments[1],
+                    operation.spelling(),
+                    "memory order",
+                )?;
+                self.validate_atomic_order(operation.spelling(), &order, &[0, 1, 2, 5])?;
+                let result = FullTypedExpression {
+                    kind: FullTypedExpressionKind::AtomicLoad {
+                        pointer: Box::new(pointer),
+                        object,
+                        order: sequentially_consistent,
+                    },
+                    ty: value_ty,
+                    category: ValueCategory::Value,
+                    place: None,
+                    constant: None,
+                    constant_expression_kind: ConstantExpressionKind::Invalid,
+                    span,
+                };
+                Ok(self.sequence_atomic_controls(vec![order], result, span))
+            }
+            syntax::AtomicBuiltinOperation::Store => {
+                let value = self.analyze_expression(&arguments[1])?;
+                let value = self.sync_operand_conversion(value, value_ty, arguments[1].span)?;
+                let order = self.analyze_atomic_control_argument(
+                    &arguments[2],
+                    operation.spelling(),
+                    "memory order",
+                )?;
+                self.validate_atomic_order(operation.spelling(), &order, &[0, 3, 5])?;
+                let result = FullTypedExpression {
+                    kind: FullTypedExpressionKind::AtomicStore {
+                        pointer: Box::new(pointer),
+                        value: Box::new(value),
+                        object,
+                        order: sequentially_consistent,
+                    },
+                    ty: QualifiedType::unqualified(TypeId::VOID),
+                    category: ValueCategory::Value,
+                    place: None,
+                    constant: None,
+                    constant_expression_kind: ConstantExpressionKind::Invalid,
+                    span,
+                };
+                Ok(self.sequence_atomic_controls(vec![order], result, span))
+            }
+            syntax::AtomicBuiltinOperation::Exchange
+            | syntax::AtomicBuiltinOperation::FetchAdd
+            | syntax::AtomicBuiltinOperation::FetchSubtract
+            | syntax::AtomicBuiltinOperation::FetchAnd
+            | syntax::AtomicBuiltinOperation::FetchOr
+            | syntax::AtomicBuiltinOperation::FetchXor
+            | syntax::AtomicBuiltinOperation::AddFetch
+            | syntax::AtomicBuiltinOperation::SubtractFetch
+            | syntax::AtomicBuiltinOperation::AndFetch
+            | syntax::AtomicBuiltinOperation::OrFetch
+            | syntax::AtomicBuiltinOperation::XorFetch => {
+                let bool_object = self.types.builtin_type(object.ty) == Some(BuiltinType::Bool);
+                let integer_object = self.types.is_integer(object.ty) && !bool_object;
+                let operation_supported = match operation {
+                    syntax::AtomicBuiltinOperation::Exchange => true,
+                    syntax::AtomicBuiltinOperation::FetchAdd
+                    | syntax::AtomicBuiltinOperation::FetchSubtract
+                    | syntax::AtomicBuiltinOperation::AddFetch
+                    | syntax::AtomicBuiltinOperation::SubtractFetch => integer_object,
+                    syntax::AtomicBuiltinOperation::FetchAnd
+                    | syntax::AtomicBuiltinOperation::FetchOr
+                    | syntax::AtomicBuiltinOperation::FetchXor
+                    | syntax::AtomicBuiltinOperation::AndFetch
+                    | syntax::AtomicBuiltinOperation::OrFetch
+                    | syntax::AtomicBuiltinOperation::XorFetch => integer_object,
+                    _ => unreachable!(),
+                };
+                if !operation_supported {
+                    return self.fail(
+                        "CCC2455",
+                        arguments[0].span,
+                        format!(
+                            "`{}` does not support this atomic object type",
+                            operation.spelling()
+                        ),
+                    );
+                }
+                let operand = self.analyze_expression(&arguments[1])?;
+                let operand = self.sync_operand_conversion(operand, value_ty, arguments[1].span)?;
+                let order = self.analyze_atomic_control_argument(
+                    &arguments[2],
+                    operation.spelling(),
+                    "memory order",
+                )?;
+                self.validate_atomic_order(operation.spelling(), &order, &[0, 1, 2, 3, 4, 5])?;
+                let (operation, return_new) = match operation {
+                    syntax::AtomicBuiltinOperation::Exchange => {
+                        (AtomicReadModifyWriteOperation::Exchange, false)
+                    }
+                    syntax::AtomicBuiltinOperation::FetchAdd => {
+                        (AtomicReadModifyWriteOperation::Add, false)
+                    }
+                    syntax::AtomicBuiltinOperation::FetchSubtract => {
+                        (AtomicReadModifyWriteOperation::Subtract, false)
+                    }
+                    syntax::AtomicBuiltinOperation::FetchAnd => {
+                        (AtomicReadModifyWriteOperation::BitwiseAnd, false)
+                    }
+                    syntax::AtomicBuiltinOperation::FetchOr => {
+                        (AtomicReadModifyWriteOperation::BitwiseOr, false)
+                    }
+                    syntax::AtomicBuiltinOperation::FetchXor => {
+                        (AtomicReadModifyWriteOperation::BitwiseXor, false)
+                    }
+                    syntax::AtomicBuiltinOperation::AddFetch => {
+                        (AtomicReadModifyWriteOperation::Add, true)
+                    }
+                    syntax::AtomicBuiltinOperation::SubtractFetch => {
+                        (AtomicReadModifyWriteOperation::Subtract, true)
+                    }
+                    syntax::AtomicBuiltinOperation::AndFetch => {
+                        (AtomicReadModifyWriteOperation::BitwiseAnd, true)
+                    }
+                    syntax::AtomicBuiltinOperation::OrFetch => {
+                        (AtomicReadModifyWriteOperation::BitwiseOr, true)
+                    }
+                    syntax::AtomicBuiltinOperation::XorFetch => {
+                        (AtomicReadModifyWriteOperation::BitwiseXor, true)
+                    }
+                    _ => unreachable!(),
+                };
+                let result = FullTypedExpression {
+                    kind: FullTypedExpressionKind::AtomicReadModifyWrite {
+                        operation,
+                        pointer: Box::new(pointer),
+                        operand: Box::new(operand),
+                        object,
+                        return_new,
+                        order: sequentially_consistent,
+                    },
+                    ty: value_ty,
+                    category: ValueCategory::Value,
+                    place: None,
+                    constant: None,
+                    constant_expression_kind: ConstantExpressionKind::Invalid,
+                    span,
+                };
+                Ok(self.sequence_atomic_controls(vec![order], result, span))
+            }
+            syntax::AtomicBuiltinOperation::CompareExchange => {
+                let expected_pointer = self.analyze_expression(&arguments[1])?;
+                let expected_pointer = self.value_conversion(expected_pointer)?;
+                let Some(expected_object) = self.pointer_pointee(expected_pointer.ty.ty) else {
+                    return self.fail(
+                        "CCC2455",
+                        arguments[1].span,
+                        "the expected-value argument to `__atomic_compare_exchange_n` must be a pointer",
+                    );
+                };
+                if expected_object.qualifiers.contains(TypeQualifiers::CONST)
+                    || expected_object
+                        .qualifiers
+                        .contains(TypeQualifiers::VOLATILE)
+                    || expected_object.qualifiers.contains(TypeQualifiers::ATOMIC)
+                    || !self.type_ids_compatible(expected_object.ty, object.ty)
+                {
+                    return self.fail(
+                        "CCC2455",
+                        arguments[1].span,
+                        "the expected-value argument to `__atomic_compare_exchange_n` must point to a modifiable non-atomic object of the compared type",
+                    );
+                }
+                let replacement = self.analyze_expression(&arguments[2])?;
+                let replacement =
+                    self.sync_operand_conversion(replacement, value_ty, arguments[2].span)?;
+                let weak = self.analyze_atomic_control_argument(
+                    &arguments[3],
+                    operation.spelling(),
+                    "weak flag",
+                )?;
+                let success = self.analyze_atomic_control_argument(
+                    &arguments[4],
+                    operation.spelling(),
+                    "success memory order",
+                )?;
+                let failure = self.analyze_atomic_control_argument(
+                    &arguments[5],
+                    operation.spelling(),
+                    "failure memory order",
+                )?;
+                self.validate_atomic_compare_exchange_orders(
+                    operation.spelling(),
+                    &success,
+                    &failure,
+                )?;
+                let result = FullTypedExpression {
+                    kind: FullTypedExpressionKind::AtomicCompareExchange {
+                        pointer: Box::new(pointer),
+                        expected: Box::new(expected_pointer),
+                        replacement: Box::new(replacement),
+                        object,
+                        return_boolean: true,
+                        expected_is_pointer: true,
+                        order: sequentially_consistent,
+                    },
+                    ty: QualifiedType::unqualified(TypeId::BOOL),
+                    category: ValueCategory::Value,
+                    place: None,
+                    constant: None,
+                    constant_expression_kind: ConstantExpressionKind::Invalid,
+                    span,
+                };
+                Ok(self.sequence_atomic_controls(vec![weak, success, failure], result, span))
+            }
+            syntax::AtomicBuiltinOperation::IsLockFree => unreachable!(),
+            syntax::AtomicBuiltinOperation::ThreadFence
+            | syntax::AtomicBuiltinOperation::SignalFence => unreachable!(),
+        }
+    }
+
+    fn analyze_atomic_pointer(
+        &mut self,
+        spelling: &str,
+        argument: &syntax::Expression,
+        modifies: bool,
+    ) -> AnalysisResult<(FullTypedExpression, QualifiedType)> {
+        let pointer = self.analyze_expression(argument)?;
+        let pointer = self.value_conversion(pointer)?;
+        let Some(object) = self.pointer_pointee(pointer.ty.ty) else {
+            return self.fail(
+                "CCC2455",
+                argument.span,
+                format!("the first argument to `{spelling}` must point to an atomic scalar object"),
+            );
+        };
+        if modifies && object.qualifiers.contains(TypeQualifiers::CONST) {
+            return self.fail(
+                "CCC2455",
+                argument.span,
+                format!("the first argument to `{spelling}` points to a const-qualified object"),
+            );
+        }
+        let integer = self.types.is_integer(object.ty);
+        let pointer_object = self.pointer_pointee(object.ty).is_some();
+        let native_alignment = match self.native_atomic_object_alignment(object.ty) {
+            Some(alignment) if integer || pointer_object => alignment,
+            _ => {
+                return self.fail(
+                    "CCC2455",
+                    argument.span,
+                    format!(
+                        "`{spelling}` requires a naturally aligned 1, 2, 4, or 8-byte integer or pointer object"
+                    ),
+                );
+            }
+        };
+        if self
+            .pointer_alignment_provenance(&pointer)
+            .known_minimum()
+            .is_some_and(|alignment| alignment < native_alignment)
+        {
+            return self.fail(
+                "CCC2455",
+                argument.span,
+                format!("the first argument to `{spelling}` has weakened packed-member alignment"),
+            );
+        }
+        Ok((pointer, object))
+    }
+
+    /// Returns the native alignment required by the selected scalar atomic
+    /// instruction. Alignment-adjusted aliases may strengthen this contract,
+    /// but may not weaken the representation's underlying alignment.
+    fn native_atomic_object_alignment(&self, ty: TypeId) -> Option<u64> {
+        let layout = self.types.layout_of(ty, self.config).ok()?;
+        if !matches!(layout.size, 1 | 2 | 4 | 8) {
+            return None;
+        }
+        let native_alignment = match self.types.try_kind(ty) {
+            Some(TypeKind::AlignmentAdjusted(adjusted)) => {
+                self.types
+                    .layout_of(adjusted.underlying, self.config)
+                    .ok()?
+                    .align
+            }
+            _ => layout.align,
+        };
+        (layout.align >= native_alignment).then_some(native_alignment)
+    }
+
+    /// Recovers known alignment alternatives from the typed expression.
+    /// An arbitrary pointer remains unknown because callers may supply a
+    /// correctly aligned object even when its provenance is not locally
+    /// visible. A conditional retains known alternatives even when another
+    /// branch is unknown, so an arbitrary branch cannot mask a packed member.
+    fn pointer_alignment_provenance(
+        &self,
+        expression: &FullTypedExpression,
+    ) -> PointerAlignmentProvenance {
+        match &expression.kind {
+            FullTypedExpressionKind::AddressOf(object) => self.lvalue_alignment_provenance(object),
+            FullTypedExpressionKind::Conversion {
+                kind: ConversionKind::ArrayToPointer,
+                expression,
+            } => self.lvalue_alignment_provenance(expression),
+            FullTypedExpressionKind::Conversion {
+                kind: ConversionKind::PointerConversion | ConversionKind::QualificationAdjustment,
+                expression,
+            }
+            | FullTypedExpressionKind::BuiltinExpect {
+                value: expression, ..
+            } => self.pointer_alignment_provenance(expression),
+            FullTypedExpressionKind::Binary {
+                operator: syntax::BinaryOperator::Add | syntax::BinaryOperator::Subtract,
+                left,
+                right,
+            } => {
+                let base = if self.pointer_pointee(left.ty.ty).is_some() {
+                    left
+                } else if self.pointer_pointee(right.ty.ty).is_some() {
+                    right
+                } else {
+                    return PointerAlignmentProvenance::Unknown;
+                };
+                let Some(element) = self.pointer_pointee(expression.ty.ty) else {
+                    return PointerAlignmentProvenance::Unknown;
+                };
+                let Ok(layout) = self.types.layout_of(element.ty, self.config) else {
+                    return PointerAlignmentProvenance::Unknown;
+                };
+                let stride = layout.size;
+                self.pointer_alignment_provenance(base)
+                    .map_known(|alignment| common_power_of_two_alignment(alignment, stride))
+            }
+            FullTypedExpressionKind::Conditional {
+                then_expression,
+                else_expression,
+                ..
+            } => self
+                .pointer_alignment_provenance(then_expression)
+                .merge(self.pointer_alignment_provenance(else_expression)),
+            FullTypedExpressionKind::Comma(expressions) => expressions
+                .last()
+                .map_or(PointerAlignmentProvenance::Unknown, |expression| {
+                    self.pointer_alignment_provenance(expression)
+                }),
+            _ => PointerAlignmentProvenance::Unknown,
+        }
+    }
+
+    fn lvalue_alignment_provenance(
+        &self,
+        expression: &FullTypedExpression,
+    ) -> PointerAlignmentProvenance {
+        match &expression.kind {
+            FullTypedExpressionKind::Member {
+                base,
+                field_index,
+                indirect,
+                ..
+            } => {
+                let record = if *indirect {
+                    let Some(record) = self.pointer_pointee(base.ty.ty) else {
+                        return PointerAlignmentProvenance::Unknown;
+                    };
+                    record.ty
+                } else {
+                    base.ty.ty
+                };
+                let Ok(layout) = self.types.layout_of(record, self.config) else {
+                    return PointerAlignmentProvenance::Unknown;
+                };
+                let LayoutShape::Record(record) = layout.shape else {
+                    return PointerAlignmentProvenance::Unknown;
+                };
+                let Some(field) = record.fields.get(*field_index) else {
+                    return PointerAlignmentProvenance::Unknown;
+                };
+                if *indirect {
+                    PointerAlignmentProvenance::known(field.align)
+                } else {
+                    self.lvalue_alignment_provenance(base)
+                        .map_known(|base_alignment| {
+                            field
+                                .align
+                                .min(common_power_of_two_alignment(base_alignment, field.offset))
+                        })
+                }
+            }
+            FullTypedExpressionKind::Subscript { base, .. }
+            | FullTypedExpressionKind::Dereference(base) => self.pointer_alignment_provenance(base),
+            FullTypedExpressionKind::DeclRef(_)
+            | FullTypedExpressionKind::CompoundLiteral { .. }
+            | FullTypedExpressionKind::StringLiteral(_) => self
+                .types
+                .layout_of(expression.ty.ty, self.config)
+                .ok()
+                .map_or(PointerAlignmentProvenance::Unknown, |layout| {
+                    PointerAlignmentProvenance::known(layout.align)
+                }),
+            _ => PointerAlignmentProvenance::Unknown,
+        }
+    }
+
+    fn analyze_atomic_control_argument(
+        &mut self,
+        argument: &syntax::Expression,
+        spelling: &str,
+        description: &str,
+    ) -> AnalysisResult<FullTypedExpression> {
+        let argument = self.analyze_expression(argument)?;
+        let argument = self.value_conversion(argument)?;
+        if !self.types.is_integer(argument.ty.ty) {
+            return self.fail(
+                "CCC2455",
+                argument.span,
+                format!("the {description} argument to `{spelling}` must have integer type"),
+            );
+        }
+        Ok(argument)
+    }
+
+    fn sequence_atomic_controls(
+        &self,
+        mut controls: Vec<FullTypedExpression>,
+        result: FullTypedExpression,
+        span: Span,
+    ) -> FullTypedExpression {
+        let ty = result.ty;
+        controls.push(result);
+        FullTypedExpression {
+            kind: FullTypedExpressionKind::Comma(controls),
+            ty,
+            category: ValueCategory::Value,
+            place: None,
+            constant: None,
+            constant_expression_kind: ConstantExpressionKind::Invalid,
+            span,
+        }
+    }
+
+    fn validate_atomic_order(
+        &mut self,
+        spelling: &str,
+        order: &FullTypedExpression,
+        allowed: &[i128],
+    ) -> AnalysisResult<()> {
+        let Some(value) = order.constant.and_then(ConstantValue::as_i128) else {
+            return Ok(());
+        };
+        if allowed.contains(&value) {
+            Ok(())
+        } else {
+            self.fail(
+                "CCC2455",
+                order.span,
+                format!("`{spelling}` does not permit memory order value {value}"),
+            )
+        }
+    }
+
+    fn validate_atomic_compare_exchange_orders(
+        &mut self,
+        spelling: &str,
+        success: &FullTypedExpression,
+        failure: &FullTypedExpression,
+    ) -> AnalysisResult<()> {
+        self.validate_atomic_order(spelling, success, &[0, 1, 2, 3, 4, 5])?;
+        self.validate_atomic_order(spelling, failure, &[0, 1, 2, 5])?;
+        let failure_span = failure.span;
+        let Some(success) = success.constant.and_then(ConstantValue::as_i128) else {
+            return Ok(());
+        };
+        let Some(failure) = failure.constant.and_then(ConstantValue::as_i128) else {
+            return Ok(());
+        };
+        let permitted = match success {
+            0 => matches!(failure, 0),
+            1 => matches!(failure, 0 | 1),
+            2 => matches!(failure, 0..=2),
+            3 => matches!(failure, 0),
+            4 => matches!(failure, 0..=2),
+            5 => matches!(failure, 0 | 1 | 2 | 5),
+            _ => false,
+        };
+        if permitted {
+            Ok(())
+        } else {
+            self.fail(
+                "CCC2455",
+                failure_span,
+                format!(
+                    "`{spelling}` failure memory order {failure} is stronger than success order {success}"
+                ),
+            )
+        }
     }
 
     fn sync_operand_conversion(
@@ -3944,13 +5022,13 @@ impl<'a> Analyzer<'a> {
                 ),
             );
         }
-        if self.config.target.data_layout.long_double_width > 64
+        if self.config.target.data_layout.long_double_format == LongDoubleFormat::IeeeBinary128
             && self.type_contains_long_double(requested.ty, &mut HashSet::new())
         {
             return self.fail(
                 "CCC2404",
                 type_name.span,
-                "`va_arg` does not support `long double` or an aggregate containing it",
+                "`va_arg` does not support binary128 `long double` or an aggregate containing it",
             );
         }
         if !self.config.target.abi.supports_int128_values()
@@ -4396,6 +5474,80 @@ impl<'a> Analyzer<'a> {
             QualifiedType::unqualified(self.types.builtin(kind)),
             span,
         ))
+    }
+
+    fn analyze_floating_literal(
+        &mut self,
+        floating: &FloatingConstant,
+        span: Span,
+    ) -> AnalysisResult<FullTypedExpression> {
+        let (constant, ty) = match floating.suffix {
+            FloatingConstantSuffix::Float => {
+                let value = self.parse_apfloat::<Single>(&floating.number, span)?;
+                let bits = u32::try_from(value.to_bits()).expect("binary32 bits fit in u32");
+                (
+                    ConstantValue::Floating(f64::from(f32::from_bits(bits))),
+                    TypeId::FLOAT,
+                )
+            }
+            FloatingConstantSuffix::Double => {
+                let value = self.parse_apfloat::<Double>(&floating.number, span)?;
+                let bits = u64::try_from(value.to_bits()).expect("binary64 bits fit in u64");
+                (
+                    ConstantValue::Floating(f64::from_bits(bits)),
+                    TypeId::DOUBLE,
+                )
+            }
+            FloatingConstantSuffix::LongDouble => {
+                let format = self.config.target.data_layout.long_double_format;
+                let constant = match format {
+                    LongDoubleFormat::Binary64 => {
+                        let value = self.parse_apfloat::<Double>(&floating.number, span)?;
+                        let bits =
+                            u64::try_from(value.to_bits()).expect("binary64 bits fit in u64");
+                        ConstantValue::Floating(f64::from_bits(bits))
+                    }
+                    LongDoubleFormat::X87Extended => {
+                        let value =
+                            self.parse_apfloat::<X87DoubleExtended>(&floating.number, span)?;
+                        ConstantValue::LongDouble(LongDoubleConstant::from_bits(
+                            format,
+                            value.to_bits(),
+                        ))
+                    }
+                    LongDoubleFormat::IeeeBinary128 => {
+                        let value = self.parse_apfloat::<Quad>(&floating.number, span)?;
+                        ConstantValue::LongDouble(LongDoubleConstant::from_bits(
+                            format,
+                            value.to_bits(),
+                        ))
+                    }
+                };
+                (constant, TypeId::LONG_DOUBLE)
+            }
+        };
+        Ok(self.constant_expression(constant, QualifiedType::unqualified(ty), span))
+    }
+
+    fn parse_apfloat<F: Float>(&mut self, number: &str, span: Span) -> AnalysisResult<F> {
+        let parsed = match F::from_str_r(number, Round::NearestTiesToEven) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return self.fail(
+                    "CCC2444",
+                    span,
+                    format!("invalid floating constant: {}", error.0),
+                );
+            }
+        };
+        if parsed.status.contains(Status::OVERFLOW) {
+            return self.fail(
+                "CCC2444",
+                span,
+                "floating constant is outside the range of its type",
+            );
+        }
+        Ok(parsed.value)
     }
 
     fn analyze_string_literal(
@@ -4851,6 +6003,24 @@ impl<'a> Analyzer<'a> {
             (value, Some(plan))
         };
         let store = place.access;
+        if store.atomic && compound.is_some() {
+            use syntax::AssignmentOperator as A;
+            let pointer = self.pointer_pointee(target.ty.ty).is_some();
+            let integer = self.types.is_integer(target.ty.ty)
+                && self.types.builtin_type(target.ty.ty) != Some(BuiltinType::Bool);
+            let supported = match operator {
+                A::Add | A::Subtract => integer || pointer,
+                A::BitwiseAnd | A::BitwiseXor | A::BitwiseOr => integer,
+                _ => false,
+            };
+            if !supported {
+                return self.fail(
+                    "CCC2455",
+                    span,
+                    "this atomic compound assignment has no enabled native read-modify-write operation",
+                );
+            }
+        }
         Ok(FullTypedExpression {
             kind: FullTypedExpressionKind::Assignment {
                 operator,
@@ -5014,6 +6184,17 @@ impl<'a> Analyzer<'a> {
         self.reject_long_double_operation(&[operand.ty], span)?;
         self.reject_int128_value_operation(&[operand.ty], span)?;
         let store = place.access;
+        if store.atomic
+            && !(self.pointer_pointee(operand.ty.ty).is_some()
+                || (self.types.is_integer(operand.ty.ty)
+                    && self.types.builtin_type(operand.ty.ty) != Some(BuiltinType::Bool)))
+        {
+            return self.fail(
+                "CCC2455",
+                span,
+                "atomic increment requires a non-boolean integer or pointer object",
+            );
+        }
         Ok(FullTypedExpression {
             kind: FullTypedExpressionKind::Increment {
                 operand: Box::new(operand.clone()),
@@ -5459,7 +6640,7 @@ impl<'a> Analyzer<'a> {
         let converted = self.assignment_conversion(argument, field.ty, span)?;
         let scalar = FullTypedInitializer {
             ty: field.ty,
-            kind: FullTypedInitializerKind::Scalar(converted),
+            kind: FullTypedInitializerKind::Scalar(Box::new(converted)),
             span,
         };
         let initializer = FullTypedInitializer {
@@ -5721,7 +6902,7 @@ impl<'a> Analyzer<'a> {
                     FullTypedInitializer {
                         ty,
                         span: converted.span,
-                        kind: FullTypedInitializerKind::Scalar(converted),
+                        kind: FullTypedInitializerKind::Scalar(Box::new(converted)),
                     },
                     ty,
                 ))
@@ -6488,7 +7669,9 @@ impl<'a> Analyzer<'a> {
             ConstantValue::Signed(_) | ConstantValue::Unsigned(_) => {
                 ConstantExpressionKind::Integer
             }
-            ConstantValue::Floating(_) => ConstantExpressionKind::FloatingLiteral,
+            ConstantValue::Floating(_) | ConstantValue::LongDouble(_) => {
+                ConstantExpressionKind::FloatingLiteral
+            }
             ConstantValue::NullPointer | ConstantValue::Address(_) => {
                 ConstantExpressionKind::Invalid
             }
@@ -6798,6 +7981,9 @@ impl<'a> Analyzer<'a> {
                     value as i128 as u128
                 }
                 ConstantValue::Floating(value) => value as u128,
+                ConstantValue::LongDouble(value) => {
+                    long_double_to_integer(value, width, self.integer_kind_is_signed(kind))?
+                }
                 ConstantValue::NullPointer => 0,
                 ConstantValue::Address(_) => return None,
             };
@@ -6817,13 +8003,23 @@ impl<'a> Analyzer<'a> {
             )
         ) {
             let target = self.types.builtin_type(target)?;
+            if target == BuiltinType::LongDouble {
+                match self.config.target.data_layout.long_double_format {
+                    LongDoubleFormat::Binary64 => {}
+                    format => return constant_to_long_double(value, format),
+                }
+            }
             let value = match (target, value) {
                 (BuiltinType::Float, ConstantValue::Signed(value)) => f64::from(value as f32),
                 (BuiltinType::Float, ConstantValue::Unsigned(value)) => f64::from(value as f32),
                 (BuiltinType::Float, ConstantValue::Floating(value)) => f64::from(value as f32),
+                (BuiltinType::Float, ConstantValue::LongDouble(value)) => {
+                    long_double_to_f32(value)?
+                }
                 (_, ConstantValue::Signed(value)) => value as f64,
                 (_, ConstantValue::Unsigned(value)) => value as f64,
                 (_, ConstantValue::Floating(value)) => value,
+                (_, ConstantValue::LongDouble(value)) => long_double_to_f64(value)?,
                 (_, ConstantValue::NullPointer | ConstantValue::Address(_)) => return None,
             };
             Some(ConstantValue::Floating(value))
@@ -7352,13 +8548,13 @@ impl<'a> Analyzer<'a> {
         types: &[QualifiedType],
         span: Span,
     ) -> AnalysisResult<()> {
-        if self.config.target.data_layout.long_double_width > 64
+        if self.config.target.data_layout.long_double_format == LongDoubleFormat::IeeeBinary128
             && types.iter().any(|ty| ty.ty == TypeId::LONG_DOUBLE)
         {
             self.fail(
                 "CCC2343",
                 span,
-                "long double layout is supported, but this operation requires unavailable arithmetic or ABI support",
+                "binary128 long double layout is supported, but this operation requires unavailable arithmetic or ABI support",
             )
         } else {
             Ok(())
@@ -7587,6 +8783,37 @@ impl<'a> Analyzer<'a> {
                     "atomic type `{}` has {}-byte alignment, weaker than its native {natural}-byte alignment",
                     self.types.display_qualified(ty),
                     adjusted.alignment
+                ),
+            );
+        }
+        Ok(())
+    }
+
+    fn reject_packed_atomic_field(
+        &mut self,
+        ty: QualifiedType,
+        requested_alignment: Option<u64>,
+        packing: PackingPolicy,
+        span: Span,
+    ) -> AnalysisResult<()> {
+        if !ty.qualifiers.contains(TypeQualifiers::ATOMIC) {
+            return Ok(());
+        }
+        let natural = self
+            .types
+            .layout_of(ty.ty, self.config)
+            .map_err(|error| self.emit("CCC2453", span, error.to_string()))?
+            .align;
+        let effective = packing
+            .field_alignment(natural)
+            .max(requested_alignment.unwrap_or(1));
+        if effective < natural {
+            return self.fail(
+                "CCC2453",
+                span,
+                format!(
+                    "packed atomic field `{}` has {effective}-byte alignment, weaker than its native {natural}-byte alignment",
+                    self.types.display_qualified(ty)
                 ),
             );
         }
@@ -8217,6 +9444,7 @@ impl<'a> Analyzer<'a> {
             S::Expression(_)
             | S::Goto(_)
             | S::ComputedGoto(_)
+            | S::Asm(_)
             | S::Continue
             | S::Break
             | S::Return(_) => {}
@@ -8436,6 +9664,139 @@ impl<'a> Analyzer<'a> {
     }
 }
 
+fn constant_to_long_double(
+    value: ConstantValue,
+    format: LongDoubleFormat,
+) -> Option<ConstantValue> {
+    let bits = match format {
+        LongDoubleFormat::Binary64 => return None,
+        LongDoubleFormat::X87Extended => {
+            let converted = match value {
+                ConstantValue::Signed(value) => X87DoubleExtended::from_i128(value).value,
+                ConstantValue::Unsigned(value) => X87DoubleExtended::from_u128(value).value,
+                ConstantValue::Floating(value) => {
+                    let source = Double::from_bits(u128::from(value.to_bits()));
+                    let mut loses_info = false;
+                    let converted: X87DoubleExtended = source.convert(&mut loses_info).value;
+                    converted
+                }
+                ConstantValue::LongDouble(value)
+                    if value.format == LongDoubleFormat::X87Extended =>
+                {
+                    return Some(ConstantValue::LongDouble(value));
+                }
+                ConstantValue::LongDouble(value)
+                    if value.format == LongDoubleFormat::IeeeBinary128 =>
+                {
+                    let source = Quad::from_bits(value.bits());
+                    let mut loses_info = false;
+                    let converted: X87DoubleExtended = source.convert(&mut loses_info).value;
+                    converted
+                }
+                ConstantValue::LongDouble(_)
+                | ConstantValue::NullPointer
+                | ConstantValue::Address(_) => return None,
+            };
+            converted.to_bits()
+        }
+        LongDoubleFormat::IeeeBinary128 => {
+            let converted = match value {
+                ConstantValue::Signed(value) => Quad::from_i128(value).value,
+                ConstantValue::Unsigned(value) => Quad::from_u128(value).value,
+                ConstantValue::Floating(value) => {
+                    let source = Double::from_bits(u128::from(value.to_bits()));
+                    let mut loses_info = false;
+                    let converted: Quad = source.convert(&mut loses_info).value;
+                    converted
+                }
+                ConstantValue::LongDouble(value)
+                    if value.format == LongDoubleFormat::IeeeBinary128 =>
+                {
+                    return Some(ConstantValue::LongDouble(value));
+                }
+                ConstantValue::LongDouble(value)
+                    if value.format == LongDoubleFormat::X87Extended =>
+                {
+                    let source = X87DoubleExtended::from_bits(value.bits());
+                    let mut loses_info = false;
+                    let converted: Quad = source.convert(&mut loses_info).value;
+                    converted
+                }
+                ConstantValue::LongDouble(_)
+                | ConstantValue::NullPointer
+                | ConstantValue::Address(_) => return None,
+            };
+            converted.to_bits()
+        }
+    };
+    Some(ConstantValue::LongDouble(LongDoubleConstant::from_bits(
+        format, bits,
+    )))
+}
+
+fn long_double_to_integer(value: LongDoubleConstant, width: u8, signed: bool) -> Option<u128> {
+    let width = usize::from(width);
+    let mut exact = false;
+    let (status, raw) = match value.format {
+        LongDoubleFormat::Binary64 => return None,
+        LongDoubleFormat::X87Extended => {
+            let value = X87DoubleExtended::from_bits(value.bits());
+            if signed {
+                let result = value.to_i128_r(width, Round::TowardZero, &mut exact);
+                (result.status, result.value as u128)
+            } else {
+                let result = value.to_u128_r(width, Round::TowardZero, &mut exact);
+                (result.status, result.value)
+            }
+        }
+        LongDoubleFormat::IeeeBinary128 => {
+            let value = Quad::from_bits(value.bits());
+            if signed {
+                let result = value.to_i128_r(width, Round::TowardZero, &mut exact);
+                (result.status, result.value as u128)
+            } else {
+                let result = value.to_u128_r(width, Round::TowardZero, &mut exact);
+                (result.status, result.value)
+            }
+        }
+    };
+    (!status.contains(Status::INVALID_OP)).then_some(raw)
+}
+
+fn long_double_to_f32(value: LongDoubleConstant) -> Option<f64> {
+    let mut loses_info = false;
+    let converted: Single = match value.format {
+        LongDoubleFormat::Binary64 => return None,
+        LongDoubleFormat::X87Extended => {
+            X87DoubleExtended::from_bits(value.bits())
+                .convert(&mut loses_info)
+                .value
+        }
+        LongDoubleFormat::IeeeBinary128 => {
+            Quad::from_bits(value.bits()).convert(&mut loses_info).value
+        }
+    };
+    let bits = u32::try_from(converted.to_bits()).ok()?;
+    Some(f64::from(f32::from_bits(bits)))
+}
+
+fn long_double_to_f64(value: LongDoubleConstant) -> Option<f64> {
+    let mut loses_info = false;
+    let converted: Double = match value.format {
+        LongDoubleFormat::Binary64 => return None,
+        LongDoubleFormat::X87Extended => {
+            X87DoubleExtended::from_bits(value.bits())
+                .convert(&mut loses_info)
+                .value
+        }
+        LongDoubleFormat::IeeeBinary128 => {
+            Quad::from_bits(value.bits()).convert(&mut loses_info).value
+        }
+    };
+    let bits = u64::try_from(converted.to_bits()).ok()?;
+    Some(f64::from_bits(bits))
+}
+
 fn initializer_string_literal(expression: &syntax::Expression) -> Option<&ccc_pp::StringLiteral> {
     match &expression.kind {
         syntax::ExpressionKind::String(literal) => Some(literal),
@@ -8444,6 +9805,24 @@ fn initializer_string_literal(expression: &syntax::Expression) -> Option<&ccc_pp
         }
         _ => None,
     }
+}
+
+fn ordinary_asm_text(literal: &ccc_pp::StringLiteral) -> Option<String> {
+    if literal.prefix != StringLiteralPrefix::None
+        || literal
+            .code_units
+            .iter()
+            .any(|unit| *unit == 0 || *unit > 0x7f)
+    {
+        return None;
+    }
+    Some(
+        literal
+            .code_units
+            .iter()
+            .map(|unit| char::from_u32(*unit).expect("ASCII code unit is a valid scalar"))
+            .collect(),
+    )
 }
 
 fn defining_function_parameter_list_span(declarator: &syntax::Declarator) -> Option<Span> {
@@ -8682,6 +10061,8 @@ fn builtin_expect_folded_constant(expression: &FullTypedExpression) -> bool {
         | E::MemoryCopy { .. }
         | E::MemorySet { .. }
         | E::Prefetch { .. }
+        | E::AtomicLoad { .. }
+        | E::AtomicStore { .. }
         | E::AtomicReadModifyWrite { .. }
         | E::AtomicCompareExchange { .. }
         | E::MemoryFence { .. } => false,
@@ -8847,6 +10228,10 @@ fn evaluate_unary_constant(
             unsigned_integer_constant(value.wrapping_neg(), integer_type)
         }
         (U::Minus, ConstantValue::Floating(value)) => Some(ConstantValue::Floating(-value)),
+        (U::Plus, value @ ConstantValue::LongDouble(_)) => Some(value),
+        (U::Minus, ConstantValue::LongDouble(value)) => {
+            negate_long_double(value).map(ConstantValue::LongDouble)
+        }
         (U::BitwiseNot, ConstantValue::Signed(value)) => {
             signed_integer_constant(!value, integer_type)
         }
@@ -8882,9 +10267,10 @@ fn evaluate_binary_constant(
         let count = match right {
             ConstantValue::Signed(value) => u32::try_from(value).ok()?,
             ConstantValue::Unsigned(value) => u32::try_from(value).ok()?,
-            ConstantValue::Floating(_) | ConstantValue::NullPointer | ConstantValue::Address(_) => {
-                return None;
-            }
+            ConstantValue::Floating(_)
+            | ConstantValue::LongDouble(_)
+            | ConstantValue::NullPointer
+            | ConstantValue::Address(_) => return None,
         };
         if count >= u32::from(integer_type.width) {
             return None;
@@ -8987,6 +10373,9 @@ fn evaluate_binary_constant(
             B::LogicalOr => boolean(left != 0.0 || right != 0.0),
             _ => None,
         },
+        (ConstantValue::LongDouble(left), ConstantValue::LongDouble(right)) => {
+            evaluate_long_double_binary(operator, left, right)
+        }
         (ConstantValue::NullPointer, ConstantValue::NullPointer) => match operator {
             B::Equal => boolean(true),
             B::NotEqual => boolean(false),
@@ -9031,6 +10420,100 @@ fn fold_floating_binary(
             B::Subtract => left - right,
             _ => unreachable!("only arithmetic operations are folded here"),
         })
+    }
+}
+
+fn negate_long_double(value: LongDoubleConstant) -> Option<LongDoubleConstant> {
+    let bits = match value.format {
+        LongDoubleFormat::Binary64 => return None,
+        LongDoubleFormat::X87Extended => {
+            let value = X87DoubleExtended::from_bits(value.bits());
+            if value.is_nan() {
+                return None;
+            }
+            (-value).to_bits()
+        }
+        LongDoubleFormat::IeeeBinary128 => {
+            let value = Quad::from_bits(value.bits());
+            if value.is_nan() {
+                return None;
+            }
+            (-value).to_bits()
+        }
+    };
+    Some(LongDoubleConstant::from_bits(value.format, bits))
+}
+
+fn evaluate_long_double_binary(
+    operator: syntax::BinaryOperator,
+    left: LongDoubleConstant,
+    right: LongDoubleConstant,
+) -> Option<ConstantValue> {
+    if left.format != right.format {
+        return None;
+    }
+    match left.format {
+        LongDoubleFormat::Binary64 => None,
+        LongDoubleFormat::X87Extended => evaluate_apfloat_binary(
+            operator,
+            X87DoubleExtended::from_bits(left.bits()),
+            X87DoubleExtended::from_bits(right.bits()),
+            left.format,
+        ),
+        LongDoubleFormat::IeeeBinary128 => evaluate_apfloat_binary(
+            operator,
+            Quad::from_bits(left.bits()),
+            Quad::from_bits(right.bits()),
+            left.format,
+        ),
+    }
+}
+
+fn evaluate_apfloat_binary<F: Float>(
+    operator: syntax::BinaryOperator,
+    left: F,
+    right: F,
+    format: LongDoubleFormat,
+) -> Option<ConstantValue> {
+    use syntax::BinaryOperator as B;
+    if left.is_nan() || right.is_nan() {
+        // Runtime comparison and arithmetic preserve the target's exception
+        // behavior for signaling NaNs; the default frontend contract does not
+        // need to speculate about it while folding.
+        return None;
+    }
+    let boolean = |value: bool| Some(ConstantValue::Signed(i128::from(value)));
+    match operator {
+        B::Multiply | B::Divide | B::Add | B::Subtract => {
+            let result = match operator {
+                B::Multiply => left.mul_r(right, Round::NearestTiesToEven),
+                B::Divide => left.div_r(right, Round::NearestTiesToEven),
+                B::Add => left.add_r(right, Round::NearestTiesToEven),
+                B::Subtract => left.sub_r(right, Round::NearestTiesToEven),
+                _ => unreachable!(),
+            };
+            if result.value.is_nan() {
+                return None;
+            }
+            Some(ConstantValue::LongDouble(LongDoubleConstant::from_bits(
+                format,
+                result.value.to_bits(),
+            )))
+        }
+        B::Less => boolean(left < right),
+        B::LessEqual => boolean(left <= right),
+        B::Greater => boolean(left > right),
+        B::GreaterEqual => boolean(left >= right),
+        B::Equal => boolean(left == right),
+        B::NotEqual => boolean(left != right),
+        B::LogicalAnd => boolean(!left.is_zero() && !right.is_zero()),
+        B::LogicalOr => boolean(!left.is_zero() || !right.is_zero()),
+        B::Remainder
+        | B::LeftShift
+        | B::RightShift
+        | B::BitwiseAnd
+        | B::BitwiseXor
+        | B::BitwiseOr => None,
     }
 }
 
@@ -9139,6 +10622,13 @@ fn strongest_alignment(left: Option<u64>, right: Option<u64>) -> Option<u64> {
     }
 }
 
+fn common_power_of_two_alignment(base_alignment: u64, byte_offset: u64) -> u64 {
+    if byte_offset == 0 {
+        return base_alignment;
+    }
+    base_alignment.min(1_u64 << byte_offset.trailing_zeros())
+}
+
 fn supported_object_alignment(alignment: u64) -> bool {
     alignment.is_power_of_two() && alignment.trailing_zeros() < 32
 }
@@ -9180,6 +10670,10 @@ fn defines_inline_anonymous_record(specifiers: &syntax::DeclarationSpecifiers) -
 
 fn attribute_has_name(attribute: &FullTypedAttribute, name: &str) -> bool {
     canonical_gnu_attribute_name(&attribute.name) == name
+}
+
+fn is_known_returns_twice_function(name: &str) -> bool {
+    matches!(name, "setjmp" | "_setjmp" | "sigsetjmp" | "__sigsetjmp")
 }
 
 fn attribute_argument_identifier(arguments: &[String]) -> Option<&str> {

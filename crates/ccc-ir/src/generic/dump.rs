@@ -3,9 +3,10 @@ use std::fmt::Write;
 use ccc_types::TypeStore;
 
 use super::{
-    AggregateProjection, BinaryOperation, CallEffects, FullEdge, FullInstructionKind, FullModule,
-    FullTerminator, InitializerGraph, InitializerNodeKind, InitializerPath, MemoryAccess,
-    RelocationTarget, ScalarConstant, ScalarConversion, UnaryOperation,
+    AggregateProjection, BinaryOperation, CallEffects, CodeLayoutHint, FullEdge,
+    FullInstructionKind, FullModule, FullTerminator, InitializerGraph, InitializerNodeKind,
+    InitializerPath, MemoryAccess, RelocationTarget, ScalarConstant, ScalarConversion,
+    UnaryOperation,
 };
 
 pub fn dump_frontend_ir(module: &FullModule) -> String {
@@ -104,7 +105,7 @@ pub fn dump_frontend_ir(module: &FullModule) -> String {
             .join(", ");
         let _ = writeln!(
             output,
-            "function f{} @{}({}) -> {} [signature={} linkage={:?}{} visibility={:?} inline={} noreturn={}] {{",
+            "function f{} @{}({}) -> {} [signature={} linkage={:?}{} visibility={:?} inline={} noreturn={}{}] {{",
             function.id.0,
             function.symbol_name,
             parameters,
@@ -119,6 +120,11 @@ pub fn dump_frontend_ir(module: &FullModule) -> String {
             function.visibility,
             function.properties.inline,
             function.properties.no_return,
+            if function.properties.returns_twice {
+                " returns-twice=true"
+            } else {
+                ""
+            },
         );
         for storage in &function.storage {
             let reasons = storage
@@ -609,6 +615,35 @@ fn display_instruction(module: &FullModule, kind: &FullInstructionKind) -> Strin
         FullInstructionKind::MemoryFence { order } => {
             format!("memory.fence order={order:?}")
         }
+        FullInstructionKind::CompilerBarrier { memory } => {
+            format!("compiler.barrier memory={memory}")
+        }
+        FullInstructionKind::OpaqueScalar { operand } => {
+            format!("opaque.scalar v{}", operand.0)
+        }
+        FullInstructionKind::CodeLayoutHint(CodeLayoutHint::AlignToPowerOfTwo(power)) => {
+            format!("code.align power={power}")
+        }
+        FullInstructionKind::CodeLayoutHint(CodeLayoutHint::Nop) => "code.nop-hint".to_owned(),
+        FullInstructionKind::X86Cpuid {
+            leaf,
+            subleaf,
+            eax,
+            ebx,
+            ecx,
+            edx,
+        } => format!(
+            "x86.cpuid leaf=v{} subleaf={} eax={} ebx={} ecx={} edx={}",
+            leaf.0,
+            display_optional_value(*subleaf),
+            display_optional_value(*eax),
+            display_optional_value(*ebx),
+            display_optional_value(*ecx),
+            display_optional_value(*edx)
+        ),
+        FullInstructionKind::X86Rdtsc { low, high } => {
+            format!("x86.rdtsc low=v{} high=v{}", low.0, high.0)
+        }
         FullInstructionKind::VaStart {
             list,
             last_named_parameter,
@@ -680,11 +715,18 @@ fn display_values(values: &[super::ValueId]) -> String {
         .join(", ")
 }
 
+fn display_optional_value(value: Option<super::ValueId>) -> String {
+    value.map_or_else(|| "_".to_owned(), |value| format!("v{}", value.0))
+}
+
 fn display_constant(constant: ScalarConstant) -> String {
     match constant {
         ScalarConstant::Signed(value) => format!("signed:{value}"),
         ScalarConstant::Unsigned(value) => format!("unsigned:{value}"),
         ScalarConstant::Floating(value) => format!("float:0x{:016x}", value.to_bits()),
+        ScalarConstant::LongDouble(value) => {
+            format!("long-double:{:?}:0x{:032x}", value.format, value.bits())
+        }
         ScalarConstant::NullPointer => "null".to_owned(),
     }
 }
@@ -709,8 +751,16 @@ fn display_access(access: MemoryAccess) -> String {
 
 fn display_call_effects(effects: CallEffects) -> String {
     format!(
-        "[read={} write={} unwind={} noreturn={}]",
-        effects.reads_memory, effects.writes_memory, effects.may_unwind, effects.no_return
+        "[read={} write={} unwind={} noreturn={}{}]",
+        effects.reads_memory,
+        effects.writes_memory,
+        effects.may_unwind,
+        effects.no_return,
+        if effects.returns_twice {
+            " returns-twice=true"
+        } else {
+            ""
+        }
     )
 }
 

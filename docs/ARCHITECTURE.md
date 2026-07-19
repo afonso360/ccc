@@ -81,7 +81,7 @@ The significant, cross-cutting decisions live as ADRs in [`docs/adr/`](adr/):
 | [0004](adr/0004-recursive-descent-parser.md)                     | Hand-written recursive-descent parser                                                             |
 | [0005](adr/0005-preprocessor-owns-pp-token-lexing.md)            | Preprocessor owns pp-token lexing                                                                 |
 | [0006](adr/0006-link-via-target-driver.md)                       | Link via a resolved target compiler driver                                                        |
-| [0007](adr/0007-long-double-and-complex.md)                      | Preserve target `long double` ABI; reject unsupported operations, explicit f64 compatibility mode |
+| [0007](adr/0007-long-double-and-complex.md)                      | Preserve target `long double` ABI and reject unsupported operations or ABI-changing overrides     |
 | [0008](adr/0008-pin-cranelift.md)                                | Pin Cranelift; upgrade deliberately                                                               |
 | [0009](adr/0009-shared-type-and-layout-crate.md)                 | Shared `ccc-types` crate: one canonical type representation and layout engine                     |
 | [0010](adr/0010-generate-abi-bridges-as-assembly.md)             | Generate ABI bridges as auditable target assembly                                                 |

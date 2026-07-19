@@ -1,8 +1,10 @@
+use std::collections::BTreeSet;
 use std::fmt;
 
 use ccc_sema::generic::{
     FullFunctionId, FullLocalId, FunctionProperties, GlobalEmission, GlobalId, Linkage,
-    SemanticStorageClass, StorageDuration, StringId, SymbolBinding, SymbolVisibility,
+    LongDoubleConstant, SemanticStorageClass, StorageDuration, StringId, SymbolBinding,
+    SymbolVisibility,
 };
 use ccc_session::Span;
 use ccc_types::{QualifiedType, TypeId, TypeStore};
@@ -33,6 +35,37 @@ pub struct FullModule {
     /// Includes declarations so consumers can declare every symbol before
     /// translating function bodies.
     pub functions: Vec<FullFunction>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum NativeInlineAsmHelper {
+    X86Cpuid,
+    X86Rdtsc,
+}
+
+impl FullModule {
+    /// Returns the complete deterministic helper set required by retained
+    /// inline-assembly operations. Packaging may use this without rediscovering
+    /// source templates or constraints.
+    pub fn required_native_inline_asm_helpers(&self) -> BTreeSet<NativeInlineAsmHelper> {
+        let mut helpers = BTreeSet::new();
+        for function in &self.functions {
+            for block in &function.blocks {
+                for instruction in &block.instructions {
+                    match &instruction.kind {
+                        FullInstructionKind::X86Cpuid { .. } => {
+                            helpers.insert(NativeInlineAsmHelper::X86Cpuid);
+                        }
+                        FullInstructionKind::X86Rdtsc { .. } => {
+                            helpers.insert(NativeInlineAsmHelper::X86Rdtsc);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        helpers
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -135,6 +168,7 @@ pub enum ScalarConstant {
     Signed(i128),
     Unsigned(u128),
     Floating(f64),
+    LongDouble(LongDoubleConstant),
     NullPointer,
 }
 
@@ -220,7 +254,13 @@ pub enum MemoryResidencyReason {
     Aggregate,
     Atomic,
     VariablyModified,
+    /// The backend represents this scalar value by the address of owned
+    /// storage rather than a native SSA register type.
+    AddressBackedScalar,
     IndirectControlFlow,
+    /// The local must remain materialized across a continuation that can be
+    /// entered more than once by a returns-twice call.
+    ReturnsTwice,
 }
 
 #[derive(Clone, Debug)]
@@ -400,6 +440,31 @@ pub enum FullInstructionKind {
     MemoryFence {
         order: MemoryOrder,
     },
+    /// A compiler barrier. `memory` requests ordering of memory operations;
+    /// the instruction has no source-level hardware-fence requirement.
+    CompilerBarrier {
+        memory: bool,
+    },
+    /// Preserves a scalar value while making it opaque to optimization.
+    OpaqueScalar {
+        operand: ValueId,
+    },
+    /// An advisory code-placement operation with no observable C behavior.
+    CodeLayoutHint(CodeLayoutHint),
+    /// Executes CPUID once and stores requested 32-bit register outputs.
+    X86Cpuid {
+        leaf: ValueId,
+        subleaf: Option<ValueId>,
+        eax: Option<ValueId>,
+        ebx: Option<ValueId>,
+        ecx: Option<ValueId>,
+        edx: Option<ValueId>,
+    },
+    /// Reads the timestamp counter once and stores its low and high halves.
+    X86Rdtsc {
+        low: ValueId,
+        high: ValueId,
+    },
     VaStart {
         list: ValueId,
         last_named_parameter: FullLocalId,
@@ -475,6 +540,15 @@ pub enum AtomicReadModifyWriteOperation {
     Add,
     Subtract,
     Exchange,
+    BitwiseAnd,
+    BitwiseOr,
+    BitwiseXor,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CodeLayoutHint {
+    AlignToPowerOfTwo(u8),
+    Nop,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -555,6 +629,7 @@ pub struct CallEffects {
     pub writes_memory: bool,
     pub may_unwind: bool,
     pub no_return: bool,
+    pub returns_twice: bool,
 }
 
 impl Default for CallEffects {
@@ -564,6 +639,7 @@ impl Default for CallEffects {
             writes_memory: true,
             may_unwind: true,
             no_return: false,
+            returns_twice: false,
         }
     }
 }

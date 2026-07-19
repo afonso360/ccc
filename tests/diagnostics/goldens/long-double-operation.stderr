@@ -1,4 +1,4 @@
-ccc: error[CCC2343]: long double layout is supported, but this operation requires unavailable arithmetic or ABI support
+ccc: error[CCC2343]: binary128 long double layout is supported, but this operation requires unavailable arithmetic or ABI support
  --> tests/diagnostics/cases/long-double-operation.c:2:12
    |
  2 |     return value + 1.0L;

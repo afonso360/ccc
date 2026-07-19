@@ -4,7 +4,7 @@ pub mod generic;
 
 use std::fmt;
 
-use ccc_session::Span;
+use ccc_session::{SourceMap, Span};
 use ccc_target::{CallingConvention, EffectiveCompilationConfig};
 use cranelift_codegen::ir::{self, AbiParam, ArgumentPurpose, Signature};
 use cranelift_codegen::isa::CallConv;
@@ -25,9 +25,14 @@ impl Output {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct Options {
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Options<'a> {
     pub emit_clif: bool,
+    /// Emit source-level DWARF using this compilation's source map.
+    ///
+    /// Keeping the map in the invocation options makes it impossible to emit
+    /// line information from stale or reconstructed file identities.
+    pub debug_info: Option<&'a SourceMap>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

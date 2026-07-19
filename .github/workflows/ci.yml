@@ -19,8 +19,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes \
-            binutils clang coreutils curl g++ gcc gdb make openssl patch \
-            pkg-config tcl-dev zlib1g-dev
+            binutils clang coreutils curl diffutils file findutils g++ gcc gdb \
+            git make openssl patch pkg-config tar tcl-dev unzip zlib1g-dev
       - name: Verify runner prerequisites
         shell: bash
         run: |
@@ -28,7 +28,10 @@ jobs:
           artifact_dir="$RUNNER_TEMP/ccc-sysv-amd64-artifacts"
           mkdir -p "$artifact_dir"
           missing=()
-          for tool in curl cc gcc clang make tclsh pkg-config objdump readelf gdb objcopy timeout openssl patch; do
+          for tool in ar awk basename cat chmod cmp cp curl cc dd diff dirname file find \
+              gcc clang git grep id ln make md5sum mkdir mkfifo mktemp mv nm ranlib \
+              tclsh pkg-config objdump readelf gdb objcopy openssl patch rm sed \
+              sha256sum sort stat tail tar tee timeout touch tr uname unzip wc; do
             if ! command -v "$tool" >/dev/null; then
               missing+=("$tool")
             fi
@@ -49,7 +52,7 @@ jobs:
           fi
           printf 'All runner prerequisites are available.\n' \
             > "$artifact_dir/runner-prerequisites.txt"
-      - name: Verify pinned ABI sources
+      - name: Verify pinned ABI and arithmetic-oracle sources
         run: |
           mkdir -p "$RUNNER_TEMP/ccc-sysv-amd64-artifacts"
           curl --fail --silent --show-error --location --retry 3 \
@@ -64,6 +67,14 @@ jobs:
             https://raw.githubusercontent.com/riscv-non-isa/riscv-elf-psabi-doc/e03d44ae2f0e1144f9498c2896b5ae25b0449398/riscv-cc.adoc \
             --output "$RUNNER_TEMP/ccc-sysv-amd64-artifacts/riscv-cc.adoc"
           echo "c87c97d518681c44398add931cc41a43235abe656eaf831b849934a3919d86e5  $RUNNER_TEMP/ccc-sysv-amd64-artifacts/riscv-cc.adoc" | sha256sum --check --strict
+          curl --fail --silent --show-error --location --retry 3 \
+            https://www.jhauser.us/arithmetic/SoftFloat-3e.zip \
+            --output "$RUNNER_TEMP/ccc-sysv-amd64-artifacts/SoftFloat-3e.zip"
+          echo "21130ce885d35c1fe73fc1e1bf2244178167e05c6747cad5f450cc991714c746  $RUNNER_TEMP/ccc-sysv-amd64-artifacts/SoftFloat-3e.zip" | sha256sum --check --strict
+          curl --fail --silent --show-error --location --retry 3 \
+            https://www.jhauser.us/arithmetic/TestFloat-3e.zip \
+            --output "$RUNNER_TEMP/ccc-sysv-amd64-artifacts/TestFloat-3e.zip"
+          echo "6d4bdf0096b48a653aa59fc203a9e5fe18b5a58d7a1b715107c7146776a0aad6  $RUNNER_TEMP/ccc-sysv-amd64-artifacts/TestFloat-3e.zip" | sha256sum --check --strict
       - uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: clippy,rustfmt
@@ -100,6 +111,66 @@ jobs:
       - run: cargo test -p ccc-driver --features ci-sysv-amd64 --test sysv_amd64_interop -- --show-output
         env:
           TMPDIR: ${{ runner.temp }}/ccc-sysv-amd64-artifacts/tmp
+      - name: Run native x86-64 target oracle
+        env:
+          CCC_REQUIRE_TARGET_ORACLE: "1"
+          CCC_TARGET_ORACLE_ARTIFACTS: ${{ runner.temp }}/ccc-sysv-amd64-artifacts/target-oracle
+        run: |
+          cargo build --locked -p ccc-driver
+          tests/target-oracle/run.sh x86_64-linux
+      - name: Run independent extF80 arithmetic oracle
+        env:
+          CCC_REQUIRE_TESTFLOAT_ORACLE: "1"
+          CCC_SOFTFLOAT_ARCHIVE: ${{ runner.temp }}/ccc-sysv-amd64-artifacts/SoftFloat-3e.zip
+          CCC_TESTFLOAT_ARCHIVE: ${{ runner.temp }}/ccc-sysv-amd64-artifacts/TestFloat-3e.zip
+          CCC_TESTFLOAT_ARTIFACTS: ${{ runner.temp }}/ccc-sysv-amd64-artifacts/testfloat-oracle
+        run: |
+          if CCC_SOFTFLOAT_ARCHIVE=/definitely/missing/SoftFloat-3e.zip \
+               CCC_TESTFLOAT_ARCHIVE=/definitely/missing/TestFloat-3e.zip \
+               CCC_TESTFLOAT_ARTIFACTS="$RUNNER_TEMP/testfloat-fail-closed" \
+               tests/target-oracle/run-testfloat.sh; then
+            echo "extF80 oracle masked missing pinned archives" >&2
+            exit 1
+          fi
+          tests/target-oracle/run-testfloat.sh
+      - name: Build and test Lua with CCC
+        env:
+          CCC: target/debug/ccc
+        run: |
+          test-corpus/lua/run.sh \
+            --work-dir "$RUNNER_TEMP/ccc-sysv-amd64-artifacts/lua"
+      - name: Build and run SQLite veryquick with CCC
+        env:
+          CCC: target/debug/ccc
+        run: |
+          test-corpus/sqlite/run.sh \
+            --suite veryquick \
+            --work-dir "$RUNNER_TEMP/ccc-sysv-amd64-artifacts/sqlite"
+      - name: Build and test bzip2 with CCC
+        env:
+          CCC: target/debug/ccc
+        run: |
+          test-corpus/bzip2/run.sh \
+            --target x86_64-unknown-linux-gnu \
+            --work-dir "$RUNNER_TEMP/ccc-sysv-amd64-artifacts/bzip2"
+      - name: Build and test zlib with CCC
+        env:
+          CCC: target/debug/ccc
+        run: |
+          test-corpus/zlib/run.sh \
+            --work-dir "$RUNNER_TEMP/ccc-sysv-amd64-artifacts/zlib"
+      - name: Build and smoke-test Redis with CCC
+        env:
+          CCC: target/debug/ccc
+        run: |
+          test-corpus/redis/run.sh \
+            --work-dir "$RUNNER_TEMP/ccc-sysv-amd64-artifacts/redis"
+      - name: Build and test zstd with CCC
+        env:
+          CCC: target/debug/ccc
+        run: |
+          test-corpus/zstd/run.sh \
+            --work-dir "$RUNNER_TEMP/ccc-sysv-amd64-artifacts/zstd"
       - run: cargo test --workspace --all-targets
       - name: Retain native ABI failure artifacts
         if: failure()

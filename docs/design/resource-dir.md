@@ -17,10 +17,10 @@ hosted-header path.
 Headers are classified rather than all being treated as complete CCC replacements:
 
 - **Compiler-owned:** target-invariant compiler interface text such as
-  `stdarg.h`, which may delegate representation to a target-derived builtin
-  type; small standard spelling headers such as `stdbool.h`, `stdalign.h`, and
-  `stdnoreturn.h` where no libc ABI is involved.
-- **Target-derived compiler headers:** `stddef.h`, `float.h`, and `stdatomic.h`, generated or selected from the effective configuration and backend/runtime capability table.
+  `stdarg.h` and `stdatomic.h`, which delegate representation or operations to
+  target-aware compiler builtins; small standard spelling headers such as
+  `stdbool.h`, `stdalign.h`, and `stdnoreturn.h` where no libc ABI is involved.
+- **Target-derived compiler headers:** `stddef.h` and `float.h`, generated or selected from the effective configuration.
 - **Hosted wrappers:** `math.h`, `stdint.h`, `limits.h`, and any platform header for which libc owns public typedefs, feature-test integration, or ABI declarations. A wrapper supplies compiler builtins and uses `#include_next` when the resolved libc header is authoritative. The shipped `math.h` wrapper retains libc declarations and constants while replacing only the `float`/`double` classification macros that would otherwise expose unselected `long double` branches. On Apple arm64, the `sys/cdefs.h` wrapper selects the SDK's documented static-inline fallback for header implementation functions because CCC does not claim optimizer-driven `always_inline`; public declarations and ABI types continue to come from the SDK.
 
 Every wrapper is tested against each supported libc. CCC does not place a generic header ahead of the system tree if doing so changes libc typedefs or feature-test behavior. Freestanding mode uses self-contained target-derived variants and does not pretend hosted libc declarations are available.
@@ -41,14 +41,19 @@ It implements the conventional `__need_*` partial-include protocol used by
 hosted headers. The associated parser and builtin requirements are part of the
 [frontend capability contract](frontend-capabilities.md).
 
-`stdatomic.h` reports lock-free properties from the same table used by codegen.
+`stdatomic.h` exposes the native fundamental integer/pointer subset and maps its
+operations to registry-gated compiler builtins. Its lock-free query applies the
+same type/width/alignment gate as semantic lowering. The complete atomic-type
+capability remains denied while aggregate, floating, wide, and weakened-alignment
+forms have no runtime-helper fallback.
 `stdarg.h` aliases the reserved `__builtin_va_list` spelling and maps the
 standard operations to compiler builtins; its source does not embed a target
 record layout. The canonical builtin type supplies the target's actual
-array-of-one representation. `float.h` follows the selected native or explicit
-compatibility long-double mode. When complex support is unavailable, the
-configuration defines `__STDC_NO_COMPLEX__` and the complex wrapper fails
-clearly rather than exposing unusable declarations.
+array-of-one representation. Native `long double` predefined macros come from
+the same target layout used by semantic analysis; the target toolchain owns its
+hosted `float.h`. When complex support is unavailable, the configuration
+defines `__STDC_NO_COMPLEX__` and the complex wrapper fails clearly rather than
+exposing unusable declarations.
 
 ## Include search
 
@@ -101,11 +106,11 @@ Versioned runtime shims may be resource-owned when a target operation is not
 provided with the required ABI by the selected toolchain. The
 [runtime helper manifest](toolchain.md#runtime-helper-manifest) chooses the
 provider for each such symbol. The hosted scoped-arena provider is different:
-its versioned support functions are local CLIF definitions in the primary
-object, while the manifest records their hosted allocator dependencies. It does
-not require a resource-owned runtime object. A freestanding arena provider may
-be resource-owned and is enabled only for the exact targets listed by that
-manifest. ABI bridge assembly is not a resource template:
+its allocation and cleanup logic lowers directly into each affected function,
+with ordinary `realloc` and `free` imports outside the compiler-builtins helper
+manifest. It does not require a resource-owned runtime object. A freestanding
+arena provider may be resource-owned and is enabled only for the exact targets
+listed by its provider contract. ABI bridge assembly is not a resource template:
 `ccc-link` renders it from the verified `ModuleAbiPlan` for each compilation,
 then assembles, partially links, and exactly localizes it as specified by
 [ADR-0010](../adr/0010-generate-abi-bridges-as-assembly.md).

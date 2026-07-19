@@ -72,6 +72,138 @@ fn lowers_runtime_sized_objects_and_dynamic_pointer_strides_explicitly() {
 }
 
 #[test]
+fn returns_twice_calls_keep_automatic_objects_in_stable_storage() {
+    let module = lower_source(
+        "extern int checkpoint(void *) __attribute__((returns_twice));\n\
+         int probe(void *environment, int seed) {\n\
+             int unchanged = seed + 1;\n\
+             volatile int changed = 2;\n\
+             int result = checkpoint(environment);\n\
+             if (result) return unchanged + changed;\n\
+             changed = 5;\n\
+             return 0;\n\
+         }",
+    );
+    verify_frontend(&module).unwrap();
+    let probe = module
+        .functions
+        .iter()
+        .find(|function| function.name == "probe")
+        .unwrap();
+    assert!(!probe.storage.is_empty());
+    assert!(probe.storage.iter().all(|storage| {
+        storage.location != StorageLocation::Automatic
+            || storage
+                .required_by
+                .contains(&MemoryResidencyReason::ReturnsTwice)
+    }));
+    assert!(probe.blocks.iter().any(|block| {
+        block.instructions.iter().any(|instruction| {
+            matches!(
+                &instruction.kind,
+                FullInstructionKind::DirectCall { effects, .. }
+                    if effects.returns_twice
+            )
+        })
+    }));
+    let dump = dump_frontend_ir(&module);
+    assert!(dump.contains("returns-twice=true"), "{dump}");
+    assert!(dump.contains("ReturnsTwice"), "{dump}");
+}
+
+#[test]
+fn returns_twice_calls_reject_runtime_sized_automatic_storage() {
+    let error = lower_frontend(&typed_source(
+        "extern int checkpoint(void *) __attribute__((returns_twice));\n\
+         int probe(void *environment, int count) {\n\
+             int values[count];\n\
+             return checkpoint(environment) + values[0];\n\
+         }",
+    ))
+    .unwrap_err();
+    assert_eq!(error.code, "CCC3101");
+    assert!(
+        error
+            .message
+            .contains("returns-twice call cannot be combined with runtime-sized")
+    );
+}
+
+#[test]
+fn indirect_calls_conservatively_keep_automatic_objects_in_stable_storage() {
+    let module = lower_source(
+        "int invoke(int (*callback)(int), int seed) {\n\
+             int retained = seed + 1;\n\
+             return callback(seed) + retained;\n\
+         }\n\
+         int ordinary(int value) { return value + 1; }\n\
+         int direct(int value) {\n\
+             int promotable = value + 2;\n\
+             return ordinary(promotable);\n\
+         }",
+    );
+    verify_frontend(&module).unwrap();
+
+    let invoke = module
+        .functions
+        .iter()
+        .find(|function| function.name == "invoke")
+        .unwrap();
+    assert!(invoke.blocks.iter().any(|block| {
+        block.instructions.iter().any(|instruction| {
+            matches!(
+                &instruction.kind,
+                FullInstructionKind::IndirectCall { effects, .. }
+                    if effects.returns_twice
+            )
+        })
+    }));
+    assert!(invoke.storage.iter().any(|storage| {
+        storage.location == StorageLocation::Automatic
+            && storage
+                .required_by
+                .contains(&MemoryResidencyReason::ReturnsTwice)
+    }));
+
+    let direct = module
+        .functions
+        .iter()
+        .find(|function| function.name == "direct")
+        .unwrap();
+    assert!(direct.blocks.iter().all(|block| {
+        block.instructions.iter().all(|instruction| {
+            !matches!(
+                &instruction.kind,
+                FullInstructionKind::DirectCall { effects, .. }
+                    if effects.returns_twice
+            )
+        })
+    }));
+    assert!(direct.storage.iter().all(|storage| {
+        !storage
+            .required_by
+            .contains(&MemoryResidencyReason::ReturnsTwice)
+    }));
+}
+
+#[test]
+fn indirect_calls_reject_runtime_sized_automatic_storage() {
+    let error = lower_frontend(&typed_source(
+        "int invoke(int (*callback)(void), int count) {\n\
+             int values[count];\n\
+             return callback() + values[0];\n\
+         }",
+    ))
+    .unwrap_err();
+    assert_eq!(error.code, "CCC3101");
+    assert!(
+        error
+            .message
+            .contains("returns-twice call cannot be combined with runtime-sized")
+    );
+}
+
+#[test]
 fn aligned_integer_pointer_accesses_keep_the_layout_bearing_object_type() {
     let module = lower_source(
         "typedef __attribute__((aligned(1))) unsigned int unalign32;\n\
@@ -956,6 +1088,172 @@ fn lowers_legacy_sync_operations_to_explicit_sequentially_consistent_atomics() {
 }
 
 #[test]
+fn lowers_scalar_atomic_load_store_rmw_compare_exchange_and_fences_explicitly() {
+    let module = lower_source(
+        "_Atomic int value;\n\
+         int update(int replacement, int *expected) {\n\
+             int old = __atomic_load_n(&value, 0);\n\
+             __atomic_store_n(&value, replacement, 3);\n\
+             old ^= __atomic_fetch_and(&value, 255, 2);\n\
+             old ^= __atomic_or_fetch(&value, 16, 4);\n\
+             old ^= __atomic_xor_fetch(&value, 3, 1);\n\
+             old ^= __atomic_compare_exchange_n(\n\
+                 &value, expected, old, 1, 0, 0);\n\
+             __atomic_thread_fence(2);\n\
+             __atomic_signal_fence(3);\n\
+             return old;\n\
+         }",
+    );
+    verify_frontend(&module).unwrap();
+    let function = module
+        .functions
+        .iter()
+        .find(|function| function.name == "update")
+        .unwrap();
+    let instructions = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .collect::<Vec<_>>();
+
+    assert!(instructions.iter().any(|instruction| matches!(
+        instruction.kind,
+        FullInstructionKind::Load {
+            access: MemoryAccess {
+                atomic: Some(MemoryOrder::SequentiallyConsistent),
+                non_elidable: true,
+                non_movable: true,
+                ..
+            },
+            ..
+        }
+    )));
+    assert!(instructions.iter().any(|instruction| matches!(
+        instruction.kind,
+        FullInstructionKind::Store {
+            access: MemoryAccess {
+                atomic: Some(MemoryOrder::SequentiallyConsistent),
+                non_elidable: true,
+                non_movable: true,
+                ..
+            },
+            ..
+        }
+    )));
+    let operations = instructions
+        .iter()
+        .filter_map(|instruction| match instruction.kind {
+            FullInstructionKind::AtomicReadModifyWrite { operation, .. } => Some(operation),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        operations,
+        [
+            AtomicReadModifyWriteOperation::BitwiseAnd,
+            AtomicReadModifyWriteOperation::BitwiseOr,
+            AtomicReadModifyWriteOperation::BitwiseXor,
+        ]
+    );
+    assert_eq!(
+        instructions
+            .iter()
+            .filter(|instruction| matches!(
+                instruction.kind,
+                FullInstructionKind::AtomicCompareExchange { .. }
+            ))
+            .count(),
+        1
+    );
+    assert!(instructions.iter().any(|instruction| matches!(
+        instruction.kind,
+        FullInstructionKind::Store {
+            access: MemoryAccess { atomic: None, .. },
+            ..
+        }
+    )));
+    assert_eq!(
+        instructions
+            .iter()
+            .filter(|instruction| matches!(
+                instruction.kind,
+                FullInstructionKind::MemoryFence {
+                    order: MemoryOrder::SequentiallyConsistent
+                }
+            ))
+            .count(),
+        2
+    );
+
+    let dump = dump_frontend_ir(&module);
+    assert!(
+        dump.contains("atomic=Some(SequentiallyConsistent)"),
+        "{dump}"
+    );
+    assert!(dump.contains("atomic.rmw operation=BitwiseAnd"), "{dump}");
+    assert!(dump.contains("atomic.cmpxchg"), "{dump}");
+}
+
+#[test]
+fn lowers_atomic_compound_updates_and_scaled_pointer_increments_as_rmw() {
+    let module = lower_source(
+        "_Atomic int value; _Atomic(int *) cursor;\n\
+         int update(int *base) {\n\
+             value += 3;\n\
+             value &= 7;\n\
+             ++value;\n\
+             cursor = base;\n\
+             cursor++;\n\
+             cursor -= 1;\n\
+             return value;\n\
+         }",
+    );
+    verify_frontend(&module).unwrap();
+    let function = module
+        .functions
+        .iter()
+        .find(|function| function.name == "update")
+        .unwrap();
+    let instructions = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .collect::<Vec<_>>();
+    let operations = instructions
+        .iter()
+        .filter_map(|instruction| match instruction.kind {
+            FullInstructionKind::AtomicReadModifyWrite {
+                operation,
+                return_new,
+                ..
+            } => Some((operation, return_new)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        operations,
+        [
+            (AtomicReadModifyWriteOperation::Add, true),
+            (AtomicReadModifyWriteOperation::BitwiseAnd, true),
+            (AtomicReadModifyWriteOperation::Add, true),
+            (AtomicReadModifyWriteOperation::Add, false),
+            (AtomicReadModifyWriteOperation::Subtract, true),
+        ]
+    );
+    assert_eq!(
+        instructions
+            .iter()
+            .filter(|instruction| matches!(
+                instruction.kind,
+                FullInstructionKind::PointerOffset { .. }
+            ))
+            .count(),
+        2,
+        "pointer RMW deltas must be scaled explicitly before the atomic instruction"
+    );
+}
+
+#[test]
 fn verifier_rejects_inconsistent_atomic_rmw_value_types() {
     let mut module = lower_source(
         "int value; int update(int delta) { return __sync_fetch_and_add(&value, delta); }",
@@ -1246,6 +1544,71 @@ fn lowers_scalar_builtins_to_value_preserving_ir_without_calls() {
             "}\n",
         )
     );
+}
+
+#[test]
+fn carries_exact_x87_constants_and_keeps_long_double_locals_memory_resident() {
+    let mut module = lower_source(
+        "static long double exact = 0x1.0000000000000002p0L;
+         long double add(long double input) {
+             long double local = exact;
+             return local + input;
+         }",
+    );
+    verify_frontend(&module).unwrap();
+
+    let initializer = module.globals[0].initializer.as_ref().unwrap();
+    let InitializerNodeKind::Scalar(ScalarConstant::LongDouble(value)) =
+        initializer.nodes[initializer.root.0 as usize].kind
+    else {
+        panic!("global initializer is an exact long-double constant")
+    };
+    assert_eq!(
+        value.bytes,
+        [1, 0, 0, 0, 0, 0, 0, 128, 255, 63, 0, 0, 0, 0, 0, 0]
+    );
+    let function = &module.functions[0];
+    assert!(function.storage.iter().all(|storage| {
+        storage
+            .required_by
+            .contains(&MemoryResidencyReason::AddressBackedScalar)
+    }));
+    assert!(
+        function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .any(|instruction| matches!(
+                instruction.kind,
+                FullInstructionKind::Load { object, .. }
+                    if object.ty == TypeId::LONG_DOUBLE
+            ))
+    );
+    assert!(
+        function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .any(|instruction| matches!(
+                instruction.kind,
+                FullInstructionKind::Store { object, .. }
+                    if object.ty == TypeId::LONG_DOUBLE
+            ))
+    );
+    let dump = dump_frontend_ir(&module);
+    assert!(
+        dump.contains("long-double:X87Extended:0x0000000000003fff8000000000000001"),
+        "{dump}"
+    );
+
+    let InitializerNodeKind::Scalar(ScalarConstant::LongDouble(value)) =
+        &mut module.globals[0].initializer.as_mut().unwrap().nodes[0].kind
+    else {
+        unreachable!()
+    };
+    value.bytes[15] = 1;
+    let error = verify_frontend(&module).unwrap_err();
+    assert!(error.message.contains("nonzero ABI padding"), "{error}");
 }
 
 #[test]
@@ -2076,11 +2439,22 @@ fn verifier_rejects_edge_types_storage_terminators_and_relocation_targets() {
 }
 
 #[test]
-fn reports_unsupported_atomic_updates_and_accepts_aggregate_calls() {
-    let atomic = typed_source("_Atomic int value; int f(void) { return value += 1; }");
-    let error = lower_frontend(&atomic).unwrap_err();
-    assert_eq!(error.code, "CCC3101");
-    assert!(error.message.contains("atomic compound"), "{error}");
+fn lowers_supported_atomic_updates_and_accepts_aggregate_calls() {
+    let atomic = lower_source("_Atomic int value; int f(void) { return value += 1; }");
+    verify_frontend(&atomic).unwrap();
+    assert!(atomic.functions[0].blocks.iter().any(|block| {
+        block.instructions.iter().any(|instruction| {
+            matches!(
+                instruction.kind,
+                FullInstructionKind::AtomicReadModifyWrite {
+                    operation: AtomicReadModifyWriteOperation::Add,
+                    return_new: true,
+                    order: MemoryOrder::SequentiallyConsistent,
+                    ..
+                }
+            )
+        })
+    }));
 
     let aggregate = lower_source(
         "struct Pair { int x; int y; };\n\
@@ -2094,4 +2468,87 @@ fn reports_unsupported_atomic_updates_and_accepts_aggregate_calls() {
             .iter()
             .any(|instruction| matches!(instruction.kind, FullInstructionKind::DirectCall { .. }))
     }));
+}
+
+#[test]
+fn lowers_certified_inline_assembly_to_explicit_effects_and_helpers() {
+    let module = lower_source(
+        "void operations(unsigned index, unsigned low, const unsigned char *backup,\n\
+                         long *field, long *expected, long desired) {\n\
+             unsigned eax, ebx, ecx, edx;\n\
+             const unsigned char *candidate = backup;\n\
+             long value = desired; long original;\n\
+             asm(\"\");\n\
+             asm volatile(\"\" ::: \"memory\");\n\
+             asm(\"\" : \"+r\"(index));\n\
+             asm(\".p2align 5\"); asm(\"nop\");\n\
+             asm(\"cpuid\" : \"=a\"(eax), \"=b\"(ebx), \"=c\"(ecx) : \"a\"(7), \"c\"(0) : \"edx\");\n\
+             asm volatile(\"rdtsc\" : \"=a\"(eax), \"=d\"(edx));\n\
+             asm(\"cmp %1, %2\\ncmova %3, %0\\n\" : \"+r\"(candidate) : \"r\"(index), \"r\"(low), \"r\"(backup));\n\
+             asm volatile(\"lock; xchgq %0, %1\" : \"+q\"(value), \"+m\"(*field));\n\
+             asm volatile(\"lock; cmpxchgq %2, %1\" : \"=a\"(original), \"+m\"(*field) : \"q\"(desired), \"0\"(*expected));\n\
+         }",
+    );
+    verify_frontend(&module).unwrap();
+    let dump = dump_frontend_ir(&module);
+    for operation in [
+        "compiler.barrier memory=false",
+        "compiler.barrier memory=true",
+        "opaque.scalar",
+        "code.align power=5",
+        "code.nop-hint",
+        "x86.cpuid",
+        "x86.rdtsc",
+        "atomic.rmw operation=Exchange",
+        "atomic.cmpxchg",
+        "less",
+    ] {
+        assert!(dump.contains(operation), "missing {operation}:\n{dump}");
+    }
+    assert_eq!(
+        module.required_native_inline_asm_helpers(),
+        [
+            NativeInlineAsmHelper::X86Cpuid,
+            NativeInlineAsmHelper::X86Rdtsc,
+        ]
+        .into_iter()
+        .collect()
+    );
+}
+
+#[test]
+fn verifier_rejects_malformed_retained_inline_assembly_operations() {
+    let mut module = lower_source("void f(void) { asm(\".p2align 5\"); }");
+    let hint = module.functions[0]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match &mut instruction.kind {
+            FullInstructionKind::CodeLayoutHint(hint) => Some(hint),
+            _ => None,
+        })
+        .unwrap();
+    *hint = CodeLayoutHint::AlignToPowerOfTwo(7);
+    let error = verify_frontend(&module).unwrap_err();
+    assert!(error.message.contains("certified range"), "{error}");
+
+    let mut module = lower_source(
+        "void f(unsigned long wide) { unsigned eax; asm(\"cpuid\" : \"=a\"(eax) : \"a\"(0) : \"ebx\", \"ecx\", \"edx\"); (void)wide; }",
+    );
+    let replacement = module.functions[0].parameters[0].incoming.unwrap();
+    let leaf = module.functions[0]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match &mut instruction.kind {
+            FullInstructionKind::X86Cpuid { leaf, .. } => Some(leaf),
+            _ => None,
+        })
+        .unwrap();
+    *leaf = replacement;
+    let error = verify_frontend(&module).unwrap_err();
+    assert!(
+        error.message.contains("leaf is not unsigned int"),
+        "{error}"
+    );
 }

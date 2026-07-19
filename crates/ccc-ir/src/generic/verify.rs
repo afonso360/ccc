@@ -6,10 +6,10 @@ use ccc_types::{
 };
 
 use super::{
-    AggregateProjection, BlockId, DataOrigin, FullEdge, FullFunction, FullInstruction,
+    AggregateProjection, BlockId, CallEffects, DataOrigin, FullEdge, FullFunction, FullInstruction,
     FullInstructionKind, FullModule, FullTerminator, InitializerGraph, InitializerNodeId,
-    InitializerNodeKind, InitializerPath, IrError, MemoryAccess, RelocationKind, RelocationTarget,
-    ScalarConversion, StorageLocation, ValueId,
+    InitializerNodeKind, InitializerPath, IrError, MemoryAccess, MemoryResidencyReason,
+    RelocationKind, RelocationTarget, ScalarConstant, ScalarConversion, StorageLocation, ValueId,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -152,12 +152,13 @@ fn verify_initializer_node(
     verify_type(&module.types, node.ty, "initializer node")?;
     match &node.kind {
         InitializerNodeKind::Zero => {}
-        InitializerNodeKind::Scalar(_) => {
+        InitializerNodeKind::Scalar(constant) => {
             if is_aggregate(&module.types, node.ty.ty) {
                 return Err(IrError::verify(
                     "aggregate initializer node contains a scalar leaf directly",
                 ));
             }
+            verify_long_double_constant(&module.types, node.ty.ty, *constant)?;
         }
         InitializerNodeKind::Relocation { target, kind, .. } => {
             verify_relocation(module, *target, *kind)?;
@@ -496,6 +497,35 @@ fn verify_function(module: &FullModule, function: &FullFunction) -> Result<(), I
         }
     }
 
+    let contains_returns_twice = function.blocks.iter().any(|block| {
+        block.instructions.iter().any(|instruction| {
+            matches!(
+                &instruction.kind,
+                FullInstructionKind::DirectCall { effects, .. }
+                    | FullInstructionKind::IndirectCall { effects, .. }
+                    if effects.returns_twice
+            )
+        })
+    });
+    if contains_returns_twice {
+        for storage in &function.storage {
+            if storage.location == StorageLocation::RuntimeSized {
+                return Err(IrError::verify(
+                    "returns-twice function contains runtime-sized automatic storage",
+                ));
+            }
+            if storage.location == StorageLocation::Automatic
+                && !storage
+                    .required_by
+                    .contains(&MemoryResidencyReason::ReturnsTwice)
+            {
+                return Err(IrError::verify(
+                    "automatic storage across a returns-twice call is not memory-resident",
+                ));
+            }
+        }
+    }
+
     let mut definitions = vec![None; function.value_types.len()];
     let mut instruction_ids = vec![false; function.instruction_count as usize];
     for (index, block) in function.blocks.iter().enumerate() {
@@ -730,11 +760,12 @@ impl FunctionVerifier<'_> {
             .map(|value| value_type(self.function, value))
             .transpose()?;
         match &instruction.kind {
-            FullInstructionKind::Constant(_) => {
+            FullInstructionKind::Constant(constant) => {
                 let ty = require_result(result, instruction, "constant")?;
                 if is_aggregate(types, ty.ty) || is_void(types, ty.ty) {
                     return Err(IrError::verify("constant has a non-scalar result type"));
                 }
+                verify_long_double_constant(types, ty.ty, *constant)?;
             }
             FullInstructionKind::AddressConstant { target, .. } => {
                 let ty = require_result(result, instruction, "address constant")?;
@@ -1380,6 +1411,7 @@ impl FunctionVerifier<'_> {
                     result,
                     instruction,
                 )?;
+                self.verify_returns_twice(effects)?;
                 self.verify_noreturn(block, position, effects.no_return)?;
             }
             FullInstructionKind::IndirectCall {
@@ -1402,6 +1434,7 @@ impl FunctionVerifier<'_> {
                     result,
                     instruction,
                 )?;
+                self.verify_returns_twice(effects)?;
                 self.verify_noreturn(block, position, effects.no_return)?;
             }
             FullInstructionKind::AtomicReadModifyWrite {
@@ -1479,6 +1512,67 @@ impl FunctionVerifier<'_> {
             }
             FullInstructionKind::MemoryFence { order: _ } => {
                 require_no_result(result, instruction, "memory fence")?;
+            }
+            FullInstructionKind::CompilerBarrier { memory: _ } => {
+                require_no_result(result, instruction, "compiler barrier")?;
+            }
+            FullInstructionKind::OpaqueScalar { operand } => {
+                let result = require_result(result, instruction, "opaque scalar")?;
+                let operand = self.value_type(*operand)?;
+                if result.ty != operand.ty || !is_pointer_or_integer(types, result.ty) {
+                    return Err(IrError::verify(
+                        "opaque scalar operand and result must have the same integer or pointer type",
+                    ));
+                }
+            }
+            FullInstructionKind::CodeLayoutHint(hint) => {
+                require_no_result(result, instruction, "code layout hint")?;
+                if matches!(hint, super::CodeLayoutHint::AlignToPowerOfTwo(power) if !matches!(power, 3..=6))
+                {
+                    return Err(IrError::verify(
+                        "code alignment hint is outside the certified range",
+                    ));
+                }
+            }
+            FullInstructionKind::X86Cpuid {
+                leaf,
+                subleaf,
+                eax,
+                ebx,
+                ecx,
+                edx,
+            } => {
+                require_no_result(result, instruction, "x86 CPUID")?;
+                if self.value_type(*leaf)?.ty != TypeId::UNSIGNED_INT {
+                    return Err(IrError::verify("CPUID leaf is not unsigned int"));
+                }
+                if let Some(subleaf) = subleaf
+                    && self.value_type(*subleaf)?.ty != TypeId::UNSIGNED_INT
+                {
+                    return Err(IrError::verify("CPUID subleaf is not unsigned int"));
+                }
+                if [eax, ebx, ecx, edx].iter().all(|output| output.is_none()) {
+                    return Err(IrError::verify("CPUID has no retained output"));
+                }
+                for output in [eax, ebx, ecx, edx].into_iter().flatten() {
+                    require_address(
+                        types,
+                        self.value_type(*output)?,
+                        QualifiedType::unqualified(TypeId::UNSIGNED_INT),
+                        "CPUID output",
+                    )?;
+                }
+            }
+            FullInstructionKind::X86Rdtsc { low, high } => {
+                require_no_result(result, instruction, "x86 RDTSC")?;
+                for output in [low, high] {
+                    require_address(
+                        types,
+                        self.value_type(*output)?,
+                        QualifiedType::unqualified(TypeId::UNSIGNED_INT),
+                        "RDTSC output",
+                    )?;
+                }
             }
             FullInstructionKind::VaStart {
                 list,
@@ -1641,6 +1735,22 @@ impl FunctionVerifier<'_> {
             let result = require_result(result, instruction, "call")?;
             if result.ty != signature.result.ty {
                 return Err(IrError::verify("call result has the wrong type"));
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_returns_twice(&self, effects: &CallEffects) -> Result<(), IrError> {
+        if effects.returns_twice {
+            if effects.no_return {
+                return Err(IrError::verify(
+                    "a call cannot be both noreturn and returns-twice",
+                ));
+            }
+            if !effects.reads_memory || !effects.writes_memory {
+                return Err(IrError::verify(
+                    "a returns-twice call must conservatively read and write memory",
+                ));
             }
         }
         Ok(())
@@ -1922,7 +2032,9 @@ fn instruction_operands(kind: &FullInstructionKind) -> Vec<ValueId> {
         | FullInstructionKind::AddressOfFunction { .. }
         | FullInstructionKind::AddressOfString { .. }
         | FullInstructionKind::AddressOfStorage { .. }
-        | FullInstructionKind::MemoryFence { .. } => Vec::new(),
+        | FullInstructionKind::MemoryFence { .. }
+        | FullInstructionKind::CompilerBarrier { .. }
+        | FullInstructionKind::CodeLayoutHint(_) => Vec::new(),
         FullInstructionKind::RuntimeSizedAllocate { extents, .. } => extents.clone(),
         FullInstructionKind::ProjectField { base, .. } => vec![*base],
         FullInstructionKind::PointerOffset { base, index, .. } => vec![*base, *index],
@@ -2000,7 +2112,20 @@ fn instruction_operands(kind: &FullInstructionKind) -> Vec<ValueId> {
         } => vec![*destination, *value, *length],
         FullInstructionKind::Convert { operand, .. }
         | FullInstructionKind::Unary { operand, .. }
-        | FullInstructionKind::IntegerIntrinsic { operand, .. } => vec![*operand],
+        | FullInstructionKind::IntegerIntrinsic { operand, .. }
+        | FullInstructionKind::OpaqueScalar { operand } => vec![*operand],
+        FullInstructionKind::X86Cpuid {
+            leaf,
+            subleaf,
+            eax,
+            ebx,
+            ecx,
+            edx,
+        } => std::iter::once(*leaf)
+            .chain(subleaf.iter().copied())
+            .chain([eax, ebx, ecx, edx].into_iter().filter_map(|value| *value))
+            .collect(),
+        FullInstructionKind::X86Rdtsc { low, high } => vec![*low, *high],
         FullInstructionKind::Prefetch { address, .. } => vec![*address],
         FullInstructionKind::DirectCall { arguments, .. } => arguments.clone(),
         FullInstructionKind::IndirectCall {
@@ -2159,8 +2284,7 @@ fn verify_atomic_object(types: &TypeStore, object: QualifiedType) -> Result<(), 
     if object.qualifiers.contains(TypeQualifiers::CONST) {
         return Err(IrError::verify("atomic operation modifies a const object"));
     }
-    let integer =
-        types.is_integer(object.ty) && types.builtin_type(object.ty) != Some(BuiltinType::Bool);
+    let integer = types.is_integer(object.ty);
     if !integer && pointer_pointee(types, object.ty).is_none() {
         return Err(IrError::verify(
             "atomic operation object is not an integer or pointer",
@@ -2289,6 +2413,32 @@ fn is_aggregate(types: &TypeStore, ty: TypeId) -> bool {
         types.try_kind(ty),
         Some(TypeKind::Array(_) | TypeKind::Record(_))
     )
+}
+
+fn verify_long_double_constant(
+    types: &TypeStore,
+    ty: TypeId,
+    constant: ScalarConstant,
+) -> Result<(), IrError> {
+    let ScalarConstant::LongDouble(value) = constant else {
+        return Ok(());
+    };
+    if types.builtin_type(ty) != Some(BuiltinType::LongDouble) {
+        return Err(IrError::verify(
+            "exact long-double constant has a non-long-double result type",
+        ));
+    }
+    match value.format {
+        ccc_target::LongDoubleFormat::Binary64 => Err(IrError::verify(
+            "binary64 long double must use the native floating constant representation",
+        )),
+        ccc_target::LongDoubleFormat::X87Extended if value.bytes[10..] != [0; 6] => Err(
+            IrError::verify("x87 long-double constant has nonzero ABI padding"),
+        ),
+        ccc_target::LongDoubleFormat::X87Extended | ccc_target::LongDoubleFormat::IeeeBinary128 => {
+            Ok(())
+        }
+    }
 }
 
 fn is_pointer_or_integer(types: &TypeStore, ty: TypeId) -> bool {

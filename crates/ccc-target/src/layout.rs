@@ -7,6 +7,18 @@ pub enum ByteOrder {
     Big,
 }
 
+/// Target representation selected for the C `long double` type.
+///
+/// Storage width alone cannot distinguish the 80-bit x87 value stored in a
+/// 16-byte SysV object from IEEE binary128, so value-producing phases must use
+/// this format rather than infer semantics from `long_double_width`.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum LongDoubleFormat {
+    Binary64,
+    X87Extended,
+    IeeeBinary128,
+}
+
 /// Target scalar categories whose signedness does not affect their layout.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum TargetScalarKind {
@@ -169,6 +181,7 @@ pub struct TargetDataLayout {
     pub double_align: u8,
     pub long_double_width: u8,
     pub long_double_align: u8,
+    pub long_double_format: LongDoubleFormat,
     pub wchar_width: u8,
     pub wchar_is_signed: bool,
     pub wint_width: u8,

@@ -5,7 +5,6 @@ set -euo pipefail
 script_directory=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repository=$(cd "$script_directory/../.." && pwd)
 manifest="$script_directory/manifest.toml"
-source "$script_directory/source-adjustment.sh"
 source "$repository/test-corpus/adapter-environment.sh"
 
 manifest_string() {
@@ -104,7 +103,7 @@ verify_pie_executable() {
   fi
 }
 
-require_adjusted_count() {
+require_source_count() {
   local artifact=$1
   local label=$2
   local expected=$3
@@ -115,10 +114,10 @@ require_adjusted_count() {
   actual=$(grep -Fc -- "$pattern" "$file" || true)
   printf '%s=%s\n' "$label" "$actual" >>"$artifact"
   [[ "$actual" == "$expected" ]] ||
-    die "Redis source adjustment has unexpected $label count: expected $expected, found $actual"
+    die "Redis source surface has unexpected $label count: expected $expected, found $actual"
 }
 
-require_adjusted_regex_count() {
+require_source_regex_count() {
   local artifact=$1
   local label=$2
   local expected=$3
@@ -129,7 +128,7 @@ require_adjusted_regex_count() {
   actual=$(grep -Ec -- "$pattern" "$file" || true)
   printf '%s=%s\n' "$label" "$actual" >>"$artifact"
   [[ "$actual" == "$expected" ]] ||
-    die "Redis source adjustment has unexpected $label count: expected $expected, found $actual"
+    die "Redis source surface has unexpected $label count: expected $expected, found $actual"
 }
 
 expanded_builtin_count() {
@@ -216,12 +215,9 @@ done
   die "Redis execution validation must run as a non-root user"
 
 for tool in ar awk basename cmp cp dirname find gcc grep id make mkdir mktemp mv \
-  openssl patch ranlib readelf rm sed sleep sort tar tee tr uname wc; do
+  openssl ranlib readelf rm sed sleep sort tar tee tr uname wc; do
   require_tool "$tool"
 done
-patch_identity=$(patch --version 2>&1) || die "unable to identify the patch implementation"
-printf '%s\n' "$patch_identity" | grep -Fq 'GNU patch' ||
-  die "Redis source adjustment requires GNU patch"
 
 version=$(manifest_string version)
 origin=$(manifest_string origin)
@@ -231,16 +227,9 @@ expected_sha256=$(manifest_string archive_sha256)
 expected_sha3=$(manifest_string archive_sha3_256)
 expected_translation_units=$(manifest_integer source_translation_units)
 expected_native_links=$(manifest_integer native_link_commands)
-expected_adjustment_targets=$(manifest_integer source_adjustment_targets)
-expected_xxhash_noop_definitions=$(manifest_integer source_adjustment_xxhash_ccc_noop_definitions)
-expected_xxhash_guard_call_sites=$(manifest_integer source_adjustment_xxhash_guard_call_sites)
-expected_xxhash_clang_guard_call_sites=$(manifest_integer source_adjustment_xxhash_clang_neon_guard_call_sites)
-expected_xxhash_guard_expansions=$(manifest_integer source_adjustment_xxhash_selected_guard_expansions)
-adjustment_name=$(manifest_string source_adjustment_patch)
-adjustment_sha256=$(manifest_string source_adjustment_sha256)
-adjustment_hash_name=$(manifest_string source_adjustment_hashes)
-adjustment_hash_sha256=$(manifest_string source_adjustment_hashes_sha256)
-adjustment_rationale=$(manifest_string source_adjustment_rationale)
+expected_inline_assembly_statements=$(manifest_integer expanded_inline_assembly_statements)
+expected_hdr_inline_assembly_statements=$(manifest_integer expanded_inline_assembly_hdr_statements)
+expected_xxhash_guard_expansions=$(manifest_integer expanded_inline_assembly_xxhash_guards)
 
 if [[ -z "$work_directory" ]]; then
   work_directory=$(mktemp -d "${TMPDIR:-/tmp}/ccc-redis-$version.XXXXXX")
@@ -257,7 +246,6 @@ else
   mkdir -p "$work_directory"
 fi
 work_directory=$(absolute_directory "$work_directory")
-printf '%s\n' "$patch_identity" >"$work_directory/patch-identity.txt"
 
 if [[ -z "$archive" ]]; then
   cache_directory=${XDG_CACHE_HOME:-${HOME:?HOME must be set}/.cache}/ccc/corpus/redis
@@ -285,67 +273,50 @@ grep -Fq 'Redis Source Available License 2.0' "$source_directory/LICENSE.txt" ||
 grep -Fq 'Server Side Public License' "$source_directory/LICENSE.txt" ||
   die "Redis source license does not contain the pinned SSPL option"
 
-apply_redis_source_adjustment \
-  "$source_directory" \
-  "$work_directory" \
-  "$script_directory/$adjustment_name" \
-  "$adjustment_sha256" \
-  "$script_directory/$adjustment_hash_name" \
-  "$adjustment_hash_sha256" \
-  "$adjustment_rationale"
-
-actual_adjustment_targets=$(grep -Evc '^[[:space:]]*(#|$)' \
-  "$script_directory/$adjustment_hash_name")
-[[ "$actual_adjustment_targets" == "$expected_adjustment_targets" ]] ||
-  die "Redis source-adjustment inventory has $actual_adjustment_targets targets; expected $expected_adjustment_targets"
-
-adjustment_audit="$work_directory/source-adjustment-audit.txt"
-: >"$adjustment_audit"
-require_adjusted_count "$adjustment_audit" upstream_statement_expression_cas_uses 1 \
+source_surface_audit="$work_directory/source-surface-audit.txt"
+: >"$source_surface_audit"
+require_source_count "$source_surface_audit" upstream_statement_expression_cas_uses 1 \
   'atomicCompareExchange(size_t, zmalloc_peak' "$source_directory/src/zmalloc.c"
-require_adjusted_count "$adjustment_audit" replacement_peak_cas_helper_references 0 \
+require_source_count "$source_surface_audit" replacement_peak_cas_helper_references 0 \
   'zmalloc_compare_exchange_peak(' "$source_directory/src/zmalloc.c"
-require_adjusted_count "$adjustment_audit" histogram_val_cas_uses 3 \
-  '__sync_val_compare_and_swap' "$source_directory/deps/hdr_histogram/hdr_atomic.h"
-require_adjusted_count "$adjustment_audit" histogram_exchange_uses 3 \
-  '__sync_lock_test_and_set' "$source_directory/deps/hdr_histogram/hdr_atomic.h"
-require_adjusted_count "$adjustment_audit" histogram_inline_assembly_uses 0 \
+require_source_count "$source_surface_audit" histogram_inline_assembly_uses \
+  "$expected_hdr_inline_assembly_statements" \
   'asm volatile' "$source_directory/deps/hdr_histogram/hdr_atomic.h"
-require_adjusted_count "$adjustment_audit" hiredis_binary64_finite_checks 0 \
+require_source_count "$source_surface_audit" histogram_compiler_barriers 2 \
+  'asm volatile ("" ::: "memory")' "$source_directory/deps/hdr_histogram/hdr_atomic.h"
+require_source_count "$source_surface_audit" histogram_locked_exchanges 3 \
+  'lock; xchgq' "$source_directory/deps/hdr_histogram/hdr_atomic.h"
+require_source_count "$source_surface_audit" histogram_locked_compare_exchanges 1 \
+  'lock; cmpxchgq' "$source_directory/deps/hdr_histogram/hdr_atomic.h"
+require_source_count "$source_surface_audit" hiredis_binary64_finite_checks 0 \
   'd >= -DBL_MAX && d <= DBL_MAX' "$source_directory/deps/hiredis/read.c"
-require_adjusted_count "$adjustment_audit" hiredis_generic_finite_checks 1 \
+require_source_count "$source_surface_audit" hiredis_generic_finite_checks 1 \
   'isfinite(d)' "$source_directory/deps/hiredis/read.c"
-require_adjusted_count "$adjustment_audit" lua_cjson_binary64_inf_calls 0 \
+require_source_count "$source_surface_audit" lua_cjson_binary64_inf_calls 0 \
   'json_is_inf(num)' "$source_directory/deps/lua/src/lua_cjson.c"
-require_adjusted_count "$adjustment_audit" lua_cjson_binary64_nan_calls 0 \
+require_source_count "$source_surface_audit" lua_cjson_binary64_nan_calls 0 \
   'json_is_nan(num)' "$source_directory/deps/lua/src/lua_cjson.c"
-require_adjusted_count "$adjustment_audit" lua_cjson_generic_inf_calls 2 \
+require_source_count "$source_surface_audit" lua_cjson_generic_inf_calls 2 \
   'isinf(num)' "$source_directory/deps/lua/src/lua_cjson.c"
-require_adjusted_count "$adjustment_audit" lua_cjson_generic_nan_calls 3 \
+require_source_count "$source_surface_audit" lua_cjson_generic_nan_calls 3 \
   'isnan(num)' "$source_directory/deps/lua/src/lua_cjson.c"
-require_adjusted_count "$adjustment_audit" lua_cmsgpack_binary64_inf_calls 0 \
+require_source_count "$source_surface_audit" lua_cmsgpack_binary64_inf_calls 0 \
   'cmsgpack_is_inf(x)' "$source_directory/deps/lua/src/lua_cmsgpack.c"
-require_adjusted_count "$adjustment_audit" lua_cmsgpack_generic_inf_calls 1 \
+require_source_count "$source_surface_audit" lua_cmsgpack_generic_inf_calls 1 \
   'isinf(x)' "$source_directory/deps/lua/src/lua_cmsgpack.c"
-require_adjusted_count "$adjustment_audit" xxhash_ccc_noop_definitions \
-  "$expected_xxhash_noop_definitions" \
-  '#  define XXH_COMPILER_GUARD(var) ((void)sizeof("ccc-xxhash-compiler-guard-noop"))' \
-  "$source_directory/deps/xxhash/xxhash.h"
-require_adjusted_regex_count "$adjustment_audit" xxhash_ordinary_guard_call_sites \
-  "$expected_xxhash_guard_call_sites" \
+require_source_regex_count "$source_surface_audit" xxhash_ordinary_guard_call_sites 9 \
   '^[[:space:]]+XXH_COMPILER_GUARD\(' \
   "$source_directory/deps/xxhash/xxhash.h"
-require_adjusted_regex_count "$adjustment_audit" xxhash_clang_neon_guard_call_sites \
-  "$expected_xxhash_clang_guard_call_sites" \
+require_source_regex_count "$source_surface_audit" xxhash_clang_neon_guard_call_sites 3 \
   '^[[:space:]]+XXH_COMPILER_GUARD_CLANG_NEON\(' \
   "$source_directory/deps/xxhash/xxhash.h"
-require_adjusted_count "$adjustment_audit" xxhash_gnu_guard_definitions 1 \
+require_source_count "$source_surface_audit" xxhash_gnu_guard_definitions 1 \
   '#  define XXH_COMPILER_GUARD(var) __asm__("" : "+r" (var))' \
   "$source_directory/deps/xxhash/xxhash.h"
-require_adjusted_count "$adjustment_audit" xxhash_upstream_noop_guard_definitions 1 \
+require_source_count "$source_surface_audit" xxhash_upstream_noop_guard_definitions 1 \
   '#  define XXH_COMPILER_GUARD(var) ((void)0)' \
   "$source_directory/deps/xxhash/xxhash.h"
-printf '%s\n' 'binary64_classification_calls_rewritten=0' >>"$adjustment_audit"
+printf '%s\n' 'binary64_classification_calls_rewritten=0' >>"$source_surface_audit"
 
 : "${CCC:=$repository/target/debug/ccc}"
 : "${CCC_RESOURCE_DIR:=$repository/resource-dir}"
@@ -409,7 +380,7 @@ done
     'assertions=enabled-with-system-hosted-header' \
     'c11-atomics=unavailable' \
     'dynamic-stack-storage=none' \
-    'inline-assembly=none-after-source-adjustment' \
+    'inline-assembly=certified-upstream-forms' \
     'lto=disabled' \
     'module-bundle=excluded' \
     'systemd=disabled' \
@@ -566,19 +537,15 @@ expanded_builtin_occurrences="$work_directory/expanded-builtin-occurrences.txt"
 expanded_builtins="$work_directory/expanded-builtins.txt"
 inline_assembly_occurrences="$work_directory/inline-assembly-occurrences.txt"
 inline_assembly_inventory="$work_directory/inline-assembly-inventory.txt"
-xxhash_guard_markers="$work_directory/xxhash-guard-markers.txt"
 xxhash_guard_identifiers="$work_directory/xxhash-guard-identifiers.txt"
 : >"$expanded_builtin_occurrences"
 : >"$inline_assembly_occurrences"
-: >"$xxhash_guard_markers"
 : >"$xxhash_guard_identifiers"
 while IFS= read -r -d '' preprocessed_input; do
   grep -Eo '__builtin_[[:alnum:]_]+|__sync_[[:alnum:]_]+' "$preprocessed_input" \
     >>"$expanded_builtin_occurrences" || true
   grep -HEn '(^|[^[:alnum:]_])(__asm__|__asm|asm)[[:space:]]*(volatile[[:space:]]*)?\(' \
     "$preprocessed_input" >>"$inline_assembly_occurrences" || true
-  grep -Fo 'ccc-xxhash-compiler-guard-noop' "$preprocessed_input" \
-    >>"$xxhash_guard_markers" || true
   grep -Eo 'XXH_COMPILER_GUARD(_CLANG_NEON)?' "$preprocessed_input" \
     >>"$xxhash_guard_identifiers" || true
 done < <(find "$CCC_REDIS_PREPROCESS_DIR" -type f -name '*.i' -print0)
@@ -590,22 +557,33 @@ LC_ALL=C sort "$expanded_builtin_occurrences" |
     END { if (NR != 0) print name "=" count }
   ' >"$expanded_builtins"
 rm -f -- "$expanded_builtin_occurrences"
-if [[ -s "$inline_assembly_occurrences" ]]; then
-  mv "$inline_assembly_occurrences" "$inline_assembly_inventory"
-  die "Redis preprocessing capture selected inline assembly"
-fi
-actual_xxhash_guard_expansions=$(wc -l <"$xxhash_guard_markers" | tr -d '[:space:]')
-[[ "$actual_xxhash_guard_expansions" == "$expected_xxhash_guard_expansions" ]] ||
-  die "Redis expanded the xxHash CCC guard $actual_xxhash_guard_expansions times; expected $expected_xxhash_guard_expansions"
 [[ ! -s "$xxhash_guard_identifiers" ]] ||
   die "Redis preprocessing left an unexpanded xxHash compiler guard"
+actual_inline_assembly_statements=$(wc -l <"$inline_assembly_occurrences" | tr -d '[:space:]')
+actual_compiler_barriers=$(grep -Ec '"memory"' "$inline_assembly_occurrences" || true)
+actual_atomic_exchanges=$(grep -Ec '(^|[^[:alnum:]_])xchgq' "$inline_assembly_occurrences" || true)
+actual_atomic_compare_exchanges=$(grep -Fc 'cmpxchgq' "$inline_assembly_occurrences" || true)
+actual_xxhash_guard_expansions=$(grep -Fc '"+r"' "$inline_assembly_occurrences" || true)
+[[ "$actual_inline_assembly_statements" == "$expected_inline_assembly_statements" ]] ||
+  die "Redis expanded $actual_inline_assembly_statements inline assembly statements; expected $expected_inline_assembly_statements"
+[[ "$actual_compiler_barriers" == 2 ]] ||
+  die "Redis expanded $actual_compiler_barriers compiler barriers; expected 2"
+[[ "$actual_atomic_exchanges" == 3 ]] ||
+  die "Redis expanded $actual_atomic_exchanges atomic exchanges; expected 3"
+[[ "$actual_atomic_compare_exchanges" == 1 ]] ||
+  die "Redis expanded $actual_atomic_compare_exchanges compare-exchanges; expected 1"
+[[ "$actual_xxhash_guard_expansions" == "$expected_xxhash_guard_expansions" ]] ||
+  die "Redis expanded the xxHash compiler guard $actual_xxhash_guard_expansions times; expected $expected_xxhash_guard_expansions"
 {
-  printf '%s\n' 'expanded_inline_assembly_forms=0'
-  printf 'xxhash_ccc_noop_guard_expansions=%s\n' "$actual_xxhash_guard_expansions"
+  printf 'expanded_inline_assembly_forms=%s\n' "$actual_inline_assembly_statements"
+  printf 'compiler_memory_barriers=%s\n' "$actual_compiler_barriers"
+  printf 'x86_locked_exchanges=%s\n' "$actual_atomic_exchanges"
+  printf 'x86_locked_compare_exchanges=%s\n' "$actual_atomic_compare_exchanges"
+  printf 'empty_read_write_register_guards=%s\n' "$actual_xxhash_guard_expansions"
   printf '%s\n' 'xxhash_unexpanded_guard_identifiers=0'
 } >"$inline_assembly_inventory"
 rm -f -- "$inline_assembly_occurrences"
-rm -f -- "$xxhash_guard_markers" "$xxhash_guard_identifiers"
+rm -f -- "$xxhash_guard_identifiers"
 
 for builtin in \
   __builtin_bswap64 \

@@ -9,6 +9,8 @@ use ccc_pp::{
 };
 use ccc_session::SourceMap;
 
+use crate::warnings::WarningPolicy;
+
 #[derive(Clone, Debug)]
 struct PendingDiagnostic {
     diagnostic: PpDiagnostic,
@@ -28,31 +30,17 @@ pub(crate) struct PreprocessorDiagnostics {
 }
 
 impl PreprocessorDiagnostics {
-    pub(crate) fn new(warning_options: &[String]) -> Self {
+    pub(crate) fn new(warning_policy: &WarningPolicy) -> Self {
         let mut diagnostics = Self {
             diagnostics: Vec::new(),
             warning_levels: HashMap::new(),
             warning_stack: Vec::new(),
             raw_errors: 0,
         };
-        for option in warning_options {
-            diagnostics.apply_command_line_option(option);
+        for category in ["cpp", "trigraphs", "macro-redefined", "unknown-pragmas"] {
+            diagnostics.set_level(category, warning_policy.level(category));
         }
         diagnostics
-    }
-
-    fn apply_command_line_option(&mut self, option: &str) {
-        if let Some(category) = option.strip_prefix("-Werror=") {
-            self.set_level(category, WarningLevel::Error);
-        } else if let Some(category) = option.strip_prefix("-Wno-error=") {
-            self.set_level(category, WarningLevel::Warning);
-        } else if let Some(category) = option.strip_prefix("-Wno-") {
-            self.set_level(category, WarningLevel::Ignored);
-        } else if let Some(category) = option.strip_prefix("-W")
-            && !category.is_empty()
-        {
-            self.set_level(category, WarningLevel::Warning);
-        }
     }
 
     fn set_level(&mut self, category: &str, level: WarningLevel) {
@@ -204,7 +192,8 @@ mod tests {
 
     #[test]
     fn captures_source_ordered_diagnostic_pragma_state() {
-        let mut sink = PreprocessorDiagnostics::new(&[]);
+        let policy = WarningPolicy::new(false, false, &[]);
+        let mut sink = PreprocessorDiagnostics::new(&policy);
         sink.handle_pragma(&PragmaEvent::Diagnostic {
             action: DiagnosticPragmaAction::Push,
             option: None,

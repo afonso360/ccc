@@ -8,18 +8,30 @@ evidence.
 For Ubuntu 24.04, install:
 
 ```text
-sudo apt-get install gcc g++ clang cmake make m4 tcl-dev zlib1g-dev pkg-config binutils gdb coreutils curl openssl
+sudo apt-get install gcc g++ clang cmake make m4 tcl-dev zlib1g-dev pkg-config binutils gdb coreutils curl diffutils file findutils git openssl patch tar unzip
 ```
 
 The resulting environment must provide these commands:
 
 ```text
-curl gcc clang make tclsh pkg-config objdump readelf gdb objcopy timeout
+ar awk basename cat cc chmod cmp cp curl dd diff dirname file find gcc clang git
+grep id ln make md5sum mkdir mkfifo mktemp mv nm ranlib tclsh pkg-config
+objdump readelf gdb objcopy openssl patch rm sed sha256sum sort stat tail tar tee
+timeout touch tr uname unzip wc
 ```
 
 Both `pkg-config --exists tcl` and `pkg-config --exists zlib` must succeed. The
 workflow records compiler targets and versions plus Make, Tcl, and zlib versions
-before running any native ABI or corpus test.
+before running any native ABI or corpus test. The native job executes the
+pinned SQLite default suite, bzip2 extended profile, and zstd bounded upstream
+check directly; their archive, checksum, file, FIFO, permission, Tcl, and zlib
+probes are required rather than opportunistic.
+
+The native x86-64 job also builds the pinned Berkeley SoftFloat and TestFloat
+3e archives in disposable storage. TestFloat links a CCC-compiled subject
+object for extended-precision operations and keeps SoftFloat confined to the
+independent verifier. Missing tools, archives, hashes, licenses, or generated
+test groups are hard failures.
 
 The manually dispatched Csmith workflow additionally requires `g++`, `cmake`,
 `m4`, `objcopy`, `openssl`, and `tar`. It builds a cryptographically verified
@@ -55,10 +67,10 @@ its QEMU gdbstub ports and package state.
 ## Darwin arm64 target runner
 
 The native Darwin job requires an Apple-silicon host with `xcrun`, Apple Clang,
-the macOS SDK, `nmedit`, LLDB, `otool`, `nm`, and `dwarfdump`. Mach-O generated
-symbols are localized with the Command Line Tools' native `nmedit`; LLVM
-`objcopy` is not part of this profile. The job records the Command Line Tools
-build, SDK version, Apple Clang version and target, linker and `nmedit`
-identities, and deployment target. The recorded identities are compared with
-the Darwin evidence manifest before tests run. A non-arm64 host or a missing
-native tool is a hard failure for the required job.
+the macOS SDK, `nmedit`, `dsymutil`, LLDB, `otool`, `nm`, and `dwarfdump`.
+Mach-O generated symbols are localized with the Command Line Tools' native
+`nmedit`; LLVM `objcopy` is not part of this profile. The job records the
+Command Line Tools build, SDK version, Apple Clang version and target, linker,
+`nmedit`, and `dsymutil` identities, and the deployment target. The recorded
+identities are compared with the Darwin evidence manifest before tests run. A
+non-arm64 host or a missing native tool is a hard failure for the required job.

@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use object::{Object as _, ObjectSymbol as _};
+
 static TEST_ID: AtomicU64 = AtomicU64::new(0);
 
 struct TestDirectory {
@@ -813,13 +815,62 @@ fn warning_controls_promote_and_suppress_preprocessor_warnings() {
     assert!(promoted.stderr.contains("error"), "{}", promoted.stderr);
 
     let mut command = directory.command();
-    command.args(["-E", "-P", "-nostdinc", "-w"]).arg(source);
+    command.args(["-E", "-P", "-nostdinc", "-w"]).arg(&source);
     let suppressed = run(command);
     suppressed.assert_success();
     assert!(
         !suppressed.stderr.contains("intentional warning"),
         "{}",
         suppressed.stderr
+    );
+
+    for arguments in [
+        vec!["-Wno-cpp", "-Wcpp"],
+        vec!["-Werror", "-Wno-error=cpp"],
+        vec!["-Wno-error=cpp", "-Werror"],
+    ] {
+        let mut command = directory.command();
+        command
+            .args(["-E", "-P", "-nostdinc"])
+            .args(&arguments)
+            .arg(&source);
+        let demoted = run(command);
+        demoted.assert_success();
+        assert!(
+            demoted.stderr.contains("intentional warning"),
+            "{arguments:?}: {}",
+            demoted.stderr
+        );
+    }
+
+    for arguments in [
+        vec!["-Wcpp", "-Wno-cpp"],
+        vec!["-Wno-cpp", "-Wno-error=cpp"],
+    ] {
+        let mut command = directory.command();
+        command
+            .args(["-E", "-P", "-nostdinc"])
+            .args(&arguments)
+            .arg(&source);
+        let category_suppressed = run(command);
+        category_suppressed.assert_success();
+        assert!(
+            !category_suppressed.stderr.contains("intentional warning"),
+            "{arguments:?}: {}",
+            category_suppressed.stderr
+        );
+    }
+
+    let mut command = directory.command();
+    command
+        .args(["-E", "-P", "-nostdinc", "-Werror=cpp"])
+        .arg(source);
+    let category_promoted = run(command);
+    category_promoted.assert_failure();
+    assert!(
+        category_promoted.stderr.contains("intentional warning"),
+        "{}",
+        category_promoted.stderr
     );
 }
 
@@ -1462,6 +1513,35 @@ fn recompiles_saved_preprocessor_output_with_numeric_linemarkers() {
 }
 
 #[test]
+fn preprocessed_c_inputs_are_not_macro_expanded_again() {
+    let directory = TestDirectory::new("preprocessed-c-language");
+    for (name, language) in [
+        ("implicit.i", None),
+        ("extensionless", Some("c-cpp-output")),
+    ] {
+        let source = directory.write(name, "int SELECTED(void) { return 42; }\n");
+        let object_path = directory.path(format!("{name}.o"));
+        let mut command = directory.command();
+        command.args(["-c", "-nostdinc", "-DSELECTED=reexpanded"]);
+        if let Some(language) = language {
+            command.args(["-x", language]);
+        }
+        command.arg(&source).arg("-o").arg(&object_path);
+        let compiled = run(command);
+        compiled.assert_success();
+
+        let bytes = fs::read(&object_path).unwrap();
+        let object = object::File::parse(bytes.as_slice()).unwrap();
+        let symbols = object
+            .symbols()
+            .filter_map(|symbol| symbol.name().ok())
+            .collect::<Vec<_>>();
+        assert!(symbols.contains(&"SELECTED"), "{name}: {symbols:?}");
+        assert!(!symbols.contains(&"reexpanded"), "{name}: {symbols:?}");
+    }
+}
+
+#[test]
 fn stringization_preserves_one_separator_between_argument_tokens() {
     let directory = TestDirectory::new("exact-stringization");
     let source = directory.write(
@@ -1782,6 +1862,36 @@ fn language_mode_controls_default_trigraph_conversion() {
 }
 
 #[test]
+fn c99_build_profile_aliases_retain_the_c11_macro_identity() {
+    let directory = TestDirectory::new("c99-alias-macro-identity");
+    let source = directory.write("identity.c", "int identity;\n");
+
+    for (mode, strict) in [("-std=gnu99", false), ("-std=c99", true)] {
+        let mut command = directory.command();
+        command.args(["-dM", "-E", "-nostdinc", mode]).arg(&source);
+        let macros = run(command);
+        macros.assert_success();
+        assert!(
+            macros
+                .stdout
+                .lines()
+                .any(|line| line == "#define __STDC_VERSION__ 201112L"),
+            "{mode}: {}",
+            macros.stdout
+        );
+        assert_eq!(
+            macros
+                .stdout
+                .lines()
+                .any(|line| line == "#define __STRICT_ANSI__ 1"),
+            strict,
+            "{mode}: {}",
+            macros.stdout
+        );
+    }
+}
+
+#[test]
 fn discovers_and_preprocesses_compiler_resource_headers() {
     let directory = TestDirectory::new("compiler-resource-headers");
     let source = directory.write(
@@ -1816,6 +1926,45 @@ fn discovers_and_preprocesses_compiler_resource_headers() {
         "{output}"
     );
     assert!(output.contains("intresource_false=0;"), "{output}");
+}
+
+#[test]
+fn stdatomic_resource_header_exposes_native_scalar_operations_without_overclaiming() {
+    let directory = TestDirectory::new("stdatomic-resource-header");
+    let source = directory.write(
+        "stdatomic.c",
+        concat!(
+            "#include <stdatomic.h>\n",
+            "#ifndef __STDC_NO_ATOMICS__\n",
+            "#error partial scalar atomics must not claim every atomic type\n",
+            "#endif\n",
+            "#if !__has_builtin(__atomic_load_n)\n",
+            "#error scalar atomic load builtin is unavailable\n",
+            "#endif\n",
+            "atomic_int value = ATOMIC_VAR_INIT(3);\n",
+            "int read(void) { return atomic_load_explicit(&value, memory_order_relaxed); }\n",
+            "int lock_free = ATOMIC_INT_LOCK_FREE;\n",
+        ),
+    );
+    let resources = repository_fixture("resource-dir");
+
+    let mut command = directory.host_command();
+    command
+        .args(["-E", "-P", "-resource-dir"])
+        .arg(resources)
+        .arg(source);
+    let result = run(command);
+    result.assert_success();
+    let output = squash_whitespace(&result.stdout);
+    assert!(
+        output.contains("typedef_Atomic(int)atomic_int;"),
+        "{output}"
+    );
+    assert!(
+        output.contains("return__atomic_load_n((&value),(memory_order_relaxed));"),
+        "{output}"
+    );
+    assert!(output.contains("intlock_free=2;"), "{output}");
 }
 
 #[test]

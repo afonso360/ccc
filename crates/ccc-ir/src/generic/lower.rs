@@ -3,13 +3,15 @@ use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use ccc_pp::StringLiteralPrefix;
 use ccc_sema::generic::{
     AccessSemantics, AtomicReadModifyWriteOperation as TypedAtomicReadModifyWriteOperation,
-    BitfieldPlace, CompoundAssignmentPlan, ConstantValue, ConversionKind, FullFunctionId,
-    FullLocalId, FullTypedBlockItem, FullTypedExpression, FullTypedExpressionKind,
-    FullTypedForInitializer, FullTypedFunction, FullTypedInitializer, FullTypedInitializerKind,
+    BitfieldPlace, CodeLayoutHint as TypedCodeLayoutHint, CompoundAssignmentPlan, ConstantValue,
+    ConversionKind, FullFunctionId, FullLocalId, FullTypedBlockItem, FullTypedExpression,
+    FullTypedExpressionKind, FullTypedForInitializer, FullTypedFunction, FullTypedInitializer,
+    FullTypedInitializerKind, FullTypedInlineAsm, FullTypedInlineAsmKind,
     FullTypedLocalDeclaration, FullTypedStatement, FullTypedStatementKind,
     FullTypedTranslationUnit, GlobalId, InitializerPathElement,
     IntegerIntrinsicOperation as TypedIntegerIntrinsicOperation, LabelId, Linkage,
     MemoryOrder as TypedMemoryOrder, Place, PlaceBase, StorageDuration, StringId, SymbolReference,
+    X86CpuidRegister,
 };
 use ccc_session::Span;
 use ccc_syntax::frontend::{
@@ -22,10 +24,10 @@ use ccc_types::{
 
 use super::{
     AggregateOverlap, AggregateProjection, AtomicReadModifyWriteOperation, BinaryOperation,
-    BitfieldDescriptor, BlockId, CallEffects, DataId, DataOrigin, FullBlock, FullEdge,
-    FullFunction, FullGlobal, FullInstruction, FullInstructionKind, FullModule, FullParameter,
-    FullStorage, FullString, FullTerminator, InitializerEdge, InitializerGraph, InitializerNode,
-    InitializerNodeId, InitializerNodeKind, InitializerPath, InstructionId,
+    BitfieldDescriptor, BlockId, CallEffects, CodeLayoutHint, DataId, DataOrigin, FullBlock,
+    FullEdge, FullFunction, FullGlobal, FullInstruction, FullInstructionKind, FullModule,
+    FullParameter, FullStorage, FullString, FullTerminator, InitializerEdge, InitializerGraph,
+    InitializerNode, InitializerNodeId, InitializerNodeKind, InitializerPath, InstructionId,
     IntegerIntrinsicOperation, IrError, MemoryAccess, MemoryOrder, MemoryResidencyReason,
     RelocationKind, RelocationTarget, ScalarConstant, ScalarConversion, StorageId, StorageLocation,
     StringEncoding, SwitchEdge, UnaryOperation, ValueId,
@@ -230,6 +232,7 @@ fn collect_static_declarations_in_statement<'a>(
         S::Expression(_)
         | S::Goto { .. }
         | S::ComputedGoto(_)
+        | S::InlineAsm(_)
         | S::Continue
         | S::Break
         | S::Return(_) => {}
@@ -401,6 +404,9 @@ fn constant_initializer(
         ConstantValue::Floating(value) => {
             InitializerNodeKind::Scalar(ScalarConstant::Floating(value))
         }
+        ConstantValue::LongDouble(value) => {
+            InitializerNodeKind::Scalar(ScalarConstant::LongDouble(value))
+        }
         ConstantValue::NullPointer => InitializerNodeKind::Scalar(ScalarConstant::NullPointer),
         ConstantValue::Address(address) => {
             let (target, kind) = match address.base {
@@ -565,7 +571,12 @@ fn contains_computed_goto(statement: &FullTypedStatement) -> bool {
                     .as_deref()
                     .is_some_and(contains_computed_goto)
         }
-        S::Expression(_) | S::Goto { .. } | S::Continue | S::Break | S::Return(_) => false,
+        S::Expression(_)
+        | S::InlineAsm(_)
+        | S::Goto { .. }
+        | S::Continue
+        | S::Break
+        | S::Return(_) => false,
     }
 }
 
@@ -587,6 +598,9 @@ fn make_local_fact(
     }
     if is_aggregate(types, ty.ty) {
         reasons.insert(MemoryResidencyReason::Aggregate);
+    }
+    if types.builtin_type(ty.ty) == Some(BuiltinType::LongDouble) {
+        reasons.insert(MemoryResidencyReason::AddressBackedScalar);
     }
     if variably_modified(types, ty.ty, &mut HashSet::new()) {
         reasons.insert(MemoryResidencyReason::VariablyModified);
@@ -725,6 +739,11 @@ fn collect_automatic_local_facts(
         }
         S::ComputedGoto(expression) => {
             collect_automatic_local_facts_in_expression(expression, types, facts);
+        }
+        S::InlineAsm(asm) => {
+            for expression in inline_asm_expressions(asm) {
+                collect_automatic_local_facts_in_expression(expression, types, facts);
+            }
         }
         S::Return(expression) => {
             if let Some(expression) = expression {
@@ -869,6 +888,13 @@ fn collect_automatic_local_facts_in_expression(
         }
         E::Prefetch { address, .. } => {
             collect_automatic_local_facts_in_expression(address, types, facts);
+        }
+        E::AtomicLoad { pointer, .. } => {
+            collect_automatic_local_facts_in_expression(pointer, types, facts);
+        }
+        E::AtomicStore { pointer, value, .. } => {
+            collect_automatic_local_facts_in_expression(pointer, types, facts);
+            collect_automatic_local_facts_in_expression(value, types, facts);
         }
         E::AtomicReadModifyWrite {
             pointer, operand, ..
@@ -1090,6 +1116,16 @@ fn scan_statement_for_address_taken(
             }
         }
         S::ComputedGoto(expression) => scan_expression_for_address_taken(expression, types, facts),
+        S::InlineAsm(asm) => {
+            for expression in inline_asm_expressions(asm) {
+                scan_expression_for_address_taken(expression, types, facts);
+            }
+            for output in inline_asm_outputs(asm) {
+                if let Some(place) = &output.place {
+                    mark_place_address_taken(place, facts);
+                }
+            }
+        }
         S::Goto { .. } | S::Continue | S::Break => {}
     }
 }
@@ -1228,6 +1264,13 @@ fn scan_expression_for_address_taken(
         }
         E::Prefetch { address, .. } => {
             scan_expression_for_address_taken(address, types, facts);
+        }
+        E::AtomicLoad { pointer, .. } => {
+            scan_expression_for_address_taken(pointer, types, facts);
+        }
+        E::AtomicStore { pointer, value, .. } => {
+            scan_expression_for_address_taken(pointer, types, facts);
+            scan_expression_for_address_taken(value, types, facts);
         }
         E::AtomicReadModifyWrite {
             pointer, operand, ..
@@ -1528,7 +1571,38 @@ impl<'a> FunctionBuilder<'a> {
                 block.terminator = Some(FullTerminator::Unreachable);
             }
         }
-        promote_scalar_locals(&mut builder.function, builder.types)?;
+        if let Some(span) = returns_twice_call_span(&builder.function) {
+            if builder
+                .function
+                .storage
+                .iter()
+                .any(|storage| storage.location == StorageLocation::RuntimeSized)
+            {
+                return Err(IrError::lower(
+                    LOWERING_ERROR,
+                    span,
+                    "a returns-twice call cannot be combined with runtime-sized automatic storage",
+                ));
+            }
+
+            // A second return resumes the machine state captured by the first
+            // call. Keep every automatic object in stable stack storage so the
+            // resumed execution observes memory, rather than an SSA value from
+            // the first path through the call.
+            for storage in &mut builder.function.storage {
+                if storage.location == StorageLocation::Automatic
+                    && !storage
+                        .required_by
+                        .contains(&MemoryResidencyReason::ReturnsTwice)
+                {
+                    storage
+                        .required_by
+                        .push(MemoryResidencyReason::ReturnsTwice);
+                }
+            }
+        } else {
+            promote_scalar_locals(&mut builder.function, builder.types)?;
+        }
         Ok(builder.function)
     }
 
@@ -1737,6 +1811,19 @@ impl<'a> FunctionBuilder<'a> {
         };
         self.emit_result(kind, result_ty, span)
     }
+}
+
+fn returns_twice_call_span(function: &FullFunction) -> Option<Span> {
+    function.blocks.iter().find_map(|block| {
+        block.instructions.iter().find_map(|instruction| {
+            let returns_twice = match &instruction.kind {
+                FullInstructionKind::DirectCall { effects, .. }
+                | FullInstructionKind::IndirectCall { effects, .. } => effects.returns_twice,
+                _ => false,
+            };
+            returns_twice.then_some(instruction.span)
+        })
+    })
 }
 
 /// Promotes automatic scalar objects that do not require an address to SSA.
@@ -2078,7 +2165,9 @@ fn remap_instruction_values(
         | FullInstructionKind::AddressOfFunction { .. }
         | FullInstructionKind::AddressOfString { .. }
         | FullInstructionKind::AddressOfStorage { .. }
-        | FullInstructionKind::MemoryFence { .. } => {}
+        | FullInstructionKind::MemoryFence { .. }
+        | FullInstructionKind::CompilerBarrier { .. }
+        | FullInstructionKind::CodeLayoutHint(_) => {}
         FullInstructionKind::RuntimeSizedAllocate { extents, .. } => {
             for extent in extents {
                 map(extent)?;
@@ -2186,7 +2275,25 @@ fn remap_instruction_values(
         }
         FullInstructionKind::Convert { operand, .. }
         | FullInstructionKind::Unary { operand, .. }
-        | FullInstructionKind::IntegerIntrinsic { operand, .. } => map(operand)?,
+        | FullInstructionKind::IntegerIntrinsic { operand, .. }
+        | FullInstructionKind::OpaqueScalar { operand } => map(operand)?,
+        FullInstructionKind::X86Cpuid {
+            leaf,
+            subleaf,
+            eax,
+            ebx,
+            ecx,
+            edx,
+        } => {
+            map(leaf)?;
+            for value in [subleaf, eax, ebx, ecx, edx].into_iter().flatten() {
+                map(value)?;
+            }
+        }
+        FullInstructionKind::X86Rdtsc { low, high } => {
+            map(low)?;
+            map(high)?;
+        }
         FullInstructionKind::DirectCall { arguments, .. } => {
             for argument in arguments {
                 map(argument)?;
@@ -2413,6 +2520,11 @@ impl FunctionBuilder<'_> {
                     self.terminate(FullTerminator::IndirectBranch { selector, targets })?;
                 }
             }
+            S::InlineAsm(asm) => {
+                if self.current.is_some() {
+                    self.inline_asm(asm, statement.span)?;
+                }
+            }
             S::Continue => {
                 if self.current.is_some() {
                     let target = self.continue_targets.last().copied().ok_or_else(|| {
@@ -2444,6 +2556,164 @@ impl FunctionBuilder<'_> {
             }
         }
         Ok(())
+    }
+
+    fn inline_asm(&mut self, asm: &FullTypedInlineAsm, span: Span) -> Result<(), IrError> {
+        match &asm.kind {
+            FullTypedInlineAsmKind::CompilerBarrier { memory } => self.emit_effect(
+                FullInstructionKind::CompilerBarrier { memory: *memory },
+                span,
+            ),
+            FullTypedInlineAsmKind::OpaqueScalar { target } => {
+                let place = self.place(target)?;
+                let value = self.load_place(&place, span)?;
+                let value = self.emit_result(
+                    FullInstructionKind::OpaqueScalar { operand: value },
+                    QualifiedType::unqualified(target.ty.ty),
+                    span,
+                )?;
+                self.store_place(&place, value, span)
+            }
+            FullTypedInlineAsmKind::CodeLayoutHint(hint) => self.emit_effect(
+                FullInstructionKind::CodeLayoutHint(match hint {
+                    TypedCodeLayoutHint::AlignToPowerOfTwo(power) => {
+                        CodeLayoutHint::AlignToPowerOfTwo(*power)
+                    }
+                    TypedCodeLayoutHint::Nop => CodeLayoutHint::Nop,
+                }),
+                span,
+            ),
+            FullTypedInlineAsmKind::X86Cpuid {
+                leaf,
+                subleaf,
+                outputs,
+            } => {
+                let leaf = self.expect_value(leaf)?;
+                let subleaf = subleaf
+                    .as_ref()
+                    .map(|subleaf| self.expect_value(subleaf))
+                    .transpose()?;
+                let mut addresses = [None; 4];
+                for output in outputs {
+                    let address = self.place(&output.target)?.address;
+                    addresses[match output.register {
+                        X86CpuidRegister::Eax => 0,
+                        X86CpuidRegister::Ebx => 1,
+                        X86CpuidRegister::Ecx => 2,
+                        X86CpuidRegister::Edx => 3,
+                    }] = Some(address);
+                }
+                self.emit_effect(
+                    FullInstructionKind::X86Cpuid {
+                        leaf,
+                        subleaf,
+                        eax: addresses[0],
+                        ebx: addresses[1],
+                        ecx: addresses[2],
+                        edx: addresses[3],
+                    },
+                    span,
+                )
+            }
+            FullTypedInlineAsmKind::X86Rdtsc { low, high } => {
+                let low = self.place(low)?.address;
+                let high = self.place(high)?.address;
+                self.emit_effect(FullInstructionKind::X86Rdtsc { low, high }, span)
+            }
+            FullTypedInlineAsmKind::X86AtomicExchange {
+                object,
+                value,
+                result,
+            } => {
+                let object = self.place(object)?;
+                let value_place = self.place(value)?;
+                let replacement = self.load_place(&value_place, span)?;
+                let old = self.emit_result(
+                    FullInstructionKind::AtomicReadModifyWrite {
+                        operation: AtomicReadModifyWriteOperation::Exchange,
+                        address: object.address,
+                        operand: replacement,
+                        object: object.object,
+                        return_new: false,
+                        order: MemoryOrder::SequentiallyConsistent,
+                    },
+                    QualifiedType::unqualified(object.object.ty),
+                    span,
+                )?;
+                self.store_place(&value_place, old, span)?;
+                if let Some(result) = result {
+                    let result = self.place(result)?;
+                    self.store_place(&result, old, span)?;
+                }
+                Ok(())
+            }
+            FullTypedInlineAsmKind::X86AtomicCompareExchange {
+                object,
+                expected,
+                desired,
+                original,
+            } => {
+                let object = self.place(object)?;
+                let expected = self.expect_value(expected)?;
+                let desired = self.expect_value(desired)?;
+                let old = self.emit_result(
+                    FullInstructionKind::AtomicCompareExchange {
+                        address: object.address,
+                        expected,
+                        replacement: desired,
+                        object: object.object,
+                        order: MemoryOrder::SequentiallyConsistent,
+                    },
+                    QualifiedType::unqualified(object.object.ty),
+                    span,
+                )?;
+                let original = self.place(original)?;
+                self.store_place(&original, old, span)
+            }
+            FullTypedInlineAsmKind::X86ConditionalMoveAbove {
+                target,
+                index,
+                low_limit,
+                backup,
+            } => {
+                let target = self.place(target)?;
+                let candidate = self.load_place(&target, span)?;
+                let index = self.expect_value(index)?;
+                let low_limit = self.expect_value(low_limit)?;
+                let backup = self.expect_value(backup)?;
+                let below = self.emit_result(
+                    FullInstructionKind::Binary {
+                        operator: BinaryOperation::Less,
+                        left: index,
+                        right: low_limit,
+                    },
+                    QualifiedType::unqualified(TypeId::BOOL),
+                    span,
+                )?;
+                let backup_block = self.new_block();
+                let candidate_block = self.new_block();
+                let merge = self.new_block();
+                let selected =
+                    self.add_block_parameter(merge, QualifiedType::unqualified(target.object.ty));
+                self.terminate(FullTerminator::Conditional {
+                    condition: below,
+                    then_edge: empty_edge(backup_block),
+                    else_edge: empty_edge(candidate_block),
+                })?;
+                self.current = Some(backup_block);
+                self.terminate(FullTerminator::Branch(FullEdge {
+                    target: merge,
+                    arguments: vec![backup],
+                }))?;
+                self.current = Some(candidate_block);
+                self.terminate(FullTerminator::Branch(FullEdge {
+                    target: merge,
+                    arguments: vec![candidate],
+                }))?;
+                self.current = Some(merge);
+                self.store_place(&target, selected, span)
+            }
+        }
     }
 
     fn local_declaration(
@@ -3173,6 +3443,58 @@ impl FunctionBuilder<'_> {
                 )?;
                 Ok(None)
             }
+            E::AtomicLoad {
+                pointer,
+                object,
+                order,
+            } => {
+                let address = self.expect_value(pointer)?;
+                let order = match order {
+                    TypedMemoryOrder::SequentiallyConsistent => MemoryOrder::SequentiallyConsistent,
+                };
+                self.emit_result(
+                    FullInstructionKind::Load {
+                        address,
+                        object: *object,
+                        access: MemoryAccess {
+                            volatile: object.qualifiers.contains(TypeQualifiers::VOLATILE),
+                            atomic: Some(order),
+                            non_elidable: true,
+                            non_movable: true,
+                        },
+                    },
+                    QualifiedType::unqualified(object.ty),
+                    expression.span,
+                )
+                .map(Some)
+            }
+            E::AtomicStore {
+                pointer,
+                value,
+                object,
+                order,
+            } => {
+                let address = self.expect_value(pointer)?;
+                let value = self.expect_value(value)?;
+                let order = match order {
+                    TypedMemoryOrder::SequentiallyConsistent => MemoryOrder::SequentiallyConsistent,
+                };
+                self.emit_effect(
+                    FullInstructionKind::Store {
+                        address,
+                        value,
+                        object: *object,
+                        access: MemoryAccess {
+                            volatile: object.qualifiers.contains(TypeQualifiers::VOLATILE),
+                            atomic: Some(order),
+                            non_elidable: true,
+                            non_movable: true,
+                        },
+                    },
+                    expression.span,
+                )?;
+                Ok(None)
+            }
             E::AtomicReadModifyWrite {
                 operation,
                 pointer,
@@ -3187,6 +3509,15 @@ impl FunctionBuilder<'_> {
                     TypedAtomicReadModifyWriteOperation::Add => AtomicReadModifyWriteOperation::Add,
                     TypedAtomicReadModifyWriteOperation::Subtract => {
                         AtomicReadModifyWriteOperation::Subtract
+                    }
+                    TypedAtomicReadModifyWriteOperation::BitwiseAnd => {
+                        AtomicReadModifyWriteOperation::BitwiseAnd
+                    }
+                    TypedAtomicReadModifyWriteOperation::BitwiseOr => {
+                        AtomicReadModifyWriteOperation::BitwiseOr
+                    }
+                    TypedAtomicReadModifyWriteOperation::BitwiseXor => {
+                        AtomicReadModifyWriteOperation::BitwiseXor
                     }
                     TypedAtomicReadModifyWriteOperation::Exchange => {
                         AtomicReadModifyWriteOperation::Exchange
@@ -3223,10 +3554,28 @@ impl FunctionBuilder<'_> {
                 replacement,
                 object,
                 return_boolean,
+                expected_is_pointer,
                 order,
             } => {
                 let address = self.expect_value(pointer)?;
-                let expected = self.expect_value(expected)?;
+                let expected_address = if *expected_is_pointer {
+                    Some(self.expect_value(expected)?)
+                } else {
+                    None
+                };
+                let expected = if let Some(expected_address) = expected_address {
+                    self.emit_result(
+                        FullInstructionKind::Load {
+                            address: expected_address,
+                            object: QualifiedType::unqualified(object.ty),
+                            access: MemoryAccess::default(),
+                        },
+                        QualifiedType::unqualified(object.ty),
+                        expression.span,
+                    )?
+                } else {
+                    self.expect_value(expected)?
+                };
                 let replacement = self.expect_value(replacement)?;
                 let order = match order {
                     TypedMemoryOrder::SequentiallyConsistent => MemoryOrder::SequentiallyConsistent,
@@ -3244,7 +3593,7 @@ impl FunctionBuilder<'_> {
                     expression.span,
                 )?;
                 if *return_boolean {
-                    self.emit_result(
+                    let succeeded = self.emit_result(
                         FullInstructionKind::Binary {
                             operator: BinaryOperation::Equal,
                             left: old,
@@ -3252,9 +3601,31 @@ impl FunctionBuilder<'_> {
                         },
                         QualifiedType::unqualified(TypeId::BOOL),
                         expression.span,
-                    )
-                    .map(Some)
+                    )?;
+                    if let Some(expected_address) = expected_address {
+                        let failure = self.new_block();
+                        let merge = self.new_block();
+                        self.terminate(FullTerminator::Conditional {
+                            condition: succeeded,
+                            then_edge: empty_edge(merge),
+                            else_edge: empty_edge(failure),
+                        })?;
+                        self.current = Some(failure);
+                        self.emit_effect(
+                            FullInstructionKind::Store {
+                                address: expected_address,
+                                value: old,
+                                object: QualifiedType::unqualified(object.ty),
+                                access: MemoryAccess::default(),
+                            },
+                            expression.span,
+                        )?;
+                        self.branch(merge)?;
+                        self.current = Some(merge);
+                    }
+                    Ok(Some(succeeded))
                 } else {
+                    debug_assert!(expected_address.is_none());
                     Ok(Some(old))
                 }
             }
@@ -3382,6 +3753,11 @@ impl FunctionBuilder<'_> {
                 ty,
                 span,
             ),
+            ConstantValue::LongDouble(value) => self.emit_result(
+                FullInstructionKind::Constant(ScalarConstant::LongDouble(value)),
+                ty,
+                span,
+            ),
             ConstantValue::NullPointer => self.emit_result(
                 FullInstructionKind::Constant(ScalarConstant::NullPointer),
                 ty,
@@ -3456,6 +3832,23 @@ impl FunctionBuilder<'_> {
     }
 
     fn zero_value(&mut self, ty: QualifiedType, span: Span) -> Result<ValueId, IrError> {
+        if self.types.builtin_type(ty.ty) == Some(BuiltinType::LongDouble) {
+            let zero = self.emit_result(
+                FullInstructionKind::Constant(ScalarConstant::Signed(0)),
+                QualifiedType::unqualified(TypeId::INT),
+                span,
+            )?;
+            return self.emit_result(
+                FullInstructionKind::Convert {
+                    kind: ScalarConversion::IntegerToFloating,
+                    operand: zero,
+                    from: QualifiedType::unqualified(TypeId::INT),
+                    to: QualifiedType::unqualified(ty.ty),
+                },
+                QualifiedType::unqualified(ty.ty),
+                span,
+            );
+        }
         let constant = if pointer_pointee(self.types, ty.ty).is_some() {
             ScalarConstant::NullPointer
         } else if self
@@ -3989,11 +4382,69 @@ impl FunctionBuilder<'_> {
         }
         let stored = if let Some(plan) = compound {
             if destination.access.atomic.is_some() {
-                return Err(IrError::lower(
-                    LOWERING_ERROR,
+                let operation = match plan.operator {
+                    AstBinary::Add => AtomicReadModifyWriteOperation::Add,
+                    AstBinary::Subtract => AtomicReadModifyWriteOperation::Subtract,
+                    AstBinary::BitwiseAnd => AtomicReadModifyWriteOperation::BitwiseAnd,
+                    AstBinary::BitwiseOr => AtomicReadModifyWriteOperation::BitwiseOr,
+                    AstBinary::BitwiseXor => AtomicReadModifyWriteOperation::BitwiseXor,
+                    _ => {
+                        return Err(IrError::lower(
+                            LOWERING_ERROR,
+                            span,
+                            "this atomic compound operator has no enabled native read-modify-write instruction",
+                        ));
+                    }
+                };
+                let right = self.expect_value(value)?;
+                let operand = if let Some(element) = pointer_pointee(self.types, target.ty.ty) {
+                    if !matches!(plan.operator, AstBinary::Add | AstBinary::Subtract) {
+                        return Err(IrError::lower(
+                            LOWERING_ERROR,
+                            span,
+                            "only addition and subtraction are defined for atomic pointer compound assignment",
+                        ));
+                    }
+                    let zero = self.emit_result(
+                        FullInstructionKind::Constant(ScalarConstant::NullPointer),
+                        result_ty,
+                        span,
+                    )?;
+                    self.pointer_offset(zero, right, element, false, result_ty, span)?
+                } else {
+                    let source =
+                        QualifiedType::unqualified(self.function.value_types[right.0 as usize]);
+                    if source.ty == destination.object.ty {
+                        right
+                    } else {
+                        self.emit_result(
+                            FullInstructionKind::Convert {
+                                kind: inferred_conversion(
+                                    self.types,
+                                    source,
+                                    QualifiedType::unqualified(destination.object.ty),
+                                ),
+                                operand: right,
+                                from: source,
+                                to: QualifiedType::unqualified(destination.object.ty),
+                            },
+                            QualifiedType::unqualified(destination.object.ty),
+                            span,
+                        )?
+                    }
+                };
+                return self.emit_result(
+                    FullInstructionKind::AtomicReadModifyWrite {
+                        operation,
+                        address: destination.address,
+                        operand,
+                        object: destination.object,
+                        return_new: true,
+                        order: MemoryOrder::SequentiallyConsistent,
+                    },
+                    result_ty,
                     span,
-                    "atomic compound read-modify-write is not supported",
-                ));
+                );
             }
             let loaded =
                 self.load_place_with_access(&destination, access_from_semantics(plan.load), span)?;
@@ -4053,15 +4504,61 @@ impl FunctionBuilder<'_> {
         let mut place = self.place(operand)?;
         place.access = access_from_semantics(store);
         if place.access.atomic.is_some() {
-            return Err(IrError::lower(
-                LOWERING_ERROR,
+            let pointer = pointer_pointee(self.types, operand.ty.ty);
+            if pointer.is_none() && !self.types.is_integer(operand.ty.ty) {
+                return Err(IrError::lower(
+                    LOWERING_ERROR,
+                    span,
+                    "atomic increment and decrement require an integer or pointer object",
+                ));
+            }
+            let one = self.emit_result(
+                FullInstructionKind::Constant(ScalarConstant::Signed(1)),
+                QualifiedType::unqualified(TypeId::INT),
                 span,
-                "atomic increment and decrement are not supported",
-            ));
+            )?;
+            let one = if let Some(element) = pointer {
+                let zero = self.emit_result(
+                    FullInstructionKind::Constant(ScalarConstant::NullPointer),
+                    result_ty,
+                    span,
+                )?;
+                self.pointer_offset(zero, one, element, false, result_ty, span)?
+            } else if operand.ty.ty != TypeId::INT {
+                self.emit_result(
+                    FullInstructionKind::Convert {
+                        kind: ScalarConversion::IntegerConversion,
+                        operand: one,
+                        from: QualifiedType::unqualified(TypeId::INT),
+                        to: result_ty,
+                    },
+                    result_ty,
+                    span,
+                )?
+            } else {
+                one
+            };
+            return self.emit_result(
+                FullInstructionKind::AtomicReadModifyWrite {
+                    operation: if decrement {
+                        AtomicReadModifyWriteOperation::Subtract
+                    } else {
+                        AtomicReadModifyWriteOperation::Add
+                    },
+                    address: place.address,
+                    operand: one,
+                    object: place.object,
+                    return_new: !postfix,
+                    order: MemoryOrder::SequentiallyConsistent,
+                },
+                result_ty,
+                span,
+            );
         }
         let old = self.load_place(&place, span)?;
         let pointer = pointer_pointee(self.types, operand.ty.ty);
-        let one_ty = if pointer.is_some() {
+        let long_double = self.types.builtin_type(operand.ty.ty) == Some(BuiltinType::LongDouble);
+        let one_ty = if pointer.is_some() || long_double {
             QualifiedType::unqualified(TypeId::INT)
         } else {
             operand.ty
@@ -4070,12 +4567,27 @@ impl FunctionBuilder<'_> {
             .types
             .builtin_type(operand.ty.ty)
             .is_some_and(|builtin| builtin.is_floating())
+            && !long_double
         {
             ScalarConstant::Floating(1.0)
         } else {
             ScalarConstant::Signed(1)
         };
         let one = self.emit_result(FullInstructionKind::Constant(one), one_ty, span)?;
+        let one = if long_double {
+            self.emit_result(
+                FullInstructionKind::Convert {
+                    kind: ScalarConversion::IntegerToFloating,
+                    operand: one,
+                    from: one_ty,
+                    to: QualifiedType::unqualified(operand.ty.ty),
+                },
+                QualifiedType::unqualified(operand.ty.ty),
+                span,
+            )?
+        } else {
+            one
+        };
         let updated = if let Some(element) = pointer {
             self.pointer_offset(old, one, element, decrement, result_ty, span)?
         } else {
@@ -4274,6 +4786,7 @@ impl FunctionBuilder<'_> {
                 declaration.signature,
                 CallEffects {
                     no_return: declaration.properties.no_return,
+                    returns_twice: declaration.properties.returns_twice,
                     ..CallEffects::default()
                 },
             )
@@ -4292,7 +4805,19 @@ impl FunctionBuilder<'_> {
                         "indirect call callee does not point to a function type",
                     )
                 })?;
-            (signature, CallEffects::default())
+            // Function types do not yet retain GNU declaration attributes, so
+            // an indirect callee may designate a returns-twice function even
+            // when the call site's type is otherwise ordinary. Select the
+            // conservative storage/frame profile for every indirect call
+            // rather than risk promoting a local whose restored value must
+            // survive a later nonlocal return.
+            (
+                signature,
+                CallEffects {
+                    returns_twice: true,
+                    ..CallEffects::default()
+                },
+            )
         };
         let function_type = self.types.function_signature(signature).ok_or_else(|| {
             IrError::lower(
@@ -4470,6 +4995,7 @@ fn collect_switch_labels(
         | S::Expression(_)
         | S::Goto { .. }
         | S::ComputedGoto(_)
+        | S::InlineAsm(_)
         | S::Continue
         | S::Break
         | S::Return(_) => {}
@@ -4517,9 +5043,71 @@ fn collect_labels(statement: &FullTypedStatement, labels: &mut Vec<LabelId>) {
         S::Expression(_)
         | S::Goto { .. }
         | S::ComputedGoto(_)
+        | S::InlineAsm(_)
         | S::Continue
         | S::Break
         | S::Return(_) => {}
+    }
+}
+
+fn inline_asm_expressions(asm: &FullTypedInlineAsm) -> Vec<&FullTypedExpression> {
+    match &asm.kind {
+        FullTypedInlineAsmKind::CompilerBarrier { .. }
+        | FullTypedInlineAsmKind::CodeLayoutHint(_) => Vec::new(),
+        FullTypedInlineAsmKind::OpaqueScalar { target } => vec![target],
+        FullTypedInlineAsmKind::X86Cpuid {
+            leaf,
+            subleaf,
+            outputs,
+        } => std::iter::once(leaf)
+            .chain(subleaf.iter())
+            .chain(outputs.iter().map(|output| &output.target))
+            .collect(),
+        FullTypedInlineAsmKind::X86Rdtsc { low, high } => vec![low, high],
+        FullTypedInlineAsmKind::X86AtomicExchange {
+            object,
+            value,
+            result,
+        } => std::iter::once(object)
+            .chain(std::iter::once(value))
+            .chain(result.iter())
+            .collect(),
+        FullTypedInlineAsmKind::X86AtomicCompareExchange {
+            object,
+            expected,
+            desired,
+            original,
+        } => vec![object, expected, desired, original],
+        FullTypedInlineAsmKind::X86ConditionalMoveAbove {
+            target,
+            index,
+            low_limit,
+            backup,
+        } => vec![target, index, low_limit, backup],
+    }
+}
+
+fn inline_asm_outputs(asm: &FullTypedInlineAsm) -> Vec<&FullTypedExpression> {
+    match &asm.kind {
+        FullTypedInlineAsmKind::CompilerBarrier { .. }
+        | FullTypedInlineAsmKind::CodeLayoutHint(_) => Vec::new(),
+        FullTypedInlineAsmKind::OpaqueScalar { target } => vec![target],
+        FullTypedInlineAsmKind::X86Cpuid { outputs, .. } => {
+            outputs.iter().map(|output| &output.target).collect()
+        }
+        FullTypedInlineAsmKind::X86Rdtsc { low, high } => vec![low, high],
+        FullTypedInlineAsmKind::X86AtomicExchange {
+            object,
+            value,
+            result,
+        } => std::iter::once(object)
+            .chain(std::iter::once(value))
+            .chain(result.iter())
+            .collect(),
+        FullTypedInlineAsmKind::X86AtomicCompareExchange {
+            object, original, ..
+        } => vec![object, original],
+        FullTypedInlineAsmKind::X86ConditionalMoveAbove { target, .. } => vec![target],
     }
 }
 

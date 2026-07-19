@@ -61,18 +61,6 @@ fn rejected_translations_match_diagnostic_goldens_and_emit_no_object() {
             ),
         },
         Case {
-            name: "long-double-operation",
-            expected: include_str!(
-                "../../../tests/diagnostics/goldens/long-double-operation.stderr"
-            ),
-        },
-        Case {
-            name: "long-double-boundary",
-            expected: include_str!(
-                "../../../tests/diagnostics/goldens/long-double-boundary.stderr"
-            ),
-        },
-        Case {
             name: "invalid-va-start",
             expected: include_str!("../../../tests/diagnostics/goldens/invalid-va-start.stderr"),
         },
@@ -105,10 +93,6 @@ fn rejected_translations_match_diagnostic_goldens_and_emit_no_object() {
             expected: include_str!(
                 "../../../tests/diagnostics/goldens/variably-modified-va-arg.stderr"
             ),
-        },
-        Case {
-            name: "atomic-access",
-            expected: include_str!("../../../tests/diagnostics/goldens/atomic-access.stderr"),
         },
         Case {
             name: "wrong-call-arity",
@@ -166,6 +150,119 @@ fn rejected_translations_match_diagnostic_goldens_and_emit_no_object() {
             "{} emitted an object despite its diagnostic",
             case.name
         );
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
+fn binary128_long_double_rejections_match_diagnostic_goldens() {
+    let cases = [
+        Case {
+            name: "long-double-operation",
+            expected: include_str!(
+                "../../../tests/diagnostics/goldens/long-double-operation.stderr"
+            ),
+        },
+        Case {
+            name: "long-double-boundary",
+            expected: include_str!(
+                "../../../tests/diagnostics/goldens/long-double-boundary.stderr"
+            ),
+        },
+    ];
+    let repository = repository();
+
+    for case in cases {
+        let directory = temporary_directory(case.name);
+        let output = directory.join(format!("{}.o", case.name));
+        let input = format!("tests/diagnostics/cases/{}.c", case.name);
+        let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+            .current_dir(&repository)
+            .env("LC_ALL", "C")
+            .env("LANG", "C")
+            .args([
+                "--target=aarch64-unknown-linux-gnu",
+                "-nostdinc",
+                "-c",
+                &input,
+                "-o",
+            ])
+            .arg(&output)
+            .output()
+            .unwrap();
+
+        assert!(
+            !result.status.success(),
+            "{} unexpectedly compiled successfully",
+            case.name
+        );
+        assert!(
+            result.stdout.is_empty(),
+            "{} wrote stdout:\n{}",
+            case.name,
+            String::from_utf8_lossy(&result.stdout)
+        );
+        assert_eq!(
+            String::from_utf8(result.stderr).unwrap(),
+            case.expected,
+            "{}",
+            case.name
+        );
+        assert!(
+            !output.exists(),
+            "{} emitted an object despite its diagnostic",
+            case.name
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
+fn inline_assembly_near_misses_fail_closed_before_object_emission() {
+    let cases = [
+        ("unknown-template", "void f(void) { asm(\"pause\"); }"),
+        (
+            "unsupported-alignment",
+            "void f(void) { asm(\".p2align 7\"); }",
+        ),
+        (
+            "incomplete-cpuid-clobbers",
+            "void f(unsigned value) { asm(\"cpuid\" : \"=a\"(value) : \"a\"(0) : \"ebx\", \"ecx\"); }",
+        ),
+        (
+            "incomplete-rdtsc-outputs",
+            "void f(unsigned value) { asm volatile(\"rdtsc\" : \"=a\"(value)); }",
+        ),
+        (
+            "wrong-atomic-width",
+            "void f(long *field, int value) { asm volatile(\"lock; xchgq %0, %1\" : \"+q\"(value), \"+m\"(*field)); }",
+        ),
+        (
+            "asm-goto",
+            "void f(void) { asm goto(\"\" : : : : target); target: ; }",
+        ),
+        (
+            "symbolic-operand",
+            "void f(unsigned value) { asm(\"\" : [value] \"+r\"(value)); }",
+        ),
+    ];
+
+    for (name, text) in cases {
+        let directory = temporary_directory(name);
+        let source = directory.join(format!("{name}.c"));
+        let object = directory.join(format!("{name}.o"));
+        fs::write(&source, text).unwrap();
+        let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+            .arg("-c")
+            .arg(&source)
+            .arg("-o")
+            .arg(&object)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(!result.status.success(), "{name} unexpectedly compiled");
+        assert!(stderr.contains("CCC2454"), "{name}: {stderr}");
+        assert!(!object.exists(), "{name} emitted an object after rejection");
         fs::remove_dir_all(directory).unwrap();
     }
 }

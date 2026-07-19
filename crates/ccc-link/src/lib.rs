@@ -3,6 +3,7 @@
 pub mod artifact;
 pub mod bridge;
 mod package;
+mod temp_cleanup;
 
 pub use artifact::{
     ArtifactBundle, BridgeManifestV2, GeneratedSymbol, GeneratedSymbolBinding,
@@ -12,8 +13,11 @@ pub use package::{
     PackagingReport, PackagingToolIdentity, package_artifact_bundle,
     package_artifact_bundle_with_runner,
 };
+#[doc(hidden)]
+pub use temp_cleanup::RegisteredTemporaryFile;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::borrow::Cow;
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -53,36 +57,226 @@ pub fn runtime_helper_link_plan(
     })
 }
 
-fn runtime_helper_link_plan_for_object(
-    object: &Path,
+#[derive(Clone, Default, Eq, PartialEq)]
+struct LinkSymbolState {
+    defined: HashSet<String>,
+    weak_defined: HashSet<String>,
+    common: HashSet<String>,
+    dynamic_defined: HashSet<String>,
+    unresolved: HashSet<String>,
+    force_all_runtime_helpers: bool,
+}
+
+#[derive(Default)]
+struct ObjectSymbolFacts {
+    defined: HashSet<String>,
+    weak_defined: HashSet<String>,
+    common: HashSet<String>,
+    undefined: HashSet<String>,
+}
+
+#[derive(Clone)]
+struct ScannableLinkInput {
+    path: PathBuf,
+    whole_archive: bool,
+    as_needed: bool,
+    explicit: bool,
+}
+
+fn runtime_helper_link_plan_for_inputs(
+    inputs: &[OsString],
+    driver: &ToolCommandSpec,
     config: &EffectiveCompilationConfig,
 ) -> Result<Option<RuntimeHelperLinkPlan>, LinkError> {
     let manifest = config.target.abi.runtime_helper_manifest();
     if manifest.is_empty() {
         return Ok(None);
     }
-    let bytes = fs::read(object).map_err(|error| LinkError {
-        code: "CCC5008",
-        message: format!(
-            "cannot inspect `{}` for runtime-helper requirements: {error}",
-            object.display()
-        ),
-    })?;
-    let parsed = object::File::parse(bytes.as_slice()).map_err(|error| LinkError {
-        code: "CCC5008",
-        message: format!(
-            "cannot parse `{}` for runtime-helper requirements: {error}",
-            object.display()
-        ),
-    })?;
-    let undefined = parsed
-        .symbols()
-        .filter(|symbol| symbol.is_undefined())
-        .filter_map(|symbol| symbol.name().ok())
-        .collect::<HashSet<_>>();
+    let ordered_arguments = driver
+        .arguments
+        .iter()
+        .cloned()
+        .chain(inputs.iter().cloned())
+        .collect::<Vec<_>>();
+    let driver_static = compiler_driver_static_mode(&ordered_arguments);
+    let scan_inputs = expanded_linker_scan_arguments(&ordered_arguments);
+    let inputs = scan_inputs.as_slice();
+    let mut state = LinkSymbolState::default();
+    state.unresolved.extend(forced_undefined_symbols(inputs));
+    // GNU-compatible drivers apply every -L option to every -l option,
+    // regardless of their relative command-line order.
+    let search_directories =
+        library_search_directories(inputs, config.toolchain.sysroot.as_deref());
+    let mut static_libraries = driver_static;
+    let mut whole_archive = false;
+    let mut as_needed = false;
+    let mut linker_state_stack = Vec::<(bool, bool, bool)>::new();
+    let mut group_stack = Vec::<Vec<ScannableLinkInput>>::new();
+    let mut index = 0;
+    while index < inputs.len() {
+        let argument = inputs[index].to_string_lossy();
+        if matches!(argument.as_ref(), "--start-group" | "-start-group" | "-(") {
+            group_stack.push(Vec::new());
+            index += 1;
+            continue;
+        } else if matches!(argument.as_ref(), "--push-state" | "-push-state") {
+            linker_state_stack.push((static_libraries, whole_archive, as_needed));
+            index += 1;
+            continue;
+        } else if matches!(argument.as_ref(), "--pop-state" | "-pop-state") {
+            if let Some((saved_static, saved_whole, saved_as_needed)) = linker_state_stack.pop() {
+                static_libraries = saved_static;
+                whole_archive = saved_whole;
+                as_needed = saved_as_needed;
+            }
+            index += 1;
+            continue;
+        } else if matches!(argument.as_ref(), "--end-group" | "-end-group" | "-)") {
+            if let Some(group) = group_stack.pop() {
+                replay_link_group(&group, &mut state)?;
+            }
+            index += 1;
+            continue;
+        } else if matches!(argument.as_ref(), "-L" | "--library-path") {
+            index += 2;
+            continue;
+        } else if argument.starts_with("-L") || argument.starts_with("--library-path=") {
+            index += 1;
+            continue;
+        } else if matches!(
+            argument.as_ref(),
+            "--ccc-linker-static" | "--ccc-linker-Bstatic" | "-dn" | "-non_shared" | "-aarchive"
+        ) {
+            static_libraries = true;
+            index += 1;
+            continue;
+        } else if matches!(
+            argument.as_ref(),
+            "--ccc-linker-Bdynamic" | "-dy" | "-call_shared" | "-ashared" | "-adefault"
+        ) {
+            static_libraries = false;
+            index += 1;
+            continue;
+        } else if argument == "-static" {
+            // Compiler drivers place their global static-link mode before
+            // libraries even when the spelling occurs later in argv. The
+            // initial state was precomputed above; positional linker-state
+            // changes still apply after this point.
+            index += 1;
+            continue;
+        } else if argument == "-a" {
+            if let Some(mode) = inputs.get(index + 1).map(|value| value.to_string_lossy()) {
+                match mode.as_ref() {
+                    "archive" => static_libraries = true,
+                    "shared" | "default" => static_libraries = false,
+                    _ => state.force_all_runtime_helpers = true,
+                }
+            }
+            index += 2;
+            continue;
+        } else if matches!(
+            argument.as_ref(),
+            "--whole-archive" | "-whole-archive" | "-Wl,--whole-archive"
+        ) {
+            whole_archive = true;
+            index += 1;
+            continue;
+        } else if matches!(
+            argument.as_ref(),
+            "--no-whole-archive" | "-no-whole-archive" | "-Wl,--no-whole-archive"
+        ) {
+            whole_archive = false;
+            index += 1;
+            continue;
+        } else if matches!(argument.as_ref(), "--as-needed" | "-as-needed") {
+            as_needed = true;
+            index += 1;
+            continue;
+        } else if matches!(argument.as_ref(), "--no-as-needed" | "-no-as-needed") {
+            as_needed = false;
+            index += 1;
+            continue;
+        } else if matches!(argument.as_ref(), "-nostartfiles" | "-nostdlib") {
+            // The target linker's default script can name an entry symbol and
+            // use that reference to extract an archive member. The entry is
+            // target dependent, so omitting startup files makes selective
+            // reconstruction unsafe.
+            state.force_all_runtime_helpers = true;
+            index += 1;
+            continue;
+        } else if let Some(width) = unmodeled_linker_argument_width(&argument) {
+            state.force_all_runtime_helpers = true;
+            index += width;
+            continue;
+        } else if linker_option_consumes_next(&argument) {
+            index += 2;
+            continue;
+        }
+
+        let library = if matches!(argument.as_ref(), "-l" | "--library") {
+            let library = inputs
+                .get(index + 1)
+                .map(|value| value.to_string_lossy().into_owned());
+            index += 2;
+            library
+        } else if let Some(library) = argument
+            .strip_prefix("-l")
+            .or_else(|| argument.strip_prefix("--library="))
+        {
+            index += 1;
+            (!library.is_empty()).then(|| library.to_owned())
+        } else {
+            None
+        };
+        if let Some(library) = library {
+            if let Some(path) = resolve_library_for_scan(
+                &library,
+                static_libraries,
+                &search_directories,
+                driver,
+                config,
+            ) {
+                scan_and_record_link_input(
+                    ScannableLinkInput {
+                        path,
+                        whole_archive,
+                        as_needed,
+                        explicit: false,
+                    },
+                    &mut state,
+                    &mut group_stack,
+                )?;
+            } else {
+                // The real driver may resolve a target-specific search path
+                // that its probes did not expose. Do not let an uninspected
+                // library produce a false negative in helper selection.
+                state.force_all_runtime_helpers = true;
+            }
+            continue;
+        }
+
+        index += 1;
+        if argument.starts_with('-') {
+            continue;
+        }
+        let path = Path::new(argument.as_ref());
+        if path.is_file() || looks_like_binary_link_input(path) {
+            scan_and_record_link_input(
+                ScannableLinkInput {
+                    path: path.to_owned(),
+                    whole_archive,
+                    as_needed,
+                    explicit: true,
+                },
+                &mut state,
+                &mut group_stack,
+            )?;
+        }
+    }
+
     let required = manifest
         .iter()
-        .filter(|entry| undefined.contains(entry.symbol))
+        .filter(|entry| state.force_all_runtime_helpers || state.unresolved.contains(entry.symbol))
         .collect::<Vec<_>>();
     let Some(first) = required.first() else {
         return Ok(None);
@@ -98,6 +292,609 @@ fn runtime_helper_link_plan_for_object(
         provider,
         symbols: required.iter().map(|entry| entry.symbol).collect(),
     }))
+}
+
+fn expanded_linker_scan_arguments(inputs: &[OsString]) -> Vec<OsString> {
+    let mut expanded = Vec::with_capacity(inputs.len());
+    let mut index = 0;
+    while index < inputs.len() {
+        let argument = inputs[index].to_string_lossy();
+        if argument == "-Xlinker" {
+            if let Some(value) = inputs.get(index + 1) {
+                expanded.push(normalize_linker_passthrough(value));
+                index += 2;
+            } else {
+                expanded.push(inputs[index].clone());
+                index += 1;
+            }
+            continue;
+        }
+        if let Some(arguments) = argument
+            .strip_prefix("-Wl,")
+            .or_else(|| argument.strip_prefix("-Wl="))
+        {
+            expanded.extend(
+                arguments
+                    .split(',')
+                    .map(OsStr::new)
+                    .map(normalize_linker_passthrough),
+            );
+            index += 1;
+            continue;
+        }
+        expanded.push(inputs[index].clone());
+        index += 1;
+    }
+    expanded
+}
+
+fn compiler_driver_static_mode(arguments: &[OsString]) -> bool {
+    let mut index = 0;
+    while index < arguments.len() {
+        if arguments[index] == OsStr::new("-Xlinker") {
+            index += 2;
+            continue;
+        }
+        if arguments[index] == OsStr::new("-static") {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
+fn normalize_linker_passthrough(argument: &OsStr) -> OsString {
+    match argument.to_str() {
+        Some("-static") => OsString::from("--ccc-linker-static"),
+        Some("-Bstatic") => OsString::from("--ccc-linker-Bstatic"),
+        Some("-Bdynamic") => OsString::from("--ccc-linker-Bdynamic"),
+        _ => argument.to_owned(),
+    }
+}
+
+fn library_search_directories(inputs: &[OsString], sysroot: Option<&Path>) -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+    let mut index = 0;
+    while index < inputs.len() {
+        let argument = inputs[index].to_string_lossy();
+        if matches!(argument.as_ref(), "-L" | "--library-path") {
+            if let Some(directory) = inputs.get(index + 1) {
+                directories.push(resolve_sysroot_path(&directory.to_string_lossy(), sysroot));
+                index += 2;
+                continue;
+            }
+        } else if let Some(directory) = argument
+            .strip_prefix("-L")
+            .or_else(|| argument.strip_prefix("--library-path="))
+            && !directory.is_empty()
+        {
+            directories.push(resolve_sysroot_path(directory, sysroot));
+        }
+        index += 1;
+    }
+    directories
+}
+
+fn forced_undefined_symbols(inputs: &[OsString]) -> HashSet<String> {
+    let mut symbols = HashSet::new();
+    let mut index = 0;
+    while index < inputs.len() {
+        let argument = inputs[index].to_string_lossy();
+        if matches!(
+            argument.as_ref(),
+            "-u" | "--undefined" | "-require-defined" | "--require-defined"
+        ) {
+            if let Some(symbol) = inputs.get(index + 1) {
+                symbols.insert(symbol.to_string_lossy().into_owned());
+                index += 2;
+                continue;
+            }
+        } else if matches!(argument.as_ref(), "-e" | "--entry") {
+            if let Some(symbol) = inputs.get(index + 1) {
+                insert_symbolic_entry(&mut symbols, &symbol.to_string_lossy());
+                index += 2;
+                continue;
+            }
+        } else if let Some(symbol) = argument
+            .strip_prefix("--undefined=")
+            .or_else(|| argument.strip_prefix("--require-defined="))
+            .or_else(|| argument.strip_prefix("-require-defined="))
+        {
+            if !symbol.is_empty() {
+                symbols.insert(symbol.to_owned());
+            }
+        } else if let Some(symbol) = argument.strip_prefix("--entry=") {
+            insert_symbolic_entry(&mut symbols, symbol);
+        } else if !argument.starts_with("--") {
+            if let Some(symbol) = argument.strip_prefix("-u")
+                && !symbol.is_empty()
+            {
+                symbols.insert(symbol.to_owned());
+            } else if let Some(symbol) = argument.strip_prefix("-e") {
+                insert_symbolic_entry(&mut symbols, symbol);
+            }
+        }
+        index += 1;
+    }
+    symbols
+}
+
+fn insert_symbolic_entry(symbols: &mut HashSet<String>, entry: &str) {
+    let unsigned = entry.strip_prefix(['+', '-']).unwrap_or(entry);
+    let numeric = unsigned
+        .strip_prefix("0x")
+        .or_else(|| unsigned.strip_prefix("0X"))
+        .is_some_and(|digits| {
+            !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        || (!unsigned.is_empty()
+            && if unsigned.starts_with('0') {
+                unsigned.bytes().all(|byte| matches!(byte, b'0'..=b'7'))
+            } else {
+                unsigned.bytes().all(|byte| byte.is_ascii_digit())
+            });
+    if !entry.is_empty() && !numeric {
+        symbols.insert(entry.to_owned());
+    }
+}
+
+fn linker_option_consumes_next(argument: &str) -> bool {
+    matches!(
+        argument,
+        "-u" | "--undefined"
+            | "-require-defined"
+            | "--require-defined"
+            | "-rpath"
+            | "--rpath"
+            | "-rpath-link"
+            | "--rpath-link"
+            | "-soname"
+            | "--soname"
+            | "-h"
+            | "-Map"
+            | "--Map"
+            | "--version-script"
+            | "--dynamic-list"
+            | "--retain-symbols-file"
+            | "-z"
+            | "-m"
+            | "-e"
+            | "--entry"
+            | "--dynamic-linker"
+            | "-plugin"
+            | "-plugin-opt"
+            | "-framework"
+            | "-install_name"
+            | "-compatibility_version"
+            | "-current_version"
+            | "-undefined"
+            | "-arch"
+    )
+}
+
+fn unmodeled_linker_argument_width(argument: &str) -> Option<usize> {
+    if matches!(
+        argument,
+        "-T" | "-dT"
+            | "--script"
+            | "--default-script"
+            | "--just-symbols"
+            | "-R"
+            | "--defsym"
+            | "--wrap"
+    ) {
+        return Some(2);
+    }
+    if argument.starts_with('@')
+        || matches!(argument, "--start-lib" | "--end-lib")
+        || (argument.starts_with("-T") && argument.len() > 2)
+        || (argument.starts_with("-dT") && argument.len() > 3)
+        || argument.starts_with("--script=")
+        || argument.starts_with("--default-script=")
+        || argument.starts_with("--just-symbols=")
+        || argument.starts_with("--defsym=")
+        || argument.starts_with("--wrap=")
+    {
+        return Some(1);
+    }
+    None
+}
+
+fn resolve_library_for_scan(
+    library: &str,
+    static_libraries: bool,
+    search_directories: &[PathBuf],
+    driver: &ToolCommandSpec,
+    config: &EffectiveCompilationConfig,
+) -> Option<PathBuf> {
+    if let Some(file_name) = library.strip_prefix(':') {
+        if let Some(path) = search_directories
+            .iter()
+            .map(|directory| directory.join(file_name))
+            .find(|path| path.is_file())
+        {
+            return Some(path);
+        }
+        let output = tool_command(driver)
+            .arg(format!("-print-file-name={file_name}"))
+            .output()
+            .ok()?;
+        if output.status.success() {
+            let reported = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+            if reported.as_os_str() != OsStr::new(file_name) && reported.is_file() {
+                return Some(reported);
+            }
+        }
+        return None;
+    }
+    let dynamic_suffix = if config.target.triple.binary_format == ccc_target::BinaryFormat::Macho {
+        "dylib"
+    } else {
+        "so"
+    };
+    let suffixes: &[&str] = if static_libraries {
+        &["a"]
+    } else {
+        &[dynamic_suffix, "a"]
+    };
+    for directory in search_directories {
+        for suffix in suffixes {
+            let path = directory.join(format!("lib{library}.{suffix}"));
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+    }
+    for directory in driver_library_search_directories(driver, config.toolchain.sysroot.as_deref())
+    {
+        for suffix in suffixes {
+            let path = directory.join(format!("lib{library}.{suffix}"));
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+    }
+    // Retain the historical query as a fallback for drivers whose search-dir
+    // report contains target-specific placeholders that the host cannot
+    // resolve directly.
+    for suffix in suffixes {
+        let file_name = format!("lib{library}.{suffix}");
+        let Ok(output) = tool_command(driver)
+            .arg(format!("-print-file-name={file_name}"))
+            .output()
+        else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        let reported = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+        if reported.as_os_str() != OsStr::new(&file_name) && reported.is_file() {
+            return Some(reported);
+        }
+    }
+    None
+}
+
+fn driver_library_search_directories(
+    driver: &ToolCommandSpec,
+    sysroot: Option<&Path>,
+) -> Vec<PathBuf> {
+    let Ok(output) = tool_command(driver).arg("-print-search-dirs").output() else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let Some(value) = text.lines().find_map(|line| {
+        line.strip_prefix("libraries:")
+            .map(str::trim)
+            .map(|value| value.strip_prefix('=').unwrap_or(value))
+    }) else {
+        return Vec::new();
+    };
+    env::split_paths(OsStr::new(value))
+        .map(|path| {
+            let text = path.to_string_lossy();
+            resolve_sysroot_path(&text, sysroot)
+        })
+        .collect()
+}
+
+fn scan_and_record_link_input(
+    input: ScannableLinkInput,
+    state: &mut LinkSymbolState,
+    groups: &mut [Vec<ScannableLinkInput>],
+) -> Result<(), LinkError> {
+    process_link_input(
+        &input.path,
+        state,
+        input.whole_archive,
+        input.as_needed,
+        input.explicit,
+    )?;
+    for group in groups {
+        group.push(input.clone());
+    }
+    Ok(())
+}
+
+fn replay_link_group(
+    inputs: &[ScannableLinkInput],
+    state: &mut LinkSymbolState,
+) -> Result<(), LinkError> {
+    loop {
+        let before = state.clone();
+        for input in inputs {
+            process_link_input(
+                &input.path,
+                state,
+                input.whole_archive,
+                input.as_needed,
+                input.explicit,
+            )?;
+        }
+        if *state == before {
+            return Ok(());
+        }
+    }
+}
+
+fn process_link_input(
+    path: &Path,
+    state: &mut LinkSymbolState,
+    whole_archive: bool,
+    as_needed: bool,
+    explicit: bool,
+) -> Result<(), LinkError> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(_error) if !explicit => return Ok(()),
+        Err(error) => {
+            return Err(LinkError {
+                code: "CCC5008",
+                message: format!(
+                    "cannot inspect `{}` for runtime-helper requirements: {error}",
+                    path.display()
+                ),
+            });
+        }
+    };
+    if ArchiveFile::parse(bytes.as_slice()).is_ok() {
+        return process_archive(path, &bytes, state, whole_archive);
+    }
+    let object = match object::File::parse(bytes.as_slice()) {
+        Ok(object) => object,
+        Err(_error) => {
+            // GNU-compatible linkers accept augmenting linker scripts and
+            // plugin/LTO inputs in the same positions as objects. Their
+            // selection graphs remain the real linker's responsibility, so
+            // helper selection is deliberately conservative.
+            state.force_all_runtime_helpers = true;
+            return Ok(());
+        }
+    };
+    if object.kind() == object::ObjectKind::Dynamic {
+        process_dynamic_object(&object, state, as_needed);
+    } else {
+        process_object_facts(state, &object_symbol_facts(&object));
+    }
+    Ok(())
+}
+
+fn looks_like_dynamic_library(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(OsStr::to_str),
+        Some("so" | "dylib")
+    ) || path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| name.contains(".so."))
+}
+
+fn looks_like_binary_link_input(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(OsStr::to_str),
+        Some("o" | "lo" | "obj" | "a" | "so" | "dylib")
+    ) || looks_like_dynamic_library(path)
+}
+
+fn process_dynamic_object(object: &object::File<'_>, state: &mut LinkSymbolState, as_needed: bool) {
+    let definitions = object
+        .dynamic_symbols()
+        .filter(|symbol| {
+            symbol.is_global()
+                && symbol.scope() == object::SymbolScope::Dynamic
+                && matches!(
+                    symbol.section(),
+                    object::SymbolSection::Section(_) | object::SymbolSection::Absolute
+                )
+        })
+        .filter_map(|symbol| symbol.name().ok().map(str::to_owned))
+        .collect::<HashSet<_>>();
+    apply_dynamic_definitions(state, definitions, as_needed);
+}
+
+fn apply_dynamic_definitions(
+    state: &mut LinkSymbolState,
+    definitions: HashSet<String>,
+    as_needed: bool,
+) {
+    if as_needed
+        && !definitions
+            .iter()
+            .any(|symbol| state.unresolved.contains(symbol))
+    {
+        return;
+    }
+    state
+        .unresolved
+        .retain(|symbol| !definitions.contains(symbol));
+    state.dynamic_defined.extend(definitions);
+}
+
+fn process_archive(
+    path: &Path,
+    bytes: &[u8],
+    state: &mut LinkSymbolState,
+    whole_archive: bool,
+) -> Result<(), LinkError> {
+    let archive = ArchiveFile::parse(bytes).map_err(|error| LinkError {
+        code: "CCC5008",
+        message: format!(
+            "cannot parse archive `{}` for runtime-helper requirements: {error}",
+            path.display()
+        ),
+    })?;
+    let mut members = Vec::new();
+    for member in archive.members() {
+        let member = member.map_err(|error| LinkError {
+            code: "CCC5008",
+            message: format!(
+                "cannot inspect a member of `{}` for runtime-helper requirements: {error}",
+                path.display()
+            ),
+        })?;
+        let data = if member.is_thin() {
+            let member_path = path
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .join(archive_member_path(member.name()));
+            Cow::Owned(fs::read(&member_path).map_err(|error| LinkError {
+                code: "CCC5008",
+                message: format!(
+                    "cannot read thin archive member `{}` from `{}`: {error}",
+                    String::from_utf8_lossy(member.name()),
+                    member_path.display()
+                ),
+            })?)
+        } else {
+            Cow::Borrowed(member.data(bytes).map_err(|error| LinkError {
+                code: "CCC5008",
+                message: format!(
+                    "cannot read archive member `{}` in `{}`: {error}",
+                    String::from_utf8_lossy(member.name()),
+                    path.display()
+                ),
+            })?)
+        };
+        if let Ok(object) = object::File::parse(data.as_ref()) {
+            members.push(Some(object_symbol_facts(&object)));
+        } else {
+            // An ordinary unparseable member may be linker-plugin input such
+            // as LLVM bitcode. Its extraction cannot be simulated safely.
+            state.force_all_runtime_helpers = true;
+        }
+    }
+    if whole_archive {
+        for member in members.into_iter().flatten() {
+            process_object_facts(state, &member);
+        }
+        return Ok(());
+    }
+
+    loop {
+        let mut selected = false;
+        for member in &mut members {
+            let Some(facts) = member else {
+                continue;
+            };
+            if facts
+                .defined
+                .iter()
+                .chain(&facts.weak_defined)
+                .any(|symbol| state.unresolved.contains(symbol) || state.common.contains(symbol))
+                || facts
+                    .common
+                    .iter()
+                    .any(|symbol| state.unresolved.contains(symbol))
+            {
+                let facts = member.take().expect("selected archive member is present");
+                process_object_facts(state, &facts);
+                selected = true;
+            }
+        }
+        if !selected {
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn archive_member_path(name: &[u8]) -> PathBuf {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        PathBuf::from(OsStr::from_bytes(name))
+    }
+    #[cfg(not(unix))]
+    {
+        PathBuf::from(String::from_utf8_lossy(name).into_owned())
+    }
+}
+
+fn object_symbol_facts(object: &object::File<'_>) -> ObjectSymbolFacts {
+    let mut facts = ObjectSymbolFacts::default();
+    for symbol in object.symbols().filter(|symbol| symbol.is_global()) {
+        let Ok(name) = symbol.name() else {
+            continue;
+        };
+        if matches!(symbol.section(), object::SymbolSection::Common) {
+            facts.common.insert(name.to_owned());
+        } else if matches!(
+            symbol.section(),
+            object::SymbolSection::Section(_) | object::SymbolSection::Absolute
+        ) {
+            if symbol.is_weak() {
+                facts.weak_defined.insert(name.to_owned());
+            } else {
+                facts.defined.insert(name.to_owned());
+            }
+        } else if matches!(symbol.section(), object::SymbolSection::Undefined) && !symbol.is_weak()
+        {
+            facts.undefined.insert(name.to_owned());
+        }
+    }
+    facts
+}
+
+fn process_object_facts(state: &mut LinkSymbolState, facts: &ObjectSymbolFacts) {
+    state
+        .unresolved
+        .retain(|symbol| !facts.defined.contains(symbol));
+    state
+        .common
+        .retain(|symbol| !facts.defined.contains(symbol));
+    state
+        .weak_defined
+        .retain(|symbol| !facts.defined.contains(symbol));
+    state.defined.extend(facts.defined.iter().cloned());
+    for common in &facts.common {
+        if !state.defined.contains(common) {
+            state.unresolved.remove(common);
+            state.weak_defined.remove(common);
+            state.common.insert(common.clone());
+        }
+    }
+    for weak in &facts.weak_defined {
+        if !state.defined.contains(weak) && !state.common.contains(weak) {
+            state.unresolved.remove(weak);
+            state.weak_defined.insert(weak.clone());
+        }
+    }
+    state.unresolved.extend(
+        facts
+            .undefined
+            .iter()
+            .filter(|symbol| {
+                !state.defined.contains(*symbol)
+                    && !state.common.contains(*symbol)
+                    && !state.weak_defined.contains(*symbol)
+                    && !state.dynamic_defined.contains(*symbol)
+            })
+            .cloned(),
+    );
 }
 
 fn resolve_runtime_helper_provider(
@@ -385,7 +1182,6 @@ const RELEVANT_ENVIRONMENT_VARIABLES: &[&str] = &[
     "CCC_CC",
     "CCC_OBJCOPY",
     "CCC_NMEDIT",
-    "CC",
     "OBJCOPY",
     "PATH",
     "SDKROOT",
@@ -1276,9 +2072,36 @@ impl<R: ProbeRunner> ToolchainResolver<R> {
 }
 
 /// Link with a previously resolved toolchain without executing discovery probes.
-pub fn link_executable_with_toolchain(
-    object: &Path,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LinkOutputKind {
+    Executable,
+    Shared,
+    Relocatable,
+}
+
+fn append_runtime_helper_providers(
+    command: &mut Command,
+    providers: &BTreeSet<PathBuf>,
+    format: ccc_target::BinaryFormat,
+) {
+    if providers.is_empty() {
+        return;
+    }
+    if format == ccc_target::BinaryFormat::Elf {
+        command.arg("-Wl,--push-state,--no-whole-archive");
+        command.args(providers);
+        command.arg("-Wl,--pop-state");
+    } else {
+        command.args(providers);
+    }
+}
+
+/// Link an ordered mixture of objects, archives, libraries, and driver
+/// arguments with a previously resolved target toolchain.
+pub fn link_inputs_with_toolchain(
+    inputs: &[OsString],
     output: &Path,
+    kind: LinkOutputKind,
     config: &EffectiveCompilationConfig,
     toolchain: &ToolchainSpec,
 ) -> Result<(), LinkError> {
@@ -1300,14 +2123,34 @@ pub fn link_executable_with_toolchain(
             ),
         })?;
     let mut command = tool_command(driver);
-    command.arg(object).arg("-o").arg(output);
-    if let Some(runtime_helpers) = runtime_helper_link_plan_for_object(object, config)? {
-        let provider = resolve_runtime_helper_provider(driver, &runtime_helpers)?;
-        // Link the exact archive that was inspected. A generic `-l` argument
-        // could resolve a different provider after user-supplied search paths.
-        command.arg(provider);
+    command.args(inputs).arg("-o").arg(output);
+
+    let mut providers = BTreeSet::new();
+    if let Some(runtime_helpers) = runtime_helper_link_plan_for_inputs(inputs, driver, config)? {
+        providers.insert(resolve_runtime_helper_provider(driver, &runtime_helpers)?);
     }
-    command.arg(relocation_link_argument(config));
+    // Helper providers follow user objects and archives so their members
+    // participate in normal left-to-right extraction. Isolate them from a
+    // user --whole-archive state: loading an entire compiler runtime is both
+    // semantically wrong and likely to create duplicate definitions.
+    append_runtime_helper_providers(&mut command, &providers, config.target.triple.binary_format);
+    match kind {
+        LinkOutputKind::Executable => {
+            command.arg(relocation_link_argument(config));
+        }
+        LinkOutputKind::Shared => {
+            command.arg(
+                if config.target.triple.binary_format == ccc_target::BinaryFormat::Macho {
+                    "-dynamiclib"
+                } else {
+                    "-shared"
+                },
+            );
+        }
+        LinkOutputKind::Relocatable => {
+            command.arg("-r");
+        }
+    }
     let result = command.output().map_err(|error| LinkError {
         code: "CCC5003",
         message: format!(
@@ -1327,6 +2170,22 @@ pub fn link_executable_with_toolchain(
         });
     }
     Ok(())
+}
+
+/// Link with a previously resolved toolchain without executing discovery probes.
+pub fn link_executable_with_toolchain(
+    object: &Path,
+    output: &Path,
+    config: &EffectiveCompilationConfig,
+    toolchain: &ToolchainSpec,
+) -> Result<(), LinkError> {
+    link_inputs_with_toolchain(
+        &[object.as_os_str().to_owned()],
+        output,
+        LinkOutputKind::Executable,
+        config,
+        toolchain,
+    )
 }
 
 fn relocation_link_argument(config: &EffectiveCompilationConfig) -> &'static str {
@@ -1528,7 +2387,6 @@ fn driver_from_environment(
     target: &Triple,
 ) -> Result<ToolCommandSpec, LinkError> {
     environment_value(environment, "CCC_CC")
-        .or_else(|| environment_value(environment, "CC"))
         .map(OsStr::to_os_string)
         .map_or_else(
             || {
@@ -1730,7 +2588,133 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
 
+    use object::write::{Object, Symbol, SymbolSection};
+    use object::{Architecture as ObjectArchitecture, BinaryFormat, Endianness, SymbolFlags};
+
     use super::*;
+
+    #[derive(Clone, Copy)]
+    enum FixtureSymbol {
+        Strong,
+        Weak,
+        Common,
+        Undefined,
+        WeakUndefined,
+        ZeroSizedNotype,
+    }
+
+    fn fixture_object(symbols: &[(&str, FixtureSymbol)]) -> Vec<u8> {
+        let mut object = Object::new(
+            BinaryFormat::Elf,
+            ObjectArchitecture::X86_64,
+            Endianness::Little,
+        );
+        let text = object.section_id(object::write::StandardSection::Text);
+        object.append_section_data(text, &[0xc3], 1);
+        for (name, fixture) in symbols {
+            let (value, size, kind, scope, weak, section) = match fixture {
+                FixtureSymbol::Strong => (
+                    0,
+                    1,
+                    object::SymbolKind::Text,
+                    object::SymbolScope::Linkage,
+                    false,
+                    SymbolSection::Section(text),
+                ),
+                FixtureSymbol::Weak => (
+                    0,
+                    1,
+                    object::SymbolKind::Text,
+                    object::SymbolScope::Linkage,
+                    true,
+                    SymbolSection::Section(text),
+                ),
+                FixtureSymbol::Common => (
+                    8,
+                    8,
+                    object::SymbolKind::Data,
+                    object::SymbolScope::Linkage,
+                    false,
+                    SymbolSection::Common,
+                ),
+                FixtureSymbol::Undefined | FixtureSymbol::WeakUndefined => (
+                    0,
+                    0,
+                    object::SymbolKind::Unknown,
+                    object::SymbolScope::Unknown,
+                    matches!(fixture, FixtureSymbol::WeakUndefined),
+                    SymbolSection::Undefined,
+                ),
+                FixtureSymbol::ZeroSizedNotype => (
+                    0,
+                    0,
+                    object::SymbolKind::Label,
+                    object::SymbolScope::Linkage,
+                    false,
+                    SymbolSection::Section(text),
+                ),
+            };
+            object.add_symbol(Symbol {
+                name: name.as_bytes().to_vec(),
+                value,
+                size,
+                kind,
+                scope,
+                weak,
+                section,
+                flags: SymbolFlags::None,
+            });
+        }
+        object.write().unwrap()
+    }
+
+    fn symbol_object(defined: &[&str], undefined: &[&str]) -> Vec<u8> {
+        let symbols = defined
+            .iter()
+            .map(|name| (*name, FixtureSymbol::Strong))
+            .chain(
+                undefined
+                    .iter()
+                    .map(|name| (*name, FixtureSymbol::Undefined)),
+            )
+            .collect::<Vec<_>>();
+        fixture_object(&symbols)
+    }
+
+    fn archive(members: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let mut archive = b"!<arch>\n".to_vec();
+        for (name, data) in members {
+            let name = format!("{name}/");
+            let header = format!(
+                "{name:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+                0,
+                0,
+                0,
+                "100644",
+                data.len()
+            );
+            assert_eq!(header.len(), 60);
+            archive.extend_from_slice(header.as_bytes());
+            archive.extend_from_slice(data);
+            if data.len() % 2 != 0 {
+                archive.push(b'\n');
+            }
+        }
+        archive
+    }
+
+    fn thin_archive(member_name: &str, member_size: usize) -> Vec<u8> {
+        assert!(member_name.len() < 16);
+        let mut archive = b"!<thin>\n".to_vec();
+        let name = format!("{member_name}/");
+        let header = format!(
+            "{name:<16}{:<12}{:<6}{:<6}{:<8}{:<10}`\n",
+            0, 0, 0, "100644", member_size
+        );
+        assert_eq!(header.len(), 60);
+        archive.extend_from_slice(header.as_bytes());
+        archive
+    }
 
     #[test]
     fn recognizes_common_spellings_of_the_primary_target() {
@@ -1777,12 +2761,706 @@ mod tests {
         let linux = EffectiveCompilationConfig::x86_64_unknown_linux_gnu();
         let plan = runtime_helper_link_plan(&linux).unwrap();
         assert_eq!(plan.provider, RuntimeHelperProvider::CompilerBuiltins);
-        assert_eq!(plan.symbols.len(), 12);
+        assert_eq!(plan.symbols.len(), 16);
         assert!(plan.symbols.contains(&"__divti3"));
         assert!(plan.symbols.contains(&"__fixunsdfti"));
+        assert!(plan.symbols.contains(&"__floattixf"));
+        assert!(plan.symbols.contains(&"__fixunsxfti"));
 
         let darwin = EffectiveCompilationConfig::aarch64_apple_darwin();
         assert_eq!(runtime_helper_link_plan(&darwin), None);
+    }
+
+    #[test]
+    fn runtime_helper_scan_follows_archive_extraction_and_library_search() {
+        let directory = env::temp_dir().join(format!(
+            "ccc-runtime-helper-scan-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let main = directory.join("main.o");
+        fs::write(&main, symbol_object(&[], &["needed"])).unwrap();
+        let library = directory.join("libselected.a");
+        let selected_without_helper = symbol_object(&["needed"], &[]);
+        let unselected_with_helper = symbol_object(&["unused"], &["__divti3"]);
+        fs::write(
+            &library,
+            archive(&[
+                ("selected.o", selected_without_helper),
+                ("unselected.o", unselected_with_helper),
+            ]),
+        )
+        .unwrap();
+
+        let config = EffectiveCompilationConfig::x86_64_unknown_linux_gnu();
+        let driver = ToolCommandSpec::new("/definitely/not/invoked");
+        let explicit = [main.as_os_str().to_owned(), library.as_os_str().to_owned()];
+        assert_eq!(
+            runtime_helper_link_plan_for_inputs(&explicit, &driver, &config).unwrap(),
+            None,
+            "an unselected archive member must not pull in its helper"
+        );
+        let whole_archive = [
+            main.as_os_str().to_owned(),
+            OsString::from("--whole-archive"),
+            library.as_os_str().to_owned(),
+            OsString::from("--no-whole-archive"),
+        ];
+        let whole_plan = runtime_helper_link_plan_for_inputs(&whole_archive, &driver, &config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(whole_plan.symbols, ["__divti3"]);
+
+        fs::write(
+            &library,
+            archive(&[("selected.o", symbol_object(&["needed"], &["__divti3"]))]),
+        )
+        .unwrap();
+        let searched = [
+            main.as_os_str().to_owned(),
+            OsString::from("-L"),
+            directory.as_os_str().to_owned(),
+            OsString::from("-lselected"),
+        ];
+        let plan = runtime_helper_link_plan_for_inputs(&searched, &driver, &config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.symbols, ["__divti3"]);
+        let later_search_path = [
+            main.as_os_str().to_owned(),
+            OsString::from("-lselected"),
+            OsString::from("-L"),
+            directory.as_os_str().to_owned(),
+        ];
+        let later_plan = runtime_helper_link_plan_for_inputs(&later_search_path, &driver, &config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(later_plan.symbols, ["__divti3"]);
+        let long_library_options = [
+            main.as_os_str().to_owned(),
+            OsString::from("--library=selected"),
+            OsString::from(format!("--library-path={}", directory.display())),
+        ];
+        assert_eq!(
+            runtime_helper_link_plan_for_inputs(&long_library_options, &driver, &config)
+                .unwrap()
+                .unwrap()
+                .symbols,
+            ["__divti3"]
+        );
+        let exact_name = [
+            main.as_os_str().to_owned(),
+            OsString::from(format!("-L{}", directory.display())),
+            OsString::from("-l:libselected.a"),
+        ];
+        let exact_plan = runtime_helper_link_plan_for_inputs(&exact_name, &driver, &config)
+            .unwrap()
+            .unwrap();
+        assert_eq!(exact_plan.symbols, ["__divti3"]);
+
+        let first = directory.join("first");
+        let second = directory.join("second");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        fs::write(
+            first.join("libpriority.a"),
+            archive(&[("selected.o", symbol_object(&["needed"], &["__divti3"]))]),
+        )
+        .unwrap();
+        fs::write(
+            second.join("libpriority.so"),
+            symbol_object(&["needed"], &[]),
+        )
+        .unwrap();
+        let directory_priority = [
+            main.as_os_str().to_owned(),
+            OsString::from("-L"),
+            first.as_os_str().to_owned(),
+            OsString::from("-L"),
+            second.as_os_str().to_owned(),
+            OsString::from("-lpriority"),
+        ];
+        let priority_plan =
+            runtime_helper_link_plan_for_inputs(&directory_priority, &driver, &config)
+                .unwrap()
+                .unwrap();
+        assert_eq!(priority_plan.symbols, ["__divti3"]);
+
+        let wrong_order = [library.as_os_str().to_owned(), main.as_os_str().to_owned()];
+        assert_eq!(
+            runtime_helper_link_plan_for_inputs(&wrong_order, &driver, &config).unwrap(),
+            None,
+            "a non-group archive is not revisited for a later undefined symbol"
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn runtime_helper_scan_matches_archive_group_and_symbol_precedence_rules() {
+        let directory = env::temp_dir().join(format!(
+            "ccc-runtime-helper-symbol-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let config = EffectiveCompilationConfig::x86_64_unknown_linux_gnu();
+        let driver = ToolCommandSpec::new("/definitely/not/invoked");
+
+        let group_main = directory.join("group-main.o");
+        let group_a = directory.join("group-a.a");
+        let group_b = directory.join("group-b.a");
+        fs::write(&group_main, symbol_object(&[], &["from_b"])).unwrap();
+        fs::write(
+            &group_a,
+            archive(&[("a.o", symbol_object(&["from_a"], &["__divti3"]))]),
+        )
+        .unwrap();
+        fs::write(
+            &group_b,
+            archive(&[("b.o", symbol_object(&["from_b"], &["from_a"]))]),
+        )
+        .unwrap();
+        let without_group = [
+            group_main.as_os_str().to_owned(),
+            group_a.as_os_str().to_owned(),
+            group_b.as_os_str().to_owned(),
+        ];
+        assert_eq!(
+            runtime_helper_link_plan_for_inputs(&without_group, &driver, &config).unwrap(),
+            None
+        );
+        let with_group = [
+            group_main.as_os_str().to_owned(),
+            OsString::from("-Wl,--start-group"),
+            group_a.as_os_str().to_owned(),
+            group_b.as_os_str().to_owned(),
+            OsString::from("-Wl,--end-group"),
+        ];
+        assert_eq!(
+            runtime_helper_link_plan_for_inputs(&with_group, &driver, &config)
+                .unwrap()
+                .unwrap()
+                .symbols,
+            ["__divti3"]
+        );
+
+        let forced = directory.join("forced.a");
+        fs::write(
+            &forced,
+            archive(&[("forced.o", symbol_object(&["forced_entry"], &["__divti3"]))]),
+        )
+        .unwrap();
+        for inputs in [
+            vec![
+                OsString::from("-u"),
+                OsString::from("forced_entry"),
+                forced.as_os_str().to_owned(),
+            ],
+            vec![
+                forced.as_os_str().to_owned(),
+                OsString::from("--undefined=forced_entry"),
+            ],
+        ] {
+            assert_eq!(
+                runtime_helper_link_plan_for_inputs(&inputs, &driver, &config)
+                    .unwrap()
+                    .unwrap()
+                    .symbols,
+                ["__divti3"]
+            );
+        }
+        let fixed_argument_driver =
+            ToolCommandSpec::with_arguments("/definitely/not/invoked", ["-Wl,-u,forced_entry"]);
+        assert_eq!(
+            runtime_helper_link_plan_for_inputs(
+                &[forced.as_os_str().to_owned()],
+                &fixed_argument_driver,
+                &config,
+            )
+            .unwrap()
+            .unwrap()
+            .symbols,
+            ["__divti3"],
+            "fixed target-driver arguments participate before user inputs"
+        );
+
+        for inputs in [
+            vec![
+                OsString::from("-eforced_entry"),
+                forced.as_os_str().to_owned(),
+            ],
+            vec![
+                forced.as_os_str().to_owned(),
+                OsString::from("--entry=forced_entry"),
+            ],
+            vec![
+                OsString::from("-e"),
+                OsString::from("forced_entry"),
+                forced.as_os_str().to_owned(),
+            ],
+            vec![
+                forced.as_os_str().to_owned(),
+                OsString::from("--entry"),
+                OsString::from("forced_entry"),
+            ],
+        ] {
+            assert_eq!(
+                runtime_helper_link_plan_for_inputs(&inputs, &driver, &config)
+                    .unwrap()
+                    .unwrap()
+                    .symbols,
+                ["__divti3"]
+            );
+        }
+        assert_eq!(
+            runtime_helper_link_plan_for_inputs(
+                &[
+                    OsString::from("-e"),
+                    OsString::from("0x1000"),
+                    forced.as_os_str().to_owned()
+                ],
+                &driver,
+                &config,
+            )
+            .unwrap(),
+            None,
+            "a numeric entry address must not extract an archive member"
+        );
+        let digit_symbol = directory.join("digit-symbol.a");
+        fs::write(
+            &digit_symbol,
+            archive(&[("digit.o", symbol_object(&["123abc", "08"], &["__divti3"]))]),
+        )
+        .unwrap();
+        for entry in ["-e123abc", "-e08"] {
+            assert_eq!(
+                runtime_helper_link_plan_for_inputs(
+                    &[OsString::from(entry), digit_symbol.as_os_str().to_owned(),],
+                    &driver,
+                    &config,
+                )
+                .unwrap()
+                .unwrap()
+                .symbols,
+                ["__divti3"],
+                "a partially numeric entry remains a symbol"
+            );
+        }
+
+        let default_entry = directory.join("default-entry.a");
+        fs::write(
+            &default_entry,
+            archive(&[("start.o", symbol_object(&["_start"], &["__divti3"]))]),
+        )
+        .unwrap();
+        for suppression in ["-nostartfiles", "-nostdlib"] {
+            let inputs = [
+                OsString::from(suppression),
+                default_entry.as_os_str().to_owned(),
+            ];
+            let plan = runtime_helper_link_plan_for_inputs(&inputs, &driver, &config)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                plan.symbols.len(),
+                config.target.abi.runtime_helper_manifest().len(),
+                "the target-dependent default entry must use the conservative provider plan"
+            );
+        }
+
+        let common_main = directory.join("common-main.o");
+        let weak_archive = directory.join("weak.a");
+        let strong_archive = directory.join("strong.a");
+        fs::write(
+            &common_main,
+            fixture_object(&[("replaceable", FixtureSymbol::Common)]),
+        )
+        .unwrap();
+        fs::write(
+            &weak_archive,
+            archive(&[(
+                "weak.o",
+                fixture_object(&[("replaceable", FixtureSymbol::Weak)]),
+            )]),
+        )
+        .unwrap();
+        fs::write(
+            &strong_archive,
+            archive(&[("strong.o", symbol_object(&["replaceable"], &["__divti3"]))]),
+        )
+        .unwrap();
+        let common_chain = [
+            common_main.as_os_str().to_owned(),
+            weak_archive.as_os_str().to_owned(),
+            strong_archive.as_os_str().to_owned(),
+        ];
+        assert_eq!(
+            runtime_helper_link_plan_for_inputs(&common_chain, &driver, &config)
+                .unwrap()
+                .unwrap()
+                .symbols,
+            ["__divti3"]
+        );
+
+        let weak_undefined = directory.join("weak-undefined.o");
+        let strong_undefined = directory.join("strong-undefined.o");
+        let strong_member = directory.join("strong-member.a");
+        let weak_member = directory.join("weak-member.a");
+        fs::write(
+            &weak_undefined,
+            fixture_object(&[("weak_target", FixtureSymbol::WeakUndefined)]),
+        )
+        .unwrap();
+        fs::write(
+            &strong_undefined,
+            fixture_object(&[("weak_target", FixtureSymbol::Undefined)]),
+        )
+        .unwrap();
+        fs::write(
+            &strong_member,
+            archive(&[("strong.o", symbol_object(&["weak_target"], &["__divti3"]))]),
+        )
+        .unwrap();
+        fs::write(
+            &weak_member,
+            archive(&[(
+                "weak.o",
+                fixture_object(&[
+                    ("weak_target", FixtureSymbol::Weak),
+                    ("__divti3", FixtureSymbol::Undefined),
+                ]),
+            )]),
+        )
+        .unwrap();
+        assert_eq!(
+            runtime_helper_link_plan_for_inputs(
+                &[
+                    weak_undefined.as_os_str().to_owned(),
+                    strong_member.as_os_str().to_owned(),
+                ],
+                &driver,
+                &config,
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            runtime_helper_link_plan_for_inputs(
+                &[
+                    strong_undefined.as_os_str().to_owned(),
+                    weak_member.as_os_str().to_owned(),
+                ],
+                &driver,
+                &config,
+            )
+            .unwrap()
+            .unwrap()
+            .symbols,
+            ["__divti3"]
+        );
+
+        let notype_main = directory.join("notype-main.o");
+        let notype_archive = directory.join("notype.a");
+        fs::write(&notype_main, symbol_object(&[], &["asm_entry"])).unwrap();
+        fs::write(
+            &notype_archive,
+            archive(&[(
+                "asm.o",
+                fixture_object(&[
+                    ("asm_entry", FixtureSymbol::ZeroSizedNotype),
+                    ("__divti3", FixtureSymbol::Undefined),
+                ]),
+            )]),
+        )
+        .unwrap();
+        assert_eq!(
+            runtime_helper_link_plan_for_inputs(
+                &[
+                    notype_main.as_os_str().to_owned(),
+                    notype_archive.as_os_str().to_owned(),
+                ],
+                &driver,
+                &config,
+            )
+            .unwrap()
+            .unwrap()
+            .symbols,
+            ["__divti3"]
+        );
+
+        let thin_member = directory.join("thinmember.o");
+        let thin = directory.join("thin.a");
+        fs::write(&thin_member, symbol_object(&["thin_entry"], &["__divti3"])).unwrap();
+        fs::write(
+            &thin,
+            thin_archive(
+                "thinmember.o",
+                fs::metadata(&thin_member).unwrap().len() as usize,
+            ),
+        )
+        .unwrap();
+        let thin_main = directory.join("thin-main.o");
+        fs::write(&thin_main, symbol_object(&[], &["thin_entry"])).unwrap();
+        assert_eq!(
+            runtime_helper_link_plan_for_inputs(
+                &[
+                    thin_main.as_os_str().to_owned(),
+                    thin.as_os_str().to_owned(),
+                ],
+                &driver,
+                &config,
+            )
+            .unwrap()
+            .unwrap()
+            .symbols,
+            ["__divti3"]
+        );
+
+        let suffixless_object = directory.join("suffixless-object");
+        fs::write(&suffixless_object, symbol_object(&[], &["__divti3"])).unwrap();
+        assert_eq!(
+            runtime_helper_link_plan_for_inputs(
+                &[suffixless_object.as_os_str().to_owned()],
+                &driver,
+                &config,
+            )
+            .unwrap()
+            .unwrap()
+            .symbols,
+            ["__divti3"]
+        );
+        let suffixless_main = directory.join("suffixless-main");
+        let suffixless_archive = directory.join("suffixless-archive");
+        fs::write(&suffixless_main, symbol_object(&[], &["suffixless_entry"])).unwrap();
+        fs::write(
+            &suffixless_archive,
+            archive(&[(
+                "member.o",
+                symbol_object(&["suffixless_entry"], &["__divti3"]),
+            )]),
+        )
+        .unwrap();
+        assert_eq!(
+            runtime_helper_link_plan_for_inputs(
+                &[
+                    suffixless_main.as_os_str().to_owned(),
+                    suffixless_archive.as_os_str().to_owned(),
+                ],
+                &driver,
+                &config,
+            )
+            .unwrap()
+            .unwrap()
+            .symbols,
+            ["__divti3"]
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn runtime_helper_scan_tracks_linker_state_and_uncertain_inputs() {
+        let directory = env::temp_dir().join(format!(
+            "ccc-runtime-helper-state-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let config = EffectiveCompilationConfig::x86_64_unknown_linux_gnu();
+        let driver = ToolCommandSpec::new("/definitely/not/invoked");
+        let main = directory.join("main.o");
+        fs::write(&main, symbol_object(&[], &["needed"])).unwrap();
+        let library = directory.join("state.a");
+        fs::write(
+            &library,
+            archive(&[
+                ("selected.o", symbol_object(&["needed"], &[])),
+                ("unused.o", symbol_object(&["unused"], &["__divti3"])),
+            ]),
+        )
+        .unwrap();
+        let restored_whole = [
+            main.as_os_str().to_owned(),
+            OsString::from("-Wl,--push-state,--whole-archive,--pop-state"),
+            library.as_os_str().to_owned(),
+        ];
+        assert_eq!(
+            runtime_helper_link_plan_for_inputs(&restored_whole, &driver, &config).unwrap(),
+            None
+        );
+
+        fs::write(
+            directory.join("libchoice.so"),
+            symbol_object(&["needed"], &[]),
+        )
+        .unwrap();
+        fs::write(
+            directory.join("libchoice.a"),
+            archive(&[("selected.o", symbol_object(&["needed"], &["__divti3"]))]),
+        )
+        .unwrap();
+        let restored_static = [
+            main.as_os_str().to_owned(),
+            OsString::from("-Wl,--push-state,-dn,--pop-state"),
+            OsString::from(format!("-L{}", directory.display())),
+            OsString::from("-lchoice"),
+        ];
+        assert_eq!(
+            runtime_helper_link_plan_for_inputs(&restored_static, &driver, &config).unwrap(),
+            None
+        );
+        let global_static = [
+            main.as_os_str().to_owned(),
+            OsString::from(format!("-L{}", directory.display())),
+            OsString::from("-lchoice"),
+            OsString::from("-static"),
+        ];
+        assert_eq!(
+            runtime_helper_link_plan_for_inputs(&global_static, &driver, &config)
+                .unwrap()
+                .unwrap()
+                .symbols,
+            ["__divti3"],
+            "driver static mode applies before libraries regardless of argv position"
+        );
+        let positional_static_after = [
+            main.as_os_str().to_owned(),
+            OsString::from(format!("-L{}", directory.display())),
+            OsString::from("-lchoice"),
+            OsString::from("-Wl,-static"),
+        ];
+        assert_eq!(
+            runtime_helper_link_plan_for_inputs(&positional_static_after, &driver, &config)
+                .unwrap(),
+            None,
+            "linker-pass-through static mode is positional"
+        );
+        let positional_static_before = [
+            main.as_os_str().to_owned(),
+            OsString::from(format!("-L{}", directory.display())),
+            OsString::from("-Xlinker"),
+            OsString::from("-static"),
+            OsString::from("-lchoice"),
+        ];
+        assert_eq!(
+            runtime_helper_link_plan_for_inputs(&positional_static_before, &driver, &config)
+                .unwrap()
+                .unwrap()
+                .symbols,
+            ["__divti3"]
+        );
+
+        let misleading_dso = directory.join("not-an-input.so");
+        fs::write(&misleading_dso, b"rpath operand").unwrap();
+        let rpath_only = [OsString::from(format!(
+            "-Wl,-rpath,{}",
+            misleading_dso.display()
+        ))];
+        assert_eq!(
+            runtime_helper_link_plan_for_inputs(&rpath_only, &driver, &config).unwrap(),
+            None
+        );
+
+        let linker_script = directory.join("layout.ld");
+        fs::write(&linker_script, b"SECTIONS {}\n").unwrap();
+        let uncertain = [OsString::from("-T"), linker_script.as_os_str().to_owned()];
+        assert_eq!(
+            runtime_helper_link_plan_for_inputs(&uncertain, &driver, &config)
+                .unwrap()
+                .unwrap()
+                .symbols
+                .len(),
+            16
+        );
+        for inputs in [
+            vec![linker_script.as_os_str().to_owned()],
+            vec![OsString::from("-dT"), linker_script.as_os_str().to_owned()],
+            vec![OsString::from(format!(
+                "--default-script={}",
+                linker_script.display()
+            ))],
+        ] {
+            assert_eq!(
+                runtime_helper_link_plan_for_inputs(&inputs, &driver, &config)
+                    .unwrap()
+                    .unwrap()
+                    .symbols
+                    .len(),
+                16
+            );
+        }
+        assert_eq!(
+            runtime_helper_link_plan_for_inputs(
+                &[OsString::from("-ldefinitely_missing_ccc_fixture")],
+                &driver,
+                &config,
+            )
+            .unwrap()
+            .unwrap()
+            .symbols
+            .len(),
+            16
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn dynamic_definitions_follow_as_needed_at_their_link_position() {
+        let main_x = fixture_object(&[("x", FixtureSymbol::Undefined)]);
+        let main_helper = fixture_object(&[("__divti3", FixtureSymbol::Undefined)]);
+        let object = object::File::parse(main_x.as_slice()).unwrap();
+        let mut state = LinkSymbolState::default();
+        process_object_facts(&mut state, &object_symbol_facts(&object));
+        apply_dynamic_definitions(&mut state, HashSet::from(["x".to_owned()]), false);
+        let archive_bytes = archive(&[("both.o", symbol_object(&["x", "__divti3"], &[]))]);
+        process_archive(Path::new("fixture.a"), &archive_bytes, &mut state, false).unwrap();
+        let object = object::File::parse(main_helper.as_slice()).unwrap();
+        process_object_facts(&mut state, &object_symbol_facts(&object));
+        assert!(state.unresolved.contains("__divti3"));
+
+        let mut dropped = LinkSymbolState::default();
+        apply_dynamic_definitions(&mut dropped, HashSet::from(["x".to_owned()]), true);
+        let object = object::File::parse(main_x.as_slice()).unwrap();
+        process_object_facts(&mut dropped, &object_symbol_facts(&object));
+        let fallback = archive(&[("fallback.o", symbol_object(&["x"], &["__divti3"]))]);
+        process_archive(Path::new("fallback.a"), &fallback, &mut dropped, false).unwrap();
+        assert!(dropped.unresolved.contains("__divti3"));
+
+        let mut retained = LinkSymbolState::default();
+        let object = object::File::parse(main_x.as_slice()).unwrap();
+        process_object_facts(&mut retained, &object_symbol_facts(&object));
+        apply_dynamic_definitions(&mut retained, HashSet::from(["x".to_owned()]), true);
+        assert!(!retained.unresolved.contains("x"));
+        assert!(retained.dynamic_defined.contains("x"));
+    }
+
+    #[test]
+    fn compiler_runtime_provider_isolated_from_user_whole_archive_state() {
+        let mut command = Command::new("cc");
+        let providers = BTreeSet::from([PathBuf::from("/runtime/libgcc.a")]);
+        append_runtime_helper_providers(&mut command, &providers, ccc_target::BinaryFormat::Elf);
+        assert_eq!(
+            command
+                .get_args()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            [
+                "-Wl,--push-state,--no-whole-archive",
+                "/runtime/libgcc.a",
+                "-Wl,--pop-state",
+            ]
+        );
     }
 
     #[test]
@@ -1831,6 +3509,20 @@ mod tests {
             command.arguments,
             [OsString::from("cc"), OsString::from("-m64")]
         );
+    }
+
+    #[test]
+    fn ambient_build_cc_does_not_select_ccc_as_its_own_toolchain_driver() {
+        let environment = relevant_environment_with(|name| match name {
+            "CC" => Some(OsString::from("ccc")),
+            "CCC_CC" => None,
+            _ => None,
+        });
+        assert!(environment.iter().all(|entry| entry.name != "CC"));
+
+        let config = EffectiveCompilationConfig::default();
+        let driver = driver_from_environment(&environment, &config.target.triple).unwrap();
+        assert_ne!(driver.program, PathBuf::from("ccc"));
     }
 
     #[test]

@@ -3,14 +3,21 @@ use ccc_sema::generic::analyze_frontend;
 use ccc_session::SourceMap;
 use ccc_syntax::frontend as syntax;
 use object::{
-    Object as _, ObjectSection as _, ObjectSymbol as _, RelocationEncoding, RelocationKind,
-    RelocationTarget,
+    Object as _, ObjectSection as _, ObjectSymbol as _, RelocationEncoding, RelocationFlags,
+    RelocationKind, RelocationTarget,
 };
 use sha2::{Digest as _, Sha256};
 
 use super::*;
 
 fn lower_source_with_config(source: &str, config: &EffectiveCompilationConfig) -> gir::FullModule {
+    lower_source_with_map(source, config).0
+}
+
+fn lower_source_with_map(
+    source: &str,
+    config: &EffectiveCompilationConfig,
+) -> (gir::FullModule, SourceMap) {
     let mut sources = SourceMap::new();
     let file = sources.add_file("generic-codegen-test.c", source);
     let tokens = lex(file, sources.source(file).unwrap()).unwrap();
@@ -20,7 +27,7 @@ fn lower_source_with_config(source: &str, config: &EffectiveCompilationConfig) -
         .unwrap_or_else(|diagnostics| panic!("semantic diagnostics: {diagnostics:#?}"));
     let module = gir::lower_frontend(&typed).unwrap();
     gir::verify_frontend(&module).unwrap();
-    module
+    (module, sources)
 }
 
 fn lower_source(source: &str) -> gir::FullModule {
@@ -247,7 +254,15 @@ fn float16_value_transport_fails_with_one_stable_diagnostic() {
         "typedef __builtin_va_list va_list; int read(int count, ...) { va_list list; __builtin_va_start(list, count); return __builtin_va_arg(list, _Float16) != 0; }",
     ] {
         let module = lower_source_with_config(source, &config);
-        let error = emit(&module, &config, Options { emit_clif: true }).unwrap_err();
+        let error = emit(
+            &module,
+            &config,
+            Options {
+                emit_clif: true,
+                debug_info: None,
+            },
+        )
+        .unwrap_err();
         assert_eq!(error.code, "CCC3518", "{source}: {error}");
         assert!(error.message.contains("_Float16"), "{source}: {error}");
     }
@@ -257,7 +272,10 @@ fn emit_source(source: &str) -> Output {
     emit(
         &lower_source(source),
         &EffectiveCompilationConfig::default(),
-        Options { emit_clif: true },
+        Options {
+            emit_clif: true,
+            debug_info: None,
+        },
     )
     .unwrap()
 }
@@ -266,9 +284,44 @@ fn emit_source_with_config(source: &str, config: &EffectiveCompilationConfig) ->
     emit(
         &lower_source_with_config(source, config),
         config,
-        Options { emit_clif: true },
+        Options {
+            emit_clif: true,
+            debug_info: None,
+        },
     )
     .unwrap()
+}
+
+#[test]
+fn indirect_calls_select_the_conservative_returns_twice_codegen_profile() {
+    let indirect = lower_source(
+        "int invoke(int (*callback)(int), int value) {\n\
+             int retained = value + 1;\n\
+             return callback(value) + retained;\n\
+         }",
+    );
+    assert!(module_contains_returns_twice_call(&indirect));
+    assert!(indirect.functions[0].storage.iter().any(|storage| {
+        storage
+            .required_by
+            .contains(&gir::MemoryResidencyReason::ReturnsTwice)
+    }));
+    let output = emit(
+        &indirect,
+        &EffectiveCompilationConfig::default(),
+        Options {
+            emit_clif: true,
+            debug_info: None,
+        },
+    )
+    .unwrap();
+    assert!(!output.object.is_empty());
+
+    let direct = lower_source(
+        "int ordinary(int value) { return value + 1; }\n\
+         int invoke(int value) { return ordinary(value); }",
+    );
+    assert!(!module_contains_returns_twice_call(&direct));
 }
 
 #[test]
@@ -540,6 +593,7 @@ fn darwin_binary64_long_double_uses_the_double_transport() {
     let output = emit_source_with_config(
         "typedef __builtin_va_list va_list;\n\
          long double identity(long double value) { return value; }\n\
+         long double call_identity(long double value) { return identity(value); }\n\
          long double read(int count, ...) { va_list list;\n\
            __builtin_va_start(list, count);\n\
            return __builtin_va_arg(list, long double); }",
@@ -864,7 +918,10 @@ fn weak_binding_reaches_defined_and_undefined_elf_symbols() {
     let output = emit(
         &module,
         &EffectiveCompilationConfig::default(),
-        Options { emit_clif: true },
+        Options {
+            emit_clif: true,
+            debug_info: None,
+        },
     )
     .unwrap();
     let object = object::File::parse(output.object.as_slice()).unwrap();
@@ -919,7 +976,15 @@ fn thread_local_accesses_use_manifested_generated_accessors() {
         ccc_abi::dump_module_plan(second.verify_against(&module, &config).unwrap())
     );
 
-    let output = emit(&module, &config, Options { emit_clif: true }).unwrap();
+    let output = emit(
+        &module,
+        &config,
+        Options {
+            emit_clif: true,
+            debug_info: None,
+        },
+    )
+    .unwrap();
     assert!(!output.clif.contains("tls_value"), "{}", output.clif);
     assert_eq!(output.assemblies.len(), 2);
     assert_eq!(
@@ -972,6 +1037,100 @@ fn thread_local_accesses_use_manifested_generated_accessors() {
 }
 
 #[test]
+fn debug_information_distinguishes_prototypes_and_locates_tls_definitions() {
+    let config = EffectiveCompilationConfig::default();
+    let (module, sources) = lower_source_with_map(
+        "_Thread_local int debug_tls = 7;\n\
+         int (*unspecified_function_pointer)();\n\
+         int prototyped(int value) { return value + debug_tls; }",
+        &config,
+    );
+    let output = emit(
+        &module,
+        &config,
+        Options {
+            emit_clif: false,
+            debug_info: Some(&sources),
+        },
+    )
+    .unwrap();
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+
+    let debug_info = object.section_by_name(".debug_info").unwrap();
+    assert!(debug_info.relocations().any(|(_, relocation)| {
+        if relocation.flags()
+            != (RelocationFlags::Elf {
+                r_type: object::elf::R_X86_64_DTPOFF64,
+            })
+        {
+            return false;
+        }
+        let RelocationTarget::Symbol(index) = relocation.target() else {
+            return false;
+        };
+        object
+            .symbol_by_index(index)
+            .is_ok_and(|symbol| symbol.name() == Ok("debug_tls"))
+    }));
+
+    let sections = gimli::DwarfSections::load(|id| {
+        Ok::<_, gimli::Error>(
+            object
+                .section_by_name(id.name())
+                .and_then(|section| section.data().ok())
+                .unwrap_or_default()
+                .to_vec(),
+        )
+    })
+    .unwrap();
+    let dwarf = sections.borrow(|section| gimli::EndianSlice::new(section, gimli::LittleEndian));
+    let mut units = dwarf.units();
+    let header = units.next().unwrap().expect("debug compilation unit");
+    let unit = dwarf.unit(header).unwrap();
+    let mut entries = unit.entries();
+    let mut prototyped_subprogram = false;
+    let mut prototyped_subroutine_type = false;
+    let mut unspecified_subroutine_type = false;
+    let mut tls_location = false;
+    while let Some(entry) = entries.next_dfs().unwrap() {
+        let has_prototype = entry.has_attr(gimli::DW_AT_prototyped);
+        if entry.tag() == gimli::DW_TAG_subroutine_type {
+            prototyped_subroutine_type |= has_prototype;
+            unspecified_subroutine_type |= !has_prototype;
+        }
+        let name = entry
+            .attr(gimli::DW_AT_name)
+            .and_then(|attribute| dwarf.attr_string(&unit, attribute.value()).ok())
+            .map(|name| name.to_string_lossy().into_owned());
+        if entry.tag() == gimli::DW_TAG_subprogram && name.as_deref() == Some("prototyped") {
+            prototyped_subprogram = has_prototype;
+        }
+        if entry.tag() == gimli::DW_TAG_variable && name.as_deref() == Some("debug_tls") {
+            let gimli::AttributeValue::Exprloc(expression) =
+                entry.attr_value(gimli::DW_AT_location).unwrap()
+            else {
+                panic!("defined TLS object has no debug location");
+            };
+            let mut operations = expression.operations(unit.encoding());
+            assert!(matches!(
+                operations.next().unwrap(),
+                Some(gimli::Operation::UnsignedConstant { value: 0 })
+            ));
+            assert!(matches!(
+                operations.next().unwrap(),
+                Some(gimli::Operation::TLS)
+            ));
+            assert!(operations.next().unwrap().is_none());
+            tls_location = true;
+        }
+    }
+    assert!(prototyped_subprogram);
+    assert!(prototyped_subroutine_type);
+    assert!(unspecified_subroutine_type);
+    assert!(tls_location);
+}
+
+#[test]
 fn incomplete_extern_arrays_remain_layout_free_undefined_data() {
     const SOURCE: &str = "extern const char bytes[];\n\
          extern int values[];\n\
@@ -995,7 +1154,15 @@ fn incomplete_extern_arrays_remain_layout_free_undefined_data() {
 
     let config = EffectiveCompilationConfig::default();
     ccc_abi::plan_module(&module, &config).unwrap();
-    let output = emit(&module, &config, Options { emit_clif: true }).unwrap();
+    let output = emit(
+        &module,
+        &config,
+        Options {
+            emit_clif: true,
+            debug_info: None,
+        },
+    )
+    .unwrap();
     let object = object::File::parse(output.object.as_slice()).unwrap();
     for name in ["bytes", "values"] {
         let symbol = object
@@ -1111,13 +1278,21 @@ fn complete_abi_plan_and_aggregate_clif_have_exact_snapshots() {
     assert!(dump.contains("packaging assembly-units=2"), "{dump}");
     assert_eq!(
         sha256(&dump),
-        "915c6743c37ee3c161837fc9fd2acf88477bfe32c0d8410357aa1c3521f12d65"
+        "e473b3371dd953205ecfc1e704bffbaebe63487d238f7c38febab5010a041441"
     );
 
-    let output = emit(&module, &config, Options { emit_clif: true }).unwrap();
+    let output = emit(
+        &module,
+        &config,
+        Options {
+            emit_clif: true,
+            debug_info: None,
+        },
+    )
+    .unwrap();
     assert_eq!(
         sha256(&output.clif),
-        "8625817673e96ef125db80b4105b803e1cd4768dce676bacdf5f8a3c23118113"
+        "66995b11436d037c292c8ea80138de4c73d2ee8ba8f9fdabc5a96daa41d4ebdd"
     );
 }
 
@@ -1184,7 +1359,15 @@ fn pinned_cranelift_accepts_rounded_struct_arguments_and_structure_returns() {
     );
     assert!(signature.returns.is_empty());
 
-    emit(&module, &config, Options { emit_clif: true }).unwrap();
+    emit(
+        &module,
+        &config,
+        Options {
+            emit_clif: true,
+            debug_info: None,
+        },
+    )
+    .unwrap();
 }
 
 #[test]
@@ -1348,17 +1531,96 @@ fn direct_external_calls_use_branch_relocations_and_function_pointers_stay_indir
 }
 
 #[test]
-fn long_double_definitions_are_rejected_while_variadic_calls_use_a_bridge() {
-    let mut definition = lower_source("long double identity(long double value);");
-    definition.functions[0].entry = Some(gir::BlockId(0));
-    let error = emit(
+fn certified_inline_assembly_reaches_native_operations_and_exact_support_helpers() {
+    let output = emit_source(
+        "void exercise(unsigned *eax_out, unsigned *ebx_out, unsigned *ecx_out, unsigned *edx_out,\n\
+                       unsigned long *field, unsigned long *expected, unsigned long desired,\n\
+                       unsigned index, unsigned low, unsigned long *backup) {\n\
+             unsigned eax, ebx, ecx, edx;\n\
+             unsigned long value = desired;\n\
+             unsigned long original;\n\
+             unsigned long *candidate = field;\n\
+             asm(\"\" : \"+r\"(candidate));\n\
+             asm volatile(\"\" ::: \"memory\");\n\
+             asm(\".p2align 5\");\n\
+             asm(\"nop\");\n\
+             asm(\"cpuid\" : \"=a\"(eax), \"=b\"(ebx), \"=c\"(ecx) : \"a\"(7), \"c\"(0) : \"edx\");\n\
+             asm volatile(\"rdtsc\" : \"=a\"(eax), \"=d\"(edx));\n\
+             asm(\"cmp %1, %2\\ncmova %3, %0\\n\" : \"+r\"(candidate) : \"r\"(index), \"r\"(low), \"r\"(backup));\n\
+             asm volatile(\"lock; xchgq %0, %1\" : \"+q\"(value), \"+m\"(*field));\n\
+             asm volatile(\"lock; cmpxchgq %2, %1\" : \"=a\"(original), \"+m\"(*field) : \"q\"(desired), \"0\"(*expected));\n\
+             *eax_out = eax; *ebx_out = ebx; *ecx_out = ecx; *edx_out = edx;\n\
+             *expected = original + (unsigned long)candidate + value;\n\
+         }",
+    );
+
+    assert_eq!(output.assemblies.len(), 1);
+    let support = &output.assemblies[0];
+    assert_eq!(support.stem(), "inline-asm-support");
+    assert!(support.source().contains("cpuid"), "{}", support.source());
+    assert!(support.source().contains("rdtsc"), "{}", support.source());
+    assert_eq!(support.defined_symbols().len(), 2);
+    assert!(
+        support
+            .defined_symbols()
+            .iter()
+            .any(|symbol| symbol.starts_with("__ccc_support_cpuid_"))
+    );
+    assert!(
+        support
+            .defined_symbols()
+            .iter()
+            .any(|symbol| symbol.starts_with("__ccc_support_rdtsc_"))
+    );
+    for symbol in support.defined_symbols() {
+        let manifest = output
+            .manifest
+            .symbols()
+            .iter()
+            .find(|entry| entry.name == *symbol)
+            .expect("inline-assembly helper manifest entry");
+        assert_eq!(
+            manifest.kind,
+            ccc_link::bridge::GeneratedSymbolKind::Support
+        );
+    }
+
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    for symbol in support.defined_symbols() {
+        assert!(
+            object.symbol_by_name(symbol).unwrap().is_undefined(),
+            "{symbol} must be resolved by generated support assembly"
+        );
+    }
+    let clif = function_clif(&output.clif, "exercise");
+    assert!(clif.contains("fence"), "{clif}");
+    assert!(clif.contains("atomic_rmw.i64 xchg"), "{clif}");
+    assert!(clif.contains("atomic_cas"), "{clif}");
+    assert_eq!(clif.matches("call fn").count(), 2, "{clif}");
+}
+
+#[test]
+fn x87_long_double_definitions_and_variadic_calls_use_generated_bridges() {
+    let definition = lower_source("long double identity(long double value) { return value; }");
+    let output = emit(
         &definition,
         &EffectiveCompilationConfig::default(),
         Options::default(),
     )
-    .unwrap_err();
-    assert_eq!(error.code, "CCC3509");
-    assert!(error.span.is_some());
+    .unwrap();
+    assert_eq!(output.assemblies.len(), 2);
+    assert!(
+        output
+            .assemblies
+            .iter()
+            .any(|assembly| assembly.source().contains("fldt 256(%rsp)"))
+    );
+    assert!(
+        output
+            .assemblies
+            .iter()
+            .any(|assembly| assembly.source().contains(".Lccc_f80_add:"))
+    );
 
     let call = lower_source(
         "int variadic(const char *, ...);\n\
@@ -1379,6 +1641,124 @@ fn long_double_definitions_are_rejected_while_variadic_calls_use_a_bridge() {
 }
 
 #[test]
+fn x87_fixed_variadic_aggregate_indirect_and_volatile_paths_share_verified_support() {
+    let module = lower_source(
+        "typedef __builtin_va_list va_list;
+         struct Box { long double value; unsigned marker; };
+         long double fixed(long double value) { return value + 1.0L; }
+         long double read(int count, ...) {
+             va_list list;
+             __builtin_va_start(list, count);
+             return __builtin_va_arg(list, long double);
+         }
+         struct Box aggregate(struct Box value) {
+             value.value = value.value * 2.0L;
+             return value;
+         }
+         long double indirect(long double (*function)(long double), long double value) {
+             return function(value);
+         }
+         void volatile_copy(volatile long double *destination,
+                            volatile long double *source) {
+             *destination = *source;
+         }",
+    );
+    let config = EffectiveCompilationConfig::default();
+    let plan = ccc_abi::plan_module(&module, &config).unwrap();
+    assert!(
+        plan.definitions
+            .values()
+            .filter(|plan| matches!(plan.boundary, ccc_abi::BoundaryPlan::Bridge(_)))
+            .count()
+            >= 4
+    );
+    let x87_va_arg = plan
+        .va_args
+        .values()
+        .find(|plan| plan.classified.ty == TypeId::LONG_DOUBLE)
+        .expect("x87 va_arg plan");
+    assert_eq!((x87_va_arg.gp_slots, x87_va_arg.sse_slots), (0, 0));
+    assert_eq!(
+        (x87_va_arg.overflow_align, x87_va_arg.overflow_size),
+        (16, 16)
+    );
+
+    let output = emit(
+        &module,
+        &config,
+        Options {
+            emit_clif: true,
+            debug_info: None,
+        },
+    )
+    .unwrap();
+    let support = output
+        .assemblies
+        .iter()
+        .find(|assembly| assembly.stem() == "f80-support")
+        .expect("one x87 support unit");
+    assert!(support.source().contains("faddp %st, %st(1)"));
+    assert!(support.source().contains("fmulp %st, %st(1)"));
+    assert!(support.source().contains("fucomip %st(1), %st"));
+    assert!(support.source().contains("fcomip %st(1), %st"));
+    assert!(
+        output
+            .assemblies
+            .iter()
+            .any(|assembly| assembly.source().contains("call *%r11")),
+        "the indirect f80 call must use the generic boundary helper"
+    );
+    let volatile = function_clif(&output.clif, "volatile_copy");
+    assert_eq!(volatile.matches("call fn").count(), 2, "{volatile}");
+}
+
+#[test]
+fn x87_wide_integer_conversions_use_exact_operation_sensitive_runtime_helpers() {
+    let output = emit_source(
+        "long double from_signed(__int128 value) { return (long double)value; }
+         long double from_unsigned(unsigned __int128 value) { return (long double)value; }
+         __int128 to_signed(long double value) { return (__int128)value; }
+         unsigned __int128 to_unsigned(long double value) { return (unsigned __int128)value; }",
+    );
+    let support = output
+        .assemblies
+        .iter()
+        .find(|assembly| assembly.stem() == "f80-support")
+        .expect("x87 support assembly");
+    for symbol in ["__floattixf", "__floatuntixf", "__fixxfti", "__fixunsxfti"] {
+        assert!(support.source().contains(&format!("call {symbol}@PLT")));
+        assert!(
+            EffectiveCompilationConfig::default()
+                .target
+                .abi
+                .runtime_helper_manifest()
+                .iter()
+                .any(|contract| contract.symbol == symbol),
+            "{symbol} must be pre-budgeted by the target runtime manifest"
+        );
+    }
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    for symbol in ["__floattixf", "__floatuntixf", "__fixxfti", "__fixunsxfti"] {
+        assert!(
+            object.symbol_by_name(symbol).is_none(),
+            "{symbol} belongs to generated assembly, not the Cranelift object"
+        );
+    }
+
+    let signed_only =
+        emit_source("long double from_signed(__int128 value) { return (long double)value; }");
+    let support = signed_only
+        .assemblies
+        .iter()
+        .find(|assembly| assembly.stem() == "f80-support")
+        .unwrap();
+    assert!(support.source().contains("call __floattixf@PLT"));
+    for absent in ["__floatuntixf", "__fixxfti", "__fixunsxfti"] {
+        assert!(!support.source().contains(absent), "{absent}");
+    }
+}
+
+#[test]
 fn unprototyped_calls_use_the_generic_bridge_with_the_promoted_actual_plan() {
     let module = lower_source(
         "int legacy();\n\
@@ -1395,7 +1775,15 @@ fn unprototyped_calls_use_the_generic_bridge_with_the_promoted_actual_plan() {
     assert_eq!(boundary.kind, ccc_abi::BridgeKind::UnprototypedCall);
     assert_eq!(boundary.variadic_sse_count, 1);
 
-    let output = emit(&module, &config, Options { emit_clif: true }).unwrap();
+    let output = emit(
+        &module,
+        &config,
+        Options {
+            emit_clif: true,
+            debug_info: None,
+        },
+    )
+    .unwrap();
     assert_eq!(output.assemblies.len(), 1);
     assert!(
         output.assemblies[0].source().contains("call *%r11"),
@@ -1552,6 +1940,89 @@ fn legacy_sync_operations_are_native_atomics_without_external_symbols() {
             }),
         "the ignored protected operand must not produce a call relocation"
     );
+}
+
+#[test]
+fn scalar_c11_and_gnu_atomics_are_native_and_weaker_orders_are_strengthened() {
+    let output = emit_source(
+        "_Atomic int value;\n\
+         int load_store(int replacement) {\n\
+             int old = __atomic_load_n(&value, 0);\n\
+             __atomic_store_n(&value, replacement, 3);\n\
+             return old;\n\
+         }\n\
+         int update(int operand, int *expected) {\n\
+             int result = __atomic_add_fetch(&value, operand, 2);\n\
+             result ^= __atomic_fetch_and(&value, 255, 4);\n\
+             result ^= __atomic_fetch_or(&value, 16, 0);\n\
+             result ^= __atomic_fetch_xor(&value, 3, 1);\n\
+             result ^= __atomic_exchange_n(&value, result, 5);\n\
+             result ^= __atomic_compare_exchange_n(\n\
+                 &value, expected, result, 1, 0, 0);\n\
+             __atomic_thread_fence(2);\n\
+             __atomic_signal_fence(3);\n\
+             return result;\n\
+         }",
+    );
+
+    let load_store = function_clif(&output.clif, "load_store");
+    let lines = load_store.lines().map(str::trim).collect::<Vec<_>>();
+    assert!(
+        lines.windows(3).any(|window| window[0] == "fence"
+            && window[1].contains("load.i32")
+            && window[2] == "fence"),
+        "{load_store}"
+    );
+    assert!(
+        lines.windows(3).any(|window| window[0] == "fence"
+            && window[1].starts_with("store ")
+            && window[2] == "fence"),
+        "{load_store}"
+    );
+
+    let update = function_clif(&output.clif, "update");
+    for operation in ["add", "and", "or", "xor", "xchg"] {
+        assert!(
+            update.contains(&format!("atomic_rmw.i32 {operation}")),
+            "{update}"
+        );
+    }
+    assert!(update.contains("atomic_cas"), "{update}");
+    assert_eq!(
+        update.lines().filter(|line| line.trim() == "fence").count(),
+        2,
+        "{update}"
+    );
+
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    assert!(
+        object
+            .symbols()
+            .filter(|symbol| symbol.is_undefined())
+            .filter_map(|symbol| symbol.name().ok())
+            .all(|name| !name.starts_with("__atomic_")),
+        "native scalar atomics must not introduce compiler-runtime symbols"
+    );
+}
+
+#[test]
+fn non_native_atomic_representations_fail_closed() {
+    for source in [
+        "_Atomic double value; double read(void) { return value; }",
+        "volatile _Atomic long double value; long double read(void) { return value; }",
+    ] {
+        let module = lower_source(source);
+        let error = emit(
+            &module,
+            &EffectiveCompilationConfig::default(),
+            Options {
+                emit_clif: true,
+                debug_info: None,
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "CCC4011", "{source}: {error}");
+    }
 }
 
 #[test]
@@ -1794,7 +2265,14 @@ fn packed_and_bitfield_memory_paths_remain_unaligned_and_explicit() {
          }",
         &config,
     );
-    let output = emit(&module, &config, Options { emit_clif: true });
+    let output = emit(
+        &module,
+        &config,
+        Options {
+            emit_clif: true,
+            debug_info: None,
+        },
+    );
     let output = output.unwrap();
     let clif = function_clif(&output.clif, "inspect");
     assert!(clif.contains("iadd_imm"), "{clif}");

@@ -34,7 +34,7 @@ _Static_assert(TARGET_CPU_ARM64 == 1, "the Darwin profile must select arm64");
 #error unexpected minimum Apple OS version
 #endif
 #else
-_Static_assert(sizeof(long double) == 16, "Linux long double must use binary128 storage");
+_Static_assert(sizeof(long double) == 16, "Linux long double must use a 16-byte object");
 #endif
 
 int main(void) {

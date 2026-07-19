@@ -3,7 +3,7 @@ compiler_version = "0.1.0"
 
 [headers]
 directory = "include"
-compiler_owned = ["stdalign.h", "stdbool.h", "stdarg.h", "stdnoreturn.h"]
+compiler_owned = ["stdalign.h", "stdatomic.h", "stdbool.h", "stdarg.h", "stdnoreturn.h"]
 target_derived = ["stddef.h"]
 hosted_wrappers = ["math.h", "sys/cdefs.h"]
 

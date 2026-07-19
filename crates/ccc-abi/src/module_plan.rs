@@ -7,10 +7,11 @@ use sha2::{Digest as _, Sha256};
 use crate::{
     AbiCarrier, AbiClass, AbiError, BoundaryPlan, BridgeArtifactPlan, BridgeEntryArtifactPlan,
     BridgeLocation, CallBridgeArtifactPlan, CallPlan, CallTarget, DefinitionPlan,
-    LoweredSignaturePlan, ModuleAbiPlan, NativePurpose, PackagingPlan, PassingMode, SourceBinding,
-    SourceLinkage, SourceVisibility, TlsAccessorArtifactPlan, VerifiedModuleAbiPlan,
-    abi_config_key, hex, ir_shape_digest, plan_boundary_type, plan_fixed_call, plan_function_type,
-    plan_unprototyped_call, plan_va_arg, plan_variadic_call, translation_unit_digest,
+    F80SupportArtifactPlan, InlineAsmSupportArtifactPlan, LoweredSignaturePlan, ModuleAbiPlan,
+    NativePurpose, PackagingPlan, PassingMode, SourceBinding, SourceLinkage, SourceVisibility,
+    TlsAccessorArtifactPlan, VerifiedModuleAbiPlan, abi_config_key, hex, ir_shape_digest,
+    plan_boundary_type, plan_fixed_call, plan_function_type, plan_unprototyped_call, plan_va_arg,
+    plan_variadic_call, translation_unit_digest,
 };
 
 pub fn plan_module(
@@ -146,7 +147,7 @@ pub fn plan_module(
                         )
                         .map_err(|error| error.with_span_if_none(instruction.span))?,
                     )
-                } else if function_signature_contains_int128(&module.types, signature) {
+                } else if function_signature_requires_bridge(&module.types, signature, config) {
                     BoundaryPlan::Bridge(
                         plan_fixed_call(&module.types, signature, &actual_types, config)
                             .map_err(|error| error.with_span_if_none(instruction.span))?,
@@ -212,34 +213,42 @@ pub fn plan_module(
     })
 }
 
-fn function_signature_contains_int128(
+fn function_signature_requires_bridge(
     types: &ccc_types::TypeStore,
     signature: ccc_types::TypeId,
+    config: &EffectiveCompilationConfig,
 ) -> bool {
     fn contains(
         types: &ccc_types::TypeStore,
         ty: ccc_types::TypeId,
+        config: &EffectiveCompilationConfig,
         active: &mut Vec<ccc_types::TypeId>,
     ) -> bool {
-        if matches!(
-            types.builtin_type(ty),
-            Some(ccc_types::BuiltinType::Int128 | ccc_types::BuiltinType::UnsignedInt128)
-        ) {
-            return true;
+        match types.builtin_type(ty) {
+            Some(ccc_types::BuiltinType::Int128 | ccc_types::BuiltinType::UnsignedInt128) => {
+                return true;
+            }
+            Some(ccc_types::BuiltinType::LongDouble) => {
+                return config.target.data_layout.long_double_format
+                    == ccc_target::LongDoubleFormat::X87Extended;
+            }
+            _ => {}
         }
         if active.contains(&ty) {
             return false;
         }
         active.push(ty);
         let result = match types.try_kind(ty) {
-            Some(ccc_types::TypeKind::Array(array)) => contains(types, array.element.ty, active),
+            Some(ccc_types::TypeKind::Array(array)) => {
+                contains(types, array.element.ty, config, active)
+            }
             Some(ccc_types::TypeKind::Record(id)) => types
                 .record(*id)
                 .and_then(|record| record.fields.as_ref())
                 .is_some_and(|fields| {
                     fields
                         .iter()
-                        .any(|field| contains(types, field.ty.ty, active))
+                        .any(|field| contains(types, field.ty.ty, config, active))
                 }),
             _ => false,
         };
@@ -250,11 +259,11 @@ fn function_signature_contains_int128(
     let Some(signature) = types.function_signature(signature) else {
         return false;
     };
-    contains(types, signature.result.ty, &mut Vec::new())
+    contains(types, signature.result.ty, config, &mut Vec::new())
         || match signature.parameters {
             ccc_types::FunctionParameters::Prototype(parameters) => parameters
                 .iter()
-                .any(|parameter| contains(types, parameter.ty, &mut Vec::new())),
+                .any(|parameter| contains(types, parameter.ty, config, &mut Vec::new())),
             ccc_types::FunctionParameters::Unspecified => false,
         }
 }
@@ -269,6 +278,49 @@ fn plan_artifacts(
     translation_unit_digest: crate::TranslationUnitDigest,
     abi_identity: ccc_target::AbiIdentity,
 ) -> Result<BridgeArtifactPlan, AbiError> {
+    let inline_helpers = module.required_native_inline_asm_helpers();
+    if !inline_helpers.is_empty() && abi_identity != ccc_target::AbiIdentity::SysvAmd64Lp64 {
+        return Err(AbiError::new(
+            "CCC3515",
+            "x86 inline-assembly helpers require the System V AMD64 ABI",
+        ));
+    }
+    let inline_asm_support = (!inline_helpers.is_empty()).then(|| InlineAsmSupportArtifactPlan {
+        cpuid_symbol: inline_helpers
+            .contains(&gir::NativeInlineAsmHelper::X86Cpuid)
+            .then(|| {
+                generated_symbol_for(
+                    translation_unit_digest,
+                    "support_cpuid",
+                    ccc_sema::generic::FullFunctionId(u32::MAX - 2),
+                    None,
+                )
+            }),
+        rdtsc_symbol: inline_helpers
+            .contains(&gir::NativeInlineAsmHelper::X86Rdtsc)
+            .then(|| {
+                generated_symbol_for(
+                    translation_unit_digest,
+                    "support_rdtsc",
+                    ccc_sema::generic::FullFunctionId(u32::MAX - 3),
+                    None,
+                )
+            }),
+    });
+    let f80_support = (abi_identity == ccc_target::AbiIdentity::SysvAmd64Lp64
+        && module.functions.iter().any(|function| {
+            function.value_types.iter().any(|ty| {
+                module.types.builtin_type(*ty) == Some(ccc_types::BuiltinType::LongDouble)
+            })
+        }))
+    .then(|| F80SupportArtifactPlan {
+        helper_symbol: generated_symbol_for(
+            translation_unit_digest,
+            "support_f80",
+            ccc_sema::generic::FullFunctionId(u32::MAX - 1),
+            None,
+        ),
+    });
     let call_sites = calls
         .iter()
         .filter_map(|(site, plan)| {
@@ -283,11 +335,7 @@ fn plan_artifacts(
             None,
         ),
         call_sites,
-        frame_version: if abi_identity == ccc_target::AbiIdentity::SysvAmd64Lp64 {
-            1
-        } else {
-            2
-        },
+        frame_version: 2,
     });
 
     let mut bridge_entries = std::collections::BTreeMap::new();
@@ -352,11 +400,7 @@ fn plan_artifacts(
                     *function,
                     None,
                 ),
-                frame_version: if abi_identity == ccc_target::AbiIdentity::SysvAmd64Lp64 {
-                    1
-                } else {
-                    2
-                },
+                frame_version: 2,
                 va_state_version: if abi_identity == ccc_target::AbiIdentity::SysvAmd64Lp64 {
                     1
                 } else {
@@ -421,6 +465,13 @@ fn plan_artifacts(
     if let Some(call_bridge) = &call_bridge {
         exact_localization_symbols.push(call_bridge.helper_symbol.clone());
     }
+    if let Some(support) = &f80_support {
+        exact_localization_symbols.push(support.helper_symbol.clone());
+    }
+    if let Some(support) = &inline_asm_support {
+        exact_localization_symbols.extend(support.cpuid_symbol.iter().cloned());
+        exact_localization_symbols.extend(support.rdtsc_symbol.iter().cloned());
+    }
     for entry in bridge_entries.values() {
         exact_localization_symbols.push(entry.body_symbol.clone());
         if matches!(
@@ -444,7 +495,11 @@ fn plan_artifacts(
     exact_localization_symbols.sort();
     exact_localization_symbols.dedup();
     let generated_assembly_units = u32::try_from(
-        usize::from(call_bridge.is_some()) + bridge_entries.len() + tls_accessors.len(),
+        usize::from(call_bridge.is_some())
+            + usize::from(f80_support.is_some())
+            + usize::from(inline_asm_support.is_some())
+            + bridge_entries.len()
+            + tls_accessors.len(),
     )
     .map_err(|_| AbiError::new("CCC3503", "generated assembly unit count overflow"))?;
     let needs_packaging = generated_assembly_units != 0;
@@ -452,6 +507,8 @@ fn plan_artifacts(
         call_bridge,
         bridge_entries,
         tls_accessors,
+        f80_support,
+        inline_asm_support,
         packaging: PackagingPlan {
             generated_assembly_units,
             requires_assembler: needs_packaging,
@@ -750,6 +807,17 @@ fn dump_artifacts(output: &mut String, artifacts: &BridgeArtifactPlan) {
             accessor.source_defined,
         )
         .unwrap();
+    }
+    if let Some(support) = &artifacts.inline_asm_support {
+        writeln!(
+            output,
+            "inline-asm-support cpuid={} rdtsc={}",
+            support.cpuid_symbol.as_deref().unwrap_or("none"),
+            support.rdtsc_symbol.as_deref().unwrap_or("none")
+        )
+        .unwrap();
+    } else {
+        writeln!(output, "inline-asm-support none").unwrap();
     }
     writeln!(
         output,
@@ -1092,6 +1160,7 @@ fn render_location(location: BridgeLocation) -> String {
             match register.bank {
                 crate::RegisterBank::Integer => "integer",
                 crate::RegisterBank::Float => "float",
+                crate::RegisterBank::X87 => "x87",
             },
             register.index
         ),
@@ -1102,6 +1171,27 @@ fn render_location(location: BridgeLocation) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixed_bridge_selection_treats_darwin_long_double_as_binary64() {
+        let mut types = ccc_types::TypeStore::default();
+        let signature = types.function_type(ccc_types::FunctionType::prototype(
+            ccc_types::QualifiedType::unqualified(ccc_types::TypeId::LONG_DOUBLE),
+            vec![ccc_types::QualifiedType::unqualified(
+                ccc_types::TypeId::LONG_DOUBLE,
+            )],
+        ));
+        assert!(function_signature_requires_bridge(
+            &types,
+            signature,
+            &EffectiveCompilationConfig::default(),
+        ));
+        assert!(!function_signature_requires_bridge(
+            &types,
+            signature,
+            &EffectiveCompilationConfig::aarch64_apple_darwin(),
+        ));
+    }
 
     #[test]
     fn generated_names_use_the_full_translation_unit_digest() {
@@ -1118,7 +1208,7 @@ mod tests {
         let verified = plan
             .verify_against(&module, &EffectiveCompilationConfig::default())
             .unwrap();
-        assert!(dump_module_plan(verified).contains("abi-plan schema=ccc-abi-config-v2"));
+        assert!(dump_module_plan(verified).contains("abi-plan schema=ccc-abi-config-v3"));
     }
 
     #[test]

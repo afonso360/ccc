@@ -77,6 +77,10 @@ impl Default for PreprocessLimits {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreprocessOptions {
     pub language_mode: LanguageMode,
+    /// Treat the main file as output from an earlier preprocessing pass.
+    /// Command-line/predefined macros and forced inputs are ignored, and
+    /// ordinary tokens are forwarded without macro expansion.
+    pub preprocessed_input: bool,
     /// Overrides the language mode when present.
     pub trigraphs: Option<bool>,
     pub warn_trigraphs: bool,
@@ -100,6 +104,7 @@ impl Default for PreprocessOptions {
     fn default() -> Self {
         Self {
             language_mode: LanguageMode::Gnu11,
+            preprocessed_input: false,
             trigraphs: None,
             warn_trigraphs: true,
             include_paths: Vec::new(),

@@ -70,7 +70,7 @@ mod tests {
             FrontendItem::Token(Token {
                 kind: TokenKind::Floating(value),
                 ..
-            }) if value.value == 6.0
+            }) if value.number == "0x1.8p+2"
         )));
     }
 
@@ -394,6 +394,74 @@ mod tests {
     }
 
     #[test]
+    fn parses_and_preserves_complete_gnu_asm_statements() {
+        let unit = parse_source(
+            "int f(int index, int limit, int backup) {\n\
+                 int candidate = 1;\n\
+                 __asm__ __volatile__ __inline__ goto (\"cmp %[limit], %[index]\\n\\t\" \"cmova %[backup], %[candidate]\"\n\
+                     : [candidate] \"+r\" (candidate)\n\
+                     : [index] \"r\" (index), [limit] \"r\" (limit), [backup] \"r\" (backup)\n\
+                     : \"cc\", \"memory\" : done);\n\
+             done: return candidate;\n\
+             }",
+        )
+        .unwrap();
+        let ExternalItem::FunctionDefinition(function) = &unit.items[0] else {
+            panic!("expected function definition");
+        };
+        let StatementKind::Compound(items) = &function.body.kind else {
+            panic!("expected compound statement");
+        };
+        let BlockItem::Statement(statement) = &items[1] else {
+            panic!("expected asm statement");
+        };
+        let StatementKind::Asm(asm) = &statement.kind else {
+            panic!("expected asm statement");
+        };
+        assert_eq!(asm.keyword_spelling, "__asm__");
+        assert_eq!(asm.qualifiers.len(), 3);
+        assert_eq!(asm.outputs.len(), 1);
+        assert_eq!(asm.inputs.len(), 3);
+        assert_eq!(asm.clobbers.len(), 2);
+        assert_eq!(asm.goto_labels[0].name, "done");
+        assert_eq!(asm.colon_group_count, 4);
+        assert_eq!(asm.outputs[0].constraint.spelling, "\"+r\"");
+        assert_eq!(
+            asm.outputs[0].symbolic_name.as_ref().unwrap().name,
+            "candidate"
+        );
+        assert!(dump_ast(&unit).contains("asm-statement"));
+    }
+
+    #[test]
+    fn parses_basic_and_empty_group_asm_statements() {
+        let unit = parse_source(
+            "void f(long *field, long value) {\n\
+                 asm(\"nop\");\n\
+                 asm volatile (\"\" ::: \"memory\");\n\
+                 __asm__(\"lock; xchgq %0, %1\" : \"+q\"(value), \"+m\"(*field));\n\
+             }",
+        )
+        .unwrap();
+        let dump = dump_ast(&unit);
+        assert_eq!(dump.matches("asm-statement").count(), 3, "{dump}");
+        assert!(dump.contains("colon-groups=3"), "{dump}");
+    }
+
+    #[test]
+    fn rejects_malformed_gnu_asm_operands() {
+        for source in [
+            "void f(void) { asm(); }",
+            "void f(int x) { asm(\"\" : +r(x)); }",
+            "void f(int x) { asm(\"\" : \"+r\" x); }",
+            "void f(void) { asm(\"\" ::: memory); }",
+            "void f(void) { asm goto (\"\" :::: 1); }",
+        ] {
+            assert!(parse_source(source).is_err(), "accepted {source}");
+        }
+    }
+
+    #[test]
     fn parses_enumerator_attributes_before_and_after_the_enumerator() {
         let unit = parse_source(
             "enum State {
@@ -603,6 +671,68 @@ mod tests {
             let error = parse_source(source).unwrap_err();
             assert!(
                 error.message.contains("requires at least"),
+                "{source}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_the_exact_scalar_atomic_builtin_surface() {
+        let unit = parse_source(
+            "int value; int expected;\n\
+             int update(int operand) {\n\
+                 int result = __atomic_load_n(&value, 0);\n\
+                 __atomic_store_n(&value, operand, 3);\n\
+                 result ^= __atomic_exchange_n(&value, operand, 5);\n\
+                 result ^= __atomic_fetch_add(&value, operand, 0);\n\
+                 result ^= __atomic_fetch_sub(&value, operand, 1);\n\
+                 result ^= __atomic_fetch_and(&value, operand, 2);\n\
+                 result ^= __atomic_fetch_or(&value, operand, 3);\n\
+                 result ^= __atomic_fetch_xor(&value, operand, 4);\n\
+                 result ^= __atomic_add_fetch(&value, operand, 5);\n\
+                 result ^= __atomic_sub_fetch(&value, operand, 0);\n\
+                 result ^= __atomic_and_fetch(&value, operand, 1);\n\
+                 result ^= __atomic_or_fetch(&value, operand, 2);\n\
+                 result ^= __atomic_xor_fetch(&value, operand, 3);\n\
+                 result ^= __atomic_compare_exchange_n(\n\
+                     &value, &expected, operand, 1, 4, 2);\n\
+                 __atomic_thread_fence(5);\n\
+                 __atomic_signal_fence(5);\n\
+                 return result;\n\
+             }",
+        )
+        .unwrap();
+        let dump = dump_ast(&unit);
+        for spelling in [
+            "__atomic_load_n",
+            "__atomic_store_n",
+            "__atomic_exchange_n",
+            "__atomic_fetch_add",
+            "__atomic_fetch_sub",
+            "__atomic_fetch_and",
+            "__atomic_fetch_or",
+            "__atomic_fetch_xor",
+            "__atomic_add_fetch",
+            "__atomic_sub_fetch",
+            "__atomic_and_fetch",
+            "__atomic_or_fetch",
+            "__atomic_xor_fetch",
+            "__atomic_compare_exchange_n",
+            "__atomic_thread_fence",
+            "__atomic_signal_fence",
+        ] {
+            assert!(dump.contains(spelling), "{dump}");
+        }
+
+        for source in [
+            "int x; int f(void) { return __atomic_load_n(&x); }",
+            "int x; void f(void) { __atomic_store_n(&x, 1); }",
+            "int x, expected; int f(void) { return __atomic_compare_exchange_n(&x, &expected, 1, 0, 5); }",
+            "void f(void) { __atomic_thread_fence(); }",
+        ] {
+            let error = parse_source(source).unwrap_err();
+            assert!(
+                error.message.contains("requires exactly"),
                 "{source}: {error}"
             );
         }

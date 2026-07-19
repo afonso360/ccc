@@ -156,6 +156,8 @@ test_expected_bytes=$(manifest_integer test_archive_bytes)
 test_expected_sha256=$(manifest_string test_archive_sha256)
 test_expected_sha3=$(manifest_string test_archive_sha3_256)
 expected_translation_units=$(manifest_integer source_translation_units)
+expected_archive_members=$(manifest_integer archive_members)
+expected_link_commands=$(manifest_integer link_commands)
 success_marker=$(manifest_string success_marker)
 
 if [[ -z "$work_directory" ]]; then
@@ -217,15 +219,14 @@ grep -Fq 'local version = "Lua 5.5"' "$test_directory/all.lua" ||
 
 : "${CCC:=$repository/target/debug/ccc}"
 : "${CCC_RESOURCE_DIR:=$repository/resource-dir}"
-: "${CCC_LINK_CC:=gcc}"
+: "${CCC_CC:=${CCC_LINK_CC:-gcc}}"
 CCC=$(resolve_executable "$CCC")
 CCC_RESOURCE_DIR=$(absolute_directory "$CCC_RESOURCE_DIR")
-CCC_LINK_CC=$(resolve_executable "$CCC_LINK_CC")
-export CCC CCC_RESOURCE_DIR CCC_LINK_CC
-export CCC_LUA_COMMAND_LOG="$work_directory/compile-commands.txt"
+CCC_CC=$(resolve_executable "$CCC_CC")
+export CCC CCC_RESOURCE_DIR CCC_CC
 
 record_native_gcc_driver \
-  Lua "$CCC_LINK_CC" \
+  Lua "$CCC_CC" \
   "$work_directory/link-driver-identity.txt" \
   "$work_directory/link-driver-macros.txt"
 
@@ -235,12 +236,11 @@ clear_ambient_make_injection
 unset CFLAGS CPPFLAGS LDFLAGS LIBS
 unset MYCFLAGS MYLDFLAGS MYLIBS MYOBJS SYSCFLAGS SYSLDFLAGS SYSLIBS
 
-: >"$CCC_LUA_COMMAND_LOG"
-"$script_directory/ccc-cc" -dM -E \
+"$CCC" -dM -E \
   "$script_directory/predicate-probe.c" >"$work_directory/effective-macros.txt"
-"$script_directory/ccc-cc" -P -E \
+"$CCC" -P -E \
   "$script_directory/predicate-probe.c" >"$work_directory/predicate-probe.txt"
-"$script_directory/ccc-cc" -P -E \
+"$CCC" -P -E \
   "$script_directory/hosted-probe.c" | grep '^selected_' \
   >"$work_directory/hosted-probe.txt"
 
@@ -282,50 +282,134 @@ grep -Fq '__builtin_huge_val' "$work_directory/hosted-probe.txt" ||
     'statement_expression=none'
 } >"$work_directory/capability-inventory.txt"
 
-: >"$CCC_LUA_COMMAND_LOG"
-export CCC_LUA_SOURCE_ROOT="$source_directory/src"
-export CCC_LUA_SOURCE_LOG="$work_directory/source-inputs.txt"
-: >"$CCC_LUA_SOURCE_LOG"
+source_input_log="$work_directory/source-inputs.txt"
+: >"$source_input_log"
 expected_source_inputs="$work_directory/expected-source-inputs.txt"
-find "$CCC_LUA_SOURCE_ROOT" -maxdepth 1 -type f -name '*.c' -print | \
+find "$source_directory/src" -maxdepth 1 -type f -name '*.c' -print | \
   LC_ALL=C sort >"$expected_source_inputs"
 expected_source_count=$(wc -l <"$expected_source_inputs" | tr -d '[:space:]')
 [[ "$expected_source_count" == "$expected_translation_units" ]] ||
   die "Lua source archive contains $expected_source_count C inputs; expected $expected_translation_units"
 make -C "$source_directory" -j"$jobs" linux \
-  CC="$script_directory/ccc-cc" \
+  CC="$CCC" \
   2>&1 | tee "$work_directory/build.log"
 
 [[ -x "$source_directory/src/lua" ]] || die "Lua interpreter was not produced"
 [[ -x "$source_directory/src/luac" ]] || die "Lua bytecode compiler was not produced"
 [[ -f "$source_directory/src/liblua.a" ]] || die "Lua static library was not produced"
 
-actual_translation_units=$(grep -c '^ccc ' "$CCC_LUA_COMMAND_LOG" || true)
+awk -v compiler="$CCC" '
+  $1 == compiler {
+    for (index = 1; index <= NF; ++index)
+      printf "%s%s", (index == 1 ? "" : " "), $index
+    print ""
+  }
+' "$work_directory/build.log" >"$work_directory/ccc-commands.txt"
+awk '
+  {
+    compile = 0
+    for (index = 2; index <= NF; ++index)
+      if ($index == "-c") compile = 1
+    if (compile) print
+  }
+' "$work_directory/ccc-commands.txt" >"$work_directory/compile-commands.txt"
+awk '
+  {
+    compile = 0
+    for (index = 2; index <= NF; ++index)
+      if ($index == "-c") compile = 1
+    if (!compile) print
+  }
+' "$work_directory/ccc-commands.txt" >"$work_directory/link-commands.txt"
+
+ccc_commands=$(wc -l <"$work_directory/ccc-commands.txt" | tr -d '[:space:]')
+expected_ccc_commands=$((expected_translation_units + expected_link_commands))
+[[ "$ccc_commands" == "$expected_ccc_commands" ]] ||
+  die "Lua build invoked CCC $ccc_commands times; expected $expected_ccc_commands translations and links"
+
+awk -v compiler="$CCC" -v root="$source_directory/src" '
+  $1 == compiler {
+    compile = 0
+    source = ""
+    for (index = 2; index <= NF; ++index) {
+      if ($index == "-c") compile = 1
+      if ($index ~ /^[^[:space:]]+\.c$/) source = $index
+    }
+    if (compile && source != "") print root "/" source
+  }
+' "$work_directory/build.log" >"$source_input_log"
+actual_translation_units=$(wc -l <"$source_input_log" | tr -d '[:space:]')
 [[ "$actual_translation_units" == "$expected_translation_units" ]] ||
   die "Lua build translated $actual_translation_units C inputs; expected $expected_translation_units"
-LC_ALL=C sort "$CCC_LUA_SOURCE_LOG" >"$CCC_LUA_SOURCE_LOG.sorted"
-mv "$CCC_LUA_SOURCE_LOG.sorted" "$CCC_LUA_SOURCE_LOG"
-cmp -s "$expected_source_inputs" "$CCC_LUA_SOURCE_LOG" ||
+LC_ALL=C sort "$source_input_log" >"$source_input_log.sorted"
+mv "$source_input_log.sorted" "$source_input_log"
+cmp -s "$expected_source_inputs" "$source_input_log" ||
   die "Lua build did not translate the exact pinned set of C source files"
-if grep '^link ' "$CCC_LUA_COMMAND_LOG" | grep -Eq '\.(c|i)( |$)'; then
-  die "Lua native link command received a C source input"
+
+expected_object_outputs="$work_directory/expected-object-outputs.txt"
+sed 's|.*/||; s/\.c$/.o/' "$expected_source_inputs" >"$expected_object_outputs"
+object_output_log="$work_directory/object-outputs.txt"
+awk '
+  {
+    compile = 0
+    output = ""
+    source = ""
+    for (index = 2; index <= NF; ++index) {
+      if ($index == "-c") compile = 1
+      if ($index == "-o" && index < NF) output = $(index + 1)
+      if ($index ~ /^[^[:space:]]+\.c$/) source = $index
+    }
+    if (compile && output == "" && source != "") {
+      output = source
+      sub(/^.*\//, "", output)
+      sub(/\.c$/, ".o", output)
+    }
+    if (compile && output != "") print output
+  }
+' "$work_directory/compile-commands.txt" | LC_ALL=C sort >"$object_output_log"
+cmp -s "$expected_object_outputs" "$object_output_log" ||
+  die "Lua build did not produce the exact pinned set of object files"
+
+archive_member_log="$work_directory/archive-members.txt"
+ar t "$source_directory/src/liblua.a" | LC_ALL=C sort >"$archive_member_log"
+archive_members=$(wc -l <"$archive_member_log" | tr -d '[:space:]')
+[[ "$archive_members" == "$expected_archive_members" ]] ||
+  die "Lua archive contains $archive_members members; expected $expected_archive_members"
+grep -Ev '^(lua|luac)\.o$' "$expected_object_outputs" >"$work_directory/expected-archive-members.txt"
+cmp -s "$work_directory/expected-archive-members.txt" "$archive_member_log" ||
+  die "Lua archive does not contain the exact pinned library object set"
+
+actual_links="$work_directory/normalized-link-arguments.txt"
+awk '
+  {
+    for (index = 2; index <= NF; ++index)
+      printf "%s%s", (index == 2 ? "" : " "), $index
+    print ""
+  }
+' "$work_directory/link-commands.txt" | LC_ALL=C sort >"$actual_links"
+expected_links="$work_directory/expected-link-arguments.txt"
+printf '%s\n' \
+  '-o lua lua.o liblua.a -lm -Wl,-E -ldl' \
+  '-o luac luac.o liblua.a -lm -Wl,-E -ldl' | LC_ALL=C sort >"$expected_links"
+link_commands=$(wc -l <"$actual_links" | tr -d '[:space:]')
+[[ "$link_commands" == "$expected_link_commands" ]] ||
+  die "Lua build invoked $link_commands CCC links; expected $expected_link_commands"
+cmp -s "$expected_links" "$actual_links" ||
+  die "Lua build did not use the exact two pinned upstream CCC link commands"
+
+if grep -q -- ' -no-pie' "$work_directory/link-commands.txt"; then
+  die "Lua links unexpectedly disabled PIE"
 fi
-link_commands=$(grep -c '^link ' "$CCC_LUA_COMMAND_LOG" || true)
-[[ "$link_commands" == 2 ]] ||
-  die "Lua build invoked $link_commands native links; expected 2"
-if grep '^link ' "$CCC_LUA_COMMAND_LOG" | grep -q -- ' -no-pie'; then
-  die "Lua native links unexpectedly disabled PIE"
-fi
-linux_translations=$(grep '^ccc ' "$CCC_LUA_COMMAND_LOG" | \
+linux_translations=$(grep -- ' -c ' "$work_directory/compile-commands.txt" | \
   grep -c -- ' -DLUA_USE_LINUX' || true)
 [[ "$linux_translations" == "$expected_translation_units" ]] ||
   die "Lua C translations did not all select the pinned Linux profile"
-explicit_standard_translations=$(grep '^ccc ' "$CCC_LUA_COMMAND_LOG" | \
-  grep -Ec -- ' -std=' || true)
-[[ "$explicit_standard_translations" == 0 ]] ||
-  die "Lua C translations unexpectedly overrode CCC's default GNU language mode"
-if grep '^ccc ' "$CCC_LUA_COMMAND_LOG" | \
-  grep -Eq -- '-DLUA_NOBUILTIN|-DLUA_USE_JUMPTABLE=0'; then
+optimized_translations=$(grep -- ' -c ' "$work_directory/compile-commands.txt" | \
+  grep -c -- ' -O2' || true)
+[[ "$optimized_translations" == "$expected_translation_units" ]] ||
+  die "Lua C translations did not all retain the upstream optimization profile"
+if grep -- ' -c ' "$work_directory/compile-commands.txt" | \
+  grep -Eq -- '-std=|-DLUA_NOBUILTIN|-DLUA_USE_JUMPTABLE=0'; then
   die "Lua C translations disabled a compiler-selected source path"
 fi
 

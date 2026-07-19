@@ -214,6 +214,11 @@ mod tests {
             "c11-vla",
             ccc_target::CapabilityState::Implemented,
         );
+        config.capabilities.insert(
+            CapabilityKind::Feature,
+            "c11-atomics",
+            ccc_target::CapabilityState::Unsupported,
+        );
 
         let macros = additional_predefined_macros(&config);
         assert!(!macros.contains_key("__STDC_NO_VLA__"));

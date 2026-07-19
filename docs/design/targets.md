@@ -36,7 +36,7 @@ The `EffectiveCompilationConfig` type and per-target defaults are defined in `cc
 
 - `TargetSpec`: triple defaults, data layout, object format, default ABI, default CPU features, and native `long double` representation;
 - `LanguageOptions`: language/GNU profile, character set, overflow, enum, character-signedness, and diagnostic-affecting choices;
-- `AbiOptions`: calling convention, packing, long-double mode, vector ABI, TLS model, and target ABI flags;
+- `AbiOptions`: calling convention, packing, vector ABI, TLS model, and target ABI flags;
 - `CodegenOptions`: CPU/ISA features, relocation model, code model, optimization contract, debug information, stack policy, and automatic-storage provider;
 - `ToolchainSpec`: resolved compiler driver, assembler, linker, archiver, sysroot/SDK, runtime libraries, system includes, deployment target, and a probe fingerprint. Components are resolved [per selected phase](toolchain.md#target-toolchain-resolution); compile-only invocations do not require a resolved linker.
 

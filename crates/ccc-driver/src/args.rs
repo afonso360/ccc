@@ -1,6 +1,10 @@
+use std::collections::HashSet;
+use std::fs;
 use std::path::PathBuf;
 
 use ccc_target::{LanguageMode, RelocationModel, TrigraphPolicy};
+
+use crate::warnings::validate_warning_option;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DumpKind {
@@ -17,7 +21,33 @@ pub(crate) enum DumpKind {
 pub(crate) enum PrimaryAction {
     Compile { link: bool },
     Preprocess,
+    SyntaxOnly,
     Dump(DumpKind),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum LinkOutputKind {
+    #[default]
+    Executable,
+    Shared,
+    Relocatable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum LinkItem {
+    Input {
+        path: PathBuf,
+        language: Option<DriverInputLanguage>,
+    },
+    Argument(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DriverInputLanguage {
+    C,
+    PreprocessedC,
+    Assembly,
+    PreprocessedAssembly,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -88,6 +118,10 @@ impl Default for DependencyOptions {
 pub(crate) struct DriverOptions {
     pub action: PrimaryAction,
     pub input: PathBuf,
+    pub inputs: Vec<PathBuf>,
+    pub input_languages: Vec<Option<DriverInputLanguage>>,
+    pub link_items: Vec<LinkItem>,
+    pub link_output_kind: LinkOutputKind,
     pub output: Option<PathBuf>,
     pub language_mode: LanguageMode,
     pub relocation_model: RelocationModel,
@@ -112,21 +146,62 @@ pub(crate) struct DriverOptions {
     pub warnings_as_errors: bool,
     pub warning_options: Vec<String>,
     pub error_limit: Option<usize>,
+    pub debug_info: bool,
+    pub verbose: bool,
+    pub degraded_hardening: Vec<String>,
+    pub print_commands_only: bool,
 }
 
+#[derive(Debug)]
 pub(crate) enum ParsedCommand {
     Run(Box<DriverOptions>),
     Help,
     Version,
+    VerboseVersion,
+    Query(DriverQuery, Box<QueryOptions>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum DriverQuery {
+    DumpMachine,
+    DumpVersion,
+    PrintProgram(String),
+    PrintFile(String),
+    PrintSearchDirectories,
+    PrintEffectiveConfig,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct QueryOptions {
+    pub target: Option<String>,
+    pub target_arch: Option<String>,
+    pub target_cpu: Option<String>,
+    pub target_abi: Option<String>,
+    pub sysroot: Option<PathBuf>,
+    pub resource_dir: Option<PathBuf>,
+    pub sdk_root: Option<PathBuf>,
+    pub deployment_target: Option<String>,
+    pub language_mode: LanguageMode,
+    pub relocation_model: RelocationModel,
 }
 
 pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<ParsedCommand, String> {
+    let mut active_response_files = HashSet::new();
+    let arguments = expand_response_arguments(
+        arguments.into_iter().collect(),
+        0,
+        &mut active_response_files,
+    )?;
     let mut arguments = arguments.into_iter();
     let mut compile_only = false;
     let mut preprocess_only = false;
+    let mut syntax_only = false;
     let mut dump = None;
     let mut output = None;
     let mut inputs = Vec::new();
+    let mut input_languages = Vec::new();
+    let mut link_items = Vec::new();
+    let mut link_output_kind = LinkOutputKind::Executable;
     let mut language_mode = LanguageMode::Gnu11;
     let mut relocation_model = RelocationModel::Pie;
     let mut trigraphs = TrigraphPolicy::LanguageDefault;
@@ -150,11 +225,24 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
     let mut warnings_as_errors = false;
     let mut warning_options = Vec::new();
     let mut error_limit = None;
+    let mut debug_info = false;
+    let mut verbose = false;
+    let mut query = None;
+    let mut degraded_hardening = Vec::new();
+    let mut input_language = None;
+    let mut print_commands_only = false;
 
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "-c" => compile_only = true,
+            "-S" => {
+                return Err(
+                    "ccc: unsupported capability `-S`: faithful target assembly emission is not available"
+                        .to_owned(),
+                );
+            }
             "-E" => preprocess_only = true,
+            "-fsyntax-only" => syntax_only = true,
             "-P" => suppress_linemarkers = true,
             "-dM" => dump_macros = true,
             "--dump-pp-tokens" => select_dump(&mut dump, DumpKind::PpTokens)?,
@@ -164,24 +252,80 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
             "--dump-ir" => select_dump(&mut dump, DumpKind::Ir)?,
             "--dump-abi" => select_dump(&mut dump, DumpKind::Abi)?,
             "--emit=clif" => select_dump(&mut dump, DumpKind::Clif)?,
+            "--emit=obj" => compile_only = true,
+            "--emit=asm" => {
+                return Err(
+                    "ccc: unsupported capability `--emit=asm`: annotated disassembly is not available"
+                        .to_owned(),
+                );
+            }
             "-trigraphs" => trigraphs = TrigraphPolicy::Enabled,
             "-nostdinc" => no_standard_includes = true,
             "-nobuiltininc" => no_builtin_includes = true,
             "-w" => suppress_warnings = true,
+            "-v" => verbose = true,
+            "-###" => print_commands_only = true,
             "-Werror" => warnings_as_errors = true,
             "-Wno-error" => warnings_as_errors = false,
             "-fPIC" | "-fpic" => {
                 relocation_model = RelocationModel::Pic;
             }
-            "-fPIE" | "-fpie" | "-pie" => relocation_model = RelocationModel::Pie,
-            "-fno-PIC" | "-fno-pic" | "-fno-PIE" | "-fno-pie" | "-no-pie" => {
+            "-fPIE" | "-fpie" | "-pie" | "--pie" => relocation_model = RelocationModel::Pie,
+            "-fno-PIC" | "-fno-pic" | "-fno-PIE" | "-fno-pie" | "-no-pie" | "--no-pie"
+            | "-nopie" => {
                 relocation_model = RelocationModel::Static;
             }
-            // CCC currently has one baseline code-generation profile and does
-            // not emit debug information. These explicitly allowlisted quality
-            // options therefore cannot change language semantics, ABI,
-            // predefined macros, or the generated object.
-            "-g" | "-O" | "-O0" | "-O1" | "-O2" | "-O3" | "-Os" | "-Oz" => {}
+            "-shared" | "-dynamiclib" => {
+                link_output_kind = LinkOutputKind::Shared;
+                relocation_model = RelocationModel::Pic;
+            }
+            "-r" => link_output_kind = LinkOutputKind::Relocatable,
+            "-static" => {
+                relocation_model = RelocationModel::Static;
+                link_items.push(LinkItem::Argument(argument));
+            }
+            "-rdynamic" | "-s" | "-nostdlib" | "-nodefaultlibs" | "-nostartfiles"
+            | "-static-libgcc" | "-shared-libgcc" => {
+                link_items.push(LinkItem::Argument(argument));
+            }
+            "-pthread" => {
+                macro_actions.push(MacroAction::Define("_REENTRANT=1".to_owned()));
+                link_items.push(LinkItem::Argument(argument));
+            }
+            // CCC currently has one baseline optimization profile. These
+            // spellings cannot change language semantics, ABI, predefined
+            // macros, or the generated object until additional profiles are
+            // introduced.
+            "-O" | "-O0" | "-O1" | "-O2" | "-O3" | "-Os" | "-Oz" => {}
+            // CCC does not use driver pipes between compilation phases, so
+            // accepting this build-system preference has no observable effect.
+            "-pipe" => {}
+            // There is no type-based alias optimization in the baseline IR.
+            // Disabling it is therefore behavior-compatible.
+            "-fno-strict-aliasing" => {}
+            "-fstack-protector"
+            | "-fstack-protector-strong"
+            | "-fstack-protector-all"
+            | "-fstack-clash-protection"
+            | "-fcf-protection"
+            | "-mshstk"
+            | "-fno-plt"
+            | "-fno-omit-frame-pointer" => {
+                degraded_hardening.push(argument);
+            }
+            // Disabling a hardening transform CCC does not perform is
+            // behavior-compatible with the generated code.
+            "-fno-stack-protector"
+            | "-fno-stack-clash-protection"
+            | "-fomit-frame-pointer"
+            | "-fno-delete-null-pointer-checks"
+            | "-fno-strict-overflow" => {}
+            "-pedantic" => warning_options.push("-Wpedantic".to_owned()),
+            "-pedantic-errors" => {
+                warning_options.push("-Werror=pedantic".to_owned());
+            }
+            "-g" | "-g1" | "-g2" | "-g3" => debug_info = true,
+            "-g0" => debug_info = false,
             "-M" => select_dependency_mode(
                 &mut dependencies.mode,
                 DependencyMode::Only {
@@ -211,6 +355,36 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
                 return Err("ccc: unsupported dependency option `-MG`".to_owned());
             }
             "-o" => output = Some(take_path(&mut arguments, "-o")?),
+            "-x" => {
+                input_language = parse_input_language(&take_value(&mut arguments, "-x")?)?;
+            }
+            "-L" => {
+                link_items.push(LinkItem::Argument("-L".to_owned()));
+                link_items.push(LinkItem::Argument(take_value(&mut arguments, "-L")?));
+            }
+            "-l" => {
+                link_items.push(LinkItem::Argument("-l".to_owned()));
+                link_items.push(LinkItem::Argument(take_value(&mut arguments, "-l")?));
+            }
+            "-Xlinker" => {
+                link_items.push(LinkItem::Argument("-Xlinker".to_owned()));
+                link_items.push(LinkItem::Argument(take_value(&mut arguments, "-Xlinker")?));
+            }
+            "-R" | "-T" | "-u" | "-z" => {
+                let option = argument.clone();
+                link_items.push(LinkItem::Argument(argument));
+                link_items.push(LinkItem::Argument(take_value(&mut arguments, &option)?));
+            }
+            "-install_name"
+            | "-compatibility_version"
+            | "-current_version"
+            | "-undefined"
+            | "-arch"
+            | "-framework" => {
+                let option = argument.clone();
+                link_items.push(LinkItem::Argument(argument));
+                link_items.push(LinkItem::Argument(take_value(&mut arguments, &option)?));
+            }
             "-D" => macro_actions.push(MacroAction::Define(take_value(&mut arguments, "-D")?)),
             "-U" => {
                 macro_actions.push(MacroAction::Undefine(take_value(&mut arguments, "-U")?));
@@ -259,9 +433,38 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
                 .push(DependencyTarget::Quoted(take_value(&mut arguments, "-MQ")?)),
             "-h" | "--help" => return Ok(ParsedCommand::Help),
             "--version" => return Ok(ParsedCommand::Version),
-            "--" => inputs.extend(arguments.by_ref().map(PathBuf::from)),
-            _ if argument == "-std=gnu11" => language_mode = LanguageMode::Gnu11,
-            _ if argument == "-std=c11" => language_mode = LanguageMode::C11,
+            "-dumpmachine" => select_query(&mut query, DriverQuery::DumpMachine)?,
+            "-dumpversion" | "-dumpfullversion" => {
+                select_query(&mut query, DriverQuery::DumpVersion)?;
+            }
+            "-print-search-dirs" => {
+                select_query(&mut query, DriverQuery::PrintSearchDirectories)?;
+            }
+            "--print-effective-config" => {
+                select_query(&mut query, DriverQuery::PrintEffectiveConfig)?;
+            }
+            "--" => {
+                for argument in arguments.by_ref() {
+                    let input = PathBuf::from(argument);
+                    link_items.push(LinkItem::Input {
+                        path: input.clone(),
+                        language: input_language,
+                    });
+                    inputs.push(input);
+                    input_languages.push(input_language);
+                }
+            }
+            _ if matches!(argument.as_str(), "-std=gnu11" | "-std=gnu99") => {
+                // The supported GNU C11 language is a source-compatible
+                // superset for the C99 build profiles accepted here.
+                language_mode = LanguageMode::Gnu11;
+            }
+            _ if matches!(argument.as_str(), "-std=c11" | "-std=c99") => {
+                // Likewise, the strict C11 frontend accepts the C99 build
+                // profile while retaining CCC's documented C11 predefined
+                // macro contract.
+                language_mode = LanguageMode::C11;
+            }
             _ if argument.starts_with("-std=") => {
                 return Err(format!("ccc: unsupported language mode `{argument}`"));
             }
@@ -295,10 +498,35 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
                 require_joined_value(value, "-mmacosx-version-min")?;
                 deployment_target = Some(value.to_owned());
             }
+            _ if let Some(value) = argument.strip_prefix("-print-prog-name=") => {
+                require_joined_value(value, "-print-prog-name")?;
+                select_query(&mut query, DriverQuery::PrintProgram(value.to_owned()))?;
+            }
+            _ if let Some(value) = argument.strip_prefix("-print-file-name=") => {
+                require_joined_value(value, "-print-file-name")?;
+                select_query(&mut query, DriverQuery::PrintFile(value.to_owned()))?;
+            }
             _ if let Some(value) = argument.strip_prefix("-ferror-limit=") => {
                 error_limit = Some(parse_limit(value, "-ferror-limit")?);
             }
-            _ if is_debug_level_option(&argument) => {}
+            _ if let Some(value) = argument.strip_prefix("-fcf-protection=") => match value {
+                "none" => {}
+                "full" | "branch" | "return" => degraded_hardening.push(argument),
+                _ => {
+                    return Err(format!(
+                        "ccc: unsupported control-flow protection mode `{value}`"
+                    ));
+                }
+            },
+            _ if let Some(value) = argument.strip_prefix("-x") => {
+                require_joined_value(value, "-x")?;
+                input_language = parse_input_language(value)?;
+            }
+            _ if is_debug_level_option(&argument) => {
+                return Err(format!(
+                    "ccc: unsupported debug-information level `{argument}`"
+                ));
+            }
             _ if let Some(value) = argument.strip_prefix("-D") => {
                 require_joined_value(value, "-D")?;
                 macro_actions.push(MacroAction::Define(value.to_owned()));
@@ -313,6 +541,54 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
                     kind: IncludePathKind::User,
                     path: PathBuf::from(value),
                 });
+            }
+            _ if let Some(value) = argument.strip_prefix("-Wp,") => {
+                for option in value.split(',') {
+                    if let Some(definition) = option.strip_prefix("-D") {
+                        require_joined_value(definition, "-Wp,-D")?;
+                        macro_actions.push(MacroAction::Define(definition.to_owned()));
+                    } else if let Some(name) = option.strip_prefix("-U") {
+                        require_joined_value(name, "-Wp,-U")?;
+                        macro_actions.push(MacroAction::Undefine(name.to_owned()));
+                    } else {
+                        return Err(format!(
+                            "ccc: unsupported preprocessor pass-through option `{option}`"
+                        ));
+                    }
+                }
+            }
+            _ if argument == "-Wa"
+                || argument.starts_with("-Wa,")
+                || argument.starts_with("-Wa=") =>
+            {
+                return Err(format!(
+                    "ccc: unsupported assembler pass-through option `{argument}`"
+                ));
+            }
+            _ if argument.starts_with("-Wl,") || argument.starts_with("-Wl=") => {
+                link_items.push(LinkItem::Argument(argument));
+            }
+            _ if let Some(value) = argument.strip_prefix("-Xlinker=") => {
+                require_joined_value(value, "-Xlinker")?;
+                link_items.push(LinkItem::Argument("-Xlinker".to_owned()));
+                link_items.push(LinkItem::Argument(value.to_owned()));
+            }
+            _ if let Some(value) = argument.strip_prefix("-L") => {
+                require_joined_value(value, "-L")?;
+                link_items.push(LinkItem::Argument(argument));
+            }
+            _ if let Some(value) = argument.strip_prefix("-l") => {
+                require_joined_value(value, "-l")?;
+                link_items.push(LinkItem::Argument(argument));
+            }
+            _ if argument.starts_with("-R")
+                || argument.starts_with("-T")
+                || argument.starts_with("-u")
+                || argument.starts_with("-z") =>
+            {
+                let option = &argument[..2];
+                require_joined_value(&argument[2..], option)?;
+                link_items.push(LinkItem::Argument(argument));
             }
             _ if let Some(value) = argument.strip_prefix("-MF") => {
                 require_joined_value(value, "-MF")?;
@@ -330,24 +606,72 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
                     .targets
                     .push(DependencyTarget::Quoted(value.to_owned()));
             }
-            _ if argument.starts_with("-W") => warning_options.push(argument),
+            _ if argument.starts_with("-W") => {
+                validate_warning_option(&argument)?;
+                warning_options.push(argument);
+            }
             _ if argument.starts_with('-') => {
                 return Err(format!("ccc: unsupported option `{argument}`"));
             }
-            _ => inputs.push(PathBuf::from(argument)),
+            _ => {
+                let input = PathBuf::from(argument);
+                link_items.push(LinkItem::Input {
+                    path: input.clone(),
+                    language: input_language,
+                });
+                inputs.push(input);
+                input_languages.push(input_language);
+            }
         }
     }
 
-    if inputs.len() != 1 {
-        return Err(
-            "ccc: accepts exactly one C source input; use `ccc --help` for usage".to_owned(),
-        );
+    if let Some(query) = query {
+        if !inputs.is_empty() {
+            return Err(
+                "ccc: build-system introspection options do not accept input files".to_owned(),
+            );
+        }
+        return Ok(ParsedCommand::Query(
+            query,
+            Box::new(QueryOptions {
+                target,
+                target_arch,
+                target_cpu,
+                target_abi,
+                sysroot,
+                resource_dir,
+                sdk_root,
+                deployment_target,
+                language_mode,
+                relocation_model,
+            }),
+        ));
     }
-    if compile_only && preprocess_only {
-        return Err("ccc: `-c` and `-E` cannot be combined".to_owned());
+    if inputs.is_empty() && verbose {
+        return Ok(ParsedCommand::VerboseVersion);
+    }
+    if inputs.is_empty() {
+        return Err("ccc: no input files".to_owned());
+    }
+    if usize::from(compile_only) + usize::from(preprocess_only) + usize::from(syntax_only) > 1 {
+        return Err("ccc: `-c`, `-E`, and `-fsyntax-only` are mutually exclusive".to_owned());
     }
     if dump.is_some() && (compile_only || preprocess_only || output.is_some()) {
         return Err("ccc: dump modes cannot be combined with `-c`, `-E`, or `-o`".to_owned());
+    }
+    if (preprocess_only || syntax_only || dump.is_some()) && inputs.len() != 1 {
+        return Err(
+            "ccc: preprocessing, syntax-only, and dump modes require exactly one input".to_owned(),
+        );
+    }
+    if compile_only && inputs.len() > 1 && output.is_some() {
+        return Err("ccc: cannot use `-o` with `-c` and multiple input files".to_owned());
+    }
+    if !matches!(link_output_kind, LinkOutputKind::Executable) && compile_only {
+        return Err("ccc: link-output options cannot be combined with `-c`".to_owned());
+    }
+    if link_output_kind == LinkOutputKind::Shared && relocation_model == RelocationModel::Static {
+        return Err("ccc: shared output requires position-independent input code".to_owned());
     }
     if dump.is_some() && matches!(dependencies.mode, DependencyMode::Only { .. }) {
         return Err("ccc: dump modes cannot be combined with `-M` or `-MM`".to_owned());
@@ -374,6 +698,8 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
         PrimaryAction::Dump(kind)
     } else if preprocess_only || matches!(dependencies.mode, DependencyMode::Only { .. }) {
         PrimaryAction::Preprocess
+    } else if syntax_only {
+        PrimaryAction::SyntaxOnly
     } else {
         PrimaryAction::Compile {
             link: !compile_only,
@@ -386,7 +712,11 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
 
     Ok(ParsedCommand::Run(Box::new(DriverOptions {
         action,
-        input: inputs.pop().expect("input count was checked"),
+        input: inputs[0].clone(),
+        inputs,
+        input_languages,
+        link_items,
+        link_output_kind,
         output,
         language_mode,
         relocation_model,
@@ -411,12 +741,124 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
         warnings_as_errors,
         warning_options,
         error_limit,
+        debug_info,
+        verbose,
+        degraded_hardening,
+        print_commands_only,
     })))
+}
+
+fn expand_response_arguments(
+    arguments: Vec<String>,
+    depth: usize,
+    active: &mut HashSet<PathBuf>,
+) -> Result<Vec<String>, String> {
+    if depth > 16 {
+        return Err("ccc: response-file nesting exceeds 16 levels".to_owned());
+    }
+    let mut expanded = Vec::new();
+    for argument in arguments {
+        let Some(path) = argument.strip_prefix('@').filter(|path| !path.is_empty()) else {
+            expanded.push(argument);
+            continue;
+        };
+        if let Some(literal) = path.strip_prefix('@') {
+            expanded.push(format!("@{literal}"));
+            continue;
+        }
+        let spelled = PathBuf::from(path);
+        let canonical = fs::canonicalize(&spelled).map_err(|error| {
+            format!(
+                "ccc: cannot read response file {}: {error}",
+                spelled.display()
+            )
+        })?;
+        if !active.insert(canonical.clone()) {
+            return Err(format!(
+                "ccc: response file {} recursively includes itself",
+                spelled.display()
+            ));
+        }
+        let contents = fs::read_to_string(&canonical).map_err(|error| {
+            format!(
+                "ccc: cannot read response file {}: {error}",
+                spelled.display()
+            )
+        })?;
+        let nested = parse_response_contents(&contents, &spelled)?;
+        expanded.extend(expand_response_arguments(nested, depth + 1, active)?);
+        active.remove(&canonical);
+    }
+    Ok(expanded)
+}
+
+fn parse_response_contents(contents: &str, path: &std::path::Path) -> Result<Vec<String>, String> {
+    let mut arguments = Vec::new();
+    let mut current = String::new();
+    let mut token_started = false;
+    let mut quote = None;
+    let mut escaped = false;
+    for character in contents.chars() {
+        if escaped {
+            current.push(character);
+            token_started = true;
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            token_started = true;
+            escaped = true;
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if character == delimiter {
+                quote = None;
+            } else {
+                current.push(character);
+            }
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            token_started = true;
+            quote = Some(character);
+        } else if character.is_whitespace() {
+            if token_started {
+                arguments.push(std::mem::take(&mut current));
+                token_started = false;
+            }
+        } else {
+            current.push(character);
+            token_started = true;
+        }
+    }
+    if escaped {
+        return Err(format!(
+            "ccc: response file {} ends with an incomplete escape",
+            path.display()
+        ));
+    }
+    if quote.is_some() {
+        return Err(format!(
+            "ccc: response file {} has an unterminated quote",
+            path.display()
+        ));
+    }
+    if token_started {
+        arguments.push(current);
+    }
+    Ok(arguments)
 }
 
 fn select_dump(slot: &mut Option<DumpKind>, kind: DumpKind) -> Result<(), String> {
     if slot.replace(kind).is_some() {
         return Err("ccc: only one dump or emit mode may be selected".to_owned());
+    }
+    Ok(())
+}
+
+fn select_query(slot: &mut Option<DriverQuery>, query: DriverQuery) -> Result<(), String> {
+    if slot.replace(query).is_some() {
+        return Err("ccc: only one build-system introspection option may be selected".to_owned());
     }
     Ok(())
 }
@@ -457,6 +899,17 @@ fn parse_limit(value: &str, option: &str) -> Result<usize, String> {
     value
         .parse::<usize>()
         .map_err(|_| format!("ccc: `{option}` requires a non-negative integer"))
+}
+
+fn parse_input_language(value: &str) -> Result<Option<DriverInputLanguage>, String> {
+    match value {
+        "none" => Ok(None),
+        "c" => Ok(Some(DriverInputLanguage::C)),
+        "c-cpp-output" | "cpp-output" => Ok(Some(DriverInputLanguage::PreprocessedC)),
+        "assembler" => Ok(Some(DriverInputLanguage::Assembly)),
+        "assembler-with-cpp" => Ok(Some(DriverInputLanguage::PreprocessedAssembly)),
+        _ => Err(format!("ccc: unsupported input language `{value}`")),
+    }
 }
 
 fn is_debug_level_option(argument: &str) -> bool {
@@ -515,6 +968,124 @@ mod tests {
     }
 
     #[test]
+    fn build_system_queries_do_not_require_an_input() {
+        assert!(matches!(
+            parse(["-dumpmachine".to_owned()]),
+            Ok(ParsedCommand::Query(DriverQuery::DumpMachine, _))
+        ));
+        assert!(matches!(
+            parse(["-dumpversion".to_owned()]),
+            Ok(ParsedCommand::Query(DriverQuery::DumpVersion, _))
+        ));
+        assert!(matches!(
+            parse(["-print-prog-name=ld".to_owned()]),
+            Ok(ParsedCommand::Query(DriverQuery::PrintProgram(name), _)) if name == "ld"
+        ));
+        assert!(matches!(
+            parse(["--print-effective-config".to_owned()]),
+            Ok(ParsedCommand::Query(DriverQuery::PrintEffectiveConfig, _))
+        ));
+    }
+
+    #[test]
+    fn assembly_output_fails_with_an_exact_capability_diagnostic() {
+        let error = parse(["-S".to_owned(), "input.c".to_owned()]).unwrap_err();
+        assert!(error.contains("faithful target assembly emission"));
+    }
+
+    #[test]
+    fn classifies_distro_hardening_flags_without_accepting_unknown_codegen_flags() {
+        let options = options(&[
+            "-fstack-protector-strong",
+            "-fstack-clash-protection",
+            "-fcf-protection=branch",
+            "-fno-stack-protector",
+            "input.c",
+        ]);
+        assert_eq!(
+            options.degraded_hardening,
+            [
+                "-fstack-protector-strong",
+                "-fstack-clash-protection",
+                "-fcf-protection=branch",
+            ]
+        );
+        assert!(parse(["-fwrapv".to_owned(), "input.c".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn accepts_only_semantically_understood_preprocessor_pass_throughs() {
+        let options = options(&["-Wp,-DFORTIFIED=2,-UOLD", "input.c"]);
+        assert_eq!(
+            options.macro_actions,
+            [
+                MacroAction::Define("FORTIFIED=2".to_owned()),
+                MacroAction::Undefine("OLD".to_owned()),
+            ]
+        );
+        assert!(parse(["-Wp,-traditional".to_owned(), "input.c".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn warning_options_are_registry_checked() {
+        let options = options(&[
+            "-W",
+            "-Wall",
+            "-Wextra",
+            "-Winline",
+            "-Wno-missing-field-initializers",
+            "-Werror=deprecated-declarations",
+            "-Wstrict-prototypes",
+            "input.c",
+        ]);
+        assert_eq!(
+            options.warning_options,
+            [
+                "-W",
+                "-Wall",
+                "-Wextra",
+                "-Winline",
+                "-Wno-missing-field-initializers",
+                "-Werror=deprecated-declarations",
+                "-Wstrict-prototypes",
+            ]
+        );
+
+        for option in [
+            "-Wtypoed-category",
+            "-Wno-typoed-category",
+            "-Werror=typoed-category",
+            "-Wno-error=typoed-category",
+            "-Werror=",
+            "-Wno-error=",
+        ] {
+            let error = parse([option.to_owned(), "input.c".to_owned()]).unwrap_err();
+            assert!(
+                error.contains("unknown warning option"),
+                "{option}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn assembler_pass_throughs_are_not_misclassified_as_warnings() {
+        for option in ["-Wa", "-Wa,-mrelax-relocations=no", "-Wa=--fatal-warnings"] {
+            let error = parse([option.to_owned(), "input.c".to_owned()]).unwrap_err();
+            assert!(
+                error.contains("unsupported assembler pass-through option"),
+                "{option}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn pedantic_errors_promotes_only_the_pedantic_category() {
+        let options = options(&["-pedantic-errors", "input.c"]);
+        assert!(!options.warnings_as_errors);
+        assert_eq!(options.warning_options, ["-Werror=pedantic"]);
+    }
+
+    #[test]
     fn parses_preprocessing_and_dependency_behavior() {
         let options = options(&[
             "-E",
@@ -566,6 +1137,10 @@ mod tests {
     #[test]
     fn rejects_unsupported_or_conflicting_modes() {
         assert!(parse(["-std=c17".to_owned(), "input.c".to_owned()]).is_err());
+        assert!(
+            parse(["-mlong-double-64".to_owned(), "input.c".to_owned()]).is_err(),
+            "an ABI-changing long-double mode must fail before translation"
+        );
         assert!(parse(["-M".to_owned(), "-MD".to_owned(), "input.c".to_owned()]).is_err());
         assert!(parse(["-MG".to_owned(), "input.c".to_owned()]).is_err());
         assert!(parse(["-dM".to_owned(), "-M".to_owned(), "input.c".to_owned()]).is_err());
@@ -628,12 +1203,149 @@ mod tests {
     #[test]
     fn accepts_allowlisted_debug_and_optimization_options() {
         for argument in [
-            "-g", "-g0", "-g1", "-g2", "-g3", "-g17", "-O", "-O0", "-O1", "-O2", "-O3", "-Os",
-            "-Oz",
+            "-g", "-g0", "-g1", "-g2", "-g3", "-O", "-O0", "-O1", "-O2", "-O3", "-Os", "-Oz",
         ] {
             let options = options(&[argument, "input.c"]);
             assert_eq!(options.input, PathBuf::from("input.c"), "{argument}");
         }
+        assert!(!options(&["-g", "-g0", "input.c"]).debug_info);
+        assert!(options(&["-g0", "-g3", "input.c"]).debug_info);
+    }
+
+    #[test]
+    fn accepts_c99_build_profile_spellings_as_supported_frontend_profiles() {
+        assert_eq!(
+            options(&["-std=gnu99", "input.c"]).language_mode,
+            LanguageMode::Gnu11
+        );
+        assert_eq!(
+            options(&["-std=c99", "input.c"]).language_mode,
+            LanguageMode::C11
+        );
+    }
+
+    #[test]
+    fn preserves_link_input_and_library_order() {
+        let options = options(&[
+            "first.c",
+            "libone.a",
+            "-Lsearch",
+            "-lone",
+            "second.o",
+            "-Wl,--as-needed",
+            "-Xlinker",
+            "--gc-sections",
+        ]);
+
+        assert_eq!(
+            options.link_items,
+            [
+                LinkItem::Input {
+                    path: PathBuf::from("first.c"),
+                    language: None,
+                },
+                LinkItem::Input {
+                    path: PathBuf::from("libone.a"),
+                    language: None,
+                },
+                LinkItem::Argument("-Lsearch".to_owned()),
+                LinkItem::Argument("-lone".to_owned()),
+                LinkItem::Input {
+                    path: PathBuf::from("second.o"),
+                    language: None,
+                },
+                LinkItem::Argument("-Wl,--as-needed".to_owned()),
+                LinkItem::Argument("-Xlinker".to_owned()),
+                LinkItem::Argument("--gc-sections".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn input_language_selection_is_ordered_and_resettable() {
+        let options = options(&[
+            "-x",
+            "c",
+            "extensionless",
+            "-xassembler",
+            "startup",
+            "-xnone",
+            "ordinary.S",
+        ]);
+        assert_eq!(
+            options.input_languages,
+            [
+                Some(DriverInputLanguage::C),
+                Some(DriverInputLanguage::Assembly),
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn distinguishes_preprocessed_c_from_c_source() {
+        let options = options(&["-x", "c-cpp-output", "generated", "-x", "c", "ordinary"]);
+        assert_eq!(
+            options.input_languages,
+            [
+                Some(DriverInputLanguage::PreprocessedC),
+                Some(DriverInputLanguage::C),
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_shared_and_relocatable_link_modes() {
+        let shared = options(&["-shared", "input.c"]);
+        assert_eq!(shared.link_output_kind, LinkOutputKind::Shared);
+        assert_eq!(shared.relocation_model, RelocationModel::Pic);
+
+        let relocatable = options(&["-r", "input.o"]);
+        assert_eq!(relocatable.link_output_kind, LinkOutputKind::Relocatable);
+    }
+
+    #[test]
+    fn expands_nested_response_files_with_quotes_and_empty_arguments() {
+        let directory = std::env::temp_dir().join(format!(
+            "ccc-driver-response-{}-{}",
+            std::process::id(),
+            crate::TEMPORARY_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        fs::create_dir(&directory).unwrap();
+        let nested = directory.join("nested.rsp");
+        let outer = directory.join("outer.rsp");
+        fs::write(&nested, "'second input.o' -lanswer").unwrap();
+        fs::write(
+            &outer,
+            format!("input.c @{} -D'EMPTY=' \"\"", nested.display()),
+        )
+        .unwrap();
+
+        let expanded = expand_response_arguments(
+            vec![format!("@{}", outer.display())],
+            0,
+            &mut HashSet::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            expanded,
+            ["input.c", "second input.o", "-lanswer", "-DEMPTY=", ""]
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn validates_multiple_input_output_combinations() {
+        assert!(parse(["-c", "one.c", "two.c", "-o", "both.o"].map(str::to_owned)).is_err());
+        assert!(
+            parse(["-E", "one.c", "two.c"].map(str::to_owned)).is_err(),
+            "preprocessing remains a single-input action"
+        );
+        assert!(
+            parse(["-shared", "-no-pie", "one.c"].map(str::to_owned)).is_err(),
+            "shared output cannot select the static relocation model"
+        );
     }
 
     #[test]
@@ -668,6 +1380,7 @@ mod tests {
             "-ggdb",
             "-gline-tables-only",
             "-g-1",
+            "-g17",
             "-Og",
             "-O4",
             "-Ofast",

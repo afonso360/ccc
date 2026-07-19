@@ -20,7 +20,7 @@ state.
   pragma cannot retroactively alter an earlier token's warning behavior.
 - **Parser recovery.** Recovery synchronizes at grammar-aware declaration/statement boundaries, records inserted/skipped tokens, and suppresses dependent cascades without hiding independent errors.
 - **Stable identity.** Every diagnostic has a stable code and category. Tests pin the code, severity, primary/secondary spans, and essential message; renderers may improve layout without breaking machine consumers.
-- **Warning control.** `-W`, `-Wno-`, `-Werror`, per-category promotion, system-header suppression, and command-line provenance are handled consistently. Capability errors that protect ABI or semantics cannot be downgraded to warnings.
+- **Warning control.** `-W`, `-Wno-`, `-Werror`, per-category promotion, system-header suppression, and command-line provenance are handled consistently. Driver warning names come from an explicit registry; unknown names, including misspelled `-Werror=name` options, are rejected rather than ignored. Category switches are resolved in source order, and category-specific promotion or demotion takes precedence over global `-Werror`. Capability errors that protect ABI or semantics cannot be downgraded to warnings.
 - **Error limits.** A configurable error limit stops semantic work safely while preserving already-emitted diagnostics.
 - **Machine output.** JSON diagnostics use versioned schemas and resolved/spelled paths without leaking nondeterministic temporary directories.
 

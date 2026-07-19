@@ -159,6 +159,59 @@ fn apple_sdk_redirects_and_header_inline_fallback_link_and_execute() {
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 #[test]
+fn darwin_setjmp_and_longjmp_resume_materialized_automatic_objects() {
+    let directory = test_directory("darwin-returns-twice");
+    for optimization in ["-O0", "-O2", "-Oz"] {
+        let executable = directory.join(format!("returns-twice-{}", &optimization[1..]));
+        let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+            .arg("--target=aarch64-apple-darwin")
+            .args(["--sdk-root", &macos_sdk_root()])
+            .arg("-mmacosx-version-min=11.0")
+            .arg(optimization)
+            .arg(fixture("returns_twice.c"))
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .unwrap();
+        assert!(
+            compilation.status.success(),
+            "ccc {optimization} failed: {}",
+            String::from_utf8_lossy(&compilation.stderr)
+        );
+        assert_eq!(Command::new(&executable).status().unwrap().code(), Some(0));
+    }
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "riscv64", target_os = "linux")
+))]
+#[test]
+fn linux_setjmp_and_longjmp_resume_materialized_automatic_objects() {
+    let directory = test_directory("linux-returns-twice");
+    for optimization in ["-O0", "-O2", "-Oz"] {
+        let executable = directory.join(format!("returns-twice-{}", &optimization[1..]));
+        let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+            .arg(optimization)
+            .arg(fixture("returns_twice.c"))
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .unwrap();
+        assert!(
+            compilation.status.success(),
+            "ccc {optimization} failed: {}",
+            String::from_utf8_lossy(&compilation.stderr)
+        );
+        assert_eq!(Command::new(&executable).status().unwrap().code(), Some(0));
+    }
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[test]
 fn apple_math_public_classifiers_evaluate_once_and_fabsl_stays_a_library_call() {
     compile_and_run_darwin_header_program(
         "darwin-math-wrapper",
@@ -669,7 +722,7 @@ fn execution_cases() -> &'static [ExecutionExpectation] {
     &EXECUTION_CASES
 }
 
-static EXECUTION_CASES: [ExecutionExpectation; 55] = [
+static EXECUTION_CASES: [ExecutionExpectation; 57] = [
     exit_status("return_constant.c", 42),
     exit_status("arithmetic_precedence.c", 14),
     exit_status("unary_arithmetic.c", 3),
@@ -710,6 +763,7 @@ static EXECUTION_CASES: [ExecutionExpectation; 55] = [
     exit_status("flexible_array_members.c", 59),
     exit_status("sync_atomic_builtins.c", 60),
     exit_status("sync_atomic_pthreads.c", 64),
+    exit_status("c11_atomic_builtins.c", 68),
     bridged_exit_status("thread_local_pthreads.c", 66),
     exit_status("integer_intrinsics.c", 61),
     exit_status("predefined_function_name.c", 62),
@@ -718,6 +772,7 @@ static EXECUTION_CASES: [ExecutionExpectation; 55] = [
     exit_status("runtime_sized_storage.c", 0),
     exit_status("runtime_sized_storage_reuse.c", 66),
     exit_status("gnu_statement_and_memory_builtins.c", 66),
+    bridged_exit_status("inline_assembly.c", 0),
     exit_status("combined_language_features.c", 53),
     exit_status("semantic_regressions.c", 54),
     exit_status("aggregate_calls.c", 63),
