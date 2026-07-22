@@ -236,6 +236,48 @@ pub enum RelocationModel {
     Pie,
 }
 
+/// The user-visible optimization profile carried through the compiler.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum OptimizationLevel {
+    /// Disable optional optimization while retaining validation.
+    #[default]
+    O0,
+    /// Enable the standard optimization pipeline at its least aggressive level.
+    O1,
+    /// Enable the standard optimization pipeline.
+    O2,
+    /// Enable the standard optimization pipeline at its most aggressive level.
+    O3,
+    /// Optimize for both execution speed and code size.
+    Size,
+    /// Prefer minimum code size.
+    SizeMin,
+}
+
+impl OptimizationLevel {
+    /// Returns the canonical driver spelling for this profile.
+    pub const fn flag(self) -> &'static str {
+        match self {
+            Self::O0 => "-O0",
+            Self::O1 => "-O1",
+            Self::O2 => "-O2",
+            Self::O3 => "-O3",
+            Self::Size => "-Os",
+            Self::SizeMin => "-Oz",
+        }
+    }
+
+    /// Whether optional CCC IR cleanup is enabled.
+    pub const fn optimizes(self) -> bool {
+        !matches!(self, Self::O0)
+    }
+
+    /// Whether code size is an explicit optimization objective.
+    pub const fn optimizes_for_size(self) -> bool {
+        matches!(self, Self::Size | Self::SizeMin)
+    }
+}
+
 /// Compiler-provided C types whose representation is selected by the target
 /// ABI rather than by the language's arithmetic type system.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -1013,6 +1055,7 @@ pub struct EffectiveCompilationConfig {
     pub resource_dir: Option<PathBuf>,
     pub toolchain: ToolchainSpec,
     pub relocation_model: RelocationModel,
+    pub optimization: OptimizationLevel,
     pub target_arch: Option<String>,
     pub target_cpu: Option<String>,
     pub target_abi: Option<String>,
@@ -1099,6 +1142,7 @@ impl EffectiveCompilationConfig {
             resource_dir: None,
             toolchain: ToolchainSpec::default(),
             relocation_model: RelocationModel::Pie,
+            optimization: OptimizationLevel::O0,
             target_arch: None,
             target_cpu: None,
             target_abi: None,
@@ -1119,6 +1163,11 @@ impl EffectiveCompilationConfig {
 
     pub fn with_resource_dir(mut self, resource_dir: impl Into<PathBuf>) -> Self {
         self.resource_dir = Some(resource_dir.into());
+        self
+    }
+
+    pub fn with_optimization_level(mut self, optimization: OptimizationLevel) -> Self {
+        self.optimization = optimization;
         self
     }
 
@@ -1469,6 +1518,7 @@ mod tests {
         assert_eq!(config.language.mode, LanguageMode::Gnu11);
         assert!(!config.language.trigraphs_enabled());
         assert_eq!(config.relocation_model, RelocationModel::Pie);
+        assert_eq!(config.optimization, OptimizationLevel::O0);
         assert_eq!(
             config.gnu_profile.as_ref().map(|profile| profile.version),
             Some(CompatibilityVersion::new(4, 2, 1))
@@ -1477,6 +1527,22 @@ mod tests {
             config.gnu_profile.as_ref().map(|profile| profile.scope),
             Some(CompatibilityScope::CodeGeneration)
         );
+    }
+
+    #[test]
+    fn optimization_profiles_have_canonical_driver_spellings() {
+        for (optimization, flag, optimizes, size) in [
+            (OptimizationLevel::O0, "-O0", false, false),
+            (OptimizationLevel::O1, "-O1", true, false),
+            (OptimizationLevel::O2, "-O2", true, false),
+            (OptimizationLevel::O3, "-O3", true, false),
+            (OptimizationLevel::Size, "-Os", true, true),
+            (OptimizationLevel::SizeMin, "-Oz", true, true),
+        ] {
+            assert_eq!(optimization.flag(), flag);
+            assert_eq!(optimization.optimizes(), optimizes);
+            assert_eq!(optimization.optimizes_for_size(), size);
+        }
     }
 
     #[test]

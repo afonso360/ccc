@@ -159,6 +159,7 @@ fn command_plan_preserves_effective_compile_and_link_options() {
             "-Werror",
             "-Wpedantic",
             "-ferror-limit=7",
+            "-Os",
             "-MD",
             "-MF",
         ])
@@ -183,6 +184,7 @@ fn command_plan_preserves_effective_compile_and_link_options() {
         "-Werror",
         "-Wpedantic",
         "-ferror-limit=7",
+        "-Os",
         "-MD",
         "-MF",
         "-fPIC",
@@ -220,13 +222,14 @@ fn compiler_identity_queries_are_available_without_inputs() {
     assert_eq!(String::from_utf8(version.stdout).unwrap(), "4.2.1\n");
 
     let effective = Command::new(env!("CARGO_BIN_EXE_ccc"))
-        .args(["-std=c11", "-fPIC", "--print-effective-config"])
+        .args(["-std=c11", "-fPIC", "-Oz", "--print-effective-config"])
         .output()
         .unwrap();
     assert_success(effective.clone());
     let effective = String::from_utf8(effective.stdout).unwrap();
     assert!(effective.contains("language=c11\n"), "{effective}");
     assert!(effective.contains("relocation=pic\n"), "{effective}");
+    assert!(effective.contains("optimization=-Oz\n"), "{effective}");
     assert!(effective.contains("gnu-profile=4.2.1\n"), "{effective}");
     assert!(effective.contains("compiler-driver="), "{effective}");
 }

@@ -14,8 +14,8 @@ use ccc_sema::generic::{
     Linkage as CLinkage, ObjectDefinitionPolicy, StorageDuration, SymbolBinding, SymbolVisibility,
 };
 use ccc_target::{
-    AbiIdentity, BinaryFormat, EffectiveCompilationConfig, LongDoubleFormat, RelocationModel,
-    RuntimeHelperContract, RuntimeHelperValue,
+    AbiIdentity, BinaryFormat, EffectiveCompilationConfig, LongDoubleFormat, OptimizationLevel,
+    RelocationModel, RuntimeHelperContract, RuntimeHelperValue,
 };
 use ccc_types::{
     ArrayLength, BuiltinType, LayoutShape, QualifiedType, TypeId, TypeKind, TypeQualifiers,
@@ -103,6 +103,9 @@ fn emit_inner(
         }
     }
     let mut flag_builder = settings::builder();
+    flag_builder
+        .set("opt_level", cranelift_opt_level(config.optimization))
+        .map_err(module_error)?;
     match config.relocation_model {
         RelocationModel::Static => flag_builder.set("is_pic", "false").map_err(module_error)?,
         RelocationModel::Pic | RelocationModel::Pie => {
@@ -359,6 +362,14 @@ fn emit_inner(
         assemblies,
         manifest,
     })
+}
+
+const fn cranelift_opt_level(optimization: OptimizationLevel) -> &'static str {
+    match optimization {
+        OptimizationLevel::O0 => "none",
+        OptimizationLevel::O1 | OptimizationLevel::O2 | OptimizationLevel::O3 => "speed",
+        OptimizationLevel::Size | OptimizationLevel::SizeMin => "speed_and_size",
+    }
 }
 
 fn module_contains_returns_twice_call(module: &gir::FullModule) -> bool {

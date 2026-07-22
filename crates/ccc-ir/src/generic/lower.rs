@@ -2070,7 +2070,7 @@ fn resolve_alias(
     Ok(value)
 }
 
-fn compact_values(
+pub(super) fn compact_values(
     function: &mut FullFunction,
     aliases: &BTreeMap<ValueId, ValueId>,
 ) -> Result<(), IrError> {

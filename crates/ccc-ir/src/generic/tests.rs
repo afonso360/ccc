@@ -5,7 +5,7 @@ use ccc_sema::generic::{
 };
 use ccc_session::SourceMap;
 use ccc_syntax::frontend as syntax;
-use ccc_target::EffectiveCompilationConfig;
+use ccc_target::{EffectiveCompilationConfig, OptimizationLevel};
 use ccc_types::{ArrayLength, ArrayType, QualifiedType, RecordKind, TypeId, TypeKind};
 
 use super::*;
@@ -2153,6 +2153,93 @@ fn promotes_eligible_scalar_mutation_across_control_flow_to_block_parameters() {
 }
 
 #[test]
+fn optimization_sparsifies_trivial_block_parameters_and_is_idempotent() {
+    let mut module = lower_source(
+        "int adjust(int condition) {\n\
+             int value = 1;\n\
+             if (condition) value += 2;\n\
+             return value;\n\
+         }",
+    );
+    let parameters_before = module.functions[0]
+        .blocks
+        .iter()
+        .map(|block| block.parameters.len())
+        .sum::<usize>();
+    assert!(parameters_before > 0);
+
+    optimize_frontend(&mut module, OptimizationLevel::O2).unwrap();
+    let parameters_after = module.functions[0]
+        .blocks
+        .iter()
+        .map(|block| block.parameters.len())
+        .sum::<usize>();
+    assert!(parameters_after < parameters_before);
+    verify_frontend(&module).unwrap();
+
+    let once = dump_frontend_ir(&module);
+    optimize_frontend(&mut module, OptimizationLevel::O2).unwrap();
+    assert_eq!(dump_frontend_ir(&module), once);
+}
+
+#[test]
+fn optimization_removes_constant_control_flow_and_preserves_effects() {
+    let mut module = lower_source(
+        "int inspect(volatile int *observed, int *plain, int count) {\n\
+             int unused = *plain;\n\
+             int values[count];\n\
+             *observed;\n\
+             if (0) return unused;\n\
+             return 0;\n\
+         }",
+    );
+    let instruction_count_before = module.functions[0].instruction_count;
+    optimize_frontend(&mut module, OptimizationLevel::Size).unwrap();
+    let function = &module.functions[0];
+    assert!(function.instruction_count < instruction_count_before);
+    let optimized_dump = dump_frontend_ir(&module);
+    assert!(
+        function.blocks.iter().all(|block| {
+            !matches!(&block.terminator, Some(FullTerminator::Conditional { .. }))
+        }),
+        "{optimized_dump}"
+    );
+    assert!(function.blocks.iter().any(|block| {
+        block.instructions.iter().any(|instruction| {
+            matches!(
+                instruction.kind,
+                FullInstructionKind::RuntimeSizedAllocate { .. }
+            )
+        })
+    }));
+    assert!(function.blocks.iter().all(|block| {
+        block.instructions.iter().all(|instruction| {
+            !matches!(
+                instruction.kind,
+                FullInstructionKind::Load { access, .. } if !access.volatile
+            )
+        })
+    }));
+    assert!(function.blocks.iter().any(|block| {
+        block.instructions.iter().any(|instruction| {
+            matches!(
+                instruction.kind,
+                FullInstructionKind::Load { access, .. } if access.volatile
+            )
+        })
+    }));
+    verify_frontend(&module).unwrap();
+}
+
+#[test]
+fn zero_optimization_validates_without_rewriting_ir() {
+    let mut module = lower_source("int answer(int value) { return value + 42; }");
+    let before = dump_frontend_ir(&module);
+    optimize_frontend(&mut module, OptimizationLevel::O0).unwrap();
+    assert_eq!(dump_frontend_ir(&module), before);
+}
+
+#[test]
 fn lowers_pointer_arrays_indirect_calls_and_mixed_shift_promotions() {
     for source in [
         include_str!("../../../../tests/execution/cases/pointers_and_arrays.c"),
@@ -2251,6 +2338,34 @@ fn lowers_every_control_flow_form_to_terminators() {
             .iter()
             .all(|block| block.terminator.is_some())
     );
+}
+
+#[test]
+fn optimization_preserves_loops_switches_and_indirect_branches() {
+    for (source, expect_indirect) in [
+        (
+            include_str!("../../../../tests/execution/cases/full_control_flow.c"),
+            false,
+        ),
+        (
+            include_str!("../../../../tests/execution/cases/computed_goto.c"),
+            true,
+        ),
+    ] {
+        let mut module = lower_source(source);
+        optimize_frontend(&mut module, OptimizationLevel::O3).unwrap();
+        verify_frontend(&module).unwrap();
+        if expect_indirect {
+            assert!(module.functions.iter().any(|function| {
+                function.blocks.iter().any(|block| {
+                    matches!(
+                        &block.terminator,
+                        Some(FullTerminator::IndirectBranch { .. })
+                    )
+                })
+            }));
+        }
+    }
 }
 
 #[test]

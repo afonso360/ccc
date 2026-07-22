@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ccc_target::{CapabilityKind, EffectiveCompilationConfig, RelocationModel};
+use ccc_target::{CapabilityKind, EffectiveCompilationConfig, OptimizationLevel, RelocationModel};
 
 pub(crate) fn additional_predefined_macros(
     config: &EffectiveCompilationConfig,
@@ -16,6 +16,19 @@ pub(crate) fn additional_predefined_macros(
         ("__CCC_PATCHLEVEL__", "0"),
     ] {
         macros.insert(name.to_owned(), replacement.to_owned());
+    }
+
+    match config.optimization {
+        OptimizationLevel::O0 => {
+            macros.insert("__NO_INLINE__".to_owned(), "1".to_owned());
+        }
+        OptimizationLevel::O1 | OptimizationLevel::O2 | OptimizationLevel::O3 => {
+            macros.insert("__OPTIMIZE__".to_owned(), "1".to_owned());
+        }
+        OptimizationLevel::Size | OptimizationLevel::SizeMin => {
+            macros.insert("__OPTIMIZE__".to_owned(), "1".to_owned());
+            macros.insert("__OPTIMIZE_SIZE__".to_owned(), "1".to_owned());
+        }
     }
 
     if matches!(
@@ -190,6 +203,27 @@ mod tests {
         assert_eq!(macros.get("__pic__").map(String::as_str), Some("2"));
         assert!(!macros.contains_key("__PIE__"));
         assert!(!macros.contains_key("__pie__"));
+    }
+
+    #[test]
+    fn optimization_macros_follow_the_selected_profile() {
+        for (optimization, optimize, size, no_inline) in [
+            (OptimizationLevel::O0, false, false, true),
+            (OptimizationLevel::O1, true, false, false),
+            (OptimizationLevel::O2, true, false, false),
+            (OptimizationLevel::O3, true, false, false),
+            (OptimizationLevel::Size, true, true, false),
+            (OptimizationLevel::SizeMin, true, true, false),
+        ] {
+            let config = EffectiveCompilationConfig {
+                optimization,
+                ..EffectiveCompilationConfig::default()
+            };
+            let macros = additional_predefined_macros(&config);
+            assert_eq!(macros.contains_key("__OPTIMIZE__"), optimize);
+            assert_eq!(macros.contains_key("__OPTIMIZE_SIZE__"), size);
+            assert_eq!(macros.contains_key("__NO_INLINE__"), no_inline);
+        }
     }
 
     #[test]

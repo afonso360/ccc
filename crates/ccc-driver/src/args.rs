@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 
-use ccc_target::{LanguageMode, RelocationModel, TrigraphPolicy};
+use ccc_target::{LanguageMode, OptimizationLevel, RelocationModel, TrigraphPolicy};
 
 use crate::warnings::validate_warning_option;
 
@@ -125,6 +125,7 @@ pub(crate) struct DriverOptions {
     pub output: Option<PathBuf>,
     pub language_mode: LanguageMode,
     pub relocation_model: RelocationModel,
+    pub optimization: OptimizationLevel,
     pub trigraphs: TrigraphPolicy,
     pub suppress_linemarkers: bool,
     pub dump_macros: bool,
@@ -183,6 +184,7 @@ pub(crate) struct QueryOptions {
     pub deployment_target: Option<String>,
     pub language_mode: LanguageMode,
     pub relocation_model: RelocationModel,
+    pub optimization: OptimizationLevel,
 }
 
 pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<ParsedCommand, String> {
@@ -204,6 +206,7 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
     let mut link_output_kind = LinkOutputKind::Executable;
     let mut language_mode = LanguageMode::Gnu11;
     let mut relocation_model = RelocationModel::Pie;
+    let mut optimization = OptimizationLevel::O0;
     let mut trigraphs = TrigraphPolicy::LanguageDefault;
     let mut suppress_linemarkers = false;
     let mut dump_macros = false;
@@ -292,11 +295,12 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
                 macro_actions.push(MacroAction::Define("_REENTRANT=1".to_owned()));
                 link_items.push(LinkItem::Argument(argument));
             }
-            // CCC currently has one baseline optimization profile. These
-            // spellings cannot change language semantics, ABI, predefined
-            // macros, or the generated object until additional profiles are
-            // introduced.
-            "-O" | "-O0" | "-O1" | "-O2" | "-O3" | "-Os" | "-Oz" => {}
+            "-O0" => optimization = OptimizationLevel::O0,
+            "-O" | "-O1" => optimization = OptimizationLevel::O1,
+            "-O2" => optimization = OptimizationLevel::O2,
+            "-O3" => optimization = OptimizationLevel::O3,
+            "-Os" => optimization = OptimizationLevel::Size,
+            "-Oz" => optimization = OptimizationLevel::SizeMin,
             // CCC does not use driver pipes between compilation phases, so
             // accepting this build-system preference has no observable effect.
             "-pipe" => {}
@@ -644,6 +648,7 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
                 deployment_target,
                 language_mode,
                 relocation_model,
+                optimization,
             }),
         ));
     }
@@ -720,6 +725,7 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
         output,
         language_mode,
         relocation_model,
+        optimization,
         trigraphs,
         suppress_linemarkers,
         dump_macros,
@@ -1202,12 +1208,29 @@ mod tests {
 
     #[test]
     fn accepts_allowlisted_debug_and_optimization_options() {
-        for argument in [
-            "-g", "-g0", "-g1", "-g2", "-g3", "-O", "-O0", "-O1", "-O2", "-O3", "-Os", "-Oz",
-        ] {
+        for argument in ["-g", "-g0", "-g1", "-g2", "-g3"] {
             let options = options(&[argument, "input.c"]);
             assert_eq!(options.input, PathBuf::from("input.c"), "{argument}");
         }
+        for (argument, expected) in [
+            ("-O", OptimizationLevel::O1),
+            ("-O0", OptimizationLevel::O0),
+            ("-O1", OptimizationLevel::O1),
+            ("-O2", OptimizationLevel::O2),
+            ("-O3", OptimizationLevel::O3),
+            ("-Os", OptimizationLevel::Size),
+            ("-Oz", OptimizationLevel::SizeMin),
+        ] {
+            assert_eq!(
+                options(&[argument, "input.c"]).optimization,
+                expected,
+                "{argument}"
+            );
+        }
+        assert_eq!(
+            options(&["-O3", "-O0", "-Os", "input.c"]).optimization,
+            OptimizationLevel::Size
+        );
         assert!(!options(&["-g", "-g0", "input.c"]).debug_info);
         assert!(options(&["-g0", "-g3", "input.c"]).debug_info);
     }

@@ -47,7 +47,7 @@ fn compile_ccc_with_options(source: &Path, output: &Path, options: &[&str]) {
 fn debug_levels_emit_source_types_variables_and_relocations() {
     let directory = test_directory("quality-options");
     let source = directory.join("quality-options.c");
-    let baseline = directory.join("baseline.o");
+    let optimized = directory.join("optimized.o");
     let disabled = directory.join("disabled.o");
     let with_debug = directory.join("with-debug.o");
     fs::write(
@@ -66,13 +66,13 @@ int inspect(int *parameter) {
     )
     .unwrap();
 
-    compile_ccc(&source, &baseline);
+    compile_ccc_with_options(&source, &optimized, &["-Oz"]);
     compile_ccc_with_options(&source, &disabled, &["-g", "-g0", "-Oz"]);
     compile_ccc_with_options(&source, &with_debug, &["-g3", "-Oz"]);
 
-    assert_eq!(fs::read(&baseline).unwrap(), fs::read(&disabled).unwrap());
+    assert_eq!(fs::read(&optimized).unwrap(), fs::read(&disabled).unwrap());
     let bytes = fs::read(&with_debug).unwrap();
-    assert_ne!(fs::read(&baseline).unwrap(), bytes);
+    assert_ne!(fs::read(&optimized).unwrap(), bytes);
     for (index, level) in ["-g", "-g1", "-g2"].into_iter().enumerate() {
         let output = directory.join(format!("debug-level-{index}.o"));
         compile_ccc_with_options(&source, &output, &[level, "-Oz"]);
@@ -176,17 +176,77 @@ int inspect(int *parameter) {
 }
 
 #[test]
-fn optimization_compatibility_options_preserve_baseline_object() {
+fn optimization_profiles_emit_valid_objects_and_o0_preserves_default() {
     let directory = test_directory("optimization-options");
     let source = directory.join("optimization-options.c");
     let baseline = directory.join("baseline.o");
-    let with_options = directory.join("with-options.o");
-    fs::write(&source, "int answer(void) { return 42; }\n").unwrap();
+    let unoptimized = directory.join("unoptimized.o");
+    fs::write(
+        &source,
+        "int answer(int condition) { if (condition) return 42; return 7; }\n",
+    )
+    .unwrap();
 
     compile_ccc(&source, &baseline);
-    compile_ccc_with_options(&source, &with_options, &["-Oz"]);
+    compile_ccc_with_options(&source, &unoptimized, &["-O0"]);
 
-    assert_eq!(fs::read(baseline).unwrap(), fs::read(with_options).unwrap());
+    assert_eq!(
+        fs::read(&baseline).unwrap(),
+        fs::read(&unoptimized).unwrap()
+    );
+    for optimization in ["-O", "-O1", "-O2", "-O3", "-Os", "-Oz"] {
+        let output = directory.join(format!("{}.o", &optimization[1..]));
+        compile_ccc_with_options(&source, &output, &[optimization]);
+        let bytes = fs::read(output).unwrap();
+        object::File::parse(bytes.as_slice()).unwrap();
+    }
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn optimization_runs_before_ir_dump_and_abi_planning() {
+    let directory = test_directory("optimization-ir");
+    let source = directory.join("optimization-ir.c");
+    fs::write(
+        &source,
+        "int inspect(volatile int *observed, int *plain, int count) {\n\
+             int unused = *plain;\n\
+             int values[count];\n\
+             *observed;\n\
+             if (0) return unused;\n\
+             return 0;\n\
+         }\n",
+    )
+    .unwrap();
+
+    let dump = |optimization: &str, representation: &str| {
+        let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+            .args([
+                "--target=x86_64-unknown-linux-gnu",
+                "-nostdinc",
+                optimization,
+                representation,
+            ])
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "CCC failed:\n{}",
+            render_output(&result)
+        );
+        String::from_utf8(result.stdout).unwrap()
+    };
+
+    let unoptimized = dump("-O0", "--dump-ir");
+    let optimized = dump("-O2", "--dump-ir");
+    assert!(unoptimized.contains("conditional"), "{unoptimized}");
+    assert!(!optimized.contains("conditional"), "{optimized}");
+    assert!(optimized.contains("runtime.allocate"), "{optimized}");
+    assert!(optimized.contains("volatile=true"), "{optimized}");
+    assert!(!dump("-O2", "--dump-abi").is_empty());
+
     fs::remove_dir_all(directory).unwrap();
 }
 

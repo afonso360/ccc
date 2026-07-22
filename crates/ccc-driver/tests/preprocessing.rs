@@ -754,6 +754,38 @@ fn emits_predefined_dynamic_and_reproducible_macros() {
 }
 
 #[test]
+fn optimization_profiles_control_the_predefined_macro_contract() {
+    let directory = TestDirectory::new("optimization-macros");
+    let source = directory.write("empty.c", "\n");
+
+    for (optimization, optimize, size, no_inline) in [
+        (None, false, false, true),
+        (Some("-O0"), false, false, true),
+        (Some("-O2"), true, false, false),
+        (Some("-Os"), true, true, false),
+        (Some("-Oz"), true, true, false),
+    ] {
+        let mut command = directory.command();
+        command.args(["-dM", "-E", "-nostdinc"]);
+        if let Some(optimization) = optimization {
+            command.arg(optimization);
+        }
+        command.arg(&source);
+        let macros = run(command);
+        macros.assert_success();
+        assert_eq!(macros.stdout.contains("#define __OPTIMIZE__ 1\n"), optimize);
+        assert_eq!(
+            macros.stdout.contains("#define __OPTIMIZE_SIZE__ 1\n"),
+            size
+        );
+        assert_eq!(
+            macros.stdout.contains("#define __NO_INLINE__ 1\n"),
+            no_inline
+        );
+    }
+}
+
+#[test]
 fn expands_computed_line_operands_and_logical_locations() {
     let directory = TestDirectory::new("line-directive");
     let source = directory.write(

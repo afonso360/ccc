@@ -12,6 +12,20 @@ use sha2::{Digest as _, Sha256};
 
 use super::*;
 
+#[test]
+fn optimization_profiles_map_to_cranelift_without_inventing_backend_tiers() {
+    for (optimization, expected) in [
+        (OptimizationLevel::O0, "none"),
+        (OptimizationLevel::O1, "speed"),
+        (OptimizationLevel::O2, "speed"),
+        (OptimizationLevel::O3, "speed"),
+        (OptimizationLevel::Size, "speed_and_size"),
+        (OptimizationLevel::SizeMin, "speed_and_size"),
+    ] {
+        assert_eq!(cranelift_opt_level(optimization), expected);
+    }
+}
+
 fn lower_source_with_config(source: &str, config: &EffectiveCompilationConfig) -> gir::FullModule {
     lower_source_with_map(source, config).0
 }

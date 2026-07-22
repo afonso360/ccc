@@ -2024,7 +2024,7 @@ impl FunctionVerifier<'_> {
     }
 }
 
-fn instruction_operands(kind: &FullInstructionKind) -> Vec<ValueId> {
+pub(super) fn instruction_operands(kind: &FullInstructionKind) -> Vec<ValueId> {
     match kind {
         FullInstructionKind::Constant(_)
         | FullInstructionKind::AddressConstant { .. }
@@ -2143,7 +2143,7 @@ fn instruction_operands(kind: &FullInstructionKind) -> Vec<ValueId> {
     }
 }
 
-fn terminator_operands(terminator: &FullTerminator) -> Vec<ValueId> {
+pub(super) fn terminator_operands(terminator: &FullTerminator) -> Vec<ValueId> {
     match terminator {
         FullTerminator::Branch(edge) => edge.arguments.clone(),
         FullTerminator::Conditional {

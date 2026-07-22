@@ -55,7 +55,7 @@ const HELP: &str = "Usage: ccc [options] <input>...\n\
   -E [-P]                    Preprocess only; -P suppresses linemarkers\n\
   -fsyntax-only              Parse and analyze without emitting an object\n\
   -x language                Select c, c-cpp-output, assembler, assembler-with-cpp, or none\n\
-  -O|-O0|-O1|-O2|-O3|-Os|-Oz\n\
+  -O|-O0|-O1|-O2|-O3|-Os|-Oz Select the optimization profile\n\
   -g|-g1|-g2|-g3            Emit source-level DWARF; -g0 disables it\n\
   -fPIC|-fPIE|-pie           Select position-independent code and PIE linking (default)\n\
   -fno-pic|-fno-pie|-no-pie Select static-model code and non-PIE linking\n\
@@ -240,7 +240,7 @@ fn query_driver(query: DriverQuery, options: QueryOptions) -> Result<DriverOutpu
                 ccc_target::RelocationModel::Pie => "pie",
             };
             let mut output = format!(
-                "target={}\narchitecture={}\ncpu={}\nabi={}\nlanguage={}\ngnu-profile={}\nrelocation={}\nresource-dir={}\n",
+                "target={}\narchitecture={}\ncpu={}\nabi={}\nlanguage={}\ngnu-profile={}\nrelocation={}\noptimization={}\nresource-dir={}\n",
                 config.target.triple,
                 config.normalized_target_arch(),
                 config.normalized_target_cpu(),
@@ -256,6 +256,7 @@ fn query_driver(query: DriverQuery, options: QueryOptions) -> Result<DriverOutpu
                     },
                 ),
                 relocation,
+                config.optimization.flag(),
                 resources.root().display(),
             );
             output.push_str(&format!(
@@ -315,6 +316,7 @@ fn query_config(options: &QueryOptions) -> Result<EffectiveCompilationConfig, Dr
         config = config.with_deployment_target(version);
     }
     config.relocation_model = options.relocation_model;
+    config.optimization = options.optimization;
     if options.sdk_root.is_some() && config.target.abi != ccc_target::AbiIdentity::DarwinArm64 {
         return Err(owner_error(
             "CCC6005",
@@ -551,6 +553,7 @@ fn render_ccc_compile_command(
         ccc_target::RelocationModel::Pic => "-fPIC".into(),
         ccc_target::RelocationModel::Pie => "-fPIE".into(),
     });
+    command.push(options.optimization.flag().into());
     if options.debug_info {
         command.push("-g".into());
     }
@@ -1241,6 +1244,7 @@ fn effective_config(
         ));
     }
     config.relocation_model = options.relocation_model;
+    config.optimization = options.optimization;
     config
         .validate_target_profile_options()
         .map_err(|message| owner_error("CCC6005", message))?;
@@ -1872,12 +1876,20 @@ fn lower_frontend_preprocessed(
     prior_stderr: &str,
 ) -> Result<(FrontendParsedSource, FullModule), DriverError> {
     let (parsed, typed) = analyze_frontend_preprocessed(prepared, prior_stderr)?;
-    let ir = ccc_ir::generic::lower_frontend(&typed).map_err(|error| {
+    let mut ir = ccc_ir::generic::lower_frontend(&typed).map_err(|error| {
         with_prior_diagnostics(
             prior_stderr,
             frontend_ir_error(&parsed.session.sources, error),
         )
     })?;
+    ccc_ir::generic::optimize_frontend(&mut ir, parsed.session.config.optimization).map_err(
+        |error| {
+            with_prior_diagnostics(
+                prior_stderr,
+                frontend_ir_error(&parsed.session.sources, error),
+            )
+        },
+    )?;
     Ok((parsed, ir))
 }
 
