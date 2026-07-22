@@ -476,7 +476,12 @@ int main(void) {
     fs::remove_dir_all(directory).unwrap();
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "riscv64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "macos")
+))]
 #[test]
 fn thread_local_objects_are_isolated_in_pthreads_and_pie() {
     use object::{Object as _, ObjectKind};
@@ -496,11 +501,19 @@ fn thread_local_objects_are_isolated_in_pthreads_and_pie() {
     );
     let bytes = fs::read(&executable).unwrap();
     let file = object::File::parse(bytes.as_slice()).unwrap();
-    assert_eq!(
-        file.kind(),
-        ObjectKind::Dynamic,
-        "default output must be PIE"
-    );
+    if cfg!(target_os = "linux") {
+        assert_eq!(
+            file.kind(),
+            ObjectKind::Dynamic,
+            "default ELF output must be PIE"
+        );
+    } else {
+        assert_eq!(
+            file.kind(),
+            ObjectKind::Executable,
+            "default Mach-O output must be an executable"
+        );
+    }
 
     let execution = Command::new(&executable).output().unwrap();
     assert_eq!(
@@ -512,9 +525,14 @@ fn thread_local_objects_are_isolated_in_pthreads_and_pie() {
     fs::remove_dir_all(directory).unwrap();
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "riscv64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "macos")
+))]
 #[test]
-fn all_elf_tls_models_link_and_execute_as_pie() {
+fn all_tls_models_link_and_execute_as_pie() {
     use object::{Object as _, ObjectKind};
 
     let directory = test_directory("thread-local-models-pie");
@@ -552,11 +570,19 @@ int main(void) {
     );
     let bytes = fs::read(&executable).unwrap();
     let file = object::File::parse(bytes.as_slice()).unwrap();
-    assert_eq!(
-        file.kind(),
-        ObjectKind::Dynamic,
-        "default output must be PIE"
-    );
+    if cfg!(target_os = "linux") {
+        assert_eq!(
+            file.kind(),
+            ObjectKind::Dynamic,
+            "default ELF output must be PIE"
+        );
+    } else {
+        assert_eq!(
+            file.kind(),
+            ObjectKind::Executable,
+            "default Mach-O output must be an executable"
+        );
+    }
     let execution = Command::new(&executable).output().unwrap();
     assert!(
         execution.status.success(),

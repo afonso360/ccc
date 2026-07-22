@@ -118,28 +118,29 @@ is wrong.
 Driver tests require ABI-changing `long double` mode options to fail before
 translation; no partial object is emitted.
 
-TLS tests inspect `.tdata`/`.tbss`, symbol type and binding, and the exact
-`R_X86_64_TLSGD`, `R_X86_64_TLSLD`, `R_X86_64_DTPOFF32`,
-`R_X86_64_GOTTPOFF`, and `R_X86_64_TPOFF32` relocation families. Each model
-links and executes in a default PIE. A pthread fixture proves distinct
-addresses and initializer values per thread for external and block-local TLS,
-while two-direction reference-compiler links verify ELF TLS symbol
-interoperability. Generated accessors must retain unwind information, a
-non-executable stack note, deterministic manifest ownership, and exact local
-binding after packaging.
+TLS tests inspect `.tdata`/`.tbss` or Darwin `__thread_*` sections, symbol type
+and binding, and the exact target relocation families. The required families
+are TLSGD/TLSLD/DTPOFF/GOTTPOFF/TPOFF on x86-64, TLSDESC/TLSIE/TLSLE on
+AArch64 Linux, TLS GD/TLS GOT/TPREL on RISC-V, and TLV page/page-offset pairs on
+Darwin arm64. Each source model links and executes in a default PIE. A pthread
+fixture proves distinct addresses and initializer values per thread for
+external and block-local TLS, while two-direction reference-compiler links
+verify TLS symbol interoperability. Generated accessors must retain unwind
+information, a non-executable stack note on ELF, deterministic manifest
+ownership, target symbol spelling, and exact local binding after packaging.
 
 Planner, IR, digest, renderer, fake-command, and manifest tests run on every
-host. Native `x86_64-unknown-linux-gnu` execution and object suites compile only
-on Linux x86-64. The opt-in x86 feature rejects the wrong host at compile time,
-preflights every reference and packaging tool, and invokes each named native
-test binary explicitly. A missing tool or zero-test configuration is a hard
-failure, never an implicit skip.
+host. Native TLS execution runs on every enabled host profile. The broader
+x86-specific ABI and object suites compile only on Linux x86-64, reject the
+wrong host at compile time, preflight every reference and packaging tool, and
+invoke each named native test binary explicitly. A missing tool or zero-test
+configuration is a hard failure, never an implicit skip.
 
 The standalone target-oracle harness uses the same fail-closed rule. AArch64
-Linux and RISC-V Linux run two-way CCC/reference-compiler fixed and variadic
-calls at `-O0` and `-O2` under QEMU, inspect the resulting ELF objects, exercise
-static CFI through `_Unwind_Backtrace`, and attach `gdb-multiarch` to a QEMU
-gdbstub.
+Linux and RISC-V Linux run two-way CCC/reference-compiler fixed, variadic, and
+TLS calls at `-O0` and `-O2`, inspect the resulting ELF objects, and exercise
+static CFI through `_Unwind_Backtrace`. Native target hosts use GDB; cross hosts
+execute through QEMU and attach `gdb-multiarch` to its gdbstub.
 Both optimization profiles also execute returns-twice control flow and native
 1-, 2-, 4-, and 8-byte scalar atomics; the atomic object must not import a
 generic `__atomic_*` or `__sync_*` library entry point.

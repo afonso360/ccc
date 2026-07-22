@@ -3456,7 +3456,7 @@ fn accepts_automatic_variable_length_and_thread_local_objects() {
 }
 
 #[test]
-fn target_specific_tls_and_variadic_alignment_gates_are_exact() {
+fn enabled_target_tls_and_variadic_alignment_contracts_are_exact() {
     let tls_sources = [
         "_Thread_local int file_value;",
         "static _Thread_local int file_static;",
@@ -3467,25 +3467,19 @@ fn target_specific_tls_and_variadic_alignment_gates_are_exact() {
         "int read(void) { extern _Thread_local int block_value; return block_value; }",
     ];
     for config in [
+        EffectiveCompilationConfig::default(),
         EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
         EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
         EffectiveCompilationConfig::aarch64_apple_darwin(),
     ] {
         for source in tls_sources {
-            let diagnostics = analyze_source_with_config(source, &config).unwrap_err();
-            assert_eq!(
-                diagnostics
-                    .iter()
-                    .map(|diagnostic| diagnostic.code.as_str())
-                    .collect::<Vec<_>>(),
-                ["CCC2441"],
-                "{} should reject `{source}` before IR lowering",
-                config.target.triple
-            );
+            analyze_source_with_config(source, &config).unwrap_or_else(|diagnostics| {
+                panic!(
+                    "{} rejected supported TLS source `{source}`: {diagnostics:#?}",
+                    config.target.triple
+                )
+            });
         }
-    }
-    for source in tls_sources {
-        analyze_source_with_config(source, &EffectiveCompilationConfig::default()).unwrap();
     }
 
     let aligned_va_arg = "typedef __builtin_va_list va_list;\n\

@@ -545,10 +545,10 @@ fn generated_bridge_artifacts(
 > {
     use ccc_link::artifact::{BridgeManifestV2, GeneratedSymbol, GeneratedSymbolOwner};
     use ccc_link::bridge::{
-        AssemblyFunctionLinkage, BridgeEntryPlan, ElfTlsAccessModel, ElfTlsSymbolVisibility,
-        F80RuntimeHelperPlan, GeneratedSymbolKind, InlineAsmSupportPlan, TlsAccessorPlan,
+        AssemblyFunctionLinkage, BridgeEntryPlan, F80RuntimeHelperPlan, GeneratedSymbolKind,
+        InlineAsmSupportPlan, TlsAccessModel, TlsAccessorPlan, TlsSymbolVisibility,
         render_f80_support, render_inline_asm_support, render_target_call_helper,
-        render_target_fixed_entry, render_target_variadic_entry, render_tls_accessor,
+        render_target_fixed_entry, render_target_tls_accessor, render_target_variadic_entry,
     };
 
     let mut assemblies = Vec::new();
@@ -752,28 +752,35 @@ fn generated_bridge_artifacts(
                 "TLS accessor source symbol differs from the module ABI plan",
             ));
         }
+        if global.emission.symbol_name_is_exact != artifact.object_symbol_is_exact {
+            return Err(error(
+                "TLS accessor source symbol exactness differs from the module ABI plan",
+            ));
+        }
         let model = match artifact.model {
-            ccc_sema::generic::TlsModel::GeneralDynamic => ElfTlsAccessModel::GeneralDynamic,
-            ccc_sema::generic::TlsModel::LocalDynamic => ElfTlsAccessModel::LocalDynamic,
-            ccc_sema::generic::TlsModel::InitialExec => ElfTlsAccessModel::InitialExec,
-            ccc_sema::generic::TlsModel::LocalExec => ElfTlsAccessModel::LocalExec,
+            ccc_sema::generic::TlsModel::GeneralDynamic => TlsAccessModel::GeneralDynamic,
+            ccc_sema::generic::TlsModel::LocalDynamic => TlsAccessModel::LocalDynamic,
+            ccc_sema::generic::TlsModel::InitialExec => TlsAccessModel::InitialExec,
+            ccc_sema::generic::TlsModel::LocalExec => TlsAccessModel::LocalExec,
         };
         let object_visibility = if matches!(
             artifact.source_linkage,
             ccc_abi::SourceLinkage::None | ccc_abi::SourceLinkage::Internal
         ) {
-            ElfTlsSymbolVisibility::Hidden
+            TlsSymbolVisibility::Hidden
         } else {
             match artifact.source_visibility {
-                ccc_abi::SourceVisibility::Default => ElfTlsSymbolVisibility::Default,
-                ccc_abi::SourceVisibility::Hidden => ElfTlsSymbolVisibility::Hidden,
-                ccc_abi::SourceVisibility::Protected => ElfTlsSymbolVisibility::Protected,
-                ccc_abi::SourceVisibility::Internal => ElfTlsSymbolVisibility::Internal,
+                ccc_abi::SourceVisibility::Default => TlsSymbolVisibility::Default,
+                ccc_abi::SourceVisibility::Hidden => TlsSymbolVisibility::Hidden,
+                ccc_abi::SourceVisibility::Protected => TlsSymbolVisibility::Protected,
+                ccc_abi::SourceVisibility::Internal => TlsSymbolVisibility::Internal,
             }
         };
-        let assembly = render_tls_accessor(&TlsAccessorPlan {
+        let assembly = render_target_tls_accessor(&TlsAccessorPlan {
+            abi: config.target.abi,
             helper_symbol: artifact.helper_symbol.clone(),
             object_symbol: artifact.object_symbol.clone(),
+            object_symbol_is_exact: artifact.object_symbol_is_exact,
             model,
             object_visibility,
             logical_line: 1,
@@ -790,11 +797,15 @@ fn generated_bridge_artifacts(
                 ccc_abi::SourceLinkage::None | ccc_abi::SourceLinkage::Internal
             )
         {
-            symbols.push(GeneratedSymbol::source_internal(
+            let mut symbol = GeneratedSymbol::source_internal(
                 &artifact.object_symbol,
                 GeneratedSymbolKind::TlsObject,
                 GeneratedSymbolOwner::PrimaryObject,
-            ));
+            );
+            if artifact.object_symbol_is_exact {
+                symbol = symbol.with_exact_object_name();
+            }
+            symbols.push(symbol);
         }
         assemblies.push(assembly);
     }

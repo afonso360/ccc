@@ -348,9 +348,9 @@ pub(crate) fn is_bridge_generated_symbol(symbol: &str) -> bool {
     .any(|prefix| symbol.starts_with(prefix))
 }
 
-/// ELF x86-64 TLS address sequence selected by the source-level TLS model.
+/// Target TLS address sequence selected by the source-level TLS model.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ElfTlsAccessModel {
+pub enum TlsAccessModel {
     GeneralDynamic,
     LocalDynamic,
     InitialExec,
@@ -359,7 +359,7 @@ pub enum ElfTlsAccessModel {
 
 /// Visibility that the generated accessor must attach to its TLS reference.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ElfTlsSymbolVisibility {
+pub enum TlsSymbolVisibility {
     Default,
     Hidden,
     Protected,
@@ -369,10 +369,13 @@ pub enum ElfTlsSymbolVisibility {
 /// Canonical inputs for one compiler-generated TLS address accessor.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TlsAccessorPlan {
+    pub abi: AbiIdentity,
     pub helper_symbol: String,
     pub object_symbol: String,
-    pub model: ElfTlsAccessModel,
-    pub object_visibility: ElfTlsSymbolVisibility,
+    /// Whether the object spelling is already the physical object-file name.
+    pub object_symbol_is_exact: bool,
+    pub model: TlsAccessModel,
+    pub object_visibility: TlsSymbolVisibility,
     pub logical_line: u32,
 }
 
@@ -394,25 +397,44 @@ impl TlsAccessorPlan {
     }
 }
 
-/// Renders a hidden SysV AMD64 function that returns the calling thread's
-/// address for one ELF TLS object. Dynamic-model calls use a canonical,
-/// linker-relaxable sequence and preserve the ABI stack-alignment contract.
-pub fn render_tls_accessor(plan: &TlsAccessorPlan) -> Result<GeneratedAssembly, LinkError> {
+/// Renders a hidden function that returns the calling thread's address for one
+/// TLS object. Resolver calls preserve the target ABI's stack and unwind
+/// contracts, and every Linux sequence uses linker-relaxable relocations.
+pub fn render_target_tls_accessor(plan: &TlsAccessorPlan) -> Result<GeneratedAssembly, LinkError> {
     plan.validate()?;
-    let mut source = String::new();
-    assembly_prelude(&mut source);
-    match plan.object_visibility {
-        ElfTlsSymbolVisibility::Default => {}
-        ElfTlsSymbolVisibility::Hidden => {
-            writeln!(source, ".hidden {}", plan.object_symbol).unwrap();
+    let source = match plan.abi {
+        AbiIdentity::SysvAmd64Lp64 => render_x86_64_tls_accessor(plan),
+        AbiIdentity::Aapcs64Lp64 => render_aarch64_tls_accessor(plan),
+        AbiIdentity::RiscvLp64d => render_riscv64_tls_accessor(plan),
+        AbiIdentity::DarwinArm64 => render_darwin_arm64_tls_accessor(plan),
+    };
+    GeneratedAssembly::new(
+        format!("tls-accessor-{}", plan.helper_symbol),
+        source,
+        vec![plan.helper_symbol.clone()],
+        vec![LogicalDebugLocation::generated(plan.logical_line.max(1))],
+    )
+}
+
+fn render_elf_tls_visibility(symbol: &str, visibility: TlsSymbolVisibility, source: &mut String) {
+    match visibility {
+        TlsSymbolVisibility::Default => {}
+        TlsSymbolVisibility::Hidden => {
+            writeln!(source, ".hidden {symbol}").unwrap();
         }
-        ElfTlsSymbolVisibility::Protected => {
-            writeln!(source, ".protected {}", plan.object_symbol).unwrap();
+        TlsSymbolVisibility::Protected => {
+            writeln!(source, ".protected {symbol}").unwrap();
         }
-        ElfTlsSymbolVisibility::Internal => {
-            writeln!(source, ".internal {}", plan.object_symbol).unwrap();
+        TlsSymbolVisibility::Internal => {
+            writeln!(source, ".internal {symbol}").unwrap();
         }
     }
+}
+
+fn render_x86_64_tls_accessor(plan: &TlsAccessorPlan) -> String {
+    let mut source = String::new();
+    assembly_prelude(&mut source);
+    render_elf_tls_visibility(&plan.object_symbol, plan.object_visibility, &mut source);
     function_header(
         &plan.helper_symbol,
         AssemblyFunctionLinkage::ExternalHidden,
@@ -420,7 +442,7 @@ pub fn render_tls_accessor(plan: &TlsAccessorPlan) -> Result<GeneratedAssembly, 
         &mut source,
     );
     match plan.model {
-        ElfTlsAccessModel::GeneralDynamic => {
+        TlsAccessModel::GeneralDynamic => {
             source.push_str("subq $8, %rsp\n.cfi_def_cfa_offset 16\n");
             writeln!(
                 source,
@@ -431,31 +453,170 @@ pub fn render_tls_accessor(plan: &TlsAccessorPlan) -> Result<GeneratedAssembly, 
             source.push_str(".value 0x6666\nrex64\ncall __tls_get_addr@PLT\n");
             source.push_str("addq $8, %rsp\n.cfi_def_cfa_offset 8\nret\n");
         }
-        ElfTlsAccessModel::LocalDynamic => {
+        TlsAccessModel::LocalDynamic => {
             source.push_str("subq $8, %rsp\n.cfi_def_cfa_offset 16\n");
             writeln!(source, "leaq {}@TLSLD(%rip), %rdi", plan.object_symbol).unwrap();
             source.push_str("call __tls_get_addr@PLT\n");
             writeln!(source, "leaq {}@DTPOFF(%rax), %rax", plan.object_symbol).unwrap();
             source.push_str("addq $8, %rsp\n.cfi_def_cfa_offset 8\nret\n");
         }
-        ElfTlsAccessModel::InitialExec => {
+        TlsAccessModel::InitialExec => {
             source.push_str("movq %fs:0, %rax\n");
             writeln!(source, "addq {}@GOTTPOFF(%rip), %rax", plan.object_symbol).unwrap();
             source.push_str("ret\n");
         }
-        ElfTlsAccessModel::LocalExec => {
+        TlsAccessModel::LocalExec => {
             source.push_str("movq %fs:0, %rax\n");
             writeln!(source, "leaq {}@TPOFF(%rax), %rax", plan.object_symbol).unwrap();
             source.push_str("ret\n");
         }
     }
     function_footer(&plan.helper_symbol, &mut source);
-    GeneratedAssembly::new(
-        format!("tls-accessor-{}", plan.helper_symbol),
-        source,
-        vec![plan.helper_symbol.clone()],
-        vec![LogicalDebugLocation::generated(plan.logical_line.max(1))],
-    )
+    source
+}
+
+fn render_aarch64_tls_accessor(plan: &TlsAccessorPlan) -> String {
+    let mut source = String::new();
+    render_elf_tls_visibility(&plan.object_symbol, plan.object_visibility, &mut source);
+    target_function_header(
+        &plan.helper_symbol,
+        false,
+        AssemblyFunctionLinkage::ExternalHidden,
+        false,
+        plan.abi,
+        &mut source,
+    );
+    match plan.model {
+        TlsAccessModel::GeneralDynamic | TlsAccessModel::LocalDynamic => {
+            source.push_str(
+                "stp x29, x30, [sp, #-16]!\n\
+                 .cfi_def_cfa_offset 16\n\
+                 mov x29, sp\n\
+                 .cfi_def_cfa w29, 16\n\
+                 .cfi_offset w30, -8\n\
+                 .cfi_offset w29, -16\n",
+            );
+            writeln!(source, "adrp x0, :tlsdesc:{}", plan.object_symbol).unwrap();
+            writeln!(source, "ldr x1, [x0, :tlsdesc_lo12:{}]", plan.object_symbol).unwrap();
+            writeln!(source, "add x0, x0, :tlsdesc_lo12:{}", plan.object_symbol).unwrap();
+            writeln!(source, ".tlsdesccall {}", plan.object_symbol).unwrap();
+            source.push_str(
+                "blr x1\n\
+                 mrs x8, TPIDR_EL0\n\
+                 add x0, x8, x0\n\
+                 .cfi_def_cfa wsp, 16\n\
+                 ldp x29, x30, [sp], #16\n\
+                 .cfi_def_cfa_offset 0\n\
+                 .cfi_restore w30\n\
+                 .cfi_restore w29\n\
+                 ret\n",
+            );
+        }
+        TlsAccessModel::InitialExec => {
+            writeln!(source, "adrp x9, :gottprel:{}", plan.object_symbol).unwrap();
+            writeln!(
+                source,
+                "ldr x9, [x9, :gottprel_lo12:{}]",
+                plan.object_symbol
+            )
+            .unwrap();
+            source.push_str("mrs x8, TPIDR_EL0\nadd x0, x8, x9\nret\n");
+        }
+        TlsAccessModel::LocalExec => {
+            source.push_str("mrs x8, TPIDR_EL0\n");
+            writeln!(source, "add x8, x8, :tprel_hi12:{}", plan.object_symbol).unwrap();
+            writeln!(source, "add x0, x8, :tprel_lo12_nc:{}", plan.object_symbol).unwrap();
+            source.push_str("ret\n");
+        }
+    }
+    target_function_footer(&plan.helper_symbol, false, plan.abi, &mut source);
+    source
+}
+
+fn render_riscv64_tls_accessor(plan: &TlsAccessorPlan) -> String {
+    let mut source = String::new();
+    render_elf_tls_visibility(&plan.object_symbol, plan.object_visibility, &mut source);
+    target_function_header(
+        &plan.helper_symbol,
+        false,
+        AssemblyFunctionLinkage::ExternalHidden,
+        false,
+        plan.abi,
+        &mut source,
+    );
+    match plan.model {
+        TlsAccessModel::GeneralDynamic | TlsAccessModel::LocalDynamic => {
+            source.push_str(
+                "addi sp, sp, -16\n\
+                 .cfi_def_cfa_offset 16\n\
+                 sd ra, 8(sp)\n\
+                 .cfi_offset ra, -8\n\
+                 .Lccc_tls_dynamic:\n",
+            );
+            writeln!(source, "auipc a0, %tls_gd_pcrel_hi({})", plan.object_symbol).unwrap();
+            source.push_str("addi a0, a0, %pcrel_lo(.Lccc_tls_dynamic)\ncall __tls_get_addr\n");
+            source.push_str(
+                "ld ra, 8(sp)\n\
+                 .cfi_restore ra\n\
+                 addi sp, sp, 16\n\
+                 .cfi_def_cfa_offset 0\n\
+                 ret\n",
+            );
+        }
+        TlsAccessModel::InitialExec => {
+            source.push_str(".Lccc_tls_initial_exec:\n");
+            writeln!(source, "auipc a0, %tls_ie_pcrel_hi({})", plan.object_symbol).unwrap();
+            source.push_str(
+                "ld a0, %pcrel_lo(.Lccc_tls_initial_exec)(a0)\n\
+                 add a0, a0, tp\n\
+                 ret\n",
+            );
+        }
+        TlsAccessModel::LocalExec => {
+            writeln!(source, "lui a0, %tprel_hi({})", plan.object_symbol).unwrap();
+            writeln!(source, "add a0, a0, tp, %tprel_add({})", plan.object_symbol).unwrap();
+            writeln!(source, "addi a0, a0, %tprel_lo({})", plan.object_symbol).unwrap();
+            source.push_str("ret\n");
+        }
+    }
+    target_function_footer(&plan.helper_symbol, false, plan.abi, &mut source);
+    source
+}
+
+fn render_darwin_arm64_tls_accessor(plan: &TlsAccessorPlan) -> String {
+    let mut source = String::new();
+    target_function_header(
+        &plan.helper_symbol,
+        false,
+        AssemblyFunctionLinkage::ExternalHidden,
+        false,
+        plan.abi,
+        &mut source,
+    );
+    let object_symbol =
+        target_symbol_with_exactness(&plan.object_symbol, plan.abi, plan.object_symbol_is_exact);
+    source.push_str(
+        "stp x29, x30, [sp, #-16]!\n\
+         .cfi_def_cfa_offset 16\n\
+         mov x29, sp\n\
+         .cfi_def_cfa w29, 16\n\
+         .cfi_offset w30, -8\n\
+         .cfi_offset w29, -16\n",
+    );
+    writeln!(source, "adrp x0, {object_symbol}@TLVPPAGE").unwrap();
+    writeln!(source, "ldr x0, [x0, {object_symbol}@TLVPPAGEOFF]").unwrap();
+    source.push_str(
+        "ldr x8, [x0]\n\
+         blr x8\n\
+         .cfi_def_cfa wsp, 16\n\
+         ldp x29, x30, [sp], #16\n\
+         .cfi_def_cfa_offset 0\n\
+         .cfi_restore w30\n\
+         .cfi_restore w29\n\
+         ret\n",
+    );
+    target_function_footer(&plan.helper_symbol, false, plan.abi, &mut source);
+    source
 }
 
 fn assembly_prelude(output: &mut String) {
@@ -1893,14 +2054,14 @@ mod tests {
         let helper = "__ccc_tls_accessor_0123456789abcdef";
         for (model, required) in [
             (
-                ElfTlsAccessModel::GeneralDynamic,
+                TlsAccessModel::GeneralDynamic,
                 &[
                     "data16 leaq tls_value@TLSGD(%rip), %rdi",
                     ".value 0x6666\nrex64\ncall __tls_get_addr@PLT",
                 ][..],
             ),
             (
-                ElfTlsAccessModel::LocalDynamic,
+                TlsAccessModel::LocalDynamic,
                 &[
                     "leaq tls_value@TLSLD(%rip), %rdi",
                     "call __tls_get_addr@PLT",
@@ -1908,19 +2069,21 @@ mod tests {
                 ][..],
             ),
             (
-                ElfTlsAccessModel::InitialExec,
+                TlsAccessModel::InitialExec,
                 &["movq %fs:0, %rax", "addq tls_value@GOTTPOFF(%rip), %rax"][..],
             ),
             (
-                ElfTlsAccessModel::LocalExec,
+                TlsAccessModel::LocalExec,
                 &["movq %fs:0, %rax", "leaq tls_value@TPOFF(%rax), %rax"][..],
             ),
         ] {
-            let assembly = render_tls_accessor(&TlsAccessorPlan {
+            let assembly = render_target_tls_accessor(&TlsAccessorPlan {
+                abi: AbiIdentity::SysvAmd64Lp64,
                 helper_symbol: helper.to_owned(),
                 object_symbol: "tls_value".to_owned(),
+                object_symbol_is_exact: false,
                 model,
-                object_visibility: ElfTlsSymbolVisibility::Default,
+                object_visibility: TlsSymbolVisibility::Default,
                 logical_line: 19,
             })
             .unwrap();
@@ -1941,11 +2104,13 @@ mod tests {
 
     #[test]
     fn dynamic_tls_accessors_align_calls_and_general_dynamic_is_relaxable() {
-        let assembly = render_tls_accessor(&TlsAccessorPlan {
+        let assembly = render_target_tls_accessor(&TlsAccessorPlan {
+            abi: AbiIdentity::SysvAmd64Lp64,
             helper_symbol: "__ccc_tls_accessor_dynamic".to_owned(),
             object_symbol: "value".to_owned(),
-            model: ElfTlsAccessModel::GeneralDynamic,
-            object_visibility: ElfTlsSymbolVisibility::Hidden,
+            object_symbol_is_exact: false,
+            model: TlsAccessModel::GeneralDynamic,
+            object_visibility: TlsSymbolVisibility::Hidden,
             logical_line: 1,
         })
         .unwrap();
@@ -1959,6 +2124,120 @@ mod tests {
         assert!(source.contains(".hidden value"));
         assert!(source.contains("data16 leaq"));
         assert!(source.contains(".value 0x6666\nrex64\ncall"));
+    }
+
+    #[test]
+    fn linux_arm64_tls_accessors_use_target_relocation_families() {
+        for (model, required) in [
+            (
+                TlsAccessModel::GeneralDynamic,
+                &[":tlsdesc:value", ".tlsdesccall value", "mrs x8, TPIDR_EL0"][..],
+            ),
+            (
+                TlsAccessModel::LocalDynamic,
+                &[":tlsdesc:value", ".tlsdesccall value", "mrs x8, TPIDR_EL0"][..],
+            ),
+            (
+                TlsAccessModel::InitialExec,
+                &[":gottprel:value", ":gottprel_lo12:value"][..],
+            ),
+            (
+                TlsAccessModel::LocalExec,
+                &[":tprel_hi12:value", ":tprel_lo12_nc:value"][..],
+            ),
+        ] {
+            let assembly = render_target_tls_accessor(&TlsAccessorPlan {
+                abi: AbiIdentity::Aapcs64Lp64,
+                helper_symbol: "__ccc_tls_accessor_arm64".to_owned(),
+                object_symbol: "value".to_owned(),
+                object_symbol_is_exact: false,
+                model,
+                object_visibility: TlsSymbolVisibility::Protected,
+                logical_line: 1,
+            })
+            .unwrap();
+            for fragment in required {
+                assert!(
+                    assembly.source().contains(fragment),
+                    "{}",
+                    assembly.source()
+                );
+            }
+            assert!(assembly.source().contains(".protected value"));
+            assert!(assembly.source().contains(".note.GNU-stack"));
+        }
+    }
+
+    #[test]
+    fn linux_riscv64_tls_accessors_use_target_relocation_families() {
+        for (model, required) in [
+            (
+                TlsAccessModel::GeneralDynamic,
+                &["%tls_gd_pcrel_hi(value)", "call __tls_get_addr"][..],
+            ),
+            (
+                TlsAccessModel::LocalDynamic,
+                &["%tls_gd_pcrel_hi(value)", "call __tls_get_addr"][..],
+            ),
+            (
+                TlsAccessModel::InitialExec,
+                &["%tls_ie_pcrel_hi(value)", "add a0, a0, tp"][..],
+            ),
+            (
+                TlsAccessModel::LocalExec,
+                &["%tprel_hi(value)", "%tprel_add(value)", "%tprel_lo(value)"][..],
+            ),
+        ] {
+            let assembly = render_target_tls_accessor(&TlsAccessorPlan {
+                abi: AbiIdentity::RiscvLp64d,
+                helper_symbol: "__ccc_tls_accessor_riscv64".to_owned(),
+                object_symbol: "value".to_owned(),
+                object_symbol_is_exact: false,
+                model,
+                object_visibility: TlsSymbolVisibility::Internal,
+                logical_line: 1,
+            })
+            .unwrap();
+            for fragment in required {
+                assert!(
+                    assembly.source().contains(fragment),
+                    "{}",
+                    assembly.source()
+                );
+            }
+            assert!(assembly.source().contains(".internal value"));
+            assert!(assembly.source().contains(".note.GNU-stack"));
+        }
+    }
+
+    #[test]
+    fn darwin_arm64_tls_accessor_uses_tlv_and_respects_exact_symbols() {
+        for (exact, reference) in [(false, "_value@TLVPPAGE"), (true, "value@TLVPPAGE")] {
+            let assembly = render_target_tls_accessor(&TlsAccessorPlan {
+                abi: AbiIdentity::DarwinArm64,
+                helper_symbol: "__ccc_tls_accessor_darwin".to_owned(),
+                object_symbol: "value".to_owned(),
+                object_symbol_is_exact: exact,
+                model: TlsAccessModel::InitialExec,
+                object_visibility: TlsSymbolVisibility::Hidden,
+                logical_line: 1,
+            })
+            .unwrap();
+            assert!(
+                assembly.source().contains(reference),
+                "{}",
+                assembly.source()
+            );
+            assert!(assembly.source().contains("ldr x8, [x0]\nblr x8"));
+            assert!(assembly.source().contains("___ccc_tls_accessor_darwin:"));
+            assert!(
+                assembly
+                    .source()
+                    .contains(".private_extern ___ccc_tls_accessor_darwin")
+            );
+            assert!(assembly.source().contains(".subsections_via_symbols"));
+            assert!(!assembly.source().contains(".note.GNU-stack"));
+        }
     }
 
     #[test]

@@ -622,20 +622,108 @@ fn riscv_variadic_entry_keeps_fixed_float_arguments_separate_from_results() {
 }
 
 #[test]
-fn non_x86_tls_is_rejected_before_backend_lowering() {
-    let module = lower_source(
-        "_Thread_local int value;\n\
-         int read(void) { return value; }",
-    );
+fn enabled_targets_lower_tls_addresses_through_target_accessors() {
+    const SOURCE: &str = "_Thread_local int value;\n\
+         int *address(void) { return &value; }";
+    for (config, object_name, relocation_spelling) in [
+        (
+            EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+            "value",
+            ":tlsdesc:value",
+        ),
+        (
+            EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
+            "value",
+            "%tls_gd_pcrel_hi(value)",
+        ),
+        (
+            EffectiveCompilationConfig::aarch64_apple_darwin(),
+            "_value",
+            "_value@TLVPPAGE",
+        ),
+    ] {
+        let module = lower_source_with_config(SOURCE, &config);
+        let output = emit(&module, &config, Options::default()).unwrap();
+        let object = object::File::parse(output.object.as_slice()).unwrap();
+        let symbol = object
+            .symbol_by_name(object_name)
+            .unwrap_or_else(|| panic!("missing TLS object `{object_name}`"));
+        assert_eq!(
+            symbol.kind(),
+            object::SymbolKind::Tls,
+            "{}",
+            config.target.triple
+        );
+        assert_eq!(output.assemblies.len(), 1, "{}", config.target.triple);
+        assert!(
+            output.assemblies[0].source().contains(relocation_spelling),
+            "{} TLS accessor did not contain `{relocation_spelling}`:\n{}",
+            config.target.triple,
+            output.assemblies[0].source()
+        );
+        output.into_artifact_bundle().verify().unwrap();
+    }
+}
+
+#[test]
+fn non_x86_tls_debug_locations_fail_closed() {
+    const SOURCE: &str = "_Thread_local int value;\n\
+         int read(void) { return value; }";
     for config in [
         EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
         EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
         EffectiveCompilationConfig::aarch64_apple_darwin(),
     ] {
-        let error = emit(&module, &config, Options::default()).unwrap_err();
-        assert_eq!(error.code, "CCC3522");
+        let (module, sources) = lower_source_with_map(SOURCE, &config);
+        let error = emit(
+            &module,
+            &config,
+            Options {
+                emit_clif: false,
+                debug_info: Some(&sources),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.code, BACKEND_ERROR);
+        assert!(error.message.contains("thread-local debug locations"));
         assert!(error.message.contains(config.target.abi.name()));
     }
+}
+
+#[test]
+fn darwin_tls_declaration_label_keeps_its_exact_object_spelling() {
+    let config = EffectiveCompilationConfig::aarch64_apple_darwin();
+    let module = lower_source_with_config(
+        "static _Thread_local int logical_name asm(\"physical_tls\") = 7;\n\
+         int *address(void) { return &logical_name; }",
+        &config,
+    );
+    let output = emit(&module, &config, Options::default()).unwrap();
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    let symbol = object
+        .symbol_by_name("physical_tls")
+        .expect("exact Darwin TLS object symbol");
+    assert_eq!(symbol.kind(), object::SymbolKind::Tls);
+    assert!(object.symbol_by_name("_physical_tls").is_none());
+    assert_eq!(output.assemblies.len(), 1);
+    assert!(
+        output.assemblies[0]
+            .source()
+            .contains("physical_tls@TLVPPAGE")
+    );
+    assert!(
+        !output.assemblies[0]
+            .source()
+            .contains("_physical_tls@TLVPPAGE")
+    );
+    let manifest_symbol = output
+        .manifest
+        .symbols()
+        .iter()
+        .find(|entry| entry.kind == ccc_link::bridge::GeneratedSymbolKind::TlsObject)
+        .expect("internal TLS manifest symbol");
+    assert!(manifest_symbol.object_name_is_exact);
+    output.into_artifact_bundle().verify().unwrap();
 }
 
 #[test]

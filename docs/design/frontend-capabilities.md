@@ -223,23 +223,28 @@ bytes happen to match.
 | Linkage                | File objects and functions have internal or external linkage; block declarations without linkage remain distinct. Incompatible redeclarations are errors. `extern` followed by `static` is rejected at the later declaration (`CCC2372`) for objects and functions.                                                                                   |
 | Composite declarations | Compatible incomplete/complete arrays and unspecified/prototype function declarations form a composite type independent of declaration order. Top-level parameter qualifiers are ignored when forming function types.                                                                                                                                 |
 | Definitions            | Multiple initialized object definitions and multiple function definitions are rejected. Tentative external objects become ELF common symbols with target size/alignment; an initialized definition supersedes a tentative declaration.                                                                                                                |
-| Static locals          | Block statics use translation-unit-local ELF data symbols and require constant initialization. They are never initialized by an automatic-entry store. Thread-duration block objects use TLS sections and per-thread initialization instead.                                                                                                                  |
+| Static locals          | Block statics use translation-unit-local object symbols and require constant initialization. They are never initialized by an automatic-entry store. Thread-duration block objects use target TLS sections and per-thread initialization instead.                                                                                                                  |
 | Automatic locals       | Non-address-taken, nonvolatile scalar locals are promoted to SSA. Address-taken, volatile, aggregate, atomic, and variably modified locals retain explicit storage.                                                                                                                                                                                   |
-| Strings and globals    | Objects and functions carry symbol name, binding, and visibility through semantic analysis, IR, ABI planning, and ELF emission. `visibility("default")`, `visibility("hidden")`, `visibility("protected")`, and `visibility("internal")` are implemented; other layout and linkage override attributes remain outside the default supported registry. |
-| ELF proof              | Object tests inspect `.text`, `.data`, `.bss`, `.rodata`, `.tdata`, `.tbss`, local/global/undefined bindings, ordinary and TLS relocations, `R_X86_64_GOTPCREL` position-independent data accesses, and `R_X86_64_PLT32` direct external calls. Linux tests require normal links to produce executable ELF `DYN` files without runtime text relocations, execute relocated data and function pointers, cross-link CCC callers and callees with a reference compiler in both directions, and prove same-spelled internal names stay local. |
+| Strings and globals    | Objects and functions carry symbol name, binding, and visibility through semantic analysis, IR, ABI planning, and object emission. `visibility("default")`, `visibility("hidden")`, `visibility("protected")`, and `visibility("internal")` are implemented; other layout and linkage override attributes remain outside the default supported registry. |
+| Object proof           | Object tests inspect code, data, zero-fill, read-only, and TLS sections; local/global/undefined bindings; and ordinary, call, and TLS relocations for each enabled format and architecture. Linux tests require normal links to produce executable ELF `DYN` files without runtime text relocations. Darwin tests inspect Mach-O load commands, relocations, target symbol spelling, generated-symbol localization, and PIE output. Cross-links execute CCC callers and callees with a reference compiler in both directions. |
 
-Standard `_Thread_local` and GNU `__thread` objects use ELF TLS sections and compiler-generated
-address accessors. Each accessor is planned from the translation-unit digest,
-assembled through the verified artifact pipeline, and localized after the
-relocatable link. The default global-dynamic model and the explicit
-`tls_model` global-dynamic, local-dynamic, initial-exec, and local-exec models
-map to their canonical x86-64 relocations. Linux tests inspect those
-relocations, execute every model in a PIE, prove per-thread identity and
-initialization with pthreads, and cross-link TLS definitions and references
-with the platform compiler. AAPCS64, RISC-V LP64D, and Darwin arm64 reject
-thread-local declarations during semantic analysis with `CCC2441`; ABI planning
-and code generation repeat the fail-closed check as `CCC3522`, so no target can
-reach the x86-specific TLS lowering accidentally.
+Standard `_Thread_local` and GNU `__thread` objects use target TLS sections and
+compiler-generated address accessors. Each accessor is planned from the
+translation-unit digest, assembled through the verified artifact pipeline, and
+localized after the relocatable link. The default global-dynamic model and the
+explicit `tls_model` global-dynamic, local-dynamic, initial-exec, and local-exec
+models map to canonical target sequences: TLSGD/TLSLD/GOTTPOFF/TPOFF on x86-64,
+TLSDESC/TLSIE/TLSLE on AArch64 Linux, TLS GD/TLS GOT/TPREL on RISC-V, and TLV
+descriptors on Darwin arm64. The AArch64 and RISC-V psABI toolchains map both
+dynamic source spellings to their general dynamic relocation family. Darwin's
+ABI similarly uses TLV descriptors for every source spelling.
+
+Target tests inspect the resulting ELF or Mach-O relocations, execute every
+model in a PIE, prove per-thread identity and initialization with pthreads, and
+cross-link TLS definitions and references with the platform compiler. Source
+debug locations for TLS definitions remain available only on x86-64 ELF;
+requesting debug information for a TLS definition on another target fails
+before object publication rather than emitting an incorrect location.
 
 ### Statements and CFG behavior
 

@@ -208,7 +208,10 @@ impl AbiIdentity {
     /// Whether CCC has complete object, link, and execution evidence for
     /// thread-local storage under this ABI profile.
     pub const fn supports_tls_codegen(self) -> bool {
-        matches!(self, Self::SysvAmd64Lp64)
+        matches!(
+            self,
+            Self::SysvAmd64Lp64 | Self::Aapcs64Lp64 | Self::RiscvLp64d | Self::DarwinArm64
+        )
     }
 
     /// Whether this ABI profile has the complete scalar, boundary, varargs,

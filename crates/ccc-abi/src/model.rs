@@ -319,6 +319,7 @@ pub struct BridgeEntryArtifactPlan {
 pub struct TlsAccessorArtifactPlan {
     pub object: DataId,
     pub object_symbol: String,
+    pub object_symbol_is_exact: bool,
     pub helper_symbol: String,
     pub model: TlsModel,
     pub source_linkage: SourceLinkage,

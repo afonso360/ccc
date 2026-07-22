@@ -443,6 +443,7 @@ fn plan_artifacts(
             TlsAccessorArtifactPlan {
                 object: object.id,
                 object_symbol: object.emission.symbol_name.clone(),
+                object_symbol_is_exact: object.emission.symbol_name_is_exact,
                 helper_symbol: generated_symbol_for(
                     translation_unit_digest,
                     "tls_accessor",
@@ -797,9 +798,10 @@ fn dump_artifacts(output: &mut String, artifacts: &BridgeArtifactPlan) {
     for accessor in artifacts.tls_accessors.values() {
         writeln!(
             output,
-            "tls-accessor object={} symbol={} helper={} model={} linkage={} visibility={} defined={}",
+            "tls-accessor object={} symbol={} exact={} helper={} model={} linkage={} visibility={} defined={}",
             accessor.object.0,
             accessor.object_symbol,
+            accessor.object_symbol_is_exact,
             accessor.helper_symbol,
             tls_model_name(accessor.model),
             source_linkage_name(accessor.source_linkage),

@@ -9,6 +9,8 @@ extern int pthread_create(
 extern int pthread_join(pthread_t thread, void **result);
 
 _Thread_local int external_value = 11;
+static _Atomic int threads_ready;
+static _Atomic int release_threads;
 
 static int *block_value_address(void) {
     static _Thread_local int block_value = 17;
@@ -32,6 +34,9 @@ static void *observe(void *argument) {
     result->initial_block = *block_value;
     result->external_address = &external_value;
     result->block_address = block_value;
+    ++threads_ready;
+    while (!release_threads) {
+    }
     external_value = 30 + result->index;
     *block_value = 40 + result->index;
     result->final_external = external_value;
@@ -54,6 +59,9 @@ int main(void) {
         if (pthread_create(&threads[index], (void *)0, observe, &results[index]) != 0)
             return 1;
     }
+    while (threads_ready != thread_count) {
+    }
+    release_threads = 1;
     for (index = 0; index < thread_count; ++index) {
         void *joined = (void *)0;
         if (pthread_join(threads[index], &joined) != 0) return 2;

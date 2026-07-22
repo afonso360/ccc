@@ -96,6 +96,10 @@ case $target_name in
         ccc_min=("$ccc_bin" "--target=$triple")
         ccc_full=("$ccc_bin" "--target=$triple" -march=armv8-a -mcpu=generic -mabi=lp64)
         reference_cc=("$reference_driver" -march=armv8-a -mabi=lp64)
+        if [[ $(uname -s) == Linux && $(uname -m) =~ ^(aarch64|arm64)$ ]]; then
+            native_elf=1
+            runner=()
+        fi
         ;;
     riscv64-linux)
         platform=elf
@@ -113,6 +117,10 @@ case $target_name in
         # default.  The oracle must be able to cross the reference frames
         # before it can validate the CCC frames on the other side.
         reference_cc=("$reference_driver" -march=rv64gc -mabi=lp64d -funwind-tables)
+        if [[ $(uname -s) == Linux && $(uname -m) == riscv64 ]]; then
+            native_elf=1
+            runner=()
+        fi
         ;;
     darwin-arm64)
         platform=macho
@@ -227,7 +235,8 @@ compile_ccc_min() {
 
 compile_ref() {
     local source=$1 output=$2 optimization=$3
-    "${reference_cc[@]}" -std=gnu11 -Wall -Wextra -Werror "$optimization" -I "$fixtures" -c "$fixtures/$source" -o "$output"
+    shift 3
+    "${reference_cc[@]}" -std=gnu11 -Wall -Wextra -Werror "$optimization" -I "$fixtures" "$@" -c "$fixtures/$source" -o "$output"
 }
 
 link_ref() {
@@ -373,6 +382,24 @@ for optimization in -O0 -O2; do
     run_executable "$unwind_helper"
     pass "$optimization unwind crosses fixed frames and both variadic bridges"
 
+    ccc_tls=$artifact_dir/ccc-tls-$suffix.o
+    ref_tls_caller=$artifact_dir/ref-calls-ccc-tls-$suffix.o
+    tls_forward=$artifact_dir/tls-ref-to-ccc-$suffix
+    compile_ccc ccc_tls_definitions.c "$ccc_tls" "$optimization" -nostdinc
+    compile_ref reference_calls_ccc_tls.c "$ref_tls_caller" "$optimization" -pthread
+    link_ref "$tls_forward" "$ref_tls_caller" "$ccc_tls" -pthread
+    run_executable "$tls_forward"
+    pass "$optimization reference threads use isolated CCC TLS definitions"
+
+    ref_tls=$artifact_dir/ref-tls-$suffix.o
+    ccc_tls_caller=$artifact_dir/ccc-calls-ref-tls-$suffix.o
+    tls_reverse=$artifact_dir/tls-ccc-to-ref-$suffix
+    compile_ref reference_tls_definitions.c "$ref_tls" "$optimization"
+    compile_ccc ccc_calls_reference_tls.c "$ccc_tls_caller" "$optimization" -nostdinc
+    link_ref "$tls_reverse" "$ccc_tls_caller" "$ref_tls"
+    run_executable "$tls_reverse"
+    pass "$optimization CCC accesses a reference compiler TLS definition"
+
     if [[ $target_name == x86_64-linux ]]; then
         ccc_f80=$artifact_dir/ccc-f80-$suffix.o
         ref_f80_caller=$artifact_dir/ref-calls-ccc-f80-$suffix.o
@@ -447,6 +474,8 @@ pass "predefined target identity matches the reference compiler profile"
 
 symbol_object=$artifact_dir/symbol-contract.o
 compile_ccc darwin_symbol_contract.c "$symbol_object" -O0 -nostdinc
+tls_models_object=$artifact_dir/tls-models.o
+compile_ccc tls_models.c "$tls_models_object" -O0 -nostdinc
 
 if [[ $platform == elf ]]; then
     long_double_storage=$artifact_dir/long-double-storage.o
@@ -462,7 +491,8 @@ if [[ $platform == elf ]]; then
         expect_ccc_failure long_double_boundary.c CCC2343
         expect_ccc_failure long_double_aggregate_boundary.c CCC3509
         expect_ccc_failure long_double_va_arg.c CCC2404
-        expect_ccc_failure long_double_tls.c CCC2441
+        long_double_tls=$artifact_dir/long-double-tls.o
+        compile_ccc long_double_tls.c "$long_double_tls" -O0 -nostdinc
     fi
 
     $readelf_tool -h "$ccc_fixed" > "$artifact_dir/fixed.elf-header.txt"
@@ -504,6 +534,37 @@ if [[ $platform == elf ]]; then
         echo "packaged object requests an executable stack" >&2
         exit 1
     fi
+    $readelf_tool -SW "$tls_models_object" > "$artifact_dir/tls-models.elf-sections.txt"
+    $readelf_tool -rW "$tls_models_object" > "$artifact_dir/tls-models.elf-relocations.txt"
+    $readelf_tool -sW "$tls_models_object" > "$artifact_dir/tls-models.elf-symbols.txt"
+    grep -q '\.tdata' "$artifact_dir/tls-models.elf-sections.txt"
+    grep -q '\.tbss' "$artifact_dir/tls-models.elf-sections.txt"
+    for symbol in tls_global_dynamic tls_local_dynamic tls_initial_exec tls_local_exec tls_zero; do
+        grep -Eq "TLS +GLOBAL +[^ ]+ +[0-9]+ +$symbol$" "$artifact_dir/tls-models.elf-symbols.txt"
+    done
+    case $target_name in
+        x86_64-linux)
+            for relocation in R_X86_64_TLSGD R_X86_64_TLSLD R_X86_64_DTPOFF32 R_X86_64_GOTTPOFF R_X86_64_TPOFF32; do
+                grep -q "$relocation" "$artifact_dir/tls-models.elf-relocations.txt"
+            done
+            ;;
+        aarch64-linux)
+            for relocation in R_AARCH64_TLSDESC_ADR_PAGE21 R_AARCH64_TLSDESC_LD64_LO12 R_AARCH64_TLSDESC_ADD_LO12 R_AARCH64_TLSDESC_CALL R_AARCH64_TLSIE_ADR_GOTTPREL_PAGE21 R_AARCH64_TLSIE_LD64_GOTTPREL_LO12_NC R_AARCH64_TLSLE_ADD_TPREL_HI12 R_AARCH64_TLSLE_ADD_TPREL_LO12_NC; do
+                grep -q "$relocation" "$artifact_dir/tls-models.elf-relocations.txt"
+            done
+            ;;
+        riscv64-linux)
+            for relocation in R_RISCV_TLS_GD_HI20 R_RISCV_TLS_GOT_HI20 R_RISCV_TPREL_HI20 R_RISCV_TPREL_ADD R_RISCV_TPREL_LO12_I; do
+                grep -q "$relocation" "$artifact_dir/tls-models.elf-relocations.txt"
+            done
+            ;;
+    esac
+    $nm_tool -g "$tls_models_object" > "$artifact_dir/tls-models.elf-global-symbols.txt"
+    if grep -q '__ccc_tls_accessor_' "$artifact_dir/tls-models.elf-global-symbols.txt"; then
+        echo "packaged ELF TLS accessor remained global" >&2
+        exit 1
+    fi
+    pass "ELF TLS sections, bindings, accessor localization, and relocation models"
     $readelf_tool -sW "$symbol_object" > "$artifact_dir/symbol-contract.elf-symbols.txt"
     grep -Eq 'GLOBAL +HIDDEN .*hidden_global' "$artifact_dir/symbol-contract.elf-symbols.txt"
     grep -Eq 'LOCAL +DEFAULT .*internal_variadic' "$artifact_dir/symbol-contract.elf-symbols.txt"
@@ -555,6 +616,28 @@ else
     grep -Eq '\) private external _hidden_global$' "$artifact_dir/symbol-contract.macho-symbols.txt"
     grep -Eq '\) non-external .*_internal_variadic$' "$artifact_dir/symbol-contract.macho-symbols.txt"
     grep -q '__DATA,__bss' "$artifact_dir/symbol-contract.macho-symbols.txt"
+    nm -m "$tls_models_object" > "$artifact_dir/tls-models.macho-symbols.txt"
+    otool -l "$tls_models_object" > "$artifact_dir/tls-models.macho-load-commands.txt"
+    otool -rv "$tls_models_object" > "$artifact_dir/tls-models.macho-relocations.txt"
+    for section in __thread_vars __thread_data __thread_bss; do
+        grep -q "sectname $section" "$artifact_dir/tls-models.macho-load-commands.txt"
+    done
+    for symbol in _tls_global_dynamic _tls_local_dynamic _tls_initial_exec _tls_local_exec _tls_zero; do
+        grep -Eq "\) external $symbol$" "$artifact_dir/tls-models.macho-symbols.txt"
+    done
+    grep -Eq '\) non-external .*physical_tls$' "$artifact_dir/tls-models.macho-symbols.txt"
+    if grep -Eq '\) .*_physical_tls$' "$artifact_dir/tls-models.macho-symbols.txt"; then
+        echo "exact Mach-O TLS assembly label acquired an unwanted C prefix" >&2
+        exit 1
+    fi
+    grep -q 'TLVLDP' "$artifact_dir/tls-models.macho-relocations.txt"
+    grep -q 'TLVLDPOFF' "$artifact_dir/tls-models.macho-relocations.txt"
+    grep -q 'physical_tls' "$artifact_dir/tls-models.macho-relocations.txt"
+    if awk '/___ccc_tls_accessor_/ && /\) external / { found = 1 } END { exit found ? 0 : 1 }' "$artifact_dir/tls-models.macho-symbols.txt"; then
+        echo "generated Mach-O TLS accessor remained external" >&2
+        exit 1
+    fi
+    pass "Mach-O TLV sections, relocations, symbol spelling, and accessor localization"
     otool -hv "$fixed_forward" > "$artifact_dir/final.macho-header.txt"
     grep -q 'PIE' "$artifact_dir/final.macho-header.txt"
     pass "Mach-O build version, CFI, symbols, visibility, relocation, and PIE contract"
@@ -693,11 +776,11 @@ fi
 pass "debugger stops in the variadic entry and generated call helper with caller frames"
 
 if [[ $target_name == x86_64-linux ]]; then
-    expected_cases=27
+    expected_cases=32
 elif [[ $platform == elf ]]; then
-    expected_cases=30
+    expected_cases=34
 else
-    expected_cases=24
+    expected_cases=29
 fi
 if (( case_count != expected_cases )); then
     echo "target oracle ran $case_count cases; expected exactly $expected_cases" >&2

@@ -37,9 +37,9 @@ Supported targets:
 | Target | Notes |
 | --- | --- |
 | `x86_64-unknown-linux-gnu` | Most complete target; includes x87 `long double`, `__int128`, and ELF thread-local storage |
-| `aarch64-unknown-linux-gnu` | AAPCS64; binary128 `long double` layout is available, but value operations and thread-local storage are not |
-| `riscv64-unknown-linux-gnu` | RV64GC/LP64D; binary128 `long double` layout is available, but value operations and thread-local storage are not |
-| `aarch64-apple-darwin` | Apple arm64 ABI; `long double` uses the platform's binary64 representation; thread-local storage is not supported |
+| `aarch64-unknown-linux-gnu` | AAPCS64 with ELF thread-local storage; binary128 `long double` layout is available, but value operations are not |
+| `riscv64-unknown-linux-gnu` | RV64GC/LP64D with ELF thread-local storage; binary128 `long double` layout is available, but value operations are not |
+| `aarch64-apple-darwin` | Apple arm64 ABI; `long double` uses binary64 and thread-local storage uses the platform TLV ABI |
 
 Currently supported:
 
@@ -67,7 +67,6 @@ Not currently supported:
   contexts, including runtime `sizeof` on variable-length arrays.
 - Binary128 `long double` arithmetic or ABI transport on AArch64 and RISC-V
   Linux.
-- Thread-local storage outside x86-64 Linux.
 - Aggregate, floating-point, 128-bit, or known-misaligned atomics.
 - General GNU `typeof`, arbitrary GNU attributes, arbitrary inline assembly,
   or `asm goto`.
