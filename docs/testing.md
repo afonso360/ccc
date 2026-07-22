@@ -1,0 +1,301 @@
+# Test commands and prerequisites
+
+Run every command in this document from the repository root. The standalone
+oracles and corpus runners intentionally fail when a required compiler, target
+runtime, debugger, archive, or opt-in environment variable is absent. A skipped
+check is not successful evidence.
+
+## Common setup
+
+CCC requires Rust 1.96 and the toolchain pinned by `rust-toolchain.toml`. Build
+the compiler used by shell harnesses before running them:
+
+```sh
+rustup toolchain install 1.96.0
+cargo build --locked -p ccc-driver
+export CCC="$PWD/target/debug/ccc"
+export CCC_RESOURCE_DIR="$PWD/resource-dir"
+```
+
+Keep artifact directories outside the source tree. An explicitly supplied
+corpus work directory must be empty:
+
+```sh
+CCC_TEST_ROOT="$(mktemp -d)"
+```
+
+The fetched-source suites need network access unless their pinned archives are
+provided with the documented archive options. Their runners verify byte counts,
+SHA-256, and SHA3-256 before extraction.
+
+## Rust tests
+
+The complete Rust unit and integration suite is:
+
+```sh
+cargo test --locked --workspace --all-targets
+```
+
+That command covers every workspace crate, the `ccc-types` layout integration
+test, and these `ccc-driver` integration binaries: `abi_oracle`, `diagnostics`,
+`execution`, `header_parsing`, `link_inputs`, `object_emission`,
+`preprocessing`, `sysv_amd64_environment`, `sysv_amd64_interop`, and
+`visibility`. To run those binaries separately:
+
+```sh
+for suite in \
+  abi_oracle diagnostics execution header_parsing link_inputs object_emission \
+  preprocessing sysv_amd64_environment sysv_amd64_interop visibility
+do
+  cargo test --locked -p ccc-driver --test "$suite"
+done
+cargo test --locked -p ccc-types --test layout
+```
+
+The x86-64 ABI oracle additionally requires native x86-64 GNU/Linux, GCC, and
+Clang. `CCC_ABI_GCC` and `CCC_ABI_CLANG` may name target-qualified driver
+commands. Native execution tests require the enabled host's assembler, linker,
+runtime libraries, and object tools.
+
+Run the workspace command on each supported host profile. The RISC-V CI profile
+uses these exact settings:
+
+```sh
+rustup target add riscv64gc-unknown-linux-gnu
+export CARGO_BUILD_TARGET=riscv64gc-unknown-linux-gnu
+export CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER=riscv64-linux-gnu-gcc
+export CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_RUNNER='qemu-riscv64 -L /usr/riscv64-linux-gnu'
+export CARGO_PROFILE_DEV_OPT_LEVEL=2
+export CCC_CC=riscv64-linux-gnu-gcc
+export QEMU_LD_PREFIX=/usr/riscv64-linux-gnu
+cargo test --locked --workspace --all-targets
+```
+
+This needs the Rust RISC-V target, `riscv64-linux-gnu-gcc`, matching binutils
+and glibc under `/usr/riscv64-linux-gnu`, and QEMU user-mode execution. Native
+AArch64 Linux needs an AArch64 GCC-compatible driver and binutils. Darwin arm64
+needs Xcode Command Line Tools, an installed macOS SDK, and the platform
+`nmedit` and `dsymutil` tools.
+
+Formatting and lint validation are separate from the test suite:
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --locked --workspace --all-targets -- -D warnings
+```
+
+## Target oracles
+
+Build CCC first, then run each target explicitly:
+
+```sh
+CCC_REQUIRE_TARGET_ORACLE=1 tests/target-oracle/run.sh x86_64-linux
+CCC_REQUIRE_TARGET_ORACLE=1 tests/target-oracle/run.sh aarch64-linux
+CCC_REQUIRE_TARGET_ORACLE=1 tests/target-oracle/run.sh riscv64-linux
+CCC_REQUIRE_TARGET_ORACLE=1 tests/target-oracle/run.sh darwin-arm64
+```
+
+The common requirements are Bash, `tee`, `cmp`, the built CCC executable, and
+the selected target's compiler driver, assembler, relocatable linker, symbol
+localizer, object inspector, and runtime. `CCC_BIN` overrides the compiler and
+`CCC_TARGET_ORACLE_ARTIFACTS` selects the retained artifact directory.
+
+Target-specific prerequisites are:
+
+| Oracle | Required environment |
+| --- | --- |
+| `x86_64-linux` | Native x86-64 GNU/Linux; GCC, GNU `objcopy`, `readelf`, `nm`, `objdump`, `timeout`, and GDB. Override them with `CCC_X86_64_CC`, `CCC_X86_64_OBJCOPY`, `CCC_X86_64_READELF`, `CCC_X86_64_NM`, and `CCC_X86_64_OBJDUMP`. |
+| `aarch64-linux` | Linux; `aarch64-linux-gnu-gcc` and matching binutils. A native AArch64 host uses GDB. Other hosts use `qemu-aarch64`, `gdb-multiarch`, and an AArch64 runtime root containing the executable interpreter; set `CCC_QEMU_ROOT` when it is not `/usr/aarch64-linux-gnu`. |
+| `riscv64-linux` | Linux; `riscv64-linux-gnu-gcc` and matching binutils. A native RISC-V64 host uses GDB. Other hosts use `qemu-riscv64`, `gdb-multiarch`, and an LP64D runtime root; set `CCC_QEMU_ROOT` when it is not `/usr/riscv64-linux-gnu`. |
+| `darwin-arm64` | Native arm64 macOS; `xcrun`, Apple Clang, `otool`, `nm`, `dwarfdump`, LLDB, `file`, `shasum`, a macOS SDK, `nmedit`, and `dsymutil`. `CCC_DARWIN_SDK_ROOT`, `CCC_DARWIN_CC`, and `CCC_NMEDIT` override discovery. |
+
+The Linux cross runners execute through QEMU rather than treating a successful
+cross-link as execution evidence. They inspect the target ELF interpreter
+before launch. Fixed and variadic ABI boundaries, TLS in both link directions,
+unwind behavior, and runtime semantics execute at both `-O0` and `-O2`.
+Predefined target identity, object relocations, and debugger backtraces are
+checked once using the retained `-O0` artifacts.
+
+### Extended-precision differential oracle
+
+Berkeley SoftFloat 3e and TestFloat 3e are a separate native x86-64 Linux
+oracle. Supply the exact archives recorded in
+`tests/target-oracle/berkeley-testfloat.toml`:
+
+```sh
+CCC_REQUIRE_TESTFLOAT_ORACLE=1 \
+CCC_SOFTFLOAT_ARCHIVE=/path/to/SoftFloat-3e.zip \
+CCC_TESTFLOAT_ARCHIVE=/path/to/TestFloat-3e.zip \
+tests/target-oracle/run-testfloat.sh
+```
+
+This requires GCC, Make, GNU `readelf`, `nm`, `sha256sum`, `timeout`, `unzip`,
+and an OpenSSL build with SHA3-256. `CCC_TESTFLOAT_ARTIFACTS` changes the
+retained output directory. The script rejects missing or hash-mismatched
+archives.
+
+## Debugger suites
+
+Debugger validation is the final part of each target-oracle command; there is
+no success mode that omits it. On native Linux it uses batch GDB. Cross-Linux
+starts QEMU's gdbstub and connects with `gdb-multiarch`; `CCC_GDB_PORT_BASE`
+can move the two reserved ports. Darwin uses batch LLDB and verifies the linked
+`.dSYM` with `dwarfdump` and `dsymutil`.
+
+The host must allow the debugger to launch or attach to test processes. On
+macOS, install Xcode Command Line Tools and ensure LLDB/debugserver authorization
+is enabled for the user running the suite. A debugger timeout, an unavailable
+gdbstub port, an unresolved generated helper, or a missing caller frame fails
+the complete target oracle.
+
+## Adapter regressions and applicability
+
+The shell-only adapter tests use fake tools and local fixtures; they do not
+download or build upstream projects:
+
+```sh
+./test-corpus/test-adapters.sh
+./test-corpus/csmith/test-run.sh
+```
+
+`test-adapters.sh` runs the shared environment test, applicability regression,
+the live applicability report, and the SQLite, Lua, bzip2, Redis, zstd, and zlib
+adapter regressions. The SQLite runner regression also invokes its source-patch
+test. Csmith's runner regression is separate and must be run explicitly.
+
+To print and validate the target/corpus coverage matrix directly:
+
+```sh
+./test-corpus/report-target-applicability.py
+```
+
+The hosted GNU-like header fixture is parse-only on all enabled targets. Its
+direct entry point is:
+
+```sh
+for target in \
+  x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
+  riscv64-unknown-linux-gnu aarch64-apple-darwin
+do
+  "$CCC" --target="$target" --dump-ast -nostdinc \
+    -isystem test-corpus/libc-headers/glibc-like \
+    test-corpus/libc-headers/glibc-like/probe.c >/dev/null
+done
+```
+
+The Rust `header_parsing` and `preprocessing` integration binaries perform the
+full deterministic assertions for this fixture.
+
+## Fetched corpus suites
+
+The standard x86-64 Linux corpus run uses a non-root user, native GCC and GNU
+binutils, Bash, Python 3, Make, Clang, Git, Curl, OpenSSL with SHA3-256, and the
+usual POSIX text/file utilities. SQLite additionally needs Tcl development
+files, `patch`, and `unzip`; zlib development headers are needed by the selected
+zstd build. Set `CCC` and `CCC_RESOURCE_DIR` as shown in the common setup.
+
+The bounded commands used by CI are:
+
+```sh
+test-corpus/lua/run.sh \
+  --work-dir "$CCC_TEST_ROOT/lua"
+
+test-corpus/sqlite/run.sh --suite veryquick \
+  --work-dir "$CCC_TEST_ROOT/sqlite"
+
+test-corpus/bzip2/run.sh --target x86_64-unknown-linux-gnu \
+  --work-dir "$CCC_TEST_ROOT/bzip2-x86_64"
+
+test-corpus/zlib/run.sh \
+  --work-dir "$CCC_TEST_ROOT/zlib"
+
+test-corpus/redis/run.sh \
+  --work-dir "$CCC_TEST_ROOT/redis"
+
+test-corpus/zstd/run.sh \
+  --work-dir "$CCC_TEST_ROOT/zstd"
+```
+
+SQLite exposes four exact upstream profiles. Use a fresh empty directory for
+each:
+
+```sh
+for suite in veryquick quick all full
+do
+  test-corpus/sqlite/run.sh --suite "$suite" \
+    --work-dir "$CCC_TEST_ROOT/sqlite-$suite"
+done
+```
+
+The `all` and `full` profiles take substantially longer. SQLite, Redis, and
+zstd reject UID 0 because their upstream permission checks would be
+meaningless. Use a native Linux filesystem; a macOS-backed container bind mount
+does not provide SQLite's required mode-`0000` behavior.
+
+Lua accepts `--source-archive` and `--test-archive`; SQLite and Redis accept
+`--archive`; zlib and zstd accept `--source-archive`. Each also accepts
+`--jobs`. Supplying those archives disables the corresponding download.
+
+### bzip2 target matrix
+
+bzip2 is the corpus with execution adapters for all enabled targets:
+
+```sh
+test-corpus/bzip2/run.sh --target x86_64-unknown-linux-gnu \
+  --work-dir "$CCC_TEST_ROOT/bzip2-x86_64"
+
+BZIP2_QEMU_ROOT=/usr/aarch64-linux-gnu \
+test-corpus/bzip2/run.sh --target aarch64-unknown-linux-gnu \
+  --work-dir "$CCC_TEST_ROOT/bzip2-aarch64"
+
+BZIP2_QEMU_ROOT=/usr/riscv64-linux-gnu \
+test-corpus/bzip2/run.sh --target riscv64-unknown-linux-gnu \
+  --work-dir "$CCC_TEST_ROOT/bzip2-riscv64"
+
+BZIP2_OPENSSL=/path/to/openssl-with-sha3 \
+BZIP2_MD5SUM=/path/to/gnu-compatible-md5sum \
+test-corpus/bzip2/run.sh --target aarch64-apple-darwin \
+  --work-dir "$CCC_TEST_ROOT/bzip2-darwin-arm64"
+```
+
+The cross-Linux commands require the matching GCC, `ar`, `ranlib`, `readelf`,
+QEMU executable, and target runtime root. Darwin requires native arm64 macOS,
+Xcode Command Line Tools, an SDK, and GNU-compatible checksum tools. Use
+`--source-archive` and `--test-repository` for offline inputs. The complete
+override names are documented in `test-corpus/bzip2/README.md`.
+
+## Csmith differential suite
+
+Csmith differential execution is supported on native x86-64 GNU/Linux. It
+requires GCC, Clang, a C++ compiler, GNU `objcopy`, `timeout`, OpenSSL with
+SHA3-256, and the common file/text utilities. Run a bounded seed range with:
+
+```sh
+cargo build --locked -p ccc-driver
+test-corpus/csmith/run.sh --cases 100 --start-seed 1 \
+  --work-dir "$CCC_TEST_ROOT/csmith"
+```
+
+Without `--archive`, the runner downloads and builds the pinned Csmith 2.4.0
+revision. For an existing developer installation, both the generator and
+runtime headers are mandatory and the unverified override must be explicit:
+
+```sh
+test-corpus/csmith/run.sh --cases 100 --start-seed 1 \
+  --csmith /opt/csmith/bin/csmith \
+  --csmith-runtime /opt/csmith/include \
+  --allow-unverified-csmith \
+  --work-dir "$CCC_TEST_ROOT/csmith-installed"
+```
+
+Reproduce one retained seed with a new empty directory:
+
+```sh
+test-corpus/csmith/run.sh --cases 1 --start-seed SEED \
+  --work-dir "$CCC_TEST_ROOT/csmith-SEED"
+```
+
+`test-corpus/csmith/run.sh --help` lists timeout, attempt-limit, compiler, and
+tool overrides. Reference disagreement, a one-sided compiler rejection,
+timeout, insufficient admissible cases, or a CCC/reference output mismatch is
+an oracle failure; the runner retains the per-seed commands and artifacts.

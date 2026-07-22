@@ -22,26 +22,34 @@ jobs:
               binutils build-essential clang coreutils gdb libc-bin procps
             rust_target: ""
             qemu: false
+            oracle: x86_64-linux
+            ccc_bin: target/debug/ccc
           - name: Linux AArch64
             runner: ubuntu-24.04-arm
             packages: >-
               binutils binutils-aarch64-linux-gnu build-essential clang
-              coreutils gcc-aarch64-linux-gnu libc-bin procps
+              coreutils gdb gcc-aarch64-linux-gnu libc-bin procps
             rust_target: ""
             qemu: false
+            oracle: aarch64-linux
+            ccc_bin: target/debug/ccc
           - name: Linux RISC-V64 under QEMU
             runner: ubuntu-24.04
             packages: >-
               binutils-riscv64-linux-gnu build-essential coreutils
-              gcc-riscv64-linux-gnu libc-bin libc6-dev-riscv64-cross procps
-              qemu-user qemu-user-binfmt
+              gcc-riscv64-linux-gnu gdb-multiarch libc-bin
+              libc6-dev-riscv64-cross procps qemu-user qemu-user-binfmt
             rust_target: riscv64gc-unknown-linux-gnu
             qemu: true
+            oracle: riscv64-linux
+            ccc_bin: target/riscv64gc-unknown-linux-gnu/debug/ccc
           - name: macOS AArch64
             runner: macos-26
             packages: ""
             rust_target: ""
             qemu: false
+            oracle: darwin-arm64
+            ccc_bin: target/debug/ccc
 
     steps:
       - uses: actions/checkout@v6
@@ -80,6 +88,21 @@ jobs:
       - name: Run Rust test suite
         run: cargo test --locked --workspace --all-targets
 
+      - name: Run target oracle
+        env:
+          CCC_BIN: ${{ github.workspace }}/${{ matrix.ccc_bin }}
+          CCC_REQUIRE_TARGET_ORACLE: "1"
+          CCC_TARGET_ORACLE_ARTIFACTS: ${{ runner.temp }}/ccc-target-oracle-${{ matrix.oracle }}
+        run: tests/target-oracle/run.sh ${{ matrix.oracle }}
+
+      - name: Upload target-oracle evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: target-oracle-${{ matrix.oracle }}
+          path: ${{ runner.temp }}/ccc-target-oracle-${{ matrix.oracle }}
+          if-no-files-found: ignore
+
   corpus:
     name: Test corpus (Linux x86-64)
     runs-on: ubuntu-24.04
@@ -103,7 +126,9 @@ jobs:
         run: cargo build --locked -p ccc-driver
 
       - name: Test corpus adapters
-        run: ./test-corpus/test-adapters.sh
+        run: |
+          ./test-corpus/test-adapters.sh
+          ./test-corpus/csmith/test-run.sh
 
       - name: Test Lua
         run: test-corpus/lua/run.sh --work-dir "$RUNNER_TEMP/ccc-corpus/lua"

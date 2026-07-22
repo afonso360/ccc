@@ -93,6 +93,9 @@ AArch64 macOS. The RISC-V Rust tests are cross-compiled and run under QEMU.
 A separate x86-64 Linux job builds and runs the bounded SQLite, Lua, bzip2,
 zlib, Redis, and zstd corpus profiles.
 
+The complete local commands and target-specific prerequisites are in
+[Test commands and prerequisites](docs/testing.md).
+
 ## License
 
 CCC is licensed under [Apache-2.0 WITH LLVM-exception](LICENSE).
