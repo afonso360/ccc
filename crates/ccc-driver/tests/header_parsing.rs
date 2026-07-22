@@ -4,6 +4,12 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static TEST_ID: AtomicU64 = AtomicU64::new(0);
+const ENABLED_TARGETS: [&str; 4] = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "riscv64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+];
 
 struct TestDirectory {
     path: PathBuf,
@@ -34,11 +40,16 @@ impl TestDirectory {
         path
     }
 
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     fn command(&self) -> Command {
+        self.command_for_target("x86_64-unknown-linux-gnu")
+    }
+
+    fn command_for_target(&self, target: &str) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_ccc"));
         command
             .current_dir(&self.path)
-            .arg("--target=x86_64-unknown-linux-gnu")
+            .arg(format!("--target={target}"))
             .env("LC_ALL", "C")
             .env("LANG", "C");
         command
@@ -101,25 +112,30 @@ fn curated_hosted_declarations_reach_the_ast_intact() {
     let include = repository("test-corpus/libc-headers/glibc-like");
     let source = include.join("probe.c");
     let directory = TestDirectory::new("curated");
-    let output = directory
-        .command()
-        .args(["--dump-ast", "-nostdinc", "-isystem"])
-        .arg(include)
-        .arg(source)
-        .output()
-        .unwrap();
-    assert_success(&output, "curated hosted-header parsing failed");
-    assert_ast_lines(
-        &output,
-        &[
-            "declarator fixture_record_t",
-            "declarator fixture_read(3)",
-            "attribute __attribute__ __nothrow__",
-            "asm-label __asm__ \"fixture_read_impl\"",
-            "function-definition fixture_identity",
-            "declarator hosted_header_preprocessing_sentinel",
-        ],
-    );
+    for target in ENABLED_TARGETS {
+        let output = directory
+            .command_for_target(target)
+            .args(["--dump-ast", "-nostdinc", "-isystem"])
+            .arg(&include)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert_success(
+            &output,
+            &format!("curated hosted-header parsing failed for {target}"),
+        );
+        assert_ast_lines(
+            &output,
+            &[
+                "declarator fixture_record_t",
+                "declarator fixture_read(3)",
+                "attribute __attribute__ __nothrow__",
+                "asm-label __asm__ \"fixture_read_impl\"",
+                "function-definition fixture_identity",
+                "declarator hosted_header_preprocessing_sentinel",
+            ],
+        );
+    }
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]

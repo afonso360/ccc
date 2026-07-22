@@ -6,6 +6,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use object::{Object as _, ObjectSymbol as _};
 
 static TEST_ID: AtomicU64 = AtomicU64::new(0);
+const ENABLED_TARGETS: [&str; 4] = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "riscv64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+];
 
 struct TestDirectory {
     path: PathBuf,
@@ -37,10 +43,14 @@ impl TestDirectory {
     }
 
     fn command(&self) -> Command {
+        self.command_for_target("x86_64-unknown-linux-gnu")
+    }
+
+    fn command_for_target(&self, target: &str) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_ccc"));
         command
             .current_dir(&self.path)
-            .arg("--target=x86_64-unknown-linux-gnu")
+            .arg(format!("--target={target}"))
             .env("LC_ALL", "C")
             .env("LANG", "C")
             .env_remove("SOURCE_DATE_EPOCH");
@@ -786,12 +796,12 @@ fn optimization_profiles_control_the_predefined_macro_contract() {
     let directory = TestDirectory::new("optimization-macros");
     let source = directory.write("empty.c", "\n");
 
-    for (optimization, optimize, size, no_inline) in [
-        (None, false, false, true),
-        (Some("-O0"), false, false, true),
-        (Some("-O2"), true, false, false),
-        (Some("-Os"), true, true, false),
-        (Some("-Oz"), true, true, false),
+    for (optimization, optimize, size) in [
+        (None, false, false),
+        (Some("-O0"), false, false),
+        (Some("-O2"), true, false),
+        (Some("-Os"), true, true),
+        (Some("-Oz"), true, true),
     ] {
         let mut command = directory.command();
         command.args(["-dM", "-E", "-nostdinc"]);
@@ -806,10 +816,7 @@ fn optimization_profiles_control_the_predefined_macro_contract() {
             macros.stdout.contains("#define __OPTIMIZE_SIZE__ 1\n"),
             size
         );
-        assert_eq!(
-            macros.stdout.contains("#define __NO_INLINE__ 1\n"),
-            no_inline
-        );
+        assert!(!macros.stdout.contains("#define __NO_INLINE__ 1\n"));
     }
 }
 
@@ -1341,29 +1348,42 @@ fn preprocesses_the_curated_hosted_header_tree_as_system_headers() {
     let source = include_directory.join("probe.c");
     let directory = TestDirectory::new("curated-hosted-headers");
 
-    let mut command = directory.command();
-    command
-        .args(["-E", "-P", "-nostdinc", "-isystem"])
-        .arg(&include_directory)
-        .arg(source);
-    let result = run(command);
-    result.assert_success();
-    assert!(result.stderr.trim().is_empty(), "{}", result.stderr);
-    assert_eq!(
-        normalize_fixture_snapshot(&result.stdout),
-        include_str!("../../../tests/preprocessing/goldens/hosted-header.out")
-    );
-    let output = squash_whitespace(&result.stdout);
-    assert!(output.contains("typedefunsignedlongintsize_t;"), "{output}");
-    assert!(output.contains("typedeflongintssize_t;"), "{output}");
-    assert!(
-        output.contains("externssize_tfixture_read(int,void*__restrict,size_t)"),
-        "{output}"
-    );
-    assert!(
-        output.contains("inthosted_header_preprocessing_sentinel;"),
-        "{output}"
-    );
+    for target in ENABLED_TARGETS {
+        let mut command = directory.command_for_target(target);
+        command
+            .args(["-E", "-P", "-nostdinc", "-isystem"])
+            .arg(&include_directory)
+            .arg(&source);
+        let result = run(command);
+        result.assert_success();
+        assert!(
+            result.stderr.trim().is_empty(),
+            "{target}: {}",
+            result.stderr
+        );
+        assert_eq!(
+            normalize_fixture_snapshot(&result.stdout),
+            include_str!("../../../tests/preprocessing/goldens/hosted-header.out"),
+            "{target}"
+        );
+        let output = squash_whitespace(&result.stdout);
+        assert!(
+            output.contains("typedefunsignedlongintsize_t;"),
+            "{target}: {output}"
+        );
+        assert!(
+            output.contains("typedeflongintssize_t;"),
+            "{target}: {output}"
+        );
+        assert!(
+            output.contains("externssize_tfixture_read(int,void*__restrict,size_t)"),
+            "{target}: {output}"
+        );
+        assert!(
+            output.contains("inthosted_header_preprocessing_sentinel;"),
+            "{target}: {output}"
+        );
+    }
 }
 
 #[test]
@@ -1372,27 +1392,33 @@ fn parses_the_curated_hosted_header_tree_as_system_headers() {
     let source = include_directory.join("probe.c");
     let directory = TestDirectory::new("curated-hosted-header-parse");
 
-    let mut command = directory.command();
-    command
-        .args(["--dump-ast", "-nostdinc", "-isystem"])
-        .arg(&include_directory)
-        .arg(source);
-    let result = run(command);
-    result.assert_success();
-    assert!(result.stderr.trim().is_empty(), "{}", result.stderr);
-    for sentinel in [
-        "declarator fixture_record_t",
-        "declarator fixture_read",
-        "attribute __attribute__ __nothrow__",
-        "asm-label __asm",
-        "function-definition fixture_identity",
-        "declarator hosted_header_preprocessing_sentinel",
-    ] {
+    for target in ENABLED_TARGETS {
+        let mut command = directory.command_for_target(target);
+        command
+            .args(["--dump-ast", "-nostdinc", "-isystem"])
+            .arg(&include_directory)
+            .arg(&source);
+        let result = run(command);
+        result.assert_success();
         assert!(
-            result.stdout.contains(sentinel),
-            "AST dump is missing {sentinel:?}:\n{}",
-            result.stdout
+            result.stderr.trim().is_empty(),
+            "{target}: {}",
+            result.stderr
         );
+        for sentinel in [
+            "declarator fixture_record_t",
+            "declarator fixture_read",
+            "attribute __attribute__ __nothrow__",
+            "asm-label __asm",
+            "function-definition fixture_identity",
+            "declarator hosted_header_preprocessing_sentinel",
+        ] {
+            assert!(
+                result.stdout.contains(sentinel),
+                "{target} AST dump is missing {sentinel:?}:\n{}",
+                result.stdout
+            );
+        }
     }
 }
 

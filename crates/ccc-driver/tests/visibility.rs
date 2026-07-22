@@ -1,4 +1,11 @@
-#![cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#![cfg(all(
+    target_os = "linux",
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "riscv64"
+    )
+))]
 
 use std::fs;
 use std::process::Command;
@@ -55,7 +62,6 @@ int retain_undefined_relocations(void) {
     .unwrap();
 
     let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
-        .env("CCC_CC", "cc")
         .arg("-nostdinc")
         .arg("-c")
         .arg(&source)

@@ -3,7 +3,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "riscv64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "macos")
+))]
 use std::ffi::{OsStr, OsString};
 
 use object::{
@@ -30,17 +35,47 @@ fn compile_ccc(source: &Path, output: &Path) {
 
 fn compile_ccc_with_options(source: &Path, output: &Path, options: &[&str]) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ccc"));
-    command
-        .arg("--target=x86_64-unknown-linux-gnu")
-        .arg("-nostdinc")
-        .arg("-c")
-        .args(options);
+    command.arg("-nostdinc").arg("-c").args(options);
     let result = command.arg(source).arg("-o").arg(output).output().unwrap();
     assert!(
         result.status.success(),
         "CCC failed:\n{}",
         render_output(&result)
     );
+}
+
+fn compile_x86_64_elf_with_options(source: &Path, output: &Path, options: &[&str]) {
+    let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+        .arg("--target=x86_64-unknown-linux-gnu")
+        .arg("-nostdinc")
+        .arg("-c")
+        .args(options)
+        .arg(source)
+        .arg("-o")
+        .arg(output)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "CCC failed:\n{}",
+        render_output(&result)
+    );
+}
+
+fn native_section_name(name: &str) -> String {
+    if cfg!(target_os = "macos") {
+        format!("__{}", name.trim_start_matches('.'))
+    } else {
+        name.to_owned()
+    }
+}
+
+fn native_symbol_name(name: &str) -> String {
+    if cfg!(target_os = "macos") {
+        format!("_{name}")
+    } else {
+        name.to_owned()
+    }
 }
 
 #[test]
@@ -79,18 +114,27 @@ int inspect(int *parameter) {
         assert_eq!(fs::read(output).unwrap(), bytes, "{level} debug profile");
     }
     let file = object::File::parse(bytes.as_slice()).unwrap();
-    for section in [
-        ".debug_abbrev",
-        ".debug_info",
-        ".debug_line",
-        ".debug_ranges",
-        ".eh_frame",
-    ] {
-        assert!(file.section_by_name(section).is_some(), "missing {section}");
+    for section in [".debug_abbrev", ".debug_info", ".debug_line", ".eh_frame"] {
+        assert!(
+            file.section_by_name(&native_section_name(section))
+                .is_some(),
+            "missing {section}"
+        );
+    }
+    if cfg!(target_os = "linux") {
+        assert!(
+            file.section_by_name(&native_section_name(".debug_ranges"))
+                .is_some(),
+            "missing .debug_ranges"
+        );
     }
     let debug_relocations = [".debug_info", ".debug_line", ".debug_ranges"]
         .into_iter()
-        .flat_map(|name| file.section_by_name(name).unwrap().relocations())
+        .filter_map(|name| {
+            file.section_by_name(&native_section_name(name))
+                .map(|section| section.relocations())
+        })
+        .flatten()
         .count();
     assert!(
         debug_relocations >= 5,
@@ -98,8 +142,9 @@ int inspect(int *parameter) {
     );
 
     let sections = gimli::DwarfSections::load(|id| {
+        let name = native_section_name(id.name());
         Ok::<_, gimli::Error>(
-            file.section_by_name(id.name())
+            file.section_by_name(&name)
                 .and_then(|section| section.data().ok())
                 .unwrap_or_default()
                 .to_vec(),
@@ -212,7 +257,12 @@ fn optimization_profiles_emit_valid_objects_and_o0_preserves_default() {
     fs::remove_dir_all(directory).unwrap();
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "riscv64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "macos")
+))]
 #[test]
 fn objects_built_at_different_optimization_levels_link_and_execute_together() {
     let directory = test_directory("mixed-optimization-link");
@@ -233,10 +283,28 @@ fn objects_built_at_different_optimization_levels_link_and_execute_together() {
     )
     .unwrap();
 
-    compile_ccc_with_options(&library_source, &library_object, &["-Oz"]);
-    compile_ccc_with_options(&main_source, &main_object, &["-O0"]);
-    let link = Command::new("gcc")
-        .args(["-pie", "-o"])
+    for (source, object, optimization) in [
+        (&library_source, &library_object, "-Oz"),
+        (&main_source, &main_object, "-O0"),
+    ] {
+        let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+            .arg("-nostdinc")
+            .arg("-c")
+            .arg(optimization)
+            .arg(source)
+            .arg("-o")
+            .arg(object)
+            .output()
+            .unwrap();
+        assert!(
+            compilation.status.success(),
+            "CCC failed:\n{}",
+            render_output(&compilation)
+        );
+    }
+    let target_cc = std::env::var_os("CCC_CC").unwrap_or_else(|| "cc".into());
+    let link = Command::new(target_cc)
+        .arg("-o")
         .arg(&executable)
         .arg(&main_object)
         .arg(&library_object)
@@ -276,12 +344,7 @@ fn optimization_runs_before_ir_dump_and_abi_planning() {
 
     let dump = |optimization: &str, representation: &str| {
         let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
-            .args([
-                "--target=x86_64-unknown-linux-gnu",
-                "-nostdinc",
-                optimization,
-                representation,
-            ])
+            .args(["-nostdinc", optimization, representation])
             .arg(&source)
             .output()
             .unwrap();
@@ -318,13 +381,14 @@ fn debug_information_covers_data_only_translation_units() {
     compile_ccc_with_options(&source, &output, &["-g"]);
     let bytes = fs::read(&output).unwrap();
     let file = object::File::parse(bytes.as_slice()).unwrap();
-    assert!(file.section_by_name(".debug_info").is_some());
+    let debug_info = native_section_name(".debug_info");
+    assert!(file.section_by_name(&debug_info).is_some());
     assert!(
-        file.section_by_name(".debug_info")
+        file.section_by_name(&debug_info)
             .unwrap()
             .relocations()
             .count()
-            >= 2,
+            >= if cfg!(target_os = "macos") { 1 } else { 2 },
         "the compilation unit and global address must be relocatable"
     );
 
@@ -332,7 +396,7 @@ fn debug_information_covers_data_only_translation_units() {
 }
 
 #[test]
-fn default_objects_use_position_independent_text_relocations() {
+fn x86_64_elf_objects_use_position_independent_text_relocations() {
     let directory = test_directory("position-independent-relocations");
     let source = directory.join("position-independent-relocations.c");
     let output = directory.join("position-independent-relocations.o");
@@ -357,7 +421,7 @@ int call_imported(void) {
 "#,
     )
     .unwrap();
-    compile_ccc(&source, &output);
+    compile_x86_64_elf_with_options(&source, &output, &[]);
 
     let bytes = fs::read(&output).unwrap();
     let file = object::File::parse(bytes.as_slice()).unwrap();
@@ -438,7 +502,7 @@ int read_tls_models(void) {
 "#,
     )
     .unwrap();
-    compile_ccc_with_options(&source, &output, &["-g"]);
+    compile_x86_64_elf_with_options(&source, &output, &["-g"]);
 
     let bytes = fs::read(&output).unwrap();
     let file = object::File::parse(bytes.as_slice()).unwrap();
@@ -531,7 +595,7 @@ fn render_output(output: &Output) -> String {
 }
 
 #[test]
-fn emitted_object_has_expected_sections_bindings_and_relocations() {
+fn x86_64_elf_object_has_expected_sections_bindings_and_relocations() {
     let directory = test_directory("structure");
     let source = directory.join("structure.c");
     let output = directory.join("structure.o");
@@ -551,7 +615,7 @@ int call_imported(void) {
 "#,
     )
     .unwrap();
-    compile_ccc(&source, &output);
+    compile_x86_64_elf_with_options(&source, &output, &[]);
 
     let bytes = fs::read(&output).unwrap();
     let file = object::File::parse(bytes.as_slice()).unwrap();
@@ -658,12 +722,17 @@ fn incomplete_extern_arrays_emit_only_undefined_data_symbols() {
     let bytes = fs::read(&output).unwrap();
     let file = object::File::parse(bytes.as_slice()).unwrap();
     for name in ["bytes", "values"] {
+        let symbol_name = native_symbol_name(name);
         let symbol = file
-            .symbol_by_name(name)
+            .symbol_by_name(&symbol_name)
             .unwrap_or_else(|| panic!("missing `{name}`"));
         assert!(symbol.is_undefined(), "{name}");
         assert!(symbol.is_global(), "{name}");
-        assert_eq!(symbol.kind(), SymbolKind::Data, "{name}");
+        if cfg!(target_os = "macos") {
+            assert_eq!(symbol.kind(), SymbolKind::Unknown, "{name}");
+        } else {
+            assert_eq!(symbol.kind(), SymbolKind::Data, "{name}");
+        }
         assert_eq!(symbol.size(), 0, "{name}");
     }
 
@@ -671,7 +740,7 @@ fn incomplete_extern_arrays_emit_only_undefined_data_symbols() {
 }
 
 #[test]
-fn declaration_assembly_labels_control_defined_and_referenced_elf_symbols() {
+fn x86_64_elf_declaration_assembly_labels_control_defined_and_referenced_symbols() {
     let directory = test_directory("declaration-assembly-labels");
     let source = directory.join("declaration-assembly-labels.c");
     let output = directory.join("declaration-assembly-labels.o");
@@ -690,7 +759,7 @@ int exported_object asm("renamed_object") = 7;
 "#,
     )
     .unwrap();
-    compile_ccc(&source, &output);
+    compile_x86_64_elf_with_options(&source, &output, &[]);
 
     let bytes = fs::read(&output).unwrap();
     let file = object::File::parse(bytes.as_slice()).unwrap();
@@ -746,17 +815,29 @@ int exported_object asm("renamed_object") = 7;
     fs::remove_dir_all(directory).unwrap();
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "riscv64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "macos")
+))]
 #[derive(Clone, Debug)]
 struct ReferenceCompiler {
     program: OsString,
     arguments: Vec<OsString>,
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "riscv64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "macos")
+))]
 impl ReferenceCompiler {
     fn required() -> Self {
-        let value = std::env::var_os("CC").unwrap_or_else(|| OsString::from("cc"));
+        let value = std::env::var_os("CCC_CC")
+            .or_else(|| std::env::var_os("CC"))
+            .unwrap_or_else(|| OsString::from("cc"));
         let mut words = value
             .to_string_lossy()
             .split_whitespace()
@@ -817,20 +898,35 @@ impl ReferenceCompiler {
     }
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "riscv64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "macos")
+))]
 fn write_source(directory: &Path, name: &str, contents: &str) -> PathBuf {
     let path = directory.join(name);
     fs::write(&path, contents).unwrap();
     path
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "riscv64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "macos")
+))]
 fn run_successfully(executable: &Path) {
     let result = Command::new(executable).output().unwrap();
     assert!(result.status.success(), "{}", render_output(&result));
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "riscv64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "macos")
+))]
 #[test]
 fn objects_cross_link_in_both_directions_and_keep_static_names_local() {
     let directory = test_directory("cross-link");
@@ -910,7 +1006,12 @@ fn objects_cross_link_in_both_directions_and_keep_static_names_local() {
     fs::remove_dir_all(directory).unwrap();
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "riscv64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "macos")
+))]
 #[test]
 fn thread_local_objects_cross_link_with_the_platform_compiler() {
     let directory = test_directory("thread-local-cross-link");
@@ -968,7 +1069,12 @@ fn thread_local_objects_cross_link_with_the_platform_compiler() {
     fs::remove_dir_all(directory).unwrap();
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "riscv64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "macos")
+))]
 #[test]
 fn weak_definitions_link_as_fallbacks_for_strong_symbols() {
     let directory = test_directory("weak-definition-interop");
@@ -1014,7 +1120,12 @@ fn weak_definitions_link_as_fallbacks_for_strong_symbols() {
     fs::remove_dir_all(directory).unwrap();
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "riscv64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "macos")
+))]
 #[test]
 fn declaration_assembly_labels_interoperate_in_both_directions() {
     let directory = test_directory("declaration-assembly-label-interop");
@@ -1024,17 +1135,18 @@ fn declaration_assembly_labels_interoperate_in_both_directions() {
         reference.identity()
     );
 
-    let ccc_caller = write_source(
-        &directory,
-        "ccc-caller.c",
+    let reference_add_symbol = native_symbol_name("reference_add_impl");
+    let reference_value_symbol = native_symbol_name("reference_value_impl");
+    let ccc_caller_source = format!(
         r#"
-extern int public_add(int) asm("reference_add_impl");
-extern int public_value asm("reference_value_impl");
-int main(void) {
+extern int public_add(int) asm("{reference_add_symbol}");
+extern int public_value asm("{reference_value_symbol}");
+int main(void) {{
     return public_add(35) + public_value == 49 ? 0 : 1;
-}
+}}
 "#,
     );
+    let ccc_caller = write_source(&directory, "ccc-caller.c", &ccc_caller_source);
     let reference_callee = write_source(
         &directory,
         "reference-callee.c",
@@ -1051,15 +1163,16 @@ int main(void) {
     );
     run_successfully(&caller_program);
 
-    let ccc_callee = write_source(
-        &directory,
-        "ccc-callee.c",
+    let ccc_multiply_symbol = native_symbol_name("ccc_multiply_impl");
+    let ccc_value_symbol = native_symbol_name("ccc_value_impl");
+    let ccc_callee_source = format!(
         r#"
-int internal_multiply(int, int) asm("ccc_multiply_impl");
-int internal_multiply(int left, int right) { return left * right; }
-int internal_value asm("ccc_value_impl") = 6;
+int internal_multiply(int, int) asm("{ccc_multiply_symbol}");
+int internal_multiply(int left, int right) {{ return left * right; }}
+int internal_value asm("{ccc_value_symbol}") = 6;
 "#,
     );
+    let ccc_callee = write_source(&directory, "ccc-callee.c", &ccc_callee_source);
     let reference_caller = write_source(
         &directory,
         "reference-caller.c",

@@ -283,6 +283,36 @@ run_executable() {
     fi
 }
 
+expect_abnormal_exit() {
+    local executable=$1
+    local status
+    if [[ $platform == elf ]] && (( ! native_elf )); then
+        local interpreter
+        interpreter=$($readelf_tool -l "$executable" | awk '/Requesting program interpreter/ { value=$NF; gsub(/\]/, "", value); print value; exit }')
+        if [[ -z $interpreter || ! -e $qemu_root$interpreter ]]; then
+            echo "target interpreter is absent from QEMU root: ${interpreter:-<none>}" >&2
+            return 1
+        fi
+        if "${runner[@]}" "$executable"; then
+            echo "target executable unexpectedly succeeded: $executable" >&2
+            return 1
+        else
+            status=$?
+        fi
+    else
+        if "$executable"; then
+            echo "native executable unexpectedly succeeded: $executable" >&2
+            return 1
+        else
+            status=$?
+        fi
+    fi
+    if (( status != 132 && status != 133 )); then
+        echo "executable did not terminate with SIGILL or SIGTRAP: status $status: $executable" >&2
+        return 1
+    fi
+}
+
 expect_ccc_failure() {
     local source=$1 code=$2
     local stem=${source%.c}
@@ -365,6 +395,29 @@ for optimization in -O0 -O2; do
     fi
     run_executable "$runtime_semantics_executable"
     pass "$optimization returns-twice control flow and native scalar atomics"
+
+    vla_runtime_object=$artifact_dir/vla-runtime-$suffix.o
+    vla_runtime_executable=$artifact_dir/vla-runtime-$suffix
+    compile_ccc vla_runtime.c "$vla_runtime_object" "$optimization" -nostdinc
+    link_ref "$vla_runtime_executable" "$vla_runtime_object"
+    "$nm_tool" -u "$vla_runtime_object" \
+        > "$artifact_dir/vla-runtime-$suffix.undefined-symbols.txt"
+    for provider in realloc free; do
+        if ! grep -q "$provider" \
+                "$artifact_dir/vla-runtime-$suffix.undefined-symbols.txt"; then
+            echo "$optimization VLA object is missing hosted provider import $provider" >&2
+            exit 1
+        fi
+    done
+    run_executable "$vla_runtime_executable"
+    pass "$optimization VLA bounds, runtime sizeof, and hosted arena provider"
+
+    vla_provider_failure_object=$artifact_dir/vla-provider-failure-$suffix.o
+    vla_provider_failure_executable=$artifact_dir/vla-provider-failure-$suffix
+    compile_ccc vla_provider_failure.c "$vla_provider_failure_object" "$optimization" -nostdinc
+    link_ref "$vla_provider_failure_executable" "$vla_provider_failure_object"
+    expect_abnormal_exit "$vla_provider_failure_executable"
+    pass "$optimization VLA hosted provider failure traps"
 
     ccc_unwind=$artifact_dir/ccc-unwind-$suffix.o
     ref_unwind=$artifact_dir/ref-unwind-$suffix.o
@@ -475,7 +528,7 @@ pass "predefined target identity matches the reference compiler profile"
 symbol_object=$artifact_dir/symbol-contract.o
 compile_ccc darwin_symbol_contract.c "$symbol_object" -O0 -nostdinc
 tls_models_object=$artifact_dir/tls-models.o
-compile_ccc tls_models.c "$tls_models_object" -O0 -nostdinc
+compile_ccc tls_models.c "$tls_models_object" -O0 -g -nostdinc
 
 if [[ $platform == elf ]]; then
     long_double_storage=$artifact_dir/long-double-storage.o
@@ -537,6 +590,7 @@ if [[ $platform == elf ]]; then
     $readelf_tool -SW "$tls_models_object" > "$artifact_dir/tls-models.elf-sections.txt"
     $readelf_tool -rW "$tls_models_object" > "$artifact_dir/tls-models.elf-relocations.txt"
     $readelf_tool -sW "$tls_models_object" > "$artifact_dir/tls-models.elf-symbols.txt"
+    grep -q '\.debug_info' "$artifact_dir/tls-models.elf-sections.txt"
     grep -q '\.tdata' "$artifact_dir/tls-models.elf-sections.txt"
     grep -q '\.tbss' "$artifact_dir/tls-models.elf-sections.txt"
     for symbol in tls_global_dynamic tls_local_dynamic tls_initial_exec tls_local_exec tls_zero; do
@@ -564,7 +618,7 @@ if [[ $platform == elf ]]; then
         echo "packaged ELF TLS accessor remained global" >&2
         exit 1
     fi
-    pass "ELF TLS sections, bindings, accessor localization, and relocation models"
+    pass "ELF TLS sections, source metadata, bindings, accessor localization, and relocation models"
     $readelf_tool -sW "$symbol_object" > "$artifact_dir/symbol-contract.elf-symbols.txt"
     grep -Eq 'GLOBAL +HIDDEN .*hidden_global' "$artifact_dir/symbol-contract.elf-symbols.txt"
     grep -Eq 'LOCAL +DEFAULT .*internal_variadic' "$artifact_dir/symbol-contract.elf-symbols.txt"
@@ -730,20 +784,24 @@ else
     require_file "$source_debug_bundle/Contents/Resources/DWARF/source-debug-local"
     dwarfdump --uuid "$source_debug_executable" > "$artifact_dir/source-debug-executable.uuid.txt"
     dwarfdump --uuid "$source_debug_bundle" > "$artifact_dir/source-debug-bundle.uuid.txt"
+    dwarfdump --debug-info "$source_debug_bundle" > "$artifact_dir/source-debug-info.txt"
     executable_uuid=$(awk '/UUID:/ { print $2; exit }' "$artifact_dir/source-debug-executable.uuid.txt")
     bundle_uuid=$(awk '/UUID:/ { print $2; exit }' "$artifact_dir/source-debug-bundle.uuid.txt")
     if [[ -z $executable_uuid || $executable_uuid != "$bundle_uuid" ]]; then
         echo "executable and dSYM UUIDs differ: executable=$executable_uuid bundle=$bundle_uuid" >&2
         exit 1
     fi
+    grep -Eq 'DW_AT_name.*\("ccc_debug_tls"\)' "$artifact_dir/source-debug-info.txt"
+    grep -q 'DW_OP_form_tls_address' "$artifact_dir/source-debug-info.txt"
     source_log=$artifact_dir/lldb-source-debug.txt
     source_timeout=$artifact_dir/lldb-source-debug.timeout
     rm -f "$source_timeout"
     lldb --batch -o "target create $source_debug_executable" \
-        -o "breakpoint set --file debug_local.c --line 2" \
-        -o "breakpoint set --file debug_local.c --line 8" \
+        -o "breakpoint set --file debug_local.c --line 4" \
+        -o "breakpoint set --file debug_local.c --line 10" \
         -o run -o "frame variable left right" \
-        -o continue -o "frame variable ccc_debug_local" > "$source_log" 2>&1 &
+        -o continue -o "target variable ccc_debug_tls" \
+        -o "frame variable ccc_debug_local" > "$source_log" 2>&1 &
     source_lldb_pid=$!
     (
         sleep 30
@@ -771,16 +829,16 @@ else
     grep -Eq 'left = 20' "$source_log"
     grep -Eq 'right = 22' "$source_log"
     grep -Eq 'ccc_debug_local = 42' "$source_log"
-    pass "one-step debug links publish distinct function lines, parameters, and locals through dSYM"
+    pass "one-step debug links preserve OSO inputs and publish lines, parameters, locals, and TLS metadata through dSYM"
 fi
 pass "debugger stops in the variadic entry and generated call helper with caller frames"
 
 if [[ $target_name == x86_64-linux ]]; then
-    expected_cases=32
+    expected_cases=36
 elif [[ $platform == elf ]]; then
-    expected_cases=34
+    expected_cases=38
 else
-    expected_cases=29
+    expected_cases=33
 fi
 if (( case_count != expected_cases )); then
     echo "target oracle ran $case_count cases; expected exactly $expected_cases" >&2

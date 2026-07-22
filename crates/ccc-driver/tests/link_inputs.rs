@@ -83,7 +83,12 @@ fn explicit_c_language_compiles_an_extensionless_input() {
     fs::remove_dir_all(directory).unwrap();
 }
 
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "riscv64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "macos")
+))]
 #[test]
 fn preprocesses_and_assembles_uppercase_assembly_inputs() {
     let directory = test_directory("preprocessed-assembly");
@@ -103,6 +108,8 @@ fn preprocesses_and_assembles_uppercase_assembly_inputs() {
          .text\n.globl _assembly_answer\n.p2align 2\n_assembly_answer:\n mov w0, #42\n ret\n\
          #elif defined(__aarch64__)\n\
          .text\n.globl assembly_answer\n.p2align 2\nassembly_answer:\n mov w0, #42\n ret\n\
+         #elif defined(__riscv)\n\
+         .text\n.globl assembly_answer\n.p2align 2\nassembly_answer:\n li a0, 42\n ret\n\
          #else\n#error unsupported execution-test architecture\n#endif\n",
     )
     .unwrap();
