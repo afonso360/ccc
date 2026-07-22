@@ -158,6 +158,11 @@ download or build upstream projects:
 ./test-corpus/csmith/test-run.sh
 ```
 
+The live Csmith runner establishes GCC/Clang consensus at `-O0` and `-O2`,
+then compiles and executes every accepted case with CCC at `-O0`, `-O2`, and
+`-Oz`. A case passes only when all three CCC profiles match the same reference
+output.
+
 `test-adapters.sh` runs the shared environment test, applicability regression,
 the live applicability report, and the SQLite, Lua, bzip2, Redis, zstd, and zlib
 adapter regressions. The SQLite runner regression also invokes its source-patch

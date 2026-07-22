@@ -287,6 +287,7 @@ expected_cc=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)/gcc
 [[ "${CCC_CC:-}" == "$expected_cc" ]]
 output=
 source_file=
+optimization=
 while (($#)); do
   case "$1" in
     -o)
@@ -297,12 +298,16 @@ while (($#)); do
       source_file=$1
       shift
       ;;
+    -O0 | -O2 | -Oz)
+      optimization=$1
+      shift
+      ;;
     *)
       shift
       ;;
   esac
 done
-[[ -n "$output" && -n "$source_file" ]]
+[[ -n "$output" && -n "$source_file" && -n "$optimization" ]]
 seed=$(sed -n 's/.*Seed:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$source_file")
 [[ -n "$seed" ]]
 checksum=$seed
@@ -362,10 +367,12 @@ grep -Fq 'generator_options= --no-argc --no-float --no-packed-struct' \
 grep -Fq 'generator_revision=unverified' "$pass_directory/run-config.txt"
 grep -Fq "ccc_native_driver=$fake_bin/gcc" "$pass_directory/run-config.txt"
 grep -Fq "ccc_object_copier=$fake_bin/objcopy" "$pass_directory/run-config.txt"
+grep -Fq 'ccc_matrix= o0 o2 oz' "$pass_directory/run-config.txt"
 cmp -s "$fake_bin/ccc" "$pass_directory/tool-identities/ccc-executable"
 cmp -s "$resource_directory/manifest.toml" \
   "$pass_directory/tool-identities/ccc-resource-dir/manifest.toml"
 [[ "$(find "$pass_directory/cases" -name program.c | wc -l | tr -d '[:space:]')" == 3 ]]
+[[ "$(find "$pass_directory/cases" -name 'ccc-*.compile.status' | wc -l | tr -d '[:space:]')" == 9 ]]
 ! grep -R -E -- '-fno-pie|-no-pie' "$pass_directory/cases"/*/commands.txt
 
 mismatch_directory="$temporary_directory/mismatch results"
@@ -384,9 +391,9 @@ grep -Fq $'23\toutput-mismatch\t' "$mismatch_directory/summary.tsv"
 mismatch_case=$(find "$mismatch_directory/cases" -mindepth 1 -maxdepth 1 -type d)
 [[ -f "$mismatch_case/program.c" ]]
 [[ -f "$mismatch_case/commands.txt" ]]
-[[ "$(tr -d '[:space:]' <"$mismatch_case/ccc.run.status")" == 0 ]]
+[[ "$(tr -d '[:space:]' <"$mismatch_case/ccc-o0.run.status")" == 0 ]]
 ! cmp -s "$mismatch_case/reference-gcc-o0.run.stdout" \
-  "$mismatch_case/ccc.run.stdout"
+  "$mismatch_case/ccc-o0.run.stdout"
 
 generator_directory="$temporary_directory/generator results"
 set +e

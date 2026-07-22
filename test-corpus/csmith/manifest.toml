@@ -43,6 +43,7 @@ generator_options = [
 reference_compilers = ["gcc", "clang"]
 reference_optimizations = ["-O0", "-O2"]
 target_compiler = "ccc"
+target_optimizations = ["-O0", "-O2", "-Oz"]
 output_oracle = "reference-consensus"
 eligibility = "gcc-and-clang-strict-c11"
 inconclusive_policy = "replace-joint-reference-timeout"
