@@ -13,6 +13,7 @@ pub enum AbiScalar {
     SignedInteger { bits: u8 },
     UnsignedInteger { bits: u8 },
     Pointer { bits: u8 },
+    Float16,
     Float32,
     Float64,
 }
@@ -36,6 +37,7 @@ pub enum AbiCarrier {
     I32,
     I64,
     I128,
+    F16,
     F32,
     F64,
     V32,

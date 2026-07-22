@@ -116,6 +116,7 @@ fn abi_parameter(carrier: &ccc_abi::NativeCarrierPlan) -> Result<AbiParam, Strin
         ccc_abi::AbiCarrier::I32 => ir::types::I32,
         ccc_abi::AbiCarrier::I64 => ir::types::I64,
         ccc_abi::AbiCarrier::I128 => ir::types::I128,
+        ccc_abi::AbiCarrier::F16 => ir::types::F16,
         ccc_abi::AbiCarrier::F32 => ir::types::F32,
         ccc_abi::AbiCarrier::F64 => ir::types::F64,
         ccc_abi::AbiCarrier::V32 => ir::types::I8X4,

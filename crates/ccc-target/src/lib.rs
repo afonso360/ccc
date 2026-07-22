@@ -463,6 +463,7 @@ impl TargetSpec {
         if self.data_layout.float_width == 32 {
             insert_binary32_compatibility_facts(&mut facts);
         }
+        insert_binary16_compatibility_facts(&mut facts);
         // A 64-bit double in the enabled target data-layout contract uses the
         // IEEE 754 binary64 representation. Keep the hosted `float.h` family
         // together so its precision, ranges, and exact boundary values agree.
@@ -594,6 +595,29 @@ impl TargetSpec {
             facts.insert("_LP64", "1");
         }
         facts
+    }
+}
+
+fn insert_binary16_compatibility_facts(facts: &mut PredefinedMacroFacts) {
+    facts.insert("__SIZEOF_FLOAT16__", "2");
+    for (suffix, replacement) in [
+        ("MANT_DIG", "11"),
+        ("DIG", "3"),
+        ("MIN_EXP", "(-13)"),
+        ("MIN_10_EXP", "(-4)"),
+        ("MAX_EXP", "16"),
+        ("MAX_10_EXP", "4"),
+        ("DECIMAL_DIG", "5"),
+        ("HAS_DENORM", "1"),
+        ("HAS_INFINITY", "1"),
+        ("HAS_QUIET_NAN", "1"),
+        ("MAX", "0x1.ffcp+15"),
+        ("NORM_MAX", "0x1.ffcp+15"),
+        ("EPSILON", "0x1p-10"),
+        ("MIN", "0x1p-14"),
+        ("DENORM_MIN", "0x1p-24"),
+    ] {
+        facts.insert(format!("__FLT16_{suffix}__"), replacement);
     }
 }
 
@@ -1925,20 +1949,23 @@ mod tests {
     }
 
     #[test]
-    fn layout_only_float16_support_does_not_advertise_value_capabilities() {
+    fn float16_value_capabilities_are_advertised_on_enabled_targets() {
         for config in [
             EffectiveCompilationConfig::default(),
             EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
             EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
             EffectiveCompilationConfig::aarch64_apple_darwin(),
         ] {
-            assert!(
-                config
-                    .target_macros
-                    .iter()
-                    .all(|(name, _)| !name.starts_with("__FLT16_")),
-                "{} advertises an unsupported `_Float16` value capability",
-                config.target.triple
+            assert_eq!(config.target_macros.get("__SIZEOF_FLOAT16__"), Some("2"));
+            assert_eq!(config.target_macros.get("__FLT16_MANT_DIG__"), Some("11"));
+            assert_eq!(
+                config.target_macros.get("__FLT16_MAX__"),
+                Some("0x1.ffcp+15")
+            );
+            assert_eq!(config.target_macros.get("__FLT16_MIN__"), Some("0x1p-14"));
+            assert_eq!(
+                config.target_macros.get("__FLT16_DENORM_MIN__"),
+                Some("0x1p-24")
             );
         }
     }

@@ -134,7 +134,7 @@ fn wide_operations_select_only_manifested_helpers_that_are_actually_used() {
 }
 
 #[test]
-fn compiler_float16_storage_emits_but_scalar_lowering_fails_closed() {
+fn compiler_float16_storage_and_scalar_representation_are_binary16() {
     for (config, symbol_name) in [
         (EffectiveCompilationConfig::default(), "half_object"),
         (
@@ -166,13 +166,13 @@ fn compiler_float16_storage_emits_but_scalar_lowering_fails_closed() {
         }
 
         let types = TypeStore::default();
-        let error = super::function::scalar_type(
+        let lowered = super::function::scalar_type(
             &types,
             QualifiedType::unqualified(TypeId::FLOAT16),
             &config,
         )
-        .unwrap_err();
-        assert_eq!(error.code, "CCC3518", "{}", config.target.triple);
+        .unwrap();
+        assert_eq!(lowered, ir::types::I16, "{}", config.target.triple);
     }
 }
 
@@ -247,6 +247,37 @@ fn wide_integer_float_constants_round_at_float_precision() {
 }
 
 #[test]
+fn float16_static_initializers_preserve_binary16_bits() {
+    let output = emit_source(
+        "_Float16 one = 1.0;
+         _Float16 negative = -2.0;
+         _Float16 tie_down = 1.00048828125;
+         _Float16 tie_up = 1.00146484375;
+         _Float16 minimum_subnormal = 0x1p-24;",
+    );
+    assert_eq!(
+        symbol_bytes(&output.object, "one"),
+        0x3c00_u16.to_le_bytes()
+    );
+    assert_eq!(
+        symbol_bytes(&output.object, "negative"),
+        0xc000_u16.to_le_bytes()
+    );
+    assert_eq!(
+        symbol_bytes(&output.object, "tie_down"),
+        0x3c00_u16.to_le_bytes()
+    );
+    assert_eq!(
+        symbol_bytes(&output.object, "tie_up"),
+        0x3c02_u16.to_le_bytes()
+    );
+    assert_eq!(
+        symbol_bytes(&output.object, "minimum_subnormal"),
+        0x0001_u16.to_le_bytes()
+    );
+}
+
+#[test]
 fn unused_float16_sdk_prototypes_do_not_require_value_transport() {
     let source = "extern _Float16 __fabsf16(_Float16);\n\
                   extern _Float16 __fmaf16(_Float16, _Float16, _Float16);\n\
@@ -260,27 +291,31 @@ fn unused_float16_sdk_prototypes_do_not_require_value_transport() {
 }
 
 #[test]
-fn float16_value_transport_fails_with_one_stable_diagnostic() {
-    let config = EffectiveCompilationConfig::aarch64_apple_darwin();
-    for source in [
-        "_Float16 initialized = 1.0;",
-        "_Float16 defined(_Float16 value) { return value; }",
-        "extern _Float16 operation(_Float16); int call(void) { return operation(1.0) != 0; }",
-        "int arithmetic(void) { _Float16 value; return value + value != 0; }",
-        "typedef __builtin_va_list va_list; int read(int count, ...) { va_list list; __builtin_va_start(list, count); return __builtin_va_arg(list, _Float16) != 0; }",
+fn float16_values_lower_across_enabled_targets() {
+    for config in [
+        EffectiveCompilationConfig::default(),
+        EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+        EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
+        EffectiveCompilationConfig::aarch64_apple_darwin(),
     ] {
-        let module = lower_source_with_config(source, &config);
-        let error = emit(
-            &module,
-            &config,
-            Options {
-                emit_clif: true,
-                debug_info: None,
-            },
-        )
-        .unwrap_err();
-        assert_eq!(error.code, "CCC3518", "{source}: {error}");
-        assert!(error.message.contains("_Float16"), "{source}: {error}");
+        for source in [
+            "_Float16 initialized = 1.0;",
+            "_Float16 defined(_Float16 value) { return value; }",
+            "extern _Float16 operation(_Float16); int call(void) { return operation(1.0) != 0; }",
+            "int arithmetic(void) { _Float16 value = 1.5; return value * value + value / value != 0; }",
+            "typedef __builtin_va_list va_list; int read(int count, ...) { va_list list; __builtin_va_start(list, count); return __builtin_va_arg(list, _Float16) != 0; }",
+        ] {
+            let module = lower_source_with_config(source, &config);
+            emit(
+                &module,
+                &config,
+                Options {
+                    emit_clif: true,
+                    debug_info: None,
+                },
+            )
+            .unwrap_or_else(|error| panic!("{}: {source}: {error}", config.target.triple));
+        }
     }
 }
 

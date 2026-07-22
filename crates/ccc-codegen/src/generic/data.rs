@@ -596,6 +596,9 @@ pub(super) fn scalar_constant_bits(
         gir::ScalarConstant::Signed(value) => Ok(value as u128),
         gir::ScalarConstant::Unsigned(value) => Ok(value),
         gir::ScalarConstant::Floating(value) => match scalar_type(types, ty, config)? {
+            ir::types::I16 if types.builtin_type(ty.ty) == Some(BuiltinType::Float16) => {
+                Ok(u128::from(f64_to_f16_bits(value)))
+            }
             ir::types::F32 => Ok(u128::from((value as f32).to_bits())),
             ir::types::F64 => Ok(u128::from(value.to_bits())),
             _ => Err(error(format!(

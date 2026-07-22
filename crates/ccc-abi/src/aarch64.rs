@@ -931,7 +931,10 @@ fn homogeneous_members(
 ) -> Result<Option<Vec<HomogeneousMember>>, AbiError> {
     let result = match types.try_kind(ty) {
         Some(TypeKind::Builtin(
-            builtin @ (BuiltinType::Float | BuiltinType::Double | BuiltinType::LongDouble),
+            builtin @ (BuiltinType::Float16
+            | BuiltinType::Float
+            | BuiltinType::Double
+            | BuiltinType::LongDouble),
         )) if *builtin != BuiltinType::LongDouble
             || config.target.data_layout.long_double_width == 64 =>
         {
@@ -940,10 +943,10 @@ fn homogeneous_members(
             } else {
                 *builtin
             };
-            let size = if normalized == BuiltinType::Float {
-                4
-            } else {
-                8
+            let size = match normalized {
+                BuiltinType::Float16 => 2,
+                BuiltinType::Float => 4,
+                _ => 8,
             };
             Some(vec![HomogeneousMember {
                 offset: base,
@@ -1127,6 +1130,7 @@ fn boundary_scalar(
     boundary: &str,
 ) -> Result<AbiScalar, AbiError> {
     match types.try_kind(ty) {
+        Some(TypeKind::Builtin(BuiltinType::Float16)) => Ok(AbiScalar::Float16),
         Some(TypeKind::Builtin(BuiltinType::Float)) => Ok(AbiScalar::Float32),
         Some(TypeKind::Builtin(BuiltinType::Double)) => Ok(AbiScalar::Float64),
         Some(TypeKind::Builtin(BuiltinType::LongDouble))
@@ -1221,7 +1225,7 @@ fn boundary_scalar(
 
 fn scalar_class(scalar: AbiScalar) -> AbiClass {
     match scalar {
-        AbiScalar::Float32 | AbiScalar::Float64 => AbiClass::Sse,
+        AbiScalar::Float16 | AbiScalar::Float32 | AbiScalar::Float64 => AbiClass::Sse,
         _ => AbiClass::Integer,
     }
 }
@@ -1237,6 +1241,7 @@ fn scalar_carrier(scalar: AbiScalar) -> AbiCarrier {
             64 => AbiCarrier::I64,
             _ => unreachable!("unsupported scalar width"),
         },
+        AbiScalar::Float16 => AbiCarrier::F16,
         AbiScalar::Float32 => AbiCarrier::F32,
         AbiScalar::Float64 => AbiCarrier::F64,
     }
@@ -1247,6 +1252,7 @@ fn scalar_size(scalar: AbiScalar) -> u8 {
         AbiScalar::SignedInteger { bits }
         | AbiScalar::UnsignedInteger { bits }
         | AbiScalar::Pointer { bits } => bits / 8,
+        AbiScalar::Float16 => 2,
         AbiScalar::Float32 => 4,
         AbiScalar::Float64 => 8,
     }
@@ -1262,6 +1268,7 @@ fn scalar_extension(scalar: AbiScalar) -> IntegerExtension {
 
 fn float_piece_carrier(piece: &AbiPiece) -> Result<AbiCarrier, AbiError> {
     match piece.valid_bytes {
+        2 => Ok(AbiCarrier::F16),
         4 => Ok(AbiCarrier::F32),
         8 => Ok(AbiCarrier::F64),
         _ => Err(AbiError::new(

@@ -15,7 +15,7 @@ use ccc_types::{
     ArrayLength, ArrayType, BuiltinType, Field, FunctionParameters, FunctionType, LayoutShape,
     QualifiedType, RecordKind, TypeId, TypeKind, TypeQualifiers,
 };
-use rustc_apfloat::ieee::{Double, Quad, Single, X87DoubleExtended};
+use rustc_apfloat::ieee::{Double, Half, Quad, Single, X87DoubleExtended};
 use rustc_apfloat::{Float, FloatConvert, Round, Status};
 
 use super::model::*;
@@ -5947,10 +5947,10 @@ impl<'a> Analyzer<'a> {
             left.constant,
             right.constant,
             self.integer_constant_type(common.ty),
-            common.ty == TypeId::FLOAT,
+            matches!(common.ty, TypeId::FLOAT16 | TypeId::FLOAT),
         );
-        if result_ty.ty == TypeId::FLOAT {
-            constant = constant.and_then(|value| self.convert_constant(value, TypeId::FLOAT));
+        if matches!(result_ty.ty, TypeId::FLOAT16 | TypeId::FLOAT) {
+            constant = constant.and_then(|value| self.convert_constant(value, result_ty.ty));
         }
         let constant_expression_kind = integer_constant_expression_kind(&[&left, &right]);
         Ok(FullTypedExpression {
@@ -8010,6 +8010,10 @@ impl<'a> Analyzer<'a> {
                 }
             }
             let value = match (target, value) {
+                (BuiltinType::Float16, ConstantValue::LongDouble(value)) => {
+                    return long_double_to_float16(value)
+                        .map(|value| ConstantValue::Floating(float16_to_f64(value)));
+                }
                 (BuiltinType::Float, ConstantValue::Signed(value)) => f64::from(value as f32),
                 (BuiltinType::Float, ConstantValue::Unsigned(value)) => f64::from(value as f32),
                 (BuiltinType::Float, ConstantValue::Floating(value)) => f64::from(value as f32),
@@ -8021,6 +8025,11 @@ impl<'a> Analyzer<'a> {
                 (_, ConstantValue::Floating(value)) => value,
                 (_, ConstantValue::LongDouble(value)) => long_double_to_f64(value)?,
                 (_, ConstantValue::NullPointer | ConstantValue::Address(_)) => return None,
+            };
+            let value = if target == BuiltinType::Float16 {
+                float16_to_f64(f64_to_float16(value))
+            } else {
+                value
             };
             Some(ConstantValue::Floating(value))
         } else {
@@ -9778,6 +9787,33 @@ fn long_double_to_f32(value: LongDoubleConstant) -> Option<f64> {
     };
     let bits = u32::try_from(converted.to_bits()).ok()?;
     Some(f64::from(f32::from_bits(bits)))
+}
+
+fn f64_to_float16(value: f64) -> Half {
+    let source = Double::from_bits(u128::from(value.to_bits()));
+    let mut loses_info = false;
+    source.convert(&mut loses_info).value
+}
+
+fn long_double_to_float16(value: LongDoubleConstant) -> Option<Half> {
+    let mut loses_info = false;
+    Some(match value.format {
+        LongDoubleFormat::Binary64 => return None,
+        LongDoubleFormat::X87Extended => {
+            X87DoubleExtended::from_bits(value.bits())
+                .convert(&mut loses_info)
+                .value
+        }
+        LongDoubleFormat::IeeeBinary128 => {
+            Quad::from_bits(value.bits()).convert(&mut loses_info).value
+        }
+    })
+}
+
+fn float16_to_f64(value: Half) -> f64 {
+    let mut loses_info = false;
+    let converted: Double = value.convert(&mut loses_info).value;
+    f64::from_bits(converted.to_bits() as u64)
 }
 
 fn long_double_to_f64(value: LongDoubleConstant) -> Option<f64> {

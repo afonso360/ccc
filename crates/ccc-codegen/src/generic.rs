@@ -23,7 +23,7 @@ use ccc_types::{
 };
 use cranelift_codegen::Context;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-use cranelift_codegen::ir::immediates::{Ieee32, Ieee64};
+use cranelift_codegen::ir::immediates::{Ieee16, Ieee32, Ieee64};
 use cranelift_codegen::ir::{
     self, BlockArg, InstBuilder, MemFlags, StackSlot, StackSlotData, StackSlotKind, TrapCode,
     UserFuncName,
@@ -43,6 +43,45 @@ use crate::{CodegenError, Options, Output};
 
 const BACKEND_ERROR: &str = "CCC4002";
 const ATOMIC_ERROR: &str = "CCC4011";
+
+fn f64_to_f16_bits(value: f64) -> u16 {
+    let raw = value.to_bits();
+    let sign = ((raw >> 48) & 0x8000) as u16;
+    let magnitude = raw & 0x7fff_ffff_ffff_ffff;
+    let exponent = ((magnitude >> 52) & 0x7ff) as i32;
+    let fraction = magnitude & 0x000f_ffff_ffff_ffff;
+
+    let rounded = if exponent == 0x7ff {
+        if fraction == 0 {
+            0x7c00
+        } else {
+            let payload = (fraction >> 42) as u16;
+            0x7c00 | payload | u16::from(payload == 0)
+        }
+    } else {
+        let unbiased = exponent - 1023;
+        if unbiased > 15 {
+            0x7c00
+        } else if unbiased >= -14 {
+            let base = (((unbiased + 15) as u64) << 10) | (fraction >> 42);
+            let remainder = fraction & ((1u64 << 42) - 1);
+            let halfway = 1u64 << 41;
+            let increment = remainder > halfway || remainder == halfway && base & 1 != 0;
+            (base + u64::from(increment)).min(0x7c00) as u16
+        } else if unbiased >= -25 {
+            let significand = fraction | (1u64 << 52);
+            let shift = (28 - unbiased) as u32;
+            let base = significand >> shift;
+            let remainder = significand & ((1u64 << shift) - 1);
+            let halfway = 1u64 << (shift - 1);
+            let increment = remainder > halfway || remainder == halfway && base & 1 != 0;
+            (base + u64::from(increment)) as u16
+        } else {
+            0
+        }
+    };
+    sign | rounded
+}
 
 /// Emits an ELF object from the typed control-flow IR.
 ///

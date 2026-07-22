@@ -108,6 +108,32 @@ fn host_default_emits_a_native_relocatable_object() {
     fs::remove_dir_all(directory).unwrap();
 }
 
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "riscv64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "macos")
+))]
+#[test]
+fn float16_values_execute_with_exact_payloads_and_native_varargs() {
+    let directory = test_directory("float16-values");
+    let executable = directory.join("float16-values");
+    let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+        .arg(fixture("float16_values.c"))
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .unwrap();
+    assert!(
+        compilation.status.success(),
+        "ccc failed: {}",
+        String::from_utf8_lossy(&compilation.stderr)
+    );
+    let execution = Command::new(&executable).output().unwrap();
+    assert_eq!(execution.status.code(), Some(0));
+    fs::remove_dir_all(directory).unwrap();
+}
+
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 #[test]
 fn darwin_linker_accepts_unwind_when_functions_reference_constant_data() {

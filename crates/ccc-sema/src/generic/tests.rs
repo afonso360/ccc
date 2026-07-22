@@ -3775,7 +3775,7 @@ fn compiler_128_bit_integers_have_target_gated_value_transport() {
 }
 
 #[test]
-fn float16_supports_declarations_and_layout_without_value_transport() {
+fn float16_supports_declarations_layout_and_value_expressions() {
     analyze_source(
         "static _Float16 file_object;\n\
          struct HalfPair { _Float16 first; _Float16 second; };\n\
@@ -3789,7 +3789,15 @@ fn float16_supports_declarations_and_layout_without_value_transport() {
              _Static_assert(sizeof values == 4, \"array size\");\n\
              (void)pointer;\n\
          }\n\
-         extern _Float16 declaration_only(_Float16);",
+         _Float16 identity(_Float16 value) { return value; }
+         _Float16 arithmetic(_Float16 left, _Float16 right) { return left * right + left / right; }
+         extern _Float16 declaration_only(_Float16);
+         typedef __builtin_va_list va_list;
+         int read_half(int count, ...) {
+             va_list list;
+             __builtin_va_start(list, count);
+             return __builtin_va_arg(list, _Float16) != 0;
+         }",
     )
     .unwrap();
 
@@ -3800,6 +3808,41 @@ fn float16_supports_declarations_and_layout_without_value_transport() {
     ] {
         assert_eq!(diagnostic_codes(source), ["CCC2218"], "{source}");
     }
+}
+
+#[test]
+fn float16_constants_round_to_binary16_with_ties_to_even() {
+    let unit = analyze_source(
+        "_Float16 exact = 1.5;
+         _Float16 tie_down = 1.00048828125;
+         _Float16 tie_up = 1.00146484375;
+         _Float16 underflow_tie = 0x1p-25;
+         _Float16 subnormal_tie = 0x1.8p-24;
+         _Float16 expression_tie = (_Float16)1.0 + (_Float16)0x1p-11;",
+    )
+    .unwrap();
+    let constant = |name: &str| {
+        let global = unit
+            .globals
+            .iter()
+            .find(|global| global.name == name)
+            .unwrap();
+        let FullTypedInitializerKind::Scalar(expression) =
+            &global.initializer.as_ref().unwrap().kind
+        else {
+            panic!("{name} has a scalar initializer")
+        };
+        expression.constant.unwrap()
+    };
+    assert_eq!(constant("exact"), ConstantValue::Floating(1.5));
+    assert_eq!(constant("tie_down"), ConstantValue::Floating(1.0));
+    assert_eq!(constant("tie_up"), ConstantValue::Floating(1.001953125));
+    assert_eq!(constant("underflow_tie"), ConstantValue::Floating(0.0));
+    assert_eq!(
+        constant("subnormal_tie"),
+        ConstantValue::Floating(2.0f64.powi(-23))
+    );
+    assert_eq!(constant("expression_tie"), ConstantValue::Floating(1.0));
 }
 
 #[test]

@@ -274,7 +274,7 @@ fn inline_assembly_near_misses_fail_closed_before_object_emission() {
     all(target_arch = "aarch64", target_os = "macos")
 ))]
 #[test]
-fn float16_value_paths_fail_before_object_publication() {
+fn float16_value_paths_publish_objects() {
     for (name, source) in [
         ("initialization", "_Float16 value = 1.0;\n"),
         (
@@ -308,16 +308,14 @@ fn float16_value_paths_fail_before_object_publication() {
             .output()
             .unwrap();
 
-        assert!(!result.status.success(), "{name} unexpectedly compiled");
-        assert!(result.stdout.is_empty(), "{name} wrote stdout");
-        let stderr = String::from_utf8(result.stderr).unwrap();
-        assert_eq!(
-            stderr.matches("error[CCC3518]").count(),
-            1,
-            "{name}: {stderr}"
+        assert!(
+            result.status.success(),
+            "{name} did not compile: {}",
+            String::from_utf8_lossy(&result.stderr)
         );
-        assert!(stderr.contains("_Float16"), "{name}: {stderr}");
-        assert!(!output.exists(), "{name} emitted an object");
+        assert!(result.stdout.is_empty(), "{name} wrote stdout");
+        assert!(result.stderr.is_empty(), "{name} wrote stderr");
+        assert!(output.exists(), "{name} did not emit an object");
         fs::remove_dir_all(directory).unwrap();
     }
 }

@@ -1105,6 +1105,7 @@ fn render_native_carrier(carrier: &crate::NativeCarrierPlan) -> String {
             AbiCarrier::I32 => "i32",
             AbiCarrier::I64 => "i64",
             AbiCarrier::I128 => "i128",
+            AbiCarrier::F16 => "f16",
             AbiCarrier::F32 => "f32",
             AbiCarrier::F64 => "f64",
             AbiCarrier::V32 => "v32",

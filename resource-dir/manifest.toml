@@ -5,7 +5,7 @@ compiler_version = "0.1.0"
 directory = "include"
 compiler_owned = ["stdalign.h", "stdatomic.h", "stdbool.h", "stdarg.h", "stdnoreturn.h"]
 target_derived = ["stddef.h"]
-hosted_wrappers = ["math.h", "sys/cdefs.h"]
+hosted_wrappers = ["float.h", "math.h", "sys/cdefs.h"]
 
 [hosted_header_profile]
 name = "gcc-4.2.1"

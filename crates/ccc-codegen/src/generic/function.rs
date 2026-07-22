@@ -582,6 +582,7 @@ impl FunctionState<'_> {
         if to_f80 {
             let source_type = self.module.types.builtin_type(from.ty);
             let opcode = match source_type {
+                Some(BuiltinType::Float16) => F80_OP_FROM_F32,
                 Some(BuiltinType::Float) => F80_OP_FROM_F32,
                 Some(BuiltinType::Double) => F80_OP_FROM_F64,
                 Some(BuiltinType::Int128) => F80_OP_FROM_I128,
@@ -594,6 +595,11 @@ impl FunctionState<'_> {
                     }
                 }
                 _ => return Err(error("invalid conversion to x87 long double")),
+            };
+            let operand = if source_type == Some(BuiltinType::Float16) {
+                float16_to_f32(builder, operand)
+            } else {
+                operand
             };
             let source_ty = builder.func.dfg.value_type(operand);
             let staged_ty = match opcode {
@@ -630,6 +636,9 @@ impl FunctionState<'_> {
         }
         if from_f80 {
             let destination_builtin = self.module.types.builtin_type(to.ty);
+            if destination_builtin == Some(BuiltinType::Float16) {
+                return Ok(Some(f80_to_float16(builder, operand)));
+            }
             let (opcode, stored_ty, stored_size) = match destination_builtin {
                 Some(BuiltinType::Float) => (F80_OP_TO_F32, ir::types::F32, 4),
                 Some(BuiltinType::Double) => (F80_OP_TO_F64, ir::types::F64, 8),
@@ -2653,7 +2662,10 @@ impl FunctionState<'_> {
                     store_value(builder, destination, 0, piece_value)?;
                     continue;
                 }
-                if value_type.is_int() && value_type.bits() < 32 {
+                if piece.piece.class == ccc_abi::AbiClass::Integer
+                    && value_type.is_int()
+                    && value_type.bits() < 32
+                {
                     value = coerce_integer(
                         builder,
                         value,
@@ -3101,8 +3113,18 @@ impl FunctionState<'_> {
                 self.release_runtime_storage(builder)?;
                 builder.ins().return_(&[]);
             }
-            (ccc_abi::NativeResultPlan::Scalar { .. }, Some(value)) => {
+            (ccc_abi::NativeResultPlan::Scalar { carrier_index, .. }, Some(value)) => {
                 let value = self.value(value)?;
+                let carrier = plan
+                    .clif_results
+                    .get(*carrier_index as usize)
+                    .ok_or_else(|| error("scalar result carrier index is invalid"))?;
+                let value = coerce_carrier_value(
+                    builder,
+                    value,
+                    native_carrier_type(carrier.carrier),
+                    matches!(carrier.extension, ccc_abi::IntegerExtension::Signed),
+                )?;
                 self.release_runtime_storage(builder)?;
                 builder.ins().return_(&[value]);
             }
@@ -3370,6 +3392,7 @@ fn native_carrier_type(carrier: ccc_abi::AbiCarrier) -> ir::Type {
         ccc_abi::AbiCarrier::I32 => ir::types::I32,
         ccc_abi::AbiCarrier::I64 => ir::types::I64,
         ccc_abi::AbiCarrier::I128 => ir::types::I128,
+        ccc_abi::AbiCarrier::F16 => ir::types::F16,
         ccc_abi::AbiCarrier::F32 => ir::types::F32,
         ccc_abi::AbiCarrier::F64 => ir::types::F64,
         ccc_abi::AbiCarrier::V32 => ir::types::I8X4,
@@ -3387,6 +3410,7 @@ fn zero_carrier_value(
         | ccc_abi::AbiCarrier::I32
         | ccc_abi::AbiCarrier::I64
         | ccc_abi::AbiCarrier::I128 => builder.ins().iconst(native_carrier_type(carrier), 0),
+        ccc_abi::AbiCarrier::F16 => builder.ins().f16const(Ieee16::with_bits(0)),
         ccc_abi::AbiCarrier::F32 => builder.ins().f32const(0.0),
         ccc_abi::AbiCarrier::F64 => builder.ins().f64const(0.0),
         ccc_abi::AbiCarrier::V32 | ccc_abi::AbiCarrier::V64 => {
@@ -3708,11 +3732,7 @@ pub(super) fn scalar_type(
                 .to_owned(),
             span: None,
         }),
-        Some(TypeKind::Builtin(BuiltinType::Float16)) => Err(CodegenError {
-            code: "CCC3518",
-            message: "`_Float16` values require an enabled transport capability".to_owned(),
-            span: None,
-        }),
+        Some(TypeKind::Builtin(BuiltinType::Float16)) => Ok(ir::types::I16),
         Some(TypeKind::Builtin(BuiltinType::Int128 | BuiltinType::UnsignedInt128)) => {
             if config.target.abi.supports_int128_values() {
                 Ok(ir::types::I128)
@@ -3884,6 +3904,11 @@ fn lower_constant(
         gir::ScalarConstant::Signed(value) => Ok(builder.ins().iconst(clif_ty, value as i64)),
         gir::ScalarConstant::Unsigned(value) => Ok(builder.ins().iconst(clif_ty, value as i64)),
         gir::ScalarConstant::Floating(value) => match clif_ty {
+            ir::types::I16 if types.builtin_type(ty.ty) == Some(BuiltinType::Float16) => {
+                Ok(builder
+                    .ins()
+                    .iconst(ir::types::I16, i64::from(f64_to_f16_bits(value))))
+            }
             ir::types::F32 => Ok(builder
                 .ins()
                 .f32const(Ieee32::with_bits((value as f32).to_bits()))),
@@ -4105,6 +4130,8 @@ fn lower_conversion(
         )?));
     }
     let source = builder.func.dfg.value_type(operand);
+    let from_float16 = types.builtin_type(from.ty) == Some(BuiltinType::Float16);
+    let to_float16 = types.builtin_type(to.ty) == Some(BuiltinType::Float16);
     let value = match kind {
         gir::ScalarConversion::ArrayToPointer
         | gir::ScalarConversion::FunctionToPointer
@@ -4128,6 +4155,22 @@ fn lower_conversion(
                 is_signed(types, from, config)?,
             )
         }
+        gir::ScalarConversion::FloatingConversion if from_float16 && to_float16 => operand,
+        gir::ScalarConversion::FloatingConversion if from_float16 => {
+            let value = float16_to_f32(builder, operand);
+            if destination == ir::types::F64 {
+                builder.ins().fpromote(destination, value)
+            } else if destination == ir::types::F32 {
+                value
+            } else {
+                return Err(error("invalid `_Float16` floating destination"));
+            }
+        }
+        gir::ScalarConversion::FloatingConversion if to_float16 => match source {
+            ir::types::F32 => f32_to_float16(builder, operand),
+            ir::types::F64 => f64_to_float16(builder, operand),
+            _ => return Err(error("invalid `_Float16` floating source")),
+        },
         gir::ScalarConversion::FloatingConversion => match (source, destination) {
             (ir::types::F32, ir::types::F32) | (ir::types::F64, ir::types::F64) => operand,
             (ir::types::F32, ir::types::F64) => builder.ins().fpromote(destination, operand),
@@ -4136,8 +4179,13 @@ fn lower_conversion(
         },
         gir::ScalarConversion::IntegerToFloating => {
             let signed = is_signed(types, from, config)?;
-            if source == ir::types::I128 {
-                let symbol = match (signed, destination) {
+            let floating_destination = if to_float16 {
+                ir::types::F32
+            } else {
+                destination
+            };
+            let converted = if source == ir::types::I128 {
+                let symbol = match (signed, floating_destination) {
                     (true, ir::types::F32) => "__floattisf",
                     (true, ir::types::F64) => "__floattidf",
                     (false, ir::types::F32) => "__floatuntisf",
@@ -4146,13 +4194,24 @@ fn lower_conversion(
                 };
                 runtime_helper_call(builder, runtime_helpers, symbol, &[operand])?
             } else if signed {
-                builder.ins().fcvt_from_sint(destination, operand)
+                builder.ins().fcvt_from_sint(floating_destination, operand)
             } else {
-                builder.ins().fcvt_from_uint(destination, operand)
+                builder.ins().fcvt_from_uint(floating_destination, operand)
+            };
+            if to_float16 {
+                f32_to_float16(builder, converted)
+            } else {
+                converted
             }
         }
         gir::ScalarConversion::FloatingToInteger => {
             let signed = is_signed(types, to, config)?;
+            let (operand, source) = if from_float16 {
+                let value = float16_to_f32(builder, operand);
+                (value, ir::types::F32)
+            } else {
+                (operand, source)
+            };
             if destination == ir::types::I128 {
                 let symbol = match (signed, source) {
                     (true, ir::types::F32) => "__fixsfti",
@@ -4182,12 +4241,17 @@ fn normalize_bool(
 ) -> Result<ir::Value, CodegenError> {
     let boolean = if is_float(types, from) {
         let source = builder.func.dfg.value_type(operand);
-        let zero = match source {
-            ir::types::F32 => builder.ins().f32const(Ieee32::with_bits(0)),
-            ir::types::F64 => builder.ins().f64const(Ieee64::with_bits(0)),
-            _ => return Err(error("floating boolean conversion has invalid source type")),
-        };
-        builder.ins().fcmp(FloatCC::NotEqual, operand, zero)
+        if types.builtin_type(from.ty) == Some(BuiltinType::Float16) {
+            let magnitude = builder.ins().band_imm(operand, 0x7fff);
+            builder.ins().icmp_imm(IntCC::NotEqual, magnitude, 0)
+        } else {
+            let zero = match source {
+                ir::types::F32 => builder.ins().f32const(Ieee32::with_bits(0)),
+                ir::types::F64 => builder.ins().f64const(Ieee64::with_bits(0)),
+                _ => return Err(error("floating boolean conversion has invalid source type")),
+            };
+            builder.ins().fcmp(FloatCC::NotEqual, operand, zero)
+        }
     } else {
         builder.ins().icmp_imm(IntCC::NotEqual, operand, 0)
     };
@@ -4231,6 +4295,333 @@ fn coerce_integer(
     }
 }
 
+fn float16_to_f32(builder: &mut FunctionBuilder<'_>, value: ir::Value) -> ir::Value {
+    let raw = builder.ins().uextend(ir::types::I32, value);
+    let sign = builder.ins().band_imm(raw, 0x8000);
+    let sign = builder.ins().ishl_imm(sign, 16);
+    let exponent = builder.ins().ushr_imm(raw, 10);
+    let exponent = builder.ins().band_imm(exponent, 0x1f);
+    let fraction = builder.ins().band_imm(raw, 0x03ff);
+
+    let normal_exponent = builder.ins().iadd_imm(exponent, 112);
+    let normal_exponent = builder.ins().ishl_imm(normal_exponent, 23);
+    let normal_fraction = builder.ins().ishl_imm(fraction, 13);
+    let normal = builder.ins().bor(sign, normal_exponent);
+    let normal = builder.ins().bor(normal, normal_fraction);
+
+    let special_exponent = builder.ins().iconst(ir::types::I32, 0x7f80_0000);
+    let special = builder.ins().bor(sign, special_exponent);
+    let special = builder.ins().bor(special, normal_fraction);
+
+    let subnormal = builder.ins().fcvt_from_uint(ir::types::F32, fraction);
+    let scale = builder
+        .ins()
+        .f32const(Ieee32::with_bits((2.0f32).powi(-24).to_bits()));
+    let subnormal = builder.ins().fmul(subnormal, scale);
+    let subnormal = builder
+        .ins()
+        .bitcast(ir::types::I32, MemFlags::new(), subnormal);
+    let subnormal = builder.ins().bor(subnormal, sign);
+
+    let is_zero_or_subnormal = builder.ins().icmp_imm(IntCC::Equal, exponent, 0);
+    let is_special = builder.ins().icmp_imm(IntCC::Equal, exponent, 0x1f);
+    let finite = builder
+        .ins()
+        .select(is_zero_or_subnormal, subnormal, normal);
+    let bits = builder.ins().select(is_special, special, finite);
+    builder.ins().bitcast(ir::types::F32, MemFlags::new(), bits)
+}
+
+fn f32_to_float16(builder: &mut FunctionBuilder<'_>, value: ir::Value) -> ir::Value {
+    let raw = builder
+        .ins()
+        .bitcast(ir::types::I32, MemFlags::new(), value);
+    let sign = builder.ins().ushr_imm(raw, 16);
+    let sign = builder.ins().band_imm(sign, 0x8000);
+    let magnitude = builder.ins().band_imm(raw, 0x7fff_ffff);
+    let exponent = builder.ins().ushr_imm(magnitude, 23);
+    let fraction = builder.ins().band_imm(magnitude, 0x007f_ffff);
+
+    let half_exponent = builder.ins().iadd_imm(exponent, -112);
+    let half_exponent = builder.ins().ishl_imm(half_exponent, 10);
+    let normal_fraction = builder.ins().ushr_imm(fraction, 13);
+    let normal_base = builder.ins().bor(half_exponent, normal_fraction);
+    let normal_remainder = builder.ins().band_imm(fraction, 0x1fff);
+    let normal_above = builder
+        .ins()
+        .icmp_imm(IntCC::UnsignedGreaterThan, normal_remainder, 0x1000);
+    let normal_tie = builder
+        .ins()
+        .icmp_imm(IntCC::Equal, normal_remainder, 0x1000);
+    let normal_odd = builder.ins().band_imm(normal_base, 1);
+    let normal_odd = builder.ins().icmp_imm(IntCC::NotEqual, normal_odd, 0);
+    let normal_tie_odd = builder.ins().band(normal_tie, normal_odd);
+    let normal_increment = builder.ins().bor(normal_above, normal_tie_odd);
+    let normal_increment = builder.ins().uextend(ir::types::I32, normal_increment);
+    let normal = builder.ins().iadd(normal_base, normal_increment);
+
+    let shift = builder.ins().irsub_imm(exponent, 126);
+    let in_subnormal_range =
+        builder
+            .ins()
+            .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, exponent, 102);
+    let maximum_subnormal_exponent =
+        builder
+            .ins()
+            .icmp_imm(IntCC::UnsignedLessThanOrEqual, exponent, 112);
+    let safe_subnormal = builder
+        .ins()
+        .band(in_subnormal_range, maximum_subnormal_exponent);
+    let fallback_shift = builder.ins().iconst(ir::types::I32, 24);
+    let shift = builder.ins().select(safe_subnormal, shift, fallback_shift);
+    let significand_bit = builder.ins().iconst(ir::types::I32, 0x0080_0000);
+    let significand = builder.ins().bor(fraction, significand_bit);
+    let subnormal_base = builder.ins().ushr(significand, shift);
+    let one = builder.ins().iconst(ir::types::I32, 1);
+    let divisor = builder.ins().ishl(one, shift);
+    let mask = builder.ins().iadd_imm(divisor, -1);
+    let subnormal_remainder = builder.ins().band(significand, mask);
+    let half_shift = builder.ins().iadd_imm(shift, -1);
+    let halfway = builder.ins().ishl(one, half_shift);
+    let subnormal_above =
+        builder
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThan, subnormal_remainder, halfway);
+    let subnormal_tie = builder
+        .ins()
+        .icmp(IntCC::Equal, subnormal_remainder, halfway);
+    let subnormal_odd = builder.ins().band_imm(subnormal_base, 1);
+    let subnormal_odd = builder.ins().icmp_imm(IntCC::NotEqual, subnormal_odd, 0);
+    let subnormal_tie_odd = builder.ins().band(subnormal_tie, subnormal_odd);
+    let subnormal_increment = builder.ins().bor(subnormal_above, subnormal_tie_odd);
+    let subnormal_increment = builder.ins().uextend(ir::types::I32, subnormal_increment);
+    let subnormal = builder.ins().iadd(subnormal_base, subnormal_increment);
+
+    let payload = builder.ins().ushr_imm(fraction, 13);
+    let has_payload = builder.ins().icmp_imm(IntCC::NotEqual, fraction, 0);
+    let has_payload = builder.ins().uextend(ir::types::I32, has_payload);
+    let payload = builder.ins().bor(payload, has_payload);
+    let infinity = builder.ins().iconst(ir::types::I32, 0x7c00);
+    let special = builder.ins().bor(infinity, payload);
+
+    let is_special = builder.ins().icmp_imm(IntCC::Equal, exponent, 0xff);
+    let overflows =
+        builder
+            .ins()
+            .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, magnitude, 0x477f_f000);
+    let is_normal =
+        builder
+            .ins()
+            .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, magnitude, 0x3880_0000);
+    let zero = builder.ins().iconst(ir::types::I32, 0);
+    let underflow = builder.ins().select(in_subnormal_range, subnormal, zero);
+    let finite = builder.ins().select(is_normal, normal, underflow);
+    let finite = builder.ins().select(overflows, infinity, finite);
+    let magnitude = builder.ins().select(is_special, special, finite);
+    let result = builder.ins().bor(sign, magnitude);
+    builder.ins().ireduce(ir::types::I16, result)
+}
+
+fn f64_to_float16(builder: &mut FunctionBuilder<'_>, value: ir::Value) -> ir::Value {
+    let raw = builder
+        .ins()
+        .bitcast(ir::types::I64, MemFlags::new(), value);
+    let sign = builder.ins().ushr_imm(raw, 48);
+    let sign = builder.ins().band_imm(sign, 0x8000);
+    let magnitude = builder.ins().band_imm(raw, 0x7fff_ffff_ffff_ffff);
+    let exponent = builder.ins().ushr_imm(magnitude, 52);
+    let fraction = builder.ins().band_imm(magnitude, 0x000f_ffff_ffff_ffff);
+
+    let half_exponent = builder.ins().iadd_imm(exponent, -1008);
+    let half_exponent = builder.ins().ishl_imm(half_exponent, 10);
+    let normal_fraction = builder.ins().ushr_imm(fraction, 42);
+    let normal_base = builder.ins().bor(half_exponent, normal_fraction);
+    let normal_remainder = builder.ins().band_imm(fraction, (1i64 << 42) - 1);
+    let normal_above =
+        builder
+            .ins()
+            .icmp_imm(IntCC::UnsignedGreaterThan, normal_remainder, 1i64 << 41);
+    let normal_tie = builder
+        .ins()
+        .icmp_imm(IntCC::Equal, normal_remainder, 1i64 << 41);
+    let normal_odd = builder.ins().band_imm(normal_base, 1);
+    let normal_odd = builder.ins().icmp_imm(IntCC::NotEqual, normal_odd, 0);
+    let normal_tie_odd = builder.ins().band(normal_tie, normal_odd);
+    let normal_increment = builder.ins().bor(normal_above, normal_tie_odd);
+    let normal_increment = builder.ins().uextend(ir::types::I64, normal_increment);
+    let normal = builder.ins().iadd(normal_base, normal_increment);
+
+    let shift = builder.ins().irsub_imm(exponent, 1051);
+    let in_subnormal_range =
+        builder
+            .ins()
+            .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, exponent, 998);
+    let maximum_subnormal_exponent =
+        builder
+            .ins()
+            .icmp_imm(IntCC::UnsignedLessThanOrEqual, exponent, 1008);
+    let safe_subnormal = builder
+        .ins()
+        .band(in_subnormal_range, maximum_subnormal_exponent);
+    let fallback_shift = builder.ins().iconst(ir::types::I64, 53);
+    let shift = builder.ins().select(safe_subnormal, shift, fallback_shift);
+    let significand_bit = builder.ins().iconst(ir::types::I64, 0x0010_0000_0000_0000);
+    let significand = builder.ins().bor(fraction, significand_bit);
+    let subnormal_base = builder.ins().ushr(significand, shift);
+    let one = builder.ins().iconst(ir::types::I64, 1);
+    let divisor = builder.ins().ishl(one, shift);
+    let mask = builder.ins().iadd_imm(divisor, -1);
+    let subnormal_remainder = builder.ins().band(significand, mask);
+    let half_shift = builder.ins().iadd_imm(shift, -1);
+    let halfway = builder.ins().ishl(one, half_shift);
+    let subnormal_above =
+        builder
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThan, subnormal_remainder, halfway);
+    let subnormal_tie = builder
+        .ins()
+        .icmp(IntCC::Equal, subnormal_remainder, halfway);
+    let subnormal_odd = builder.ins().band_imm(subnormal_base, 1);
+    let subnormal_odd = builder.ins().icmp_imm(IntCC::NotEqual, subnormal_odd, 0);
+    let subnormal_tie_odd = builder.ins().band(subnormal_tie, subnormal_odd);
+    let subnormal_increment = builder.ins().bor(subnormal_above, subnormal_tie_odd);
+    let subnormal_increment = builder.ins().uextend(ir::types::I64, subnormal_increment);
+    let subnormal = builder.ins().iadd(subnormal_base, subnormal_increment);
+
+    let payload = builder.ins().ushr_imm(fraction, 42);
+    let has_payload = builder.ins().icmp_imm(IntCC::NotEqual, fraction, 0);
+    let has_payload = builder.ins().uextend(ir::types::I64, has_payload);
+    let payload = builder.ins().bor(payload, has_payload);
+    let infinity = builder.ins().iconst(ir::types::I64, 0x7c00);
+    let special = builder.ins().bor(infinity, payload);
+    let is_special = builder.ins().icmp_imm(IntCC::Equal, exponent, 0x7ff);
+    let overflows = builder.ins().icmp_imm(
+        IntCC::UnsignedGreaterThanOrEqual,
+        magnitude,
+        0x40ef_fe00_0000_0000,
+    );
+    let is_normal = builder.ins().icmp_imm(
+        IntCC::UnsignedGreaterThanOrEqual,
+        magnitude,
+        0x3f10_0000_0000_0000,
+    );
+    let zero = builder.ins().iconst(ir::types::I64, 0);
+    let underflow = builder.ins().select(in_subnormal_range, subnormal, zero);
+    let finite = builder.ins().select(is_normal, normal, underflow);
+    let finite = builder.ins().select(overflows, infinity, finite);
+    let magnitude = builder.ins().select(is_special, special, finite);
+    let result = builder.ins().bor(sign, magnitude);
+    builder.ins().ireduce(ir::types::I16, result)
+}
+
+fn f80_to_float16(builder: &mut FunctionBuilder<'_>, address: ir::Value) -> ir::Value {
+    let significand = builder
+        .ins()
+        .load(ir::types::I64, MemFlags::new(), address, 0);
+    let high = builder
+        .ins()
+        .load(ir::types::I16, MemFlags::new(), address, 8);
+    let high = builder.ins().uextend(ir::types::I64, high);
+    let sign = builder.ins().band_imm(high, 0x8000);
+    let exponent = builder.ins().band_imm(high, 0x7fff);
+
+    let half_exponent = builder.ins().iadd_imm(exponent, -16_368);
+    let half_exponent = builder.ins().ishl_imm(half_exponent, 10);
+    let normal_fraction = builder.ins().ushr_imm(significand, 53);
+    let normal_fraction = builder.ins().band_imm(normal_fraction, 0x03ff);
+    let normal_base = builder.ins().bor(half_exponent, normal_fraction);
+    let normal_remainder = builder.ins().band_imm(significand, 0x001f_ffff_ffff_ffff);
+    let normal_above = builder.ins().icmp_imm(
+        IntCC::UnsignedGreaterThan,
+        normal_remainder,
+        0x0010_0000_0000_0000,
+    );
+    let normal_tie = builder
+        .ins()
+        .icmp_imm(IntCC::Equal, normal_remainder, 0x0010_0000_0000_0000);
+    let normal_odd = builder.ins().band_imm(normal_base, 1);
+    let normal_odd = builder.ins().icmp_imm(IntCC::NotEqual, normal_odd, 0);
+    let normal_tie_odd = builder.ins().band(normal_tie, normal_odd);
+    let normal_increment = builder.ins().bor(normal_above, normal_tie_odd);
+    let normal_increment = builder.ins().uextend(ir::types::I64, normal_increment);
+    let normal = builder.ins().iadd(normal_base, normal_increment);
+
+    let shift = builder.ins().irsub_imm(exponent, 16_422);
+    let has_regular_subnormal_shift =
+        builder
+            .ins()
+            .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, exponent, 16_359);
+    let maximum_subnormal_exponent =
+        builder
+            .ins()
+            .icmp_imm(IntCC::UnsignedLessThanOrEqual, exponent, 16_368);
+    let safe_subnormal = builder
+        .ins()
+        .band(has_regular_subnormal_shift, maximum_subnormal_exponent);
+    let fallback_shift = builder.ins().iconst(ir::types::I64, 63);
+    let shift = builder.ins().select(safe_subnormal, shift, fallback_shift);
+    let subnormal_base = builder.ins().ushr(significand, shift);
+    let one = builder.ins().iconst(ir::types::I64, 1);
+    let divisor = builder.ins().ishl(one, shift);
+    let mask = builder.ins().iadd_imm(divisor, -1);
+    let subnormal_remainder = builder.ins().band(significand, mask);
+    let half_shift = builder.ins().iadd_imm(shift, -1);
+    let halfway = builder.ins().ishl(one, half_shift);
+    let subnormal_above =
+        builder
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThan, subnormal_remainder, halfway);
+    let subnormal_tie = builder
+        .ins()
+        .icmp(IntCC::Equal, subnormal_remainder, halfway);
+    let subnormal_odd = builder.ins().band_imm(subnormal_base, 1);
+    let subnormal_odd = builder.ins().icmp_imm(IntCC::NotEqual, subnormal_odd, 0);
+    let subnormal_tie_odd = builder.ins().band(subnormal_tie, subnormal_odd);
+    let subnormal_increment = builder.ins().bor(subnormal_above, subnormal_tie_odd);
+    let subnormal_increment = builder.ins().uextend(ir::types::I64, subnormal_increment);
+    let regular_subnormal = builder.ins().iadd(subnormal_base, subnormal_increment);
+
+    let minimum_halfway = builder
+        .ins()
+        .iconst(ir::types::I64, 0x8000_0000_0000_0000_u64 as i64);
+    let above_minimum_halfway =
+        builder
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThan, significand, minimum_halfway);
+    let minimum_subnormal = builder.ins().uextend(ir::types::I64, above_minimum_halfway);
+    let is_minimum_exponent = builder.ins().icmp_imm(IntCC::Equal, exponent, 16_358);
+    let subnormal = builder
+        .ins()
+        .select(is_minimum_exponent, minimum_subnormal, regular_subnormal);
+
+    let fraction = builder.ins().band_imm(significand, 0x7fff_ffff_ffff_ffff);
+    let payload = builder.ins().ushr_imm(fraction, 53);
+    let has_payload = builder.ins().icmp_imm(IntCC::NotEqual, fraction, 0);
+    let has_payload = builder.ins().uextend(ir::types::I64, has_payload);
+    let payload = builder.ins().bor(payload, has_payload);
+    let infinity = builder.ins().iconst(ir::types::I64, 0x7c00);
+    let special = builder.ins().bor(infinity, payload);
+
+    let is_special = builder.ins().icmp_imm(IntCC::Equal, exponent, 0x7fff);
+    let overflows = builder
+        .ins()
+        .icmp_imm(IntCC::UnsignedGreaterThan, exponent, 16_398);
+    let is_normal = builder
+        .ins()
+        .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, exponent, 16_369);
+    let in_subnormal_range =
+        builder
+            .ins()
+            .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, exponent, 16_358);
+    let zero = builder.ins().iconst(ir::types::I64, 0);
+    let underflow = builder.ins().select(in_subnormal_range, subnormal, zero);
+    let finite = builder.ins().select(is_normal, normal, underflow);
+    let finite = builder.ins().select(overflows, infinity, finite);
+    let magnitude = builder.ins().select(is_special, special, finite);
+    let result = builder.ins().bor(sign, magnitude);
+    builder.ins().ireduce(ir::types::I16, result)
+}
+
 fn lower_unary(
     builder: &mut FunctionBuilder<'_>,
     types: &TypeStore,
@@ -4252,6 +4643,11 @@ fn lower_unary(
                 is_signed(types, operand_ty, config)?
             },
         ),
+        gir::UnaryOperation::Negate
+            if types.builtin_type(operand_ty.ty) == Some(BuiltinType::Float16) =>
+        {
+            Ok(builder.ins().bxor_imm(operand, 0x8000))
+        }
         gir::UnaryOperation::Negate if is_float(types, operand_ty) => {
             Ok(builder.ins().fneg(operand))
         }
@@ -4266,13 +4662,18 @@ fn lower_unary(
         }
         gir::UnaryOperation::LogicalNot => {
             let boolean = if is_float(types, operand_ty) {
-                let source = builder.func.dfg.value_type(operand);
-                let zero = match source {
-                    ir::types::F32 => builder.ins().f32const(Ieee32::with_bits(0)),
-                    ir::types::F64 => builder.ins().f64const(Ieee64::with_bits(0)),
-                    _ => return Err(error("floating logical-not has invalid source type")),
-                };
-                builder.ins().fcmp(FloatCC::Equal, operand, zero)
+                if types.builtin_type(operand_ty.ty) == Some(BuiltinType::Float16) {
+                    let magnitude = builder.ins().band_imm(operand, 0x7fff);
+                    builder.ins().icmp_imm(IntCC::Equal, magnitude, 0)
+                } else {
+                    let source = builder.func.dfg.value_type(operand);
+                    let zero = match source {
+                        ir::types::F32 => builder.ins().f32const(Ieee32::with_bits(0)),
+                        ir::types::F64 => builder.ins().f64const(Ieee64::with_bits(0)),
+                        _ => return Err(error("floating logical-not has invalid source type")),
+                    };
+                    builder.ins().fcmp(FloatCC::Equal, operand, zero)
+                }
             } else {
                 builder.ins().icmp_imm(IntCC::Equal, operand, 0)
             };
@@ -4286,13 +4687,18 @@ fn lower_unary(
 fn lower_binary(
     builder: &mut FunctionBuilder<'_>,
     operator: gir::BinaryOperation,
-    left: ir::Value,
-    right: ir::Value,
+    mut left: ir::Value,
+    mut right: ir::Value,
     floating: bool,
     signed: bool,
     result: ir::Type,
     runtime_helpers: &HashMap<&'static str, ir::FuncRef>,
 ) -> Result<ir::Value, CodegenError> {
+    let float16 = floating && builder.func.dfg.value_type(left) == ir::types::I16;
+    if float16 {
+        left = float16_to_f32(builder, left);
+        right = float16_to_f32(builder, right);
+    }
     let comparison = matches!(
         operator,
         gir::BinaryOperation::Less
@@ -4334,15 +4740,20 @@ fn lower_binary(
         return Ok(coerce_integer(builder, boolean, source, result, false));
     }
     if floating {
-        return match operator {
-            gir::BinaryOperation::Multiply => Ok(builder.ins().fmul(left, right)),
-            gir::BinaryOperation::Divide => Ok(builder.ins().fdiv(left, right)),
-            gir::BinaryOperation::Add => Ok(builder.ins().fadd(left, right)),
-            gir::BinaryOperation::Subtract => Ok(builder.ins().fsub(left, right)),
+        let value = match operator {
+            gir::BinaryOperation::Multiply => builder.ins().fmul(left, right),
+            gir::BinaryOperation::Divide => builder.ins().fdiv(left, right),
+            gir::BinaryOperation::Add => builder.ins().fadd(left, right),
+            gir::BinaryOperation::Subtract => builder.ins().fsub(left, right),
             _ => Err(error(format!(
                 "operator {operator:?} is invalid for floating values"
-            ))),
+            )))?,
         };
+        return Ok(if float16 {
+            f32_to_float16(builder, value)
+        } else {
+            value
+        });
     }
     if result == ir::types::I128
         && matches!(

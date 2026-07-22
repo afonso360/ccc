@@ -61,7 +61,6 @@ pub fn plan_function_type(
 ) -> Result<NativeBoundaryPlan, AbiError> {
     validate_target(config)?;
     reject_int128_function(types, signature, config)?;
-    reject_float16_function(types, signature)?;
     match config.target.abi {
         AbiIdentity::SysvAmd64Lp64 => sysv_amd64::plan_function_type(types, signature, config),
         AbiIdentity::Aapcs64Lp64 | AbiIdentity::DarwinArm64 => {
@@ -78,7 +77,6 @@ pub fn plan_boundary_type(
 ) -> Result<BoundaryPlan, AbiError> {
     validate_target(config)?;
     reject_int128_function(types, signature, config)?;
-    reject_float16_function(types, signature)?;
     match config.target.abi {
         AbiIdentity::SysvAmd64Lp64 => sysv_amd64::plan_boundary_type(types, signature, config),
         AbiIdentity::Aapcs64Lp64 | AbiIdentity::DarwinArm64 => {
@@ -97,10 +95,8 @@ pub fn plan_variadic_call(
 ) -> Result<BridgeBoundaryPlan, AbiError> {
     validate_target(config)?;
     reject_int128_function(types, signature, config)?;
-    reject_float16_function(types, signature)?;
     for ty in actual_types {
         reject_int128_type(types, *ty, "variadic call argument", config)?;
-        reject_float16_type(types, *ty, "variadic call argument")?;
     }
     match config.target.abi {
         AbiIdentity::SysvAmd64Lp64 => sysv_amd64::plan_variadic_call(
@@ -127,10 +123,8 @@ pub fn plan_fixed_call(
 ) -> Result<BridgeBoundaryPlan, AbiError> {
     validate_target(config)?;
     reject_int128_function(types, signature, config)?;
-    reject_float16_function(types, signature)?;
     for ty in actual_types {
         reject_int128_type(types, *ty, "fixed call argument", config)?;
-        reject_float16_type(types, *ty, "fixed call argument")?;
     }
     match config.target.abi {
         AbiIdentity::SysvAmd64Lp64 => {
@@ -153,10 +147,8 @@ pub fn plan_unprototyped_call(
 ) -> Result<BridgeBoundaryPlan, AbiError> {
     validate_target(config)?;
     reject_int128_function(types, signature, config)?;
-    reject_float16_function(types, signature)?;
     for ty in promoted_actual_types {
         reject_int128_type(types, *ty, "unprototyped call argument", config)?;
-        reject_float16_type(types, *ty, "unprototyped call argument")?;
     }
     match config.target.abi {
         AbiIdentity::SysvAmd64Lp64 => {
@@ -178,7 +170,6 @@ pub fn classify_type(
 ) -> Result<ClassifiedType, AbiError> {
     validate_target(config)?;
     reject_int128_type(types, ty, "classified boundary", config)?;
-    reject_float16_type(types, ty, "classified boundary")?;
     match config.target.abi {
         AbiIdentity::SysvAmd64Lp64 => sysv_amd64::classify_type(types, ty, config),
         AbiIdentity::Aapcs64Lp64 | AbiIdentity::DarwinArm64 => {
@@ -195,7 +186,6 @@ pub fn plan_va_arg(
 ) -> Result<VaArgPlan, AbiError> {
     validate_target(config)?;
     reject_int128_type(types, ty, "`va_arg`", config)?;
-    reject_float16_type(types, ty, "`va_arg`")?;
     match config.target.abi {
         AbiIdentity::SysvAmd64Lp64 => sysv_amd64::plan_va_arg(types, ty, config),
         AbiIdentity::Aapcs64Lp64 | AbiIdentity::DarwinArm64 => {
@@ -220,22 +210,6 @@ fn reject_int128_function(
     if let FunctionParameters::Prototype(parameters) = signature.parameters {
         for parameter in parameters {
             reject_int128_type(types, parameter.ty, "function parameter", config)?;
-        }
-    }
-    Ok(())
-}
-
-fn reject_float16_function(types: &TypeStore, signature: TypeId) -> Result<(), AbiError> {
-    let signature = types.function_signature(signature).ok_or_else(|| {
-        AbiError::new(
-            "CCC3501",
-            format!("type `{}` is not a function type", types.display(signature)),
-        )
-    })?;
-    reject_float16_type(types, signature.result.ty, "function return")?;
-    if let FunctionParameters::Prototype(parameters) = signature.parameters {
-        for parameter in parameters {
-            reject_float16_type(types, parameter.ty, "function parameter")?;
         }
     }
     Ok(())
@@ -290,51 +264,6 @@ fn reject_int128_type(
             "CCC3517",
             format!(
                 "{boundary} type `{}` contains a 128-bit integer with no enabled ABI transport",
-                types.display(ty)
-            ),
-        ));
-    }
-    Ok(())
-}
-
-fn reject_float16_type(types: &TypeStore, ty: TypeId, boundary: &str) -> Result<(), AbiError> {
-    fn contains(types: &TypeStore, ty: TypeId, active: &mut Vec<TypeId>) -> Result<bool, AbiError> {
-        if types.builtin_type(ty) == Some(BuiltinType::Float16) {
-            return Ok(true);
-        }
-        if active.contains(&ty) {
-            return Ok(false);
-        }
-        active.push(ty);
-        let result = match types.try_kind(ty) {
-            Some(TypeKind::Array(array)) => contains(types, array.element.ty, active)?,
-            Some(TypeKind::Record(id)) => {
-                let fields = types
-                    .record(*id)
-                    .and_then(|record| record.fields.as_ref())
-                    .ok_or_else(|| {
-                        AbiError::new(
-                            "CCC3502",
-                            format!("type `{}` is incomplete", types.display(ty)),
-                        )
-                    })?;
-                let mut found = false;
-                for field in fields {
-                    found |= contains(types, field.ty.ty, active)?;
-                }
-                found
-            }
-            _ => false,
-        };
-        active.pop();
-        Ok(result)
-    }
-
-    if contains(types, ty, &mut Vec::new())? {
-        return Err(AbiError::new(
-            "CCC3518",
-            format!(
-                "{boundary} type `{}` contains `_Float16` with no enabled ABI transport",
                 types.display(ty)
             ),
         ));
@@ -436,10 +365,10 @@ mod float16_tests {
     use ccc_target::EffectiveCompilationConfig;
     use ccc_types::{Field, FunctionType, QualifiedType, RecordKind, TypeId, TypeStore};
 
-    use super::{plan_function_type, plan_va_arg};
+    use super::{AbiCarrier, AbiClass, PassingMode, plan_function_type, plan_va_arg};
 
     #[test]
-    fn scalar_and_aggregate_float16_boundaries_fail_before_target_classification() {
+    fn scalar_and_aggregate_float16_boundaries_are_classified_per_target() {
         for config in [
             EffectiveCompilationConfig::default(),
             EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
@@ -456,13 +385,20 @@ mod float16_tests {
                     QualifiedType::unqualified(ty),
                     vec![QualifiedType::unqualified(ty)],
                 ));
-                let error = plan_function_type(&types, signature, &config).unwrap_err();
-                assert_eq!(error.code, "CCC3518", "{}", config.target.triple);
-                assert!(error.message.contains("_Float16"), "{error}");
-
-                let error = plan_va_arg(&types, ty, &config).unwrap_err();
-                assert_eq!(error.code, "CCC3518", "{}", config.target.triple);
-                assert!(error.message.contains("_Float16"), "{error}");
+                let function = plan_function_type(&types, signature, &config)
+                    .unwrap_or_else(|error| panic!("{}: {error}", config.target.triple));
+                let va_arg = plan_va_arg(&types, ty, &config)
+                    .unwrap_or_else(|error| panic!("{}: {error}", config.target.triple));
+                if ty == TypeId::FLOAT16 {
+                    assert_eq!(
+                        function.parameters[0].classified.passing,
+                        PassingMode::Scalar
+                    );
+                    assert_eq!(function.parameters[0].classified.classes, [AbiClass::Sse]);
+                    assert_eq!(function.clif_parameters[0].carrier, AbiCarrier::F16);
+                    assert_eq!(function.clif_results[0].carrier, AbiCarrier::F16);
+                    assert_eq!(va_arg.classified.passing, PassingMode::Scalar);
+                }
             }
         }
     }

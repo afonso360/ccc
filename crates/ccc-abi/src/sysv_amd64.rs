@@ -891,7 +891,7 @@ fn classify_at(
     {
         TypeKind::Builtin(builtin) => {
             let class = match builtin {
-                BuiltinType::Float | BuiltinType::Double => AbiClass::Sse,
+                BuiltinType::Float16 | BuiltinType::Float | BuiltinType::Double => AbiClass::Sse,
                 BuiltinType::LongDouble => AbiClass::X87,
                 BuiltinType::Void => AbiClass::NoClass,
                 _ => AbiClass::Integer,
@@ -1175,6 +1175,7 @@ fn builtin_scalar(
                 types.display(ty)
             ),
         )),
+        BuiltinType::Float16 => Ok(AbiScalar::Float16),
         BuiltinType::Float => Ok(AbiScalar::Float32),
         BuiltinType::Double => Ok(AbiScalar::Float64),
         builtin if builtin.is_integer() => {
@@ -1275,7 +1276,7 @@ fn consume_scalar_register(scalar: AbiScalar, gp_used: &mut u8, sse_used: &mut u
 
 fn scalar_class(scalar: AbiScalar) -> AbiClass {
     match scalar {
-        AbiScalar::Float32 | AbiScalar::Float64 => AbiClass::Sse,
+        AbiScalar::Float16 | AbiScalar::Float32 | AbiScalar::Float64 => AbiClass::Sse,
         _ => AbiClass::Integer,
     }
 }
@@ -1285,6 +1286,7 @@ fn scalar_size(scalar: AbiScalar) -> u8 {
         AbiScalar::SignedInteger { bits }
         | AbiScalar::UnsignedInteger { bits }
         | AbiScalar::Pointer { bits } => bits / 8,
+        AbiScalar::Float16 => 2,
         AbiScalar::Float32 => 4,
         AbiScalar::Float64 => 8,
     }
@@ -1302,6 +1304,7 @@ fn scalar_carrier(scalar: AbiScalar) -> AbiCarrier {
             128 => AbiCarrier::I128,
             _ => unreachable!("unsupported scalar width"),
         },
+        AbiScalar::Float16 => AbiCarrier::F16,
         AbiScalar::Float32 => AbiCarrier::F32,
         AbiScalar::Float64 => AbiCarrier::F64,
     }

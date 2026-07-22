@@ -622,6 +622,9 @@ fn emits_predefined_dynamic_and_reproducible_macros() {
             "int translation_line = __LINE__;\n",
             "int double_mantissa_bits = __DBL_MANT_DIG__;\n",
             "int float_mantissa_bits = __FLT_MANT_DIG__;\n",
+            "int float16_mantissa_bits = __FLT16_MANT_DIG__;\n",
+            "_Float16 float16_maximum = __FLT16_MAX__;\n",
+            "_Float16 float16_epsilon = __FLT16_EPSILON__;\n",
             "float float_maximum = __FLT_MAX__;\n",
             "float float_epsilon = __FLT_EPSILON__;\n",
             "int double_decimal_digits = __DBL_DIG__;\n",
@@ -656,6 +659,15 @@ fn emits_predefined_dynamic_and_reproducible_macros() {
     assert!(output.contains("intpointer_size=8;"), "{output}");
     assert!(output.contains("intdouble_mantissa_bits=53;"), "{output}");
     assert!(output.contains("intfloat_mantissa_bits=24;"), "{output}");
+    assert!(output.contains("intfloat16_mantissa_bits=11;"), "{output}");
+    assert!(
+        output.contains("_Float16float16_maximum=0x1.ffcp+15;"),
+        "{output}"
+    );
+    assert!(
+        output.contains("_Float16float16_epsilon=0x1p-10;"),
+        "{output}"
+    );
     assert!(
         output.contains("floatfloat_maximum=0x1.fffffep+127F;"),
         "{output}"
@@ -707,6 +719,21 @@ fn emits_predefined_dynamic_and_reproducible_macros() {
         "#define __DBL_MIN__ 0x1p-1022",
         "#define __DBL_NORM_MAX__ 0x1.fffffffffffffp+1023",
         "#define __FLT_EVAL_METHOD__ 0",
+        "#define __FLT16_DECIMAL_DIG__ 5",
+        "#define __FLT16_DENORM_MIN__ 0x1p-24",
+        "#define __FLT16_DIG__ 3",
+        "#define __FLT16_EPSILON__ 0x1p-10",
+        "#define __FLT16_HAS_DENORM__ 1",
+        "#define __FLT16_HAS_INFINITY__ 1",
+        "#define __FLT16_HAS_QUIET_NAN__ 1",
+        "#define __FLT16_MANT_DIG__ 11",
+        "#define __FLT16_MAX_10_EXP__ 4",
+        "#define __FLT16_MAX_EXP__ 16",
+        "#define __FLT16_MAX__ 0x1.ffcp+15",
+        "#define __FLT16_MIN_10_EXP__ (-4)",
+        "#define __FLT16_MIN_EXP__ (-13)",
+        "#define __FLT16_MIN__ 0x1p-14",
+        "#define __FLT16_NORM_MAX__ 0x1.ffcp+15",
         "#define __FLT_DECIMAL_DIG__ 9",
         "#define __FLT_DENORM_MIN__ 0x1p-149F",
         "#define __FLT_DIG__ 6",
@@ -727,6 +754,7 @@ fn emits_predefined_dynamic_and_reproducible_macros() {
         "#define __INTMAX_TYPE__ long int",
         "#define __PTRDIFF_TYPE__ long int",
         "#define __SIZE_MAX__ 18446744073709551615UL",
+        "#define __SIZEOF_FLOAT16__ 2",
         "#define __SIZEOF_POINTER__ 8",
         "#define __SIZE_TYPE__ long unsigned int",
         "#define __STDC__ 1",
@@ -1958,6 +1986,37 @@ fn discovers_and_preprocesses_compiler_resource_headers() {
         "{output}"
     );
     assert!(output.contains("intresource_false=0;"), "{output}");
+}
+
+#[test]
+fn float_resource_header_exposes_binary16_limits_on_request() {
+    let directory = TestDirectory::new("float16-resource-header");
+    let source = directory.write(
+        "float16.c",
+        concat!(
+            "#define __STDC_WANT_IEC_60559_TYPES_EXT__ 1\n",
+            "#include <float.h>\n",
+            "#if FLT16_MANT_DIG != 11 || FLT16_MAX_EXP != 16\n",
+            "#error binary16 precision facts are unavailable\n",
+            "#endif\n",
+            "_Float16 maximum = FLT16_MAX;\n",
+            "_Float16 epsilon = FLT16_EPSILON;\n",
+            "_Float16 true_minimum = FLT16_TRUE_MIN;\n",
+        ),
+    );
+    let resources = repository_fixture("resource-dir");
+
+    let mut command = directory.host_command();
+    command
+        .args(["-E", "-P", "-resource-dir"])
+        .arg(resources)
+        .arg(source);
+    let result = run(command);
+    result.assert_success();
+    let output = squash_whitespace(&result.stdout);
+    assert!(output.contains("_Float16maximum="), "{output}");
+    assert!(output.contains("_Float16epsilon="), "{output}");
+    assert!(output.contains("_Float16true_minimum="), "{output}");
 }
 
 #[test]
