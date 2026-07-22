@@ -10,17 +10,19 @@ use ccc_types::{
     ArrayLength, BuiltinType, FunctionParameters, LayoutShape, QualifiedType, RecordKind, TypeId,
     TypeKind, TypeQualifiers, TypeStore,
 };
-use cranelift_codegen::Context;
-use cranelift_codegen::ir::SourceLoc;
+use cranelift_codegen::ir::{SourceLoc, ValueLabel};
+use cranelift_codegen::isa::TargetIsa;
+use cranelift_codegen::{Context, LabelValueLoc};
 use cranelift_module::FuncId;
 use cranelift_object::ObjectProduct;
 use gimli::constants;
 use gimli::write::{
-    Address, AttributeValue, DwarfUnit, EndianVec, Expression, LineProgram, LineString, Range,
-    RangeList, RelocateWriter, Relocation, RelocationTarget, Sections, UnitEntryId, Writer,
+    Address, AttributeValue, DwarfUnit, EndianVec, Expression, LineProgram, LineString, Location,
+    LocationList, Range, RangeList, RelocateWriter, Relocation, RelocationTarget, Sections,
+    UnitEntryId, Writer,
 };
 use gimli::{Encoding, Format, LineEncoding, Register, SectionId};
-use object::write::{Relocation as ObjectRelocation, StandardSegment, SymbolId};
+use object::write::{Relocation as ObjectRelocation, StandardSegment, SymbolId, SymbolSection};
 use object::{BinaryFormat, RelocationEncoding, RelocationFlags, RelocationKind, SectionKind};
 
 use super::function::FunctionDebugLayout;
@@ -68,6 +70,20 @@ struct FunctionRecord {
     code_size: u64,
     rows: Vec<(u64, Span)>,
     frame_locations: HashMap<u32, i64>,
+    parameter_locations: HashMap<u32, Vec<ValueLocationRange>>,
+}
+
+#[derive(Clone, Copy)]
+struct ValueLocationRange {
+    start: u64,
+    end: u64,
+    location: ValueLocation,
+}
+
+#[derive(Clone, Copy)]
+enum ValueLocation {
+    Register(Register),
+    CfaOffset(i64),
 }
 
 pub(super) struct DebugEmitter<'a> {
@@ -99,6 +115,7 @@ impl<'a> DebugEmitter<'a> {
         id: FuncId,
         context: &Context,
         lowering: &FunctionDebugLayout,
+        isa: &dyn TargetIsa,
     ) -> Result<(), CodegenError> {
         let function = &self.module.functions[function_index];
         let compiled = context.compiled_code().ok_or_else(|| {
@@ -136,12 +153,51 @@ impl<'a> DebugEmitter<'a> {
                 frame_locations.insert(*storage, offset);
             }
         }
+        let mut parameter_locations = HashMap::new();
+        for index in 0..function.parameters.len() {
+            let index = u32::try_from(index)
+                .map_err(|_| error("debug parameter index exceeds Cranelift's label space"))?;
+            let Some(ranges) = compiled
+                .value_labels_ranges
+                .get(&ValueLabel::from_u32(index))
+            else {
+                continue;
+            };
+            let mut mapped = Vec::with_capacity(ranges.len());
+            for range in ranges {
+                let start = u64::from(range.start).min(code_size);
+                let end = u64::from(range.end).min(code_size);
+                if start >= end {
+                    continue;
+                }
+                let location = match range.loc {
+                    LabelValueLoc::Reg(register) => ValueLocation::Register(Register(
+                        isa.map_regalloc_reg_to_dwarf(register).map_err(|failure| {
+                            error(format!(
+                                "cannot map a debug value register in `{}`: {failure}",
+                                function.symbol_name
+                            ))
+                        })?,
+                    )),
+                    LabelValueLoc::CFAOffset(offset) => ValueLocation::CfaOffset(offset),
+                };
+                mapped.push(ValueLocationRange {
+                    start,
+                    end,
+                    location,
+                });
+            }
+            if !mapped.is_empty() {
+                parameter_locations.insert(index, mapped);
+            }
+        }
         self.functions.push(FunctionRecord {
             function_index,
             id,
             code_size,
             rows,
             frame_locations,
+            parameter_locations,
         });
         Ok(())
     }
@@ -193,11 +249,7 @@ impl<'a> DebugEmitter<'a> {
         for record in &self.functions {
             let symbol = product.function_symbol(record.id);
             let index = targets.len();
-            targets.push(RelocationDestination {
-                symbol,
-                addend: 0,
-                kind: DwarfRelocationKind::Absolute,
-            });
+            targets.push(absolute_relocation_destination(product, symbol)?);
             function_targets.insert(record.function_index, index);
         }
 
@@ -261,7 +313,35 @@ impl<'a> DebugEmitter<'a> {
             AttributeValue::Language(constants::DW_LANG_C11),
         );
         root_entry.set(constants::DW_AT_use_UTF8, AttributeValue::Flag(true));
-        if !self.functions.is_empty() {
+        if !self.functions.is_empty() && product.object.format() == BinaryFormat::MachO {
+            let first = self
+                .functions
+                .iter()
+                .min_by_key(|record| targets[function_targets[&record.function_index]].addend)
+                .expect("nonempty function records have a first entry");
+            let first_target = function_targets[&first.function_index];
+            let start = targets[first_target].addend;
+            let end = self.functions.iter().try_fold(start, |end, record| {
+                let target = targets[function_targets[&record.function_index]].addend;
+                let size = i64::try_from(record.code_size)
+                    .map_err(|_| error("Mach-O debug function size exceeds signed range"))?;
+                target
+                    .checked_add(size)
+                    .map(|function_end| end.max(function_end))
+                    .ok_or_else(|| error("Mach-O debug compilation-unit range overflow"))
+            })?;
+            let length = u64::try_from(end - start)
+                .map_err(|_| error("Mach-O debug compilation-unit range is invalid"))?;
+            let entry = dwarf.unit.get_mut(root);
+            entry.set(
+                constants::DW_AT_low_pc,
+                AttributeValue::Address(Address::Symbol {
+                    symbol: first_target,
+                    addend: 0,
+                }),
+            );
+            entry.set(constants::DW_AT_high_pc, AttributeValue::Udata(length));
+        } else if !self.functions.is_empty() {
             let ranges = self
                 .functions
                 .iter()
@@ -341,22 +421,45 @@ impl<'a> DebugEmitter<'a> {
                 .iter()
                 .map(|parameter| parameter.local)
                 .collect::<BTreeSet<_>>();
-            for parameter in &function.parameters {
+            for (parameter_index, parameter) in function.parameters.iter().enumerate() {
                 let entry_id = types
                     .unit
                     .add(subprogram, constants::DW_TAG_formal_parameter);
                 let type_id = types.qualified(parameter.ty);
+                let frame_location = parameter
+                    .storage
+                    .and_then(|storage| record.frame_locations.get(&storage.0).copied());
+                let value_location = if frame_location.is_none() {
+                    let parameter_index = u32::try_from(parameter_index).map_err(|_| {
+                        error("debug parameter index exceeds Cranelift's label space")
+                    })?;
+                    if let Some(ranges) = record.parameter_locations.get(&parameter_index) {
+                        let list = value_location_list(
+                            product.object.format(),
+                            target,
+                            targets[target].addend,
+                            ranges,
+                        )?;
+                        Some(types.unit.locations.add(list))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
                 let entry = types.unit.get_mut(entry_id);
                 set_string(entry, constants::DW_AT_name, &parameter.name);
                 entry.set(constants::DW_AT_type, AttributeValue::UnitRef(type_id));
                 set_decl_location(entry, self.sources, &file_ids, parameter.span);
-                if let Some(offset) = parameter
-                    .storage
-                    .and_then(|storage| record.frame_locations.get(&storage.0).copied())
-                {
+                if let Some(offset) = frame_location {
                     entry.set(
                         constants::DW_AT_location,
                         AttributeValue::Exprloc(frame_expression(frame_register, offset)),
+                    );
+                } else if let Some(location) = value_location {
+                    entry.set(
+                        constants::DW_AT_location,
+                        AttributeValue::LocationListRef(location),
                     );
                 }
             }
@@ -433,10 +536,15 @@ impl<'a> DebugEmitter<'a> {
             );
             set_decl_location(entry, self.sources, &file_ids, global.span);
             let target = targets.len();
-            targets.push(RelocationDestination {
-                symbol: product.data_symbol(declaration.id),
-                addend: 0,
-                kind: relocation_kind,
+            let symbol = product.data_symbol(declaration.id);
+            targets.push(if relocation_kind == DwarfRelocationKind::Absolute {
+                absolute_relocation_destination(product, symbol)?
+            } else {
+                RelocationDestination {
+                    symbol,
+                    addend: 0,
+                    kind: relocation_kind,
+                }
             });
             let mut location = Expression::new();
             location.op_addr(Address::Symbol {
@@ -553,6 +661,62 @@ fn frame_expression(register: Register, offset: i64) -> Expression {
     let mut expression = Expression::new();
     expression.op_breg(register, offset);
     expression
+}
+
+fn value_location_expression(location: ValueLocation) -> Expression {
+    let mut expression = Expression::new();
+    match location {
+        ValueLocation::Register(register) => expression.op_reg(register),
+        // Every subprogram defines its frame base as the canonical frame
+        // address, so a regalloc spill location can use the compact fbreg form.
+        ValueLocation::CfaOffset(offset) => expression.op_fbreg(offset),
+    }
+    expression
+}
+
+fn value_location_list(
+    format: BinaryFormat,
+    target: usize,
+    function_offset: i64,
+    ranges: &[ValueLocationRange],
+) -> Result<LocationList, CodegenError> {
+    if format == BinaryFormat::MachO {
+        // dsymutil rebases raw input-section addresses through the linker's
+        // debug map.  This is the conventional Darwin DWARF v4 representation
+        // and avoids relocatable base-address-selection entries that dsymutil
+        // can discard while coalescing location lists.
+        let function_offset = u64::try_from(function_offset)
+            .map_err(|_| error("Mach-O debug function offset is negative"))?;
+        let mut locations = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            let begin = function_offset
+                .checked_add(range.start)
+                .ok_or_else(|| error("Mach-O debug value range start overflow"))?;
+            let end = function_offset
+                .checked_add(range.end)
+                .ok_or_else(|| error("Mach-O debug value range end overflow"))?;
+            locations.push(Location::StartEnd {
+                begin: Address::Constant(begin),
+                end: Address::Constant(end),
+                data: value_location_expression(range.location),
+            });
+        }
+        return Ok(LocationList(locations));
+    }
+
+    let mut locations = Vec::with_capacity(ranges.len() + 1);
+    locations.push(Location::BaseAddress {
+        address: Address::Symbol {
+            symbol: target,
+            addend: 0,
+        },
+    });
+    locations.extend(ranges.iter().map(|range| Location::OffsetPair {
+        begin: range.start,
+        end: range.end,
+        data: value_location_expression(range.location),
+    }));
+    Ok(LocationList(locations))
 }
 
 struct TypeEmitter<'a> {
@@ -867,6 +1031,39 @@ enum DwarfRelocationKind {
     X86TlsOffset,
 }
 
+/// Apple debug maps retain section contributions and their linked addresses,
+/// not a complete mapping for every private symbol in an input object.  A
+/// DWARF relocation against a private function symbol can therefore collapse
+/// to the first atom in the section when `dsymutil` resolves it.  Express
+/// defined Mach-O addresses as the containing section plus the symbol's exact
+/// section-relative offset, which is also the form emitted by Apple's compiler
+/// toolchain.
+fn absolute_relocation_destination(
+    product: &mut ObjectProduct,
+    symbol: SymbolId,
+) -> Result<RelocationDestination, CodegenError> {
+    let (section, value) = {
+        let symbol = product.object.symbol(symbol);
+        (symbol.section, symbol.value)
+    };
+    if product.object.format() == BinaryFormat::MachO {
+        if let SymbolSection::Section(section) = section {
+            let addend = i64::try_from(value)
+                .map_err(|_| error("Mach-O debug symbol offset exceeds signed relocation range"))?;
+            return Ok(RelocationDestination {
+                symbol: product.object.section_symbol(section),
+                addend,
+                kind: DwarfRelocationKind::Absolute,
+            });
+        }
+    }
+    Ok(RelocationDestination {
+        symbol,
+        addend: 0,
+        kind: DwarfRelocationKind::Absolute,
+    })
+}
+
 struct DwarfSection {
     writer: EndianVec<gimli::LittleEndian>,
     relocations: Vec<Relocation>,
@@ -949,6 +1146,24 @@ fn write_sections(
             if relocation.eh_pe.is_some() {
                 return Err(format!("unexpected unwind relocation in `{}`", id.name()));
             }
+            let offset = u64::try_from(relocation.offset)
+                .map_err(|_| "DWARF relocation offset does not fit object format".to_owned())?;
+            // Mach-O debug-map consumers treat DW_FORM_sec_offset values as
+            // offsets within the corresponding input debug section.  Apple
+            // objects therefore encode these values directly rather than
+            // carrying relocations between __DWARF sections; dsymutil can
+            // otherwise reinterpret a zero offset as a text address.
+            if format == BinaryFormat::MachO
+                && matches!(relocation.target, RelocationTarget::Section(_))
+            {
+                write_section_offset(
+                    product.object.section_mut(source).data_mut(),
+                    offset,
+                    relocation.size,
+                    relocation.addend,
+                )?;
+                continue;
+            }
             let (symbol, addend, relocation_kind) = match relocation.target {
                 RelocationTarget::Symbol(index) => {
                     let target = targets.get(index).ok_or_else(|| {
@@ -967,8 +1182,6 @@ fn write_sections(
                     )
                 }
             };
-            let offset = u64::try_from(relocation.offset)
-                .map_err(|_| "DWARF relocation offset does not fit object format".to_owned())?;
             let addend = addend
                 .checked_add(relocation.addend)
                 .ok_or_else(|| "DWARF relocation addend overflow".to_owned())?;
@@ -1007,6 +1220,38 @@ fn write_sections(
                 .map_err(|failure| {
                     format!("failed to record relocation in `{}`: {failure}", id.name())
                 })?;
+        }
+    }
+    Ok(())
+}
+
+fn write_section_offset(
+    section: &mut [u8],
+    offset: u64,
+    size: u8,
+    value: i64,
+) -> Result<(), String> {
+    let offset = usize::try_from(offset)
+        .map_err(|_| "DWARF section offset does not fit host address space".to_owned())?;
+    let value = u64::try_from(value).map_err(|_| "DWARF section offset is negative".to_owned())?;
+    let width = usize::from(size);
+    let end = offset
+        .checked_add(width)
+        .ok_or_else(|| "DWARF section offset write overflow".to_owned())?;
+    let destination = section
+        .get_mut(offset..end)
+        .ok_or_else(|| "DWARF section offset write is out of bounds".to_owned())?;
+    match size {
+        4 => destination.copy_from_slice(
+            &u32::try_from(value)
+                .map_err(|_| "DWARF32 section offset overflow".to_owned())?
+                .to_le_bytes(),
+        ),
+        8 => destination.copy_from_slice(&value.to_le_bytes()),
+        _ => {
+            return Err(format!(
+                "unsupported {size}-byte Mach-O DWARF section offset"
+            ));
         }
     }
     Ok(())

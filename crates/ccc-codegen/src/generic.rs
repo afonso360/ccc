@@ -216,7 +216,13 @@ fn emit_inner(
             .define_function(id, &mut context)
             .map_err(module_error)?;
         if let Some(debug) = debug.as_mut() {
-            debug.record_function(function_index, id, &context, &debug_layout)?;
+            debug.record_function(
+                function_index,
+                id,
+                &context,
+                &debug_layout,
+                object_module.isa(),
+            )?;
         }
         unwind
             .record_function(id, &context, object_module.isa())

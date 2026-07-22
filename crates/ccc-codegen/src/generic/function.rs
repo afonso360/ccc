@@ -169,6 +169,10 @@ pub(super) fn lower_function(
             function.symbol_name
         ))
     })?;
+    let collect_debug_values = debug_locations.is_some();
+    if collect_debug_values {
+        clif_function.collect_debug_info();
+    }
     let mut builder_context = FunctionBuilderContext::new();
     let mut builder = FunctionBuilder::new(clif_function, &mut builder_context);
     let mut blocks = HashMap::with_capacity(function.blocks.len());
@@ -308,6 +312,23 @@ pub(super) fn lower_function(
             let entry_values = builder.block_params(state.block(entry.0)?).to_vec();
             state.initialize_runtime_storage(&mut builder);
             state.bind_entry_parameters(&mut builder, &entry_values)?;
+            if collect_debug_values {
+                let parameters = state
+                    .function
+                    .parameters
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, parameter)| {
+                        (parameter.storage.is_none()).then_some((index, parameter.incoming?))
+                    })
+                    .collect::<Vec<_>>();
+                for (index, incoming) in parameters {
+                    let index = u32::try_from(index).map_err(|_| {
+                        error("debug parameter index exceeds Cranelift label space")
+                    })?;
+                    builder.set_val_label(state.value(incoming)?, ir::ValueLabel::from_u32(index));
+                }
+            }
         }
         for instruction in &block.instructions {
             if let Some(locations) = debug_locations.as_deref_mut() {

@@ -657,8 +657,10 @@ else
     source_timeout=$artifact_dir/lldb-source-debug.timeout
     rm -f "$source_timeout"
     lldb --batch -o "target create $source_debug_executable" \
-        -o "breakpoint set --file debug_local.c --line 4" \
-        -o run -o "frame variable ccc_debug_local" > "$source_log" 2>&1 &
+        -o "breakpoint set --file debug_local.c --line 2" \
+        -o "breakpoint set --file debug_local.c --line 8" \
+        -o run -o "frame variable left right" \
+        -o continue -o "frame variable ccc_debug_local" > "$source_log" 2>&1 &
     source_lldb_pid=$!
     (
         sleep 30
@@ -682,8 +684,11 @@ else
         exit "$source_status"
     fi
     grep -q 'stop reason = breakpoint' "$source_log"
+    grep -q 'ccc_debug_add' "$source_log"
+    grep -Eq 'left = 20' "$source_log"
+    grep -Eq 'right = 22' "$source_log"
     grep -Eq 'ccc_debug_local = 42' "$source_log"
-    pass "one-step debug links publish source lines and local values through dSYM"
+    pass "one-step debug links publish distinct function lines, parameters, and locals through dSYM"
 fi
 pass "debugger stops in the variadic entry and generated call helper with caller frames"
 

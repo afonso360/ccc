@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use ccc_pp::{PpItem, lex};
 use ccc_sema::generic::analyze_frontend;
 use ccc_session::SourceMap;
@@ -1128,6 +1130,116 @@ fn debug_information_distinguishes_prototypes_and_locates_tls_definitions() {
     assert!(prototyped_subroutine_type);
     assert!(unspecified_subroutine_type);
     assert!(tls_location);
+}
+
+#[test]
+fn debug_parameters_use_cranelift_value_location_ranges() {
+    let config = EffectiveCompilationConfig::default();
+    let (module, sources) = lower_source_with_map(
+        "static int add(int left, int right) { return left + right; }\n\
+         int main(void) { return add(20, 22) == 42 ? 0 : 1; }",
+        &config,
+    );
+    let output = emit(
+        &module,
+        &config,
+        Options {
+            emit_clif: false,
+            debug_info: Some(&sources),
+        },
+    )
+    .unwrap();
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    assert!(object.section_by_name(".debug_loc").is_some());
+
+    let sections = gimli::DwarfSections::load(|id| {
+        Ok::<_, gimli::Error>(
+            object
+                .section_by_name(id.name())
+                .and_then(|section| section.data().ok())
+                .unwrap_or_default()
+                .to_vec(),
+        )
+    })
+    .unwrap();
+    let dwarf = sections.borrow(|section| gimli::EndianSlice::new(section, gimli::LittleEndian));
+    let mut units = dwarf.units();
+    let header = units.next().unwrap().expect("debug compilation unit");
+    let unit = dwarf.unit(header).unwrap();
+    let mut entries = unit.entries();
+    let mut located = BTreeSet::new();
+    while let Some(entry) = entries.next_dfs().unwrap() {
+        if entry.tag() != gimli::DW_TAG_formal_parameter {
+            continue;
+        }
+        let name = entry
+            .attr(gimli::DW_AT_name)
+            .and_then(|attribute| dwarf.attr_string(&unit, attribute.value()).ok())
+            .map(|name| name.to_string_lossy().into_owned());
+        let Some(name @ ("left" | "right")) = name.as_deref() else {
+            continue;
+        };
+        assert!(matches!(
+            entry.attr_value(gimli::DW_AT_location).unwrap(),
+            gimli::AttributeValue::LocationListsRef(_)
+        ));
+        located.insert(name.to_owned());
+    }
+    assert_eq!(
+        located,
+        BTreeSet::from(["left".to_owned(), "right".to_owned()])
+    );
+}
+
+#[test]
+fn darwin_debug_code_addresses_are_text_section_relative() {
+    let config = EffectiveCompilationConfig::aarch64_apple_darwin();
+    let (module, sources) = lower_source_with_map(
+        "static int first(int value) { return value + 1; }\n\
+         static int second(int value) { return value * 2; }\n\
+         int main(void) { return second(first(20)) == 42 ? 0 : 1; }",
+        &config,
+    );
+    let output = emit(
+        &module,
+        &config,
+        Options {
+            emit_clif: false,
+            debug_info: Some(&sources),
+        },
+    )
+    .unwrap();
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    let text = object
+        .section_by_name("__text")
+        .expect("Darwin text section");
+    let line = object
+        .section_by_name("__debug_line")
+        .expect("Darwin line table");
+    let line_data = line.data().unwrap();
+    let mut sequence_bases = BTreeSet::new();
+    let mut text_relocations = 0usize;
+    for (offset, relocation) in line.relocations() {
+        let targets_text = match relocation.target() {
+            RelocationTarget::Section(index) => index == text.index(),
+            RelocationTarget::Symbol(index) => {
+                let symbol = object.symbol_by_index(index).unwrap();
+                symbol.kind() == object::SymbolKind::Section
+                    && symbol.section_index() == Some(text.index())
+            }
+            _ => false,
+        };
+        if !targets_text {
+            continue;
+        }
+        text_relocations += 1;
+        let start = usize::try_from(offset).unwrap();
+        let bytes: [u8; 8] = line_data[start..start + 8].try_into().unwrap();
+        sequence_bases.insert(u64::from_le_bytes(bytes));
+    }
+    assert_eq!(text_relocations, 3);
+    assert_eq!(sequence_bases.len(), 3);
+    assert_eq!(sequence_bases.first().copied(), Some(0));
 }
 
 #[test]
