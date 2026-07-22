@@ -14,6 +14,12 @@ pub struct FullFunctionId(pub u32);
 pub struct FullLocalId(pub u32);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum CompoundLiteralStorage {
+    Automatic(FullLocalId),
+    Static(GlobalId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct LabelId(pub u32);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -188,11 +194,13 @@ pub struct FullTypedVariableLengthBound {
     pub expression: FullTypedExpression,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct FullTypedTypedef {
     pub id: TypedefId,
     pub name: String,
     pub ty: QualifiedType,
+    /// Runtime bounds evaluated once when this typedef declaration is reached.
+    pub variable_length_bounds: Vec<FullTypedVariableLengthBound>,
     pub attributes: Vec<FullTypedAttribute>,
     pub span: Span,
 }
@@ -555,6 +563,21 @@ pub enum FullTypedExpressionKind {
     Constant(ConstantValue),
     StringLiteral(StringId),
     DeclRef(SymbolReference),
+    /// A generic selection retains only the selected association. The
+    /// controlling expression's converted type is recorded for typed-tree
+    /// inspection, but the expression itself is deliberately absent so later
+    /// stages cannot evaluate it.
+    GenericSelection {
+        controlling_ty: QualifiedType,
+        selected: Box<FullTypedExpression>,
+    },
+    /// Evaluates type-name array bounds once before producing the wrapped
+    /// expression. The IDs make those saved values available to runtime layout
+    /// operations and pointer arithmetic in the wrapped expression.
+    VariableLengthBoundEvaluation {
+        bounds: Vec<FullTypedVariableLengthBound>,
+        expression: Box<FullTypedExpression>,
+    },
     Conversion {
         kind: ConversionKind,
         expression: Box<FullTypedExpression>,
@@ -582,7 +605,7 @@ pub enum FullTypedExpressionKind {
         bitfield: Option<Box<BitfieldPlace>>,
     },
     CompoundLiteral {
-        local: FullLocalId,
+        storage: CompoundLiteralStorage,
         initializer: Box<FullTypedInitializer>,
     },
     Assignment {
@@ -619,8 +642,11 @@ pub enum FullTypedExpressionKind {
         expected: Box<FullTypedExpression>,
     },
     Sizeof {
+        /// Present when an expression operand has runtime-sized array type and
+        /// must therefore be evaluated by C11 6.5.3.4.
+        operand: Option<Box<FullTypedExpression>>,
         operand_ty: QualifiedType,
-        size: u64,
+        size: Option<u64>,
     },
     Alignof {
         operand_ty: QualifiedType,

@@ -1,6 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use ccc_target::OptimizationLevel;
+use ccc_target::{EffectiveCompilationConfig, OptimizationLevel};
+use ccc_types::TypeStore;
+
+mod cse;
+mod effects;
+mod fold;
+
+#[cfg(test)]
+mod tests;
 
 use super::lower::compact_values;
 use super::verify::{instruction_operands, terminator_operands};
@@ -18,29 +26,103 @@ pub fn optimize_frontend(
     module: &mut FullModule,
     optimization: OptimizationLevel,
 ) -> Result<(), IrError> {
+    let config = EffectiveCompilationConfig::default().with_optimization_level(optimization);
+    optimize_frontend_for_config(module, &config)
+}
+
+/// Runs target-aware C IR cleanup using the complete effective configuration.
+///
+/// Callers that already resolved a target should use this entry point so
+/// integer folding observes that target's exact widths and signedness rules.
+pub fn optimize_frontend_for_config(
+    module: &mut FullModule,
+    config: &EffectiveCompilationConfig,
+) -> Result<(), IrError> {
     verify_frontend(module)?;
-    if optimization.optimizes() {
+    let profile = OptimizationProfile::for_level(config.optimization);
+    if profile.enabled {
+        let types = &module.types;
         for function in &mut module.functions {
-            optimize_function(function)?;
+            optimize_function(types, function, config, profile)?;
         }
     }
     verify_frontend(module)
 }
 
-fn optimize_function(function: &mut FullFunction) -> Result<(), IrError> {
+#[derive(Clone, Copy)]
+struct OptimizationProfile {
+    enabled: bool,
+    local_cse: bool,
+}
+
+impl OptimizationProfile {
+    const fn for_level(level: OptimizationLevel) -> Self {
+        match level {
+            OptimizationLevel::O0 => Self {
+                enabled: false,
+                local_cse: false,
+            },
+            OptimizationLevel::O1 => Self {
+                enabled: true,
+                local_cse: false,
+            },
+            OptimizationLevel::O2
+            | OptimizationLevel::O3
+            | OptimizationLevel::Size
+            | OptimizationLevel::SizeMin => Self {
+                enabled: true,
+                local_cse: true,
+            },
+        }
+    }
+}
+
+fn optimize_function(
+    types: &TypeStore,
+    function: &mut FullFunction,
+    config: &EffectiveCompilationConfig,
+    profile: OptimizationProfile,
+) -> Result<(), IrError> {
     if function.entry.is_none() {
         return Ok(());
     }
 
-    loop {
-        let mut changed = sparsify_block_parameters(function)?;
-        changed |= simplify_control_flow(function)?;
-        changed |= eliminate_dead_pure_instructions(function)?;
+    // Every pass in this pipeline either removes an entity or replaces an
+    // instruction without growing the function. Use the input size to place a
+    // hard ceiling on accidental pass interaction while still allowing chains
+    // of newly exposed simplifications to settle.
+    let input_size = function
+        .blocks
+        .iter()
+        .map(|block| block.parameters.len() + block.instructions.len() + 1)
+        .sum::<usize>();
+    let iteration_limit = input_size.saturating_mul(2).max(8);
+    for _ in 0..iteration_limit {
+        let mut changed = fold::fold_constants(types, function, config);
+        changed |= sparsify_block_parameters(function)
+            .map_err(|error| pass_failure(error, "block-parameter cleanup"))?;
+        changed |= simplify_control_flow(types, function, config)
+            .map_err(|error| pass_failure(error, "control-flow cleanup"))?;
+        changed |= forward_empty_blocks(function)
+            .map_err(|error| pass_failure(error, "empty-block forwarding"))?;
+        if profile.local_cse {
+            changed |= cse::eliminate_common_expressions(function)
+                .map_err(|error| pass_failure(error, "local common-expression cleanup"))?;
+        }
+        changed |= eliminate_dead_pure_instructions(function)
+            .map_err(|error| pass_failure(error, "dead-instruction cleanup"))?;
         if !changed {
-            break;
+            return Ok(());
         }
     }
-    Ok(())
+    Err(IrError::verify(format!(
+        "C IR optimization did not converge within {iteration_limit} iterations"
+    )))
+}
+
+fn pass_failure(mut error: IrError, pass: &str) -> IrError {
+    error.message = format!("{pass}: {}", error.message);
+    error
 }
 
 fn sparsify_block_parameters(function: &mut FullFunction) -> Result<bool, IrError> {
@@ -92,8 +174,17 @@ fn sparsify_block_parameters(function: &mut FullFunction) -> Result<bool, IrErro
         }
     }
 
-    if aliases.is_empty() {
-        return Ok(false);
+    let mut used_values = BTreeSet::new();
+    for parameter in &function.parameters {
+        used_values.extend(parameter.incoming);
+    }
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            used_values.extend(instruction_operands(&instruction.kind));
+        }
+        if let Some(terminator) = &block.terminator {
+            used_values.extend(terminator_operands(terminator));
+        }
     }
 
     let removed = function
@@ -103,10 +194,15 @@ fn sparsify_block_parameters(function: &mut FullFunction) -> Result<bool, IrErro
             block
                 .parameters
                 .iter()
-                .map(|parameter| aliases.contains_key(parameter))
+                .map(|parameter| {
+                    aliases.contains_key(parameter) || !used_values.contains(parameter)
+                })
                 .collect::<Vec<_>>()
         })
         .collect::<Vec<_>>();
+    if removed.iter().flatten().all(|removed| !removed) {
+        return Ok(false);
+    }
 
     for block in &mut function.blocks {
         let mask = &removed[block.id.0 as usize];
@@ -132,7 +228,11 @@ fn sparsify_block_parameters(function: &mut FullFunction) -> Result<bool, IrErro
     Ok(true)
 }
 
-fn simplify_control_flow(function: &mut FullFunction) -> Result<bool, IrError> {
+fn simplify_control_flow(
+    types: &TypeStore,
+    function: &mut FullFunction,
+    config: &EffectiveCompilationConfig,
+) -> Result<bool, IrError> {
     let constants = function
         .blocks
         .iter()
@@ -180,6 +280,7 @@ fn simplify_control_flow(function: &mut FullFunction) -> Result<bool, IrError> {
     }
 
     let mut changed = false;
+    let value_types = &function.value_types;
     for block in &mut function.blocks {
         let replacement = match block.terminator.as_ref() {
             Some(FullTerminator::Conditional {
@@ -204,7 +305,10 @@ fn simplify_control_flow(function: &mut FullFunction) -> Result<bool, IrError> {
                 default,
             }) => constants
                 .get(selector)
-                .and_then(constant_integer_bits)
+                .and_then(|constant| {
+                    let ty = *value_types.get(selector.0 as usize)?;
+                    fold::normalize_integer_constant(types, *constant, ty, config)
+                })
                 .map(|value| {
                     FullTerminator::Branch(
                         cases
@@ -226,6 +330,112 @@ fn simplify_control_flow(function: &mut FullFunction) -> Result<bool, IrError> {
         compact_values(function, &BTreeMap::new())?;
     }
     Ok(changed || removed_blocks)
+}
+
+fn forward_empty_blocks(function: &mut FullFunction) -> Result<bool, IrError> {
+    let entry = function.entry;
+    let indirect_targets = function
+        .blocks
+        .iter()
+        .filter_map(|block| block.terminator.as_ref())
+        .filter_map(|terminator| match terminator {
+            FullTerminator::IndirectBranch { targets, .. } => Some(targets),
+            _ => None,
+        })
+        .flatten()
+        .map(|edge| edge.target)
+        .collect::<BTreeSet<_>>();
+
+    let candidate = function.blocks.iter().find_map(|block| {
+        if Some(block.id) == entry
+            || !block.instructions.is_empty()
+            || !block.parameters.is_empty()
+            || indirect_targets.contains(&block.id)
+        {
+            return None;
+        }
+        let FullTerminator::Branch(outgoing) = block.terminator.as_ref()? else {
+            return None;
+        };
+        // Thread only parameterless blocks. A live block parameter can
+        // dominate uses beyond the outgoing edge; moving such a phi into the
+        // successor requires a general CFG rewrite rather than local edge
+        // substitution.
+        (outgoing.target != block.id)
+            .then(|| (block.id, block.parameters.clone(), outgoing.clone()))
+    });
+    let Some((candidate, parameters, outgoing)) = candidate else {
+        return Ok(false);
+    };
+
+    for block in &mut function.blocks {
+        let Some(terminator) = &mut block.terminator else {
+            continue;
+        };
+        for edge in terminator_edges_mut(terminator) {
+            if edge.target != candidate {
+                continue;
+            }
+            if edge.arguments.len() != parameters.len() {
+                return Err(IrError::verify(
+                    "empty-block predecessor has the wrong argument count",
+                ));
+            }
+            let replacements = parameters
+                .iter()
+                .copied()
+                .zip(edge.arguments.iter().copied())
+                .collect::<BTreeMap<_, _>>();
+            edge.target = outgoing.target;
+            edge.arguments = outgoing
+                .arguments
+                .iter()
+                .map(|argument| replacements.get(argument).copied().unwrap_or(*argument))
+                .collect();
+        }
+    }
+
+    for block in &function.blocks {
+        if block.id == candidate {
+            continue;
+        }
+        for instruction in &block.instructions {
+            if let Some(parameter) = instruction_operands(&instruction.kind)
+                .into_iter()
+                .find(|operand| parameters.contains(operand))
+            {
+                return Err(IrError::verify(format!(
+                    "forwarded parameter v{} remains in instruction i{} of b{}",
+                    parameter.0, instruction.id.0, block.id.0
+                )));
+            }
+        }
+        if let Some(terminator) = &block.terminator
+            && let Some(parameter) = terminator_operands(terminator)
+                .into_iter()
+                .find(|operand| parameters.contains(operand))
+        {
+            return Err(IrError::verify(format!(
+                "forwarded parameter v{} remains in the terminator of b{}",
+                parameter.0, block.id.0
+            )));
+        }
+    }
+
+    let retained = function
+        .blocks
+        .iter()
+        .map(|block| block.id != candidate)
+        .collect::<Vec<_>>();
+    retain_blocks(function, &retained)?;
+    compact_values(function, &BTreeMap::new()).map_err(|mut error| {
+        error.message = format!(
+            "forwarding b{} with parameters {:?} to b{} left invalid values: {}",
+            candidate.0, parameters, outgoing.target.0, error.message
+        );
+        error
+    })?;
+    Ok(true)
 }
 
 fn remove_unreachable_blocks(function: &mut FullFunction) -> Result<bool, IrError> {
@@ -252,9 +462,20 @@ fn remove_unreachable_blocks(function: &mut FullFunction) -> Result<bool, IrErro
         return Ok(false);
     }
 
+    retain_blocks(function, &reachable)?;
+    Ok(true)
+}
+
+fn retain_blocks(function: &mut FullFunction, retained: &[bool]) -> Result<(), IrError> {
+    if retained.len() != function.blocks.len() {
+        return Err(IrError::verify(
+            "block retention map has the wrong length during optimization",
+        ));
+    }
+    let old_entry = function.entry;
     let mut remap = vec![None; function.blocks.len()];
     let mut next = 0u32;
-    for (index, retained) in reachable.iter().copied().enumerate() {
+    for (index, retained) in retained.iter().copied().enumerate() {
         if retained {
             remap[index] = Some(BlockId(next));
             next = next
@@ -278,82 +499,123 @@ fn remove_unreachable_blocks(function: &mut FullFunction) -> Result<bool, IrErro
         }
         function.blocks.push(block);
     }
-    function.entry = remap[entry.0 as usize];
-    Ok(true)
+    function.entry =
+        match old_entry {
+            Some(entry) => Some(remap[entry.0 as usize].ok_or_else(|| {
+                IrError::verify("optimization attempted to remove the entry block")
+            })?),
+            None => None,
+        };
+    Ok(())
 }
 
 fn eliminate_dead_pure_instructions(function: &mut FullFunction) -> Result<bool, IrError> {
-    let mut changed = false;
-    loop {
-        let mut uses = vec![0usize; function.value_types.len()];
-        for parameter in &function.parameters {
-            if let Some(incoming) = parameter.incoming {
-                uses[incoming.0 as usize] += 1;
+    let mut dependencies = vec![Vec::<ValueId>::new(); function.value_types.len()];
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            if let Some(result) = instruction.result {
+                dependencies[result.0 as usize].extend(instruction_operands(&instruction.kind));
             }
         }
-        for block in &function.blocks {
-            for instruction in &block.instructions {
-                for operand in instruction_operands(&instruction.kind) {
-                    uses[operand.0 as usize] += 1;
-                }
-            }
-            if let Some(terminator) = &block.terminator {
-                for operand in terminator_operands(terminator) {
-                    uses[operand.0 as usize] += 1;
+        if let Some(terminator) = &block.terminator {
+            for edge in terminator_edges(terminator) {
+                let parameters = &function.blocks[edge.target.0 as usize].parameters;
+                for (parameter, argument) in parameters.iter().zip(&edge.arguments) {
+                    dependencies[parameter.0 as usize].push(*argument);
                 }
             }
         }
+    }
 
-        let mut removed = false;
-        for block in &mut function.blocks {
-            block.instructions.retain(|instruction| {
-                let discard = instruction.result.is_some_and(|result| {
-                    uses[result.0 as usize] == 0 && is_pure(&instruction.kind)
+    let mut live = vec![false; function.value_types.len()];
+    let mut worklist = VecDeque::new();
+    let enqueue = |value: ValueId, live: &mut [bool], worklist: &mut VecDeque<ValueId>| {
+        if !live[value.0 as usize] {
+            live[value.0 as usize] = true;
+            worklist.push_back(value);
+        }
+    };
+
+    // Retain incoming parameter values so ABI and source-debug parameter
+    // identities remain stable even when the body does not read them.
+    for parameter in &function.parameters {
+        if let Some(incoming) = parameter.incoming {
+            enqueue(incoming, &mut live, &mut worklist);
+        }
+    }
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            if !effects::removable_when_unused(&instruction.kind) {
+                for operand in instruction_operands(&instruction.kind) {
+                    enqueue(operand, &mut live, &mut worklist);
+                }
+            }
+        }
+        if let Some(terminator) = &block.terminator {
+            let observed = match terminator {
+                FullTerminator::Branch(_) | FullTerminator::Unreachable => Vec::new(),
+                FullTerminator::Conditional { condition, .. } => vec![*condition],
+                FullTerminator::Switch { selector, .. }
+                | FullTerminator::IndirectBranch { selector, .. } => vec![*selector],
+                FullTerminator::Return(value) => value.iter().copied().collect(),
+            };
+            for operand in observed {
+                enqueue(operand, &mut live, &mut worklist);
+            }
+        }
+    }
+    while let Some(value) = worklist.pop_front() {
+        for dependency in dependencies[value.0 as usize].iter().copied() {
+            enqueue(dependency, &mut live, &mut worklist);
+        }
+    }
+
+    let parameter_liveness = function
+        .blocks
+        .iter()
+        .map(|block| {
+            block
+                .parameters
+                .iter()
+                .map(|parameter| live[parameter.0 as usize])
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut changed = parameter_liveness.iter().flatten().any(|keep| !keep);
+    for block in &mut function.blocks {
+        if let Some(terminator) = &mut block.terminator {
+            for edge in terminator_edges_mut(terminator) {
+                let keep = &parameter_liveness[edge.target.0 as usize];
+                let mut index = 0;
+                edge.arguments.retain(|_| {
+                    let retain = keep[index];
+                    index += 1;
+                    retain
                 });
-                removed |= discard;
-                !discard
-            });
+            }
         }
-        if !removed {
-            break;
-        }
-        changed = true;
+    }
+    for (block, keep) in function.blocks.iter_mut().zip(&parameter_liveness) {
+        let mut index = 0;
+        block.parameters.retain(|_| {
+            let retain = keep[index];
+            index += 1;
+            retain
+        });
+        block.instructions.retain(|instruction| {
+            let retain = !effects::removable_when_unused(&instruction.kind)
+                || instruction
+                    .result
+                    .is_some_and(|result| live[result.0 as usize]);
+            changed |= !retain;
+            retain
+        });
     }
 
     if changed {
         compact_values(function, &BTreeMap::new())?;
     }
     Ok(changed)
-}
-
-fn is_pure(kind: &FullInstructionKind) -> bool {
-    matches!(
-        kind,
-        FullInstructionKind::Constant(_)
-            | FullInstructionKind::AddressConstant { .. }
-            | FullInstructionKind::AddressOfGlobal { .. }
-            | FullInstructionKind::AddressOfFunction { .. }
-            | FullInstructionKind::AddressOfString { .. }
-            | FullInstructionKind::AddressOfStorage { .. }
-            | FullInstructionKind::ProjectField { .. }
-            | FullInstructionKind::PointerOffset { .. }
-            | FullInstructionKind::PointerDifference { .. }
-            | FullInstructionKind::AggregateProject { .. }
-            | FullInstructionKind::Convert { .. }
-            | FullInstructionKind::Unary { .. }
-            | FullInstructionKind::Binary { .. }
-            | FullInstructionKind::IntegerIntrinsic { .. }
-    ) || matches!(
-        kind,
-        FullInstructionKind::Load { access, .. }
-            | FullInstructionKind::BitfieldLoad { access, .. }
-            | FullInstructionKind::AggregateSnapshot { access, .. }
-            if !access_is_ordered(*access)
-    )
-}
-
-fn access_is_ordered(access: super::MemoryAccess) -> bool {
-    access.volatile || access.atomic.is_some() || access.non_elidable || access.non_movable
 }
 
 fn constant_truth(constant: &ScalarConstant) -> Option<bool> {
@@ -363,16 +625,6 @@ fn constant_truth(constant: &ScalarConstant) -> Option<bool> {
         ScalarConstant::Floating(value) => Some(*value != 0.0),
         ScalarConstant::NullPointer => Some(false),
         ScalarConstant::LongDouble(_) => None,
-    }
-}
-
-fn constant_integer_bits(constant: &ScalarConstant) -> Option<u128> {
-    match constant {
-        ScalarConstant::Signed(value) => Some(*value as u128),
-        ScalarConstant::Unsigned(value) => Some(*value),
-        ScalarConstant::Floating(_)
-        | ScalarConstant::LongDouble(_)
-        | ScalarConstant::NullPointer => None,
     }
 }
 

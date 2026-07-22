@@ -5,7 +5,9 @@ mod dump;
 mod model;
 mod scopes;
 
-pub use analyze::analyze_frontend;
+pub use analyze::{
+    analyze_frontend, analyze_frontend_with_error_limit, analyze_frontend_with_recovery_limit,
+};
 pub use dump::dump_frontend_typed_ast;
 pub use model::*;
 

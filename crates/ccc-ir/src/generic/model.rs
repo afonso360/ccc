@@ -480,30 +480,38 @@ pub enum FullInstructionKind {
     VaEnd {
         list: ValueId,
     },
-    /// Allocates or reuses storage for one runtime-sized automatic object.
-    /// Each extent is checked for positivity and the complete byte-size
-    /// calculation is checked for overflow by the backend.
-    RuntimeSizedAllocate {
-        storage: StorageId,
+    /// Computes the byte size of a variably modified array. Each extent is
+    /// checked for positivity and every multiplication is checked for
+    /// `size_t` overflow by the backend. The result has the canonical
+    /// `size_t` type for every enabled data model.
+    RuntimeSize {
         extents: Vec<ValueId>,
         element: QualifiedType,
         constant_factor: u64,
+    },
+    /// Allocates or reuses storage for one runtime-sized automatic object.
+    /// `size` is a canonical `size_t` produced by an explicit checked
+    /// runtime-size calculation.
+    RuntimeSizedAllocate {
+        storage: StorageId,
+        size: ValueId,
+        element: QualifiedType,
         requested_alignment: Option<u64>,
     },
-    /// Pointer arithmetic whose element stride contains runtime VLA extents.
+    /// Pointer arithmetic whose `size_t` element stride was computed at runtime.
     RuntimePointerOffset {
         base: ValueId,
         index: ValueId,
         element: QualifiedType,
-        extents: Vec<ValueId>,
+        stride: ValueId,
         subtract: bool,
     },
-    /// Pointer subtraction whose element stride contains runtime VLA extents.
+    /// Pointer subtraction whose `size_t` element stride was computed at runtime.
     RuntimePointerDifference {
         left: ValueId,
         right: ValueId,
         element: QualifiedType,
-        extents: Vec<ValueId>,
+        stride: ValueId,
     },
 }
 

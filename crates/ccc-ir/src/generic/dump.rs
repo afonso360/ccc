@@ -293,57 +293,57 @@ fn display_instruction(module: &FullModule, kind: &FullInstructionKind) -> Strin
         FullInstructionKind::AddressOfStorage { storage } => {
             format!("address.storage m{}", storage.0)
         }
-        FullInstructionKind::RuntimeSizedAllocate {
-            storage,
+        FullInstructionKind::RuntimeSize {
             extents,
             element,
             constant_factor,
-            requested_alignment,
         } => format!(
-            "runtime.allocate m{} extents=[{}] element={} constant-factor={} requested-align={}",
-            storage.0,
+            "runtime.size extents=[{}] element={} constant-factor={}",
             extents
                 .iter()
                 .map(|value| format!("v{}", value.0))
                 .collect::<Vec<_>>()
                 .join(", "),
             module.types.display_qualified(*element),
-            constant_factor,
+            constant_factor
+        ),
+        FullInstructionKind::RuntimeSizedAllocate {
+            storage,
+            size,
+            element,
+            requested_alignment,
+        } => format!(
+            "runtime.allocate m{} size=v{} element={} requested-align={}",
+            storage.0,
+            size.0,
+            module.types.display_qualified(*element),
             requested_alignment.map_or_else(|| "natural".to_owned(), |value| value.to_string())
         ),
         FullInstructionKind::RuntimePointerOffset {
             base,
             index,
             element,
-            extents,
+            stride,
             subtract,
         } => format!(
-            "pointer.offset.runtime v{}, {}v{} element={} extents=[{}]",
+            "pointer.offset.runtime v{}, {}v{} element={} stride=v{}",
             base.0,
             if *subtract { "-" } else { "" },
             index.0,
             module.types.display_qualified(*element),
-            extents
-                .iter()
-                .map(|value| format!("v{}", value.0))
-                .collect::<Vec<_>>()
-                .join(", ")
+            stride.0
         ),
         FullInstructionKind::RuntimePointerDifference {
             left,
             right,
             element,
-            extents,
+            stride,
         } => format!(
-            "pointer.difference.runtime v{}, v{} element={} extents=[{}]",
+            "pointer.difference.runtime v{}, v{} element={} stride=v{}",
             left.0,
             right.0,
             module.types.display_qualified(*element),
-            extents
-                .iter()
-                .map(|value| format!("v{}", value.0))
-                .collect::<Vec<_>>()
-                .join(", ")
+            stride.0
         ),
         FullInstructionKind::ProjectField {
             base,

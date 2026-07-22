@@ -402,16 +402,19 @@ fn dump_block_item(
                 dump_initializer(output, unit, initializer, indent + 1);
             }
         }
-        FullTypedBlockItem::Typedef(typedef) => line(
-            output,
-            indent,
-            format_args!(
-                "typedef !{} {} : {}",
-                typedef.id.0,
-                typedef.name,
-                unit.types.display_qualified(typedef.ty)
-            ),
-        ),
+        FullTypedBlockItem::Typedef(typedef) => {
+            line(
+                output,
+                indent,
+                format_args!(
+                    "typedef !{} {} : {}",
+                    typedef.id.0,
+                    typedef.name,
+                    unit.types.display_qualified(typedef.ty)
+                ),
+            );
+            dump_variable_length_bounds(output, unit, &typedef.variable_length_bounds, indent + 1);
+        }
         FullTypedBlockItem::ExternalObject(id) => {
             line(output, indent, format_args!("extern-object @{}", id.0));
         }
@@ -522,6 +525,25 @@ fn dump_expression(
                 format_args!("decl-ref {reference:?}{suffix}"),
             );
         }
+        FullTypedExpressionKind::GenericSelection {
+            controlling_ty,
+            selected,
+        } => {
+            line(
+                output,
+                indent,
+                format_args!(
+                    "generic-selection controlling={}{suffix}",
+                    unit.types.display_qualified(*controlling_ty)
+                ),
+            );
+            dump_expression(output, unit, selected, indent + 1);
+        }
+        FullTypedExpressionKind::VariableLengthBoundEvaluation { bounds, expression } => {
+            line(output, indent, format_args!("vla-bound-evaluation{suffix}"));
+            dump_variable_length_bounds(output, unit, bounds, indent + 1);
+            dump_expression(output, unit, expression, indent + 1);
+        }
         FullTypedExpressionKind::Conversion { kind, expression } => {
             line(output, indent, format_args!("convert {kind:?}{suffix}"));
             dump_expression(output, unit, expression, indent + 1);
@@ -576,11 +598,14 @@ fn dump_expression(
             );
             dump_expression(output, unit, base, indent + 1);
         }
-        FullTypedExpressionKind::CompoundLiteral { local, initializer } => {
+        FullTypedExpressionKind::CompoundLiteral {
+            storage,
+            initializer,
+        } => {
             line(
                 output,
                 indent,
-                format_args!("compound-literal l{}{suffix}", local.0),
+                format_args!("compound-literal {storage:?}{suffix}"),
             );
             dump_initializer(output, unit, initializer, indent + 1);
         }
@@ -792,14 +817,24 @@ fn dump_expression(
             dump_expression(output, unit, expected, indent + 1);
             dump_expression(output, unit, replacement, indent + 1);
         }
-        FullTypedExpressionKind::Sizeof { operand_ty, size } => line(
-            output,
-            indent,
-            format_args!(
-                "sizeof {} = {size}{suffix}",
-                unit.types.display_qualified(*operand_ty)
-            ),
-        ),
+        FullTypedExpressionKind::Sizeof {
+            operand,
+            operand_ty,
+            size,
+        } => {
+            line(
+                output,
+                indent,
+                format_args!(
+                    "sizeof {} = {}{suffix}",
+                    unit.types.display_qualified(*operand_ty),
+                    size.map_or_else(|| "runtime".to_owned(), |size| size.to_string())
+                ),
+            );
+            if let Some(operand) = operand {
+                dump_expression(output, unit, operand, indent + 1);
+            }
+        }
         FullTypedExpressionKind::Alignof { operand_ty, align } => line(
             output,
             indent,

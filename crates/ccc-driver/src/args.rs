@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 
+use ccc_diag::DiagnosticFormat;
 use ccc_target::{LanguageMode, OptimizationLevel, RelocationModel, TrigraphPolicy};
 
 use crate::warnings::validate_warning_option;
@@ -147,6 +148,7 @@ pub(crate) struct DriverOptions {
     pub warnings_as_errors: bool,
     pub warning_options: Vec<String>,
     pub error_limit: Option<usize>,
+    pub diagnostic_format: DiagnosticFormat,
     pub debug_info: bool,
     pub verbose: bool,
     pub degraded_hardening: Vec<String>,
@@ -228,6 +230,7 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
     let mut warnings_as_errors = false;
     let mut warning_options = Vec::new();
     let mut error_limit = None;
+    let mut diagnostic_format = DiagnosticFormat::Text;
     let mut debug_info = false;
     let mut verbose = false;
     let mut query = None;
@@ -513,6 +516,17 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
             _ if let Some(value) = argument.strip_prefix("-ferror-limit=") => {
                 error_limit = Some(parse_limit(value, "-ferror-limit")?);
             }
+            _ if let Some(value) = argument.strip_prefix("-fdiagnostics-format=") => {
+                diagnostic_format = match value {
+                    "text" => DiagnosticFormat::Text,
+                    "json" => DiagnosticFormat::Json,
+                    _ => {
+                        return Err(format!(
+                            "ccc: unsupported diagnostics format `{value}`; expected `text` or `json`"
+                        ));
+                    }
+                };
+            }
             _ if let Some(value) = argument.strip_prefix("-fcf-protection=") => match value {
                 "none" => {}
                 "full" | "branch" | "return" => degraded_hardening.push(argument),
@@ -747,6 +761,7 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
         warnings_as_errors,
         warning_options,
         error_limit,
+        diagnostic_format,
         debug_info,
         verbose,
         degraded_hardening,
@@ -1203,6 +1218,26 @@ mod tests {
         assert_eq!(
             options(&["-ferror-limit=0", "input.c"]).error_limit,
             Some(0)
+        );
+    }
+
+    #[test]
+    fn parses_diagnostic_output_formats() {
+        assert_eq!(
+            options(&["-fdiagnostics-format=json", "input.c"]).diagnostic_format,
+            DiagnosticFormat::Json
+        );
+        assert_eq!(
+            options(&["-fdiagnostics-format=text", "input.c"]).diagnostic_format,
+            DiagnosticFormat::Text
+        );
+        assert!(
+            parse([
+                "-fdiagnostics-format=sarif".to_owned(),
+                "input.c".to_owned()
+            ])
+            .unwrap_err()
+            .contains("expected `text` or `json`")
         );
     }
 

@@ -391,6 +391,12 @@ impl CapabilityRegistry {
             CapabilityState::Implemented,
             "the compiler-owned header and native lowering support naturally aligned 1, 2, 4, and 8-byte integer and pointer atomics; the complete C atomic-type capability remains unadvertised",
         );
+        registry.insert_with_rationale(
+            CapabilityKind::Feature,
+            "c11-vla",
+            CapabilityState::Implemented,
+            "variably modified declarations and type names retain exactly-once bounds; checked runtime layout, pointer strides, sizeof, and hosted automatic storage are implemented on every enabled target",
+        );
 
         registry
     }

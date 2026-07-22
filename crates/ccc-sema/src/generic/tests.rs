@@ -144,7 +144,11 @@ fn types_block_scope_compound_literals_as_initialized_addressable_lvalues() {
     else {
         panic!("compound literal is converted for aggregate initialization")
     };
-    let FullTypedExpressionKind::CompoundLiteral { local, initializer } = &expression.kind else {
+    let FullTypedExpressionKind::CompoundLiteral {
+        storage: CompoundLiteralStorage::Automatic(local),
+        initializer,
+    } = &expression.kind
+    else {
         panic!("pair is initialized from a compound literal")
     };
     assert_eq!(expression.category, ValueCategory::Lvalue);
@@ -157,13 +161,210 @@ fn types_block_scope_compound_literals_as_initialized_addressable_lvalues() {
         initializer.kind,
         FullTypedInitializerKind::Aggregate(ref entries) if entries.len() == 2
     ));
+}
 
+#[test]
+fn file_scope_compound_literals_create_distinct_internal_static_objects() {
+    let unit = analyze_source(
+        "struct Pair { int left; int right; };
+         struct Pair *first = &(struct Pair){ .left = 1, .right = 2 };
+         struct Pair *second = &(struct Pair){ .left = 1, .right = 2 };
+         const struct Pair *qualified = &(const struct Pair){ .left = 3, .right = 4 };
+         int *array = (int[]){ 5, 6, 7 };",
+    )
+    .unwrap();
+
+    let compound_objects = unit
+        .globals
+        .iter()
+        .filter(|global| global.name.starts_with("<compound-literal-"))
+        .collect::<Vec<_>>();
+    assert_eq!(compound_objects.len(), 4);
+    assert!(compound_objects.iter().all(|global| {
+        global.storage == SemanticStorageClass::Static
+            && global.linkage == Linkage::Internal
+            && global.duration == StorageDuration::Static
+            && global.emission.definition == ObjectDefinitionPolicy::Definition
+            && global.initializer.is_some()
+    }));
+    assert_ne!(compound_objects[0].id, compound_objects[1].id);
+    assert!(
+        compound_objects[2]
+            .ty
+            .qualifiers
+            .contains(TypeQualifiers::CONST)
+    );
+    let TypeKind::Array(array_ty) = unit.types.kind(compound_objects[3].ty.ty) else {
+        panic!("the array compound literal has array type")
+    };
+    assert_eq!(array_ty.length, ArrayLength::Constant(3));
+
+    let first = unit
+        .globals
+        .iter()
+        .find(|global| global.name == "first")
+        .unwrap();
+    let FullTypedInitializerKind::Scalar(initializer) = &first.initializer.as_ref().unwrap().kind
+    else {
+        panic!("first has a scalar pointer initializer")
+    };
+    let FullTypedExpressionKind::Conversion {
+        kind: ConversionKind::PointerConversion,
+        expression: address,
+    } = &initializer.kind
+    else {
+        panic!("first retains its pointer conversion")
+    };
+    let FullTypedExpressionKind::AddressOf(compound) = &address.kind else {
+        panic!("first takes a compound literal address")
+    };
+    let FullTypedExpressionKind::CompoundLiteral {
+        storage: CompoundLiteralStorage::Static(object),
+        ..
+    } = compound.kind
+    else {
+        panic!("the file-scope occurrence retains static compound-literal storage")
+    };
+    assert_eq!(object, compound_objects[0].id);
+    assert_eq!(
+        compound.place.as_ref().unwrap().base,
+        PlaceBase::Global(object)
+    );
+    assert_eq!(
+        compound.constant,
+        Some(ConstantValue::Address(RelocatableAddress {
+            base: RelocatableBase::Global(object),
+            addend: 0,
+            one_past: false,
+        }))
+    );
+}
+
+#[test]
+fn compound_literals_reject_dynamic_static_initializers_and_variable_types() {
+    assert_eq!(
+        diagnostic_codes("extern int value; int *pointer = &(int){ value };"),
+        vec!["CCC2344"]
+    );
+    assert_eq!(
+        diagnostic_codes("int f(int n) { return ((int[n]){ 1 })[0]; }"),
+        vec!["CCC2430"]
+    );
+}
+
+#[test]
+fn static_initializers_can_reuse_file_compound_literal_initializers() {
+    let unit = analyze_source(
+        "struct Pair { int left; int right; };
+         struct Pair copied = (struct Pair){ .left = 7, .right = 8 };
+         int scalar = (int){ 9 };
+         int selected = _Generic(0, int: (int){ 10 }, default: 0);",
+    )
+    .unwrap();
+    for (object_index, destination_name) in [(0_usize, "copied"), (2, "scalar"), (4, "selected")] {
+        let object_initializer = unit.globals[object_index].initializer.as_ref().unwrap();
+        let destination_initializer = unit
+            .globals
+            .iter()
+            .find(|global| global.name == destination_name)
+            .unwrap()
+            .initializer
+            .as_ref()
+            .unwrap();
+        assert_eq!(destination_initializer, object_initializer);
+    }
+}
+
+#[test]
+fn generic_selection_records_only_the_selected_typed_expression() {
+    let unit = analyze_source(
+        "struct Bits { unsigned flag : 1; };
+         int side_effect(void);
+         int select(struct Bits *bits) {
+             _Generic(0, int: bits->flag, default: bits->flag) = 1;
+             return _Generic(side_effect(), int: 42, default: 0);
+         }
+         _Static_assert(_Generic(*(int const *)0, int: 7, default: 0) == 7, \"\");
+         _Static_assert(_Generic(\"abc\", char *: 1, default: 0) == 1, \"\");
+         _Static_assert(_Generic(side_effect, int (*)(void): 1, default: 0) == 1, \"\");",
+    )
+    .unwrap();
+    let function = unit
+        .functions
+        .iter()
+        .find(|function| function.name == "select")
+        .unwrap();
+    let FullTypedStatementKind::Compound(items) = &function.body.as_ref().unwrap().kind else {
+        panic!("select has a compound body")
+    };
+    let FullTypedBlockItem::Statement(assignment) = &items[0] else {
+        panic!("select starts with an assignment")
+    };
+    let FullTypedStatementKind::Expression(Some(assignment)) = &assignment.kind else {
+        panic!("select starts with an expression statement")
+    };
+    let FullTypedExpressionKind::Assignment { target, .. } = &assignment.kind else {
+        panic!("the first expression assigns through the generic selection")
+    };
+    let FullTypedExpressionKind::GenericSelection {
+        controlling_ty,
+        selected,
+    } = &target.kind
+    else {
+        panic!("the assignment target remains an explicit generic selection")
+    };
+    assert_eq!(controlling_ty.ty, TypeId::INT);
+    assert_eq!(target.category, ValueCategory::Lvalue);
+    assert!(target.place.as_ref().unwrap().bitfield.is_some());
+    assert!(matches!(
+        selected.kind,
+        FullTypedExpressionKind::Member { .. }
+    ));
+
+    let FullTypedBlockItem::Statement(return_statement) = &items[1] else {
+        panic!("select ends with a return")
+    };
+    let FullTypedStatementKind::Return(Some(result)) = &return_statement.kind else {
+        panic!("select ends with a value return")
+    };
+    let FullTypedExpressionKind::GenericSelection { selected, .. } = &result.kind else {
+        panic!("the return value remains an explicit generic selection")
+    };
+    assert_eq!(result.constant, Some(ConstantValue::Signed(42)));
+    assert_eq!(
+        result.constant_expression_kind,
+        ConstantExpressionKind::Integer
+    );
+    assert!(matches!(
+        selected.kind,
+        FullTypedExpressionKind::Constant(ConstantValue::Signed(42))
+    ));
+}
+
+#[test]
+fn generic_selection_validates_association_constraints() {
+    for source in [
+        "int f(int x) { return _Generic(x, int: 1, int: 2); }",
+        "int f(int x) { return _Generic(x, default: 1, default: 2); }",
+        "int f(int x) { return _Generic(x, double: 1); }",
+        "int f(int n) { return _Generic(n, int (*)[n]: 1, default: 2); }",
+    ] {
+        assert_eq!(diagnostic_codes(source), vec!["CCC2270"], "{source}");
+    }
+    assert_eq!(
+        diagnostic_codes("int f(int x) { return _Generic(x, void: 1, default: 2); }"),
+        vec!["CCC2341"]
+    );
     assert_eq!(
         diagnostic_codes(
-            "struct Pair { int left; int right; };
-             struct Pair pair = (struct Pair){ .left = 1, .right = 2 };"
+            "struct Missing; int f(int x) { return _Generic(x, struct Missing: 1, default: 2); }"
         ),
-        vec!["CCC2430"]
+        vec!["CCC2342"]
+    );
+
+    assert_eq!(
+        diagnostic_codes("int f(int x) { return _Generic(x, int: 1, default: missing); }"),
+        vec!["CCC2274"]
     );
 }
 
@@ -395,13 +596,13 @@ fn assembly_labels_reject_conflicts_and_unsupported_storage() {
     ] {
         assert!(diagnostic_codes(source).contains(&"CCC2419".to_owned()));
     }
-    assert!(
-        diagnostic_codes("int f(void) { int local asm(\"linked\"); return local; }")
-            .contains(&"CCC2257".to_owned())
+    assert_eq!(
+        diagnostic_codes("int f(void) { int local asm(\"linked\"); return local; }"),
+        ["CCC2257"]
     );
-    assert!(
-        diagnostic_codes("int f(void) { static int local asm(\"linked\"); return local; }")
-            .contains(&"CCC2257".to_owned())
+    assert_eq!(
+        diagnostic_codes("int f(void) { static int local asm(\"linked\"); return local; }"),
+        ["CCC2257"]
     );
     assert!(diagnostic_codes("extern int object asm(\"\");").contains(&"CCC2349".to_owned()));
 }
@@ -2135,13 +2336,128 @@ fn retains_parameter_and_local_variable_length_bounds_without_requiring_vla_stor
         diagnostic_codes("int rejected(int n) { extern int (*(*value)(void))[n++]; return 0; }"),
         vec!["CCC2415"]
     );
-    assert_eq!(
-        diagnostic_codes("int rejected(int n) { typedef int Row[n]; return 0; }"),
-        vec!["CCC2416"]
+    let typedef =
+        analyze_source("int accepted(int n) { typedef int Row[n++]; return 0; }").unwrap();
+    assert_eq!(typedef.typedefs[0].variable_length_bounds.len(), 1);
+    assert!(matches!(
+        typedef.typedefs[0].variable_length_bounds[0]
+            .expression
+            .kind,
+        FullTypedExpressionKind::Increment { .. }
+    ));
+
+    let cast = analyze_source("void *accepted(int n, void *value) { return (int (*)[n++])value; }")
+        .unwrap();
+    assert!(
+        dump_frontend_typed_ast(&cast).contains("vla-bound-evaluation"),
+        "{}",
+        dump_frontend_typed_ast(&cast)
     );
+
+    let atomic =
+        analyze_source("int accepted(int n) { _Atomic(int (*)[n++]) first, second; return n; }")
+            .unwrap();
+    let function = &atomic.functions[0];
+    let FullTypedStatementKind::Compound(items) = &function.body.as_ref().unwrap().kind else {
+        panic!("accepted has a compound body")
+    };
+    let FullTypedBlockItem::Declaration(first) = &items[0] else {
+        panic!("accepted begins with an atomic pointer declaration")
+    };
+    let FullTypedBlockItem::Declaration(second) = &items[1] else {
+        panic!("accepted has a second atomic pointer declaration")
+    };
+    assert_eq!(first.variable_length_bounds.len(), 1);
+    assert!(second.variable_length_bounds.is_empty());
+}
+
+#[test]
+fn runtime_sizeof_retains_only_bounds_that_determine_the_result() {
+    let unit = analyze_source(
+        "unsigned long inspect(int n, void *value) {
+             typedef int Row[n++];
+             unsigned long first = sizeof(Row);
+             unsigned long second = sizeof *(int (*)[n++])value;
+             unsigned long pointer_size = sizeof(int (*)[n++]);
+             unsigned long alignment = _Alignof(int[n++]);
+             return first + second + pointer_size + alignment + n;
+         }",
+    )
+    .unwrap();
+    let dump = dump_frontend_typed_ast(&unit);
+    assert_eq!(dump.matches("vla-bound-evaluation").count(), 1, "{dump}");
+    assert_eq!(dump.matches("= runtime").count(), 2, "{dump}");
+}
+
+#[test]
+fn conditional_pointer_to_vla_retains_each_operand_bound() {
+    let unit = analyze_source(
+        "unsigned long inspect(int choose, int left, int right, int *address) {
+             return sizeof *(choose
+                 ? (int (*)[left++])address
+                 : (int (*)[right++])address);
+         }",
+    )
+    .unwrap();
+    let dump = dump_frontend_typed_ast(&unit);
+    assert_eq!(dump.matches("vla-bound-evaluation").count(), 2, "{dump}");
+    assert!(dump.contains("conditional"), "{dump}");
+}
+
+#[test]
+fn runtime_sizeof_expression_retains_its_evaluated_operand() {
+    let unit = analyze_source(
+        "int observe(void);
+         unsigned long inspect(int n, int (*rows)[n]) {
+             return sizeof *((observe(), rows));
+         }",
+    )
+    .unwrap();
+    let inspect = unit
+        .functions
+        .iter()
+        .find(|function| function.name == "inspect")
+        .unwrap();
+    let FullTypedStatementKind::Compound(items) = &inspect.body.as_ref().unwrap().kind else {
+        panic!("inspect has a compound body")
+    };
+    let FullTypedBlockItem::Statement(statement) = &items[0] else {
+        panic!("inspect has a return statement")
+    };
+    let FullTypedStatementKind::Return(Some(expression)) = &statement.kind else {
+        panic!("inspect returns a value")
+    };
+    let FullTypedExpressionKind::Sizeof {
+        operand: Some(operand),
+        size: None,
+        ..
+    } = &expression.kind
+    else {
+        panic!("runtime sizeof does not retain its expression operand")
+    };
+    let FullTypedExpressionKind::Dereference(pointer) = &operand.kind else {
+        panic!("sizeof operand remains an array dereference")
+    };
+    let FullTypedExpressionKind::Comma(operands) = &pointer.kind else {
+        panic!("sizeof operand retains its comma expression")
+    };
+    assert!(matches!(
+        operands[0].kind,
+        FullTypedExpressionKind::Call { .. }
+    ));
+}
+
+#[test]
+fn semantic_analysis_recovers_independent_errors_inside_one_function() {
     assert_eq!(
-        diagnostic_codes("void *rejected(int n, void *value) { return (int (*)[n++])value; }"),
-        vec!["CCC2417"]
+        diagnostic_codes(
+            "int inspect(void) {
+                 missing_one;
+                 missing_two;
+                 return 0;
+             }"
+        ),
+        vec!["CCC2274", "CCC2274"]
     );
 }
 
@@ -2266,6 +2582,49 @@ fn rejects_variably_modified_members_and_block_function_types() {
     assert!(
         analyze_source("void f(struct S { int (*callback)(int values[*]); } argument);").is_ok()
     );
+
+    assert_eq!(
+        diagnostic_codes("int f(int n) { typedef int Row[n]; Row *returns_vm(void); return 0; }"),
+        vec!["CCC2418"]
+    );
+    assert_eq!(
+        diagnostic_codes(
+            "int f(int n) {
+                 typedef int Row[n];
+                 struct S { Row *(*returns_vm)(void); };
+                 return 0;
+             }"
+        ),
+        vec!["CCC2235"]
+    );
+    assert!(
+        analyze_source(
+            "int f(int n) {
+                 typedef int Row[n];
+                 void takes_vm(Row *value);
+                 struct S { void (*takes_vm)(Row *value); };
+                 return 0;
+             }"
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn rejects_runtime_arrays_with_zero_length_dimensions() {
+    assert!(
+        analyze_source("int accepted(void) { int fixed[2][0]; return (int)sizeof(fixed); }")
+            .is_ok()
+    );
+
+    for source in [
+        "int rejected(int n) { int values[n][0]; return 0; }",
+        "int rejected(int n) { int values[0][n]; return 0; }",
+        "unsigned long rejected(int n, void *p) { return sizeof *(int (*)[n][0])p; }",
+        "void *rejected(int n, void *p) { return (int (*)[n][0])p + 1; }",
+    ] {
+        assert_eq!(diagnostic_codes(source), vec!["CCC2456"], "{source}");
+    }
 }
 
 #[test]
@@ -3368,8 +3727,23 @@ fn accepts_automatic_variable_length_and_thread_local_objects() {
     );
     assert_eq!(
         diagnostic_codes(
+            "int f(int n) { goto inside; typedef int Row[n++]; inside: return sizeof(Row); }"
+        ),
+        vec!["CCC2442"]
+    );
+    assert_eq!(
+        diagnostic_codes(
             "int f(int n, int choice) {
                  switch (choice) { int values[n]; case 0: return values[0]; }
+                 return 0;
+             }"
+        ),
+        vec!["CCC2442"]
+    );
+    assert_eq!(
+        diagnostic_codes(
+            "int f(int n, int choice) {
+                 switch (choice) { typedef int Row[n++]; case 0: return sizeof(Row); }
                  return 0;
              }"
         ),
@@ -3382,6 +3756,17 @@ fn accepts_automatic_variable_length_and_thread_local_objects() {
                  int values[n];
                  goto *target;
                  done: return values[0];
+             }"
+        ),
+        vec!["CCC2442"]
+    );
+    assert_eq!(
+        diagnostic_codes(
+            "int f(int n) {
+                 void *target = &&done;
+                 typedef int Row[n++];
+                 goto *target;
+                 done: return sizeof(Row);
              }"
         ),
         vec!["CCC2442"]

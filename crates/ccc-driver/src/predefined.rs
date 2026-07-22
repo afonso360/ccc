@@ -19,9 +19,7 @@ pub(crate) fn additional_predefined_macros(
     }
 
     match config.optimization {
-        OptimizationLevel::O0 => {
-            macros.insert("__NO_INLINE__".to_owned(), "1".to_owned());
-        }
+        OptimizationLevel::O0 => {}
         OptimizationLevel::O1 | OptimizationLevel::O2 | OptimizationLevel::O3 => {
             macros.insert("__OPTIMIZE__".to_owned(), "1".to_owned());
         }
@@ -153,7 +151,6 @@ mod tests {
             "__STDC_NO_ATOMICS__",
             "__STDC_NO_COMPLEX__",
             "__STDC_NO_THREADS__",
-            "__STDC_NO_VLA__",
         ] {
             assert_eq!(
                 macros.get(unsupported).map(String::as_str),
@@ -161,6 +158,7 @@ mod tests {
                 "missing denial macro {unsupported}"
             );
         }
+        assert!(!macros.contains_key("__STDC_NO_VLA__"));
         for (name, expected) in [
             ("__CCC__", "1"),
             ("__CCC_MAJOR__", "0"),
@@ -207,13 +205,13 @@ mod tests {
 
     #[test]
     fn optimization_macros_follow_the_selected_profile() {
-        for (optimization, optimize, size, no_inline) in [
-            (OptimizationLevel::O0, false, false, true),
-            (OptimizationLevel::O1, true, false, false),
-            (OptimizationLevel::O2, true, false, false),
-            (OptimizationLevel::O3, true, false, false),
-            (OptimizationLevel::Size, true, true, false),
-            (OptimizationLevel::SizeMin, true, true, false),
+        for (optimization, optimize, size) in [
+            (OptimizationLevel::O0, false, false),
+            (OptimizationLevel::O1, true, false),
+            (OptimizationLevel::O2, true, false),
+            (OptimizationLevel::O3, true, false),
+            (OptimizationLevel::Size, true, true),
+            (OptimizationLevel::SizeMin, true, true),
         ] {
             let config = EffectiveCompilationConfig {
                 optimization,
@@ -222,7 +220,7 @@ mod tests {
             let macros = additional_predefined_macros(&config);
             assert_eq!(macros.contains_key("__OPTIMIZE__"), optimize);
             assert_eq!(macros.contains_key("__OPTIMIZE_SIZE__"), size);
-            assert_eq!(macros.contains_key("__NO_INLINE__"), no_inline);
+            assert!(!macros.contains_key("__NO_INLINE__"));
         }
     }
 
@@ -260,6 +258,22 @@ mod tests {
             macros.get("__STDC_NO_ATOMICS__").map(String::as_str),
             Some("1")
         );
+    }
+
+    #[test]
+    fn enabled_targets_do_not_define_the_vla_denial_macro() {
+        for config in [
+            EffectiveCompilationConfig::default(),
+            EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+            EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
+            EffectiveCompilationConfig::aarch64_apple_darwin(),
+        ] {
+            assert!(
+                !additional_predefined_macros(&config).contains_key("__STDC_NO_VLA__"),
+                "{}",
+                config.target.triple
+            );
+        }
     }
 
     #[test]

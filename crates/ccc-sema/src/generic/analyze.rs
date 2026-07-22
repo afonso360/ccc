@@ -13,7 +13,7 @@ use ccc_target::{
 };
 use ccc_types::{
     ArrayLength, ArrayType, BuiltinType, Field, FunctionParameters, FunctionType, LayoutShape,
-    QualifiedType, RecordKind, TypeId, TypeKind, TypeQualifiers,
+    QualifiedType, RecordKind, TypeId, TypeKind, TypeQualifiers, TypeStore, VariableLengthId,
 };
 use rustc_apfloat::ieee::{Double, Half, Quad, Single, X87DoubleExtended};
 use rustc_apfloat::{Float, FloatConvert, Round, Status};
@@ -101,6 +101,7 @@ impl DeclaratorContext {
 #[derive(Clone, Debug)]
 struct DeclarationInfo {
     base: QualifiedType,
+    variable_length_bounds: Vec<FullTypedVariableLengthBound>,
     storage: Option<syntax::StorageClass>,
     thread_local: bool,
     properties: FunctionProperties,
@@ -113,14 +114,20 @@ struct DeclarationInfo {
 struct SwitchState {
     cases: HashMap<u128, Span>,
     default: Option<Span>,
-    entry_variably_modified_path: Vec<FullLocalId>,
+    entry_variably_modified_path: Vec<VariablyModifiedScopeEntry>,
     controlling_type: Option<QualifiedType>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VariablyModifiedScopeEntry {
+    Object(FullLocalId),
+    Typedef(TypedefId),
 }
 
 struct VariablyModifiedGoto {
     label: LabelId,
     span: Span,
-    source_path: Vec<FullLocalId>,
+    source_path: Vec<VariablyModifiedScopeEntry>,
 }
 
 /// Alignment facts retained while an atomic-object address is still expressed
@@ -200,12 +207,12 @@ struct FunctionState {
     unaddressable_locals: HashSet<FullLocalId>,
     static_duration_locals: HashMap<FullLocalId, StorageDuration>,
     labels: LabelScope,
-    active_variably_modified_path: Vec<FullLocalId>,
+    active_variably_modified_path: Vec<VariablyModifiedScopeEntry>,
     variably_modified_scope_starts: Vec<usize>,
-    variably_modified_label_paths: HashMap<LabelId, (Span, Vec<FullLocalId>)>,
+    variably_modified_label_paths: HashMap<LabelId, (Span, Vec<VariablyModifiedScopeEntry>)>,
     variably_modified_gotos: Vec<VariablyModifiedGoto>,
     computed_gotos: Vec<Span>,
-    has_variably_modified_local: bool,
+    has_variably_modified_declaration: bool,
     loop_depth: usize,
     switches: Vec<SwitchState>,
     variadic: bool,
@@ -244,7 +251,24 @@ pub fn analyze_frontend(
     unit: &syntax::TranslationUnit,
     config: &EffectiveCompilationConfig,
 ) -> Result<FullTypedTranslationUnit, Vec<Diagnostic>> {
-    let mut analyzer = Analyzer::new(config);
+    analyze_frontend_with_error_limit(unit, config, None)
+}
+
+pub fn analyze_frontend_with_error_limit(
+    unit: &syntax::TranslationUnit,
+    config: &EffectiveCompilationConfig,
+    error_limit: Option<usize>,
+) -> Result<FullTypedTranslationUnit, Vec<Diagnostic>> {
+    analyze_frontend_with_recovery_limit(unit, config, error_limit, &[])
+}
+
+pub fn analyze_frontend_with_recovery_limit(
+    unit: &syntax::TranslationUnit,
+    config: &EffectiveCompilationConfig,
+    error_limit: Option<usize>,
+    poisoned_bindings: &[syntax::PoisonedBinding],
+) -> Result<FullTypedTranslationUnit, Vec<Diagnostic>> {
+    let mut analyzer = Analyzer::new(config, error_limit, poisoned_bindings);
     analyzer.analyze_translation_unit(unit);
     analyzer.complete_tentative_arrays();
     if analyzer.diagnostics.is_empty() {
@@ -270,10 +294,16 @@ struct Analyzer<'a> {
     definition_parameter_list: Option<Span>,
     packing: PackingState,
     diagnostics: Vec<Diagnostic>,
+    error_limit: Option<usize>,
+    poisoned_bindings: &'a [syntax::PoisonedBinding],
 }
 
 impl<'a> Analyzer<'a> {
-    fn new(config: &'a EffectiveCompilationConfig) -> Self {
+    fn new(
+        config: &'a EffectiveCompilationConfig,
+        error_limit: Option<usize>,
+        poisoned_bindings: &'a [syntax::PoisonedBinding],
+    ) -> Self {
         Self {
             config,
             types: ccc_types::TypeStore::default(),
@@ -290,6 +320,8 @@ impl<'a> Analyzer<'a> {
             definition_parameter_list: None,
             packing: PackingState::default(),
             diagnostics: Vec::new(),
+            error_limit,
+            poisoned_bindings,
         }
     }
 
@@ -306,6 +338,9 @@ impl<'a> Analyzer<'a> {
 
     fn analyze_translation_unit(&mut self, unit: &syntax::TranslationUnit) {
         for item in &unit.items {
+            if self.error_limit_reached() {
+                break;
+            }
             match item {
                 syntax::ExternalItem::Pragma(pragma) => {
                     if self.handle_pragma(pragma).is_ok() {
@@ -314,7 +349,9 @@ impl<'a> Analyzer<'a> {
                     }
                 }
                 syntax::ExternalItem::Declaration(declaration) => {
-                    let _ = self.analyze_file_declaration(declaration);
+                    if self.analyze_file_declaration(declaration).is_err() {
+                        self.poison_declaration_bindings(declaration, true);
+                    }
                 }
                 syntax::ExternalItem::FunctionDefinition(definition) => {
                     let _ = self.analyze_function_definition(definition);
@@ -368,8 +405,13 @@ impl<'a> Analyzer<'a> {
             return Ok(());
         }
 
-        for init in &declaration.declarators {
-            let resolved = self.resolve_declarator(info.base, &init.declarator)?;
+        for (declarator_index, init) in declaration.declarators.iter().enumerate() {
+            let mut resolved = self.resolve_declarator(info.base, &init.declarator)?;
+            if declarator_index == 0 {
+                let mut bounds = info.variable_length_bounds.clone();
+                bounds.extend(resolved.variable_length_bounds);
+                resolved.variable_length_bounds = bounds;
+            }
             let Some(name) = resolved.name.clone() else {
                 return self.fail(
                     "CCC2201",
@@ -582,7 +624,7 @@ impl<'a> Analyzer<'a> {
             variably_modified_label_paths: HashMap::new(),
             variably_modified_gotos: Vec::new(),
             computed_gotos: Vec::new(),
-            has_variably_modified_local: false,
+            has_variably_modified_declaration: false,
             loop_depth: 0,
             switches: Vec::new(),
             variadic: signature.variadic,
@@ -738,7 +780,8 @@ impl<'a> Analyzer<'a> {
                 "a declaration requires a type specifier",
             );
         }
-        let mut base = self.resolve_type_specifiers(&type_specifiers, specifiers.span)?;
+        let (mut base, variable_length_bounds) =
+            self.resolve_type_specifiers(&type_specifiers, specifiers.span)?;
         base.qualifiers |= qualifiers;
         if base.qualifiers.contains(TypeQualifiers::ATOMIC)
             && self.type_contains_int128(base.ty, &mut HashSet::new())
@@ -760,6 +803,7 @@ impl<'a> Analyzer<'a> {
         }
         Ok(DeclarationInfo {
             base,
+            variable_length_bounds,
             storage,
             thread_local,
             properties,
@@ -776,7 +820,8 @@ impl<'a> Analyzer<'a> {
     ) -> AnalysisResult<Option<u64>> {
         let value = match specifier {
             syntax::AlignmentSpecifier::Type(type_name) => {
-                let ty = self.resolve_type_name(type_name)?;
+                let (ty, _) = self.resolve_type_name_with_bounds(type_name)?;
+                let ty = innermost_array_element(&self.types, ty);
                 self.types
                     .layout_of(ty.ty, self.config)
                     .map_err(|error| self.emit("CCC2437", span, error.to_string()))?
@@ -827,27 +872,33 @@ impl<'a> Analyzer<'a> {
         &mut self,
         specifiers: &[&syntax::TypeSpecifier],
         span: Span,
-    ) -> AnalysisResult<QualifiedType> {
+    ) -> AnalysisResult<(QualifiedType, Vec<FullTypedVariableLengthBound>)> {
         if specifiers.len() == 1 {
             match specifiers[0] {
                 syntax::TypeSpecifier::Struct(record) => {
                     return self
                         .resolve_record_specifier(RecordKind::Struct, record)
-                        .map(QualifiedType::unqualified);
+                        .map(QualifiedType::unqualified)
+                        .map(|ty| (ty, Vec::new()));
                 }
                 syntax::TypeSpecifier::Union(record) => {
                     return self
                         .resolve_record_specifier(RecordKind::Union, record)
-                        .map(QualifiedType::unqualified);
+                        .map(QualifiedType::unqualified)
+                        .map(|ty| (ty, Vec::new()));
                 }
                 syntax::TypeSpecifier::Enum(enumeration) => {
                     return self
                         .resolve_enum_specifier(enumeration)
-                        .map(QualifiedType::unqualified);
+                        .map(QualifiedType::unqualified)
+                        .map(|ty| (ty, Vec::new()));
                 }
                 syntax::TypeSpecifier::TypedefName(identifier) => {
                     return match self.lookup_ordinary(&identifier.name) {
-                        Some(OrdinarySymbol::Typedef(_, ty)) => Ok(*ty),
+                        Some(OrdinarySymbol::Typedef(_, ty)) => Ok((*ty, Vec::new())),
+                        Some(OrdinarySymbol::Poisoned) => {
+                            Ok((QualifiedType::unqualified(TypeId::INT), Vec::new()))
+                        }
                         _ => self.fail(
                             "CCC2213",
                             identifier.span,
@@ -856,9 +907,9 @@ impl<'a> Analyzer<'a> {
                     };
                 }
                 syntax::TypeSpecifier::Atomic(type_name) => {
-                    let mut ty = self.resolve_type_name(type_name)?;
+                    let (mut ty, bounds) = self.resolve_type_name_with_bounds(type_name)?;
                     ty.qualifiers |= TypeQualifiers::ATOMIC;
-                    return Ok(ty);
+                    return Ok((ty, bounds));
                 }
                 syntax::TypeSpecifier::Typeof(_) => {
                     return self.fail(
@@ -874,7 +925,7 @@ impl<'a> Analyzer<'a> {
                         .map_err(|error| {
                             self.emit("CCC2408", span, error.to_string());
                         })?;
-                    return Ok(QualifiedType::unqualified(ty));
+                    return Ok((QualifiedType::unqualified(ty), Vec::new()));
                 }
                 _ => {}
             }
@@ -1006,19 +1057,10 @@ impl<'a> Analyzer<'a> {
         } else {
             return self.fail("CCC2218", span, "invalid combination of type specifiers");
         };
-        Ok(QualifiedType::unqualified(self.types.builtin(builtin)))
-    }
-
-    fn resolve_type_name(&mut self, type_name: &syntax::TypeName) -> AnalysisResult<QualifiedType> {
-        let (ty, variable_length_bounds) = self.resolve_type_name_with_bounds(type_name)?;
-        if !variable_length_bounds.is_empty() {
-            return self.fail(
-                "CCC2417",
-                type_name.span,
-                "variably modified type-name bounds cannot yet be preserved",
-            );
-        }
-        Ok(ty)
+        Ok((
+            QualifiedType::unqualified(self.types.builtin(builtin)),
+            Vec::new(),
+        ))
     }
 
     fn resolve_type_name_with_bounds(
@@ -1049,9 +1091,11 @@ impl<'a> Analyzer<'a> {
                         "a type name cannot declare an identifier",
                     );
                 }
-                Ok((resolved.ty, resolved.variable_length_bounds))
+                let mut bounds = info.variable_length_bounds;
+                bounds.extend(resolved.variable_length_bounds);
+                Ok((resolved.ty, bounds))
             }
-            None => Ok((info.base, Vec::new())),
+            None => Ok((info.base, info.variable_length_bounds)),
         }
     }
 
@@ -1202,6 +1246,13 @@ impl<'a> Analyzer<'a> {
                 let element = ty;
                 let array =
                     QualifiedType::unqualified(self.types.array(ArrayType { element, length }));
+                if self.has_runtime_and_zero_array_dimensions(array.ty) {
+                    return self.fail(
+                        "CCC2456",
+                        *span,
+                        "an array type cannot combine a runtime bound with a zero-length dimension",
+                    );
+                }
                 self.resolve_direct_declarator(array, inner, context)
             }
             syntax::DirectDeclarator::Function {
@@ -1343,11 +1394,20 @@ impl<'a> Analyzer<'a> {
                 (
                     resolved.name,
                     resolved.ty,
-                    resolved.variable_length_bounds,
+                    {
+                        let mut bounds = info.variable_length_bounds.clone();
+                        bounds.extend(resolved.variable_length_bounds);
+                        bounds
+                    },
                     resolved.name_span,
                 )
             } else {
-                (None, info.base, Vec::new(), parameter.span)
+                (
+                    None,
+                    info.base,
+                    info.variable_length_bounds.clone(),
+                    parameter.span,
+                )
             };
         let declared_kind = self.types.try_kind(ty.ty).cloned();
         if matches!(&declared_kind, Some(TypeKind::Array(_)))
@@ -1501,6 +1561,15 @@ impl<'a> Analyzer<'a> {
                         );
                     }
                     if declaration.declarators.is_empty() {
+                        if !info.variable_length_bounds.is_empty()
+                            || self.is_variably_modified(info.base.ty)
+                        {
+                            return self.fail(
+                                "CCC2235",
+                                declaration.span,
+                                "a record member cannot have variably modified type",
+                            );
+                        }
                         if !matches!(self.types.try_kind(info.base.ty), Some(TypeKind::Record(_))) {
                             return self.fail(
                                 "CCC2233",
@@ -1544,11 +1613,17 @@ impl<'a> Analyzer<'a> {
                                 (
                                     resolved.name,
                                     resolved.ty,
-                                    !resolved.variable_length_bounds.is_empty(),
+                                    !info.variable_length_bounds.is_empty()
+                                        || !resolved.variable_length_bounds.is_empty(),
                                     resolved.attributes,
                                 )
                             } else {
-                                (None, info.base, false, Vec::new())
+                                (
+                                    None,
+                                    info.base,
+                                    !info.variable_length_bounds.is_empty(),
+                                    Vec::new(),
+                                )
                             };
                         if let Some(name) = &name
                             && !field_names.insert(name.clone())
@@ -1828,6 +1903,7 @@ impl<'a> Analyzer<'a> {
             id,
             name: name.clone(),
             ty,
+            variable_length_bounds: Vec::new(),
             attributes,
             span,
         });
@@ -2289,8 +2365,13 @@ impl<'a> Analyzer<'a> {
             self.reject_alignment_specifier(&info, declaration.span, "a type declaration")?;
         }
         let mut output = Vec::new();
-        for init in &declaration.declarators {
-            let resolved = self.resolve_declarator(info.base, &init.declarator)?;
+        for (declarator_index, init) in declaration.declarators.iter().enumerate() {
+            let mut resolved = self.resolve_declarator(info.base, &init.declarator)?;
+            if declarator_index == 0 {
+                let mut bounds = info.variable_length_bounds.clone();
+                bounds.extend(resolved.variable_length_bounds);
+                resolved.variable_length_bounds = bounds;
+            }
             let Some(name) = resolved.name.clone() else {
                 return self.fail(
                     "CCC2254",
@@ -2324,29 +2405,36 @@ impl<'a> Analyzer<'a> {
                         "a typedef cannot have an initializer or assembly label",
                     );
                 }
-                if !resolved.variable_length_bounds.is_empty() {
-                    return self.fail(
-                        "CCC2416",
-                        init.span,
-                        "variably modified typedef bounds cannot yet be preserved",
-                    );
-                }
                 let id = TypedefId(self.typedefs.len() as u32);
+                let ty = self.apply_typedef_alignment(
+                    resolved.ty,
+                    &attributes,
+                    declaration.declarators.len() == 1
+                        && defines_inline_anonymous_record(&declaration.specifiers),
+                    init.span,
+                )?;
+                let variably_modified =
+                    !resolved.variable_length_bounds.is_empty() || self.is_variably_modified(ty.ty);
                 let typed = FullTypedTypedef {
                     id,
                     name: name.clone(),
-                    ty: self.apply_typedef_alignment(
-                        resolved.ty,
-                        &attributes,
-                        declaration.declarators.len() == 1
-                            && defines_inline_anonymous_record(&declaration.specifiers),
-                        init.span,
-                    )?,
+                    ty,
+                    variable_length_bounds: resolved.variable_length_bounds,
                     attributes,
                     span: init.span,
                 };
                 self.bind_current(name, OrdinarySymbol::Typedef(id, typed.ty), init.span)?;
                 self.typedefs.push(typed.clone());
+                if variably_modified {
+                    let function = self
+                        .function
+                        .as_mut()
+                        .expect("block-scope variably modified typedefs occur inside functions");
+                    function
+                        .active_variably_modified_path
+                        .push(VariablyModifiedScopeEntry::Typedef(id));
+                    function.has_variably_modified_declaration = true;
+                }
                 output.push(FullTypedBlockItem::Typedef(Box::new(typed)));
                 continue;
             }
@@ -2364,7 +2452,9 @@ impl<'a> Analyzer<'a> {
                     "a block-scope function declaration",
                 )?;
                 self.reject_alignment_specifier(&info, init.span, "a function")?;
-                if !resolved.variable_length_bounds.is_empty() {
+                if !resolved.variable_length_bounds.is_empty()
+                    || self.is_variably_modified(resolved.ty.ty)
+                {
                     return self.fail(
                         "CCC2418",
                         init.span,
@@ -2575,8 +2665,10 @@ impl<'a> Analyzer<'a> {
                     .function
                     .as_mut()
                     .expect("variably modified locals occur inside a function");
-                function.active_variably_modified_path.push(local);
-                function.has_variably_modified_local = true;
+                function
+                    .active_variably_modified_path
+                    .push(VariablyModifiedScopeEntry::Object(local));
+                function.has_variably_modified_declaration = true;
             }
             output.push(FullTypedBlockItem::Declaration(Box::new(
                 FullTypedLocalDeclaration {
@@ -3417,24 +3509,32 @@ impl<'a> Analyzer<'a> {
     ) -> AnalysisResult<Vec<FullTypedBlockItem>> {
         let mut output = Vec::new();
         for item in items {
-            match item {
+            if self.error_limit_reached() {
+                break;
+            }
+            let analyzed = match item {
                 syntax::BlockItem::Declaration(declaration) => {
-                    output.extend(self.analyze_block_declaration(declaration)?);
+                    self.analyze_block_declaration(declaration)
                 }
                 syntax::BlockItem::StaticAssert(assertion) => {
-                    let value = self.analyze_static_assert(assertion)?;
-                    output.push(FullTypedBlockItem::StaticAssert {
-                        value,
-                        span: assertion.span,
-                    });
+                    self.analyze_static_assert(assertion).map(|value| {
+                        vec![FullTypedBlockItem::StaticAssert {
+                            value,
+                            span: assertion.span,
+                        }]
+                    })
                 }
-                syntax::BlockItem::Statement(statement) => output.push(
-                    FullTypedBlockItem::Statement(Box::new(self.analyze_statement(statement)?)),
-                ),
-                syntax::BlockItem::Pragma(pragma) => {
-                    self.handle_pragma(pragma)?;
-                    output.push(FullTypedBlockItem::Pragma(pragma.clone()));
-                }
+                syntax::BlockItem::Statement(statement) => self
+                    .analyze_statement(statement)
+                    .map(|statement| vec![FullTypedBlockItem::Statement(Box::new(statement))]),
+                syntax::BlockItem::Pragma(pragma) => self
+                    .handle_pragma(pragma)
+                    .map(|()| vec![FullTypedBlockItem::Pragma(pragma.clone())]),
+            };
+            if let Ok(items) = analyzed {
+                output.extend(items);
+            } else if let syntax::BlockItem::Declaration(declaration) = item {
+                self.poison_declaration_bindings(declaration, false);
             }
         }
         Ok(output)
@@ -3522,11 +3622,10 @@ impl<'a> Analyzer<'a> {
             E::StatementExpression(items) => {
                 self.analyze_statement_expression(items, expression.span)
             }
-            E::GenericSelection { .. } => self.fail(
-                "CCC2270",
-                expression.span,
-                "generic selections are parsed but are not semantically supported",
-            ),
+            E::GenericSelection {
+                controlling,
+                associations,
+            } => self.analyze_generic_selection(controlling, associations, expression.span),
             E::Subscript { base, index } => self.analyze_subscript(base, index, expression.span),
             E::Call { callee, arguments } => self.analyze_call(callee, arguments, expression.span),
             E::Member {
@@ -3548,17 +3647,26 @@ impl<'a> Analyzer<'a> {
             }
             E::SizeofExpression(operand) => {
                 let operand = self.analyze_expression(operand)?;
-                self.analyze_sizeof(operand.ty, expression.span)
+                let operand_ty = operand.ty;
+                let evaluated =
+                    runtime_sized_array(&self.types, operand_ty.ty).then(|| Box::new(operand));
+                self.analyze_sizeof(operand_ty, evaluated, expression.span)
             }
             E::SizeofType(type_name) => {
-                let ty = self.resolve_type_name(type_name)?;
-                self.analyze_sizeof(ty, expression.span)
+                let (ty, bounds) = self.resolve_type_name_with_bounds(type_name)?;
+                let bounds = bounds_for_runtime_type(bounds, ty, &self.types);
+                let sized = self.analyze_sizeof(ty, None, expression.span)?;
+                Ok(self.with_variable_length_bounds(bounds, sized, expression.span))
             }
             E::AlignofType(type_name) => {
-                let ty = self.resolve_type_name(type_name)?;
-                let layout = self.types.layout_of(ty.ty, self.config).map_err(|error| {
-                    self.emit("CCC2272", expression.span, error.to_string());
-                })?;
+                let (ty, _) = self.resolve_type_name_with_bounds(type_name)?;
+                let layout_ty = innermost_array_element(&self.types, ty).ty;
+                let layout = self
+                    .types
+                    .layout_of(layout_ty, self.config)
+                    .map_err(|error| {
+                        self.emit("CCC2272", expression.span, error.to_string());
+                    })?;
                 let result_ty = QualifiedType::unqualified(self.size_type());
                 Ok(FullTypedExpression {
                     kind: FullTypedExpressionKind::Alignof {
@@ -3577,10 +3685,11 @@ impl<'a> Analyzer<'a> {
                 ty: type_name,
                 expression: operand,
             } => {
-                let target = self.resolve_type_name(type_name)?;
+                let (target, bounds) = self.resolve_type_name_with_bounds(type_name)?;
                 let operand = self.analyze_expression(operand)?;
                 let operand = self.value_conversion(operand)?;
-                self.explicit_conversion(operand, target, expression.span)
+                let converted = self.explicit_conversion(operand, target, expression.span)?;
+                Ok(self.with_variable_length_bounds(bounds, converted, expression.span))
             }
             E::Binary {
                 operator,
@@ -3782,27 +3891,195 @@ impl<'a> Analyzer<'a> {
         initializer: &syntax::Initializer,
         span: Span,
     ) -> AnalysisResult<FullTypedExpression> {
-        if self.function.is_none() {
+        let (declared_ty, variable_length_bounds) =
+            self.resolve_type_name_with_bounds(type_name)?;
+        if !variable_length_bounds.is_empty() || self.is_variably_modified(declared_ty.ty) {
             return self.fail(
                 "CCC2430",
                 span,
-                "file-scope compound literals are not yet supported",
+                "a compound literal may not have variably modified type",
             );
         }
-        let declared_ty = self.resolve_type_name(type_name)?;
         let (initializer, completed_ty) = self.analyze_initializer(declared_ty, initializer)?;
         self.validate_object_type(completed_ty, span, true)?;
-        let local = self.fresh_local();
+        if self.is_variably_modified(completed_ty.ty) {
+            return self.fail(
+                "CCC2430",
+                span,
+                "a compound literal may not have variably modified type",
+            );
+        }
+
+        let (storage, place_base, constant) = if self.function.is_some() {
+            let local = self.fresh_local();
+            (
+                CompoundLiteralStorage::Automatic(local),
+                PlaceBase::CompoundLiteral(local),
+                None,
+            )
+        } else {
+            if !initializer_is_static(&initializer) {
+                return self.fail(
+                    "CCC2344",
+                    span,
+                    "a file-scope compound literal requires a constant or relocatable initializer",
+                );
+            }
+            if self.initializer_references_thread_storage(&initializer) {
+                return self.fail(
+                    "CCC2344",
+                    span,
+                    "a file-scope compound literal cannot contain the address of a thread-local object",
+                );
+            }
+            let id = GlobalId(self.globals.len() as u32);
+            let symbol_name = format!("__ccc_file_compound_literal.{}", id.0);
+            self.globals.push(FullTypedGlobal {
+                id,
+                name: format!("<compound-literal-{}>", id.0),
+                ty: completed_ty,
+                storage: SemanticStorageClass::Static,
+                linkage: Linkage::Internal,
+                duration: StorageDuration::Static,
+                initializer: Some(initializer.clone()),
+                tentative: false,
+                asm_label: None,
+                attributes: Vec::new(),
+                emission: GlobalEmission {
+                    symbol_name,
+                    symbol_name_is_exact: false,
+                    binding: SymbolBinding::Strong,
+                    visibility: SymbolVisibility::Internal,
+                    section: None,
+                    requested_alignment: None,
+                    tls: None,
+                    definition: ObjectDefinitionPolicy::Definition,
+                },
+                span,
+            });
+            (
+                CompoundLiteralStorage::Static(id),
+                PlaceBase::Global(id),
+                Some(ConstantValue::Address(RelocatableAddress {
+                    base: RelocatableBase::Global(id),
+                    addend: 0,
+                    one_past: false,
+                })),
+            )
+        };
         Ok(FullTypedExpression {
             kind: FullTypedExpressionKind::CompoundLiteral {
-                local,
+                storage,
                 initializer: Box::new(initializer),
             },
             ty: completed_ty,
             category: ValueCategory::Lvalue,
-            place: Some(self.object_place(PlaceBase::CompoundLiteral(local), completed_ty, true)),
-            constant: None,
+            place: Some(self.object_place(place_base, completed_ty, true)),
+            constant,
             constant_expression_kind: ConstantExpressionKind::Invalid,
+            span,
+        })
+    }
+
+    fn analyze_generic_selection(
+        &mut self,
+        controlling: &syntax::Expression,
+        associations: &[syntax::GenericAssociation],
+        span: Span,
+    ) -> AnalysisResult<FullTypedExpression> {
+        let controlling = self.analyze_expression(controlling)?;
+        let controlling_ty = self.value_conversion(controlling)?.ty;
+
+        let mut typed_associations = Vec::with_capacity(associations.len());
+        let mut association_types: Vec<(QualifiedType, Span)> = Vec::new();
+        let mut default_index = None;
+
+        for association in associations {
+            let association_ty = if let Some(type_name) = &association.ty {
+                let (ty, variable_length_bounds) = self.resolve_type_name_with_bounds(type_name)?;
+                self.validate_object_type(ty, type_name.span, true)?;
+                if !variable_length_bounds.is_empty() || self.is_variably_modified(ty.ty) {
+                    return self.fail(
+                        "CCC2270",
+                        type_name.span,
+                        "a generic association may not specify a variably modified type",
+                    );
+                }
+                if let Some((_, previous_span)) = association_types
+                    .iter()
+                    .find(|(previous, _)| self.types_compatible(*previous, ty))
+                {
+                    return self.fail(
+                        "CCC2270",
+                        type_name.span,
+                        format!(
+                            "generic associations specify compatible type `{}` more than once (first specified at byte {})",
+                            self.types.display_qualified(ty),
+                            previous_span.start
+                        ),
+                    );
+                }
+                association_types.push((ty, type_name.span));
+                Some(ty)
+            } else {
+                if default_index.replace(typed_associations.len()).is_some() {
+                    return self.fail(
+                        "CCC2270",
+                        association.span,
+                        "a generic selection may contain at most one default association",
+                    );
+                }
+                None
+            };
+            let typed = self.analyze_expression(&association.expression)?;
+            typed_associations.push((association_ty, typed));
+        }
+
+        let matching = typed_associations
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (ty, _))| {
+                ty.is_some_and(|ty| self.types_compatible(controlling_ty, ty))
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        let selected_index = match matching.as_slice() {
+            [selected] => *selected,
+            [] => default_index.ok_or_else(|| {
+                self.emit(
+                    "CCC2270",
+                    span,
+                    format!(
+                        "no generic association is compatible with controlling type `{}` and no default was provided",
+                        self.types.display_qualified(controlling_ty)
+                    ),
+                );
+            })?,
+            _ => {
+                return self.fail(
+                    "CCC2270",
+                    span,
+                    "the controlling expression matches more than one generic association",
+                );
+            }
+        };
+
+        let selected = typed_associations.swap_remove(selected_index).1;
+        let selected_ty = selected.ty;
+        let selected_category = selected.category;
+        let selected_place = selected.place.clone();
+        let selected_constant = selected.constant;
+        let selected_constant_expression_kind = selected.constant_expression_kind;
+        Ok(FullTypedExpression {
+            kind: FullTypedExpressionKind::GenericSelection {
+                controlling_ty,
+                selected: Box::new(selected),
+            },
+            ty: selected_ty,
+            category: selected_category,
+            place: selected_place,
+            constant: selected_constant,
+            constant_expression_kind: selected_constant_expression_kind,
             span,
         })
     }
@@ -4694,6 +4971,9 @@ impl<'a> Analyzer<'a> {
         expression: &FullTypedExpression,
     ) -> PointerAlignmentProvenance {
         match &expression.kind {
+            FullTypedExpressionKind::GenericSelection { selected, .. } => {
+                self.pointer_alignment_provenance(selected)
+            }
             FullTypedExpressionKind::AddressOf(object) => self.lvalue_alignment_provenance(object),
             FullTypedExpressionKind::Conversion {
                 kind: ConversionKind::ArrayToPointer,
@@ -4749,6 +5029,9 @@ impl<'a> Analyzer<'a> {
         expression: &FullTypedExpression,
     ) -> PointerAlignmentProvenance {
         match &expression.kind {
+            FullTypedExpressionKind::GenericSelection { selected, .. } => {
+                self.lvalue_alignment_provenance(selected)
+            }
             FullTypedExpressionKind::Member {
                 base,
                 field_index,
@@ -5227,6 +5510,18 @@ impl<'a> Analyzer<'a> {
         identifier: &syntax::Identifier,
     ) -> AnalysisResult<FullTypedExpression> {
         let Some(symbol) = self.lookup_ordinary(&identifier.name).cloned() else {
+            if self.identifier_is_poisoned(identifier) {
+                let constant = ConstantValue::Signed(0);
+                return Ok(FullTypedExpression {
+                    kind: FullTypedExpressionKind::Constant(constant),
+                    ty: QualifiedType::unqualified(TypeId::INT),
+                    category: ValueCategory::Value,
+                    place: None,
+                    constant: Some(constant),
+                    constant_expression_kind: ConstantExpressionKind::Invalid,
+                    span: identifier.span,
+                });
+            }
             return self.fail(
                 "CCC2274",
                 identifier.span,
@@ -5322,6 +5617,18 @@ impl<'a> Analyzer<'a> {
                     format!("typedef name `{}` is not an expression", identifier.name),
                 );
             }
+            OrdinarySymbol::Poisoned => {
+                let constant = ConstantValue::Signed(0);
+                return Ok(FullTypedExpression {
+                    kind: FullTypedExpressionKind::Constant(constant),
+                    ty: QualifiedType::unqualified(TypeId::INT),
+                    category: ValueCategory::Value,
+                    place: None,
+                    constant: Some(constant),
+                    constant_expression_kind: ConstantExpressionKind::Invalid,
+                    span: identifier.span,
+                });
+            }
         };
         let constant_expression_kind = if matches!(reference, SymbolReference::Enumerator { .. }) {
             ConstantExpressionKind::Integer
@@ -5337,6 +5644,40 @@ impl<'a> Analyzer<'a> {
             constant_expression_kind,
             span: identifier.span,
         })
+    }
+
+    fn identifier_is_poisoned(&self, identifier: &syntax::Identifier) -> bool {
+        self.poisoned_bindings.iter().any(|binding| {
+            binding.name == identifier.name
+                && binding.binding.file == identifier.span.file
+                && identifier.span.start >= binding.binding.end
+                && identifier.span.start < binding.scope_end
+        })
+    }
+
+    fn poison_declaration_bindings(&mut self, declaration: &syntax::Declaration, file: bool) {
+        for identifier in declaration
+            .declarators
+            .iter()
+            .filter_map(|declarator| declarator.declarator.identifier())
+        {
+            let exists = if file {
+                self.scopes.lookup_file_ordinary(&identifier.name).is_some()
+            } else {
+                self.scopes.current_ordinary(&identifier.name).is_some()
+            };
+            if exists {
+                continue;
+            }
+            let result = if file {
+                self.scopes
+                    .bind_file_ordinary(identifier.name.clone(), OrdinarySymbol::Poisoned)
+            } else {
+                self.scopes
+                    .bind_current_ordinary(identifier.name.clone(), OrdinarySymbol::Poisoned)
+            };
+            debug_assert!(result.is_ok());
+        }
     }
 
     fn predefined_function_name_string(&mut self) -> (StringId, QualifiedType) {
@@ -6658,7 +6999,7 @@ impl<'a> Analyzer<'a> {
         let local = self.fresh_local();
         let literal = FullTypedExpression {
             kind: FullTypedExpressionKind::CompoundLiteral {
-                local,
+                storage: CompoundLiteralStorage::Automatic(local),
                 initializer: Box::new(initializer),
             },
             ty: target,
@@ -6674,27 +7015,62 @@ impl<'a> Analyzer<'a> {
     fn analyze_sizeof(
         &mut self,
         operand_ty: QualifiedType,
+        operand: Option<Box<FullTypedExpression>>,
         span: Span,
     ) -> AnalysisResult<FullTypedExpression> {
-        let layout = self
-            .types
-            .layout_of(operand_ty.ty, self.config)
-            .map_err(|error| {
-                self.emit("CCC2301", span, error.to_string());
-            })?;
+        let size = if runtime_sized_array(&self.types, operand_ty.ty) {
+            None
+        } else {
+            Some(
+                self.types
+                    .layout_of(operand_ty.ty, self.config)
+                    .map_err(|error| {
+                        self.emit("CCC2301", span, error.to_string());
+                    })?
+                    .size,
+            )
+        };
         let result_ty = QualifiedType::unqualified(self.size_type());
         Ok(FullTypedExpression {
             kind: FullTypedExpressionKind::Sizeof {
+                operand,
                 operand_ty,
-                size: layout.size,
+                size,
             },
             ty: result_ty,
             category: ValueCategory::Value,
             place: None,
-            constant: Some(ConstantValue::Unsigned(u128::from(layout.size))),
-            constant_expression_kind: ConstantExpressionKind::Integer,
+            constant: size.map(|size| ConstantValue::Unsigned(u128::from(size))),
+            constant_expression_kind: if size.is_some() {
+                ConstantExpressionKind::Integer
+            } else {
+                ConstantExpressionKind::Invalid
+            },
             span,
         })
+    }
+
+    fn with_variable_length_bounds(
+        &self,
+        bounds: Vec<FullTypedVariableLengthBound>,
+        expression: FullTypedExpression,
+        span: Span,
+    ) -> FullTypedExpression {
+        if bounds.is_empty() {
+            return expression;
+        }
+        FullTypedExpression {
+            kind: FullTypedExpressionKind::VariableLengthBoundEvaluation {
+                bounds,
+                expression: Box::new(expression.clone()),
+            },
+            ty: expression.ty,
+            category: expression.category,
+            place: expression.place,
+            constant: None,
+            constant_expression_kind: ConstantExpressionKind::Invalid,
+            span,
+        }
     }
 
     fn analyze_offsetof(
@@ -6715,7 +7091,14 @@ impl<'a> Analyzer<'a> {
                 "`__builtin_offsetof` requires implemented target-layout semantics",
             );
         }
-        let record_ty = self.resolve_type_name(type_name)?;
+        let (record_ty, variable_length_bounds) = self.resolve_type_name_with_bounds(type_name)?;
+        if !variable_length_bounds.is_empty() || self.is_variably_modified(record_ty.ty) {
+            return self.fail(
+                "CCC2302",
+                type_name.span,
+                "offsetof requires a non-variably-modified record type",
+            );
+        }
         let mut current = record_ty;
         let mut offset = 0_u64;
         let mut path = Vec::new();
@@ -6837,6 +7220,14 @@ impl<'a> Analyzer<'a> {
         match initializer {
             syntax::Initializer::Expression(expression) => {
                 let expression = self.analyze_expression(expression)?;
+                if !matches!(self.types.try_kind(ty.ty), Some(TypeKind::Array(_)))
+                    && self.type_ids_compatible(ty.ty, expression.ty.ty)
+                    && let Some(initializer) = static_compound_literal_initializer(&expression)
+                {
+                    let mut initializer = initializer.clone();
+                    initializer.ty = ty;
+                    return Ok((initializer, ty));
+                }
                 if let Some(TypeKind::Array(array)) = self.types.try_kind(ty.ty).cloned()
                     && let FullTypedExpressionKind::StringLiteral(string) = expression.kind
                 {
@@ -7834,7 +8225,7 @@ impl<'a> Analyzer<'a> {
         let left = self.pointer_pointee(left)?;
         let right = self.pointer_pointee(right)?;
         let pointee = if self.type_ids_compatible(left.ty, right.ty) {
-            left.ty
+            self.composite_type_id(left.ty, right.ty)?
         } else if left.ty == TypeId::VOID || right.ty == TypeId::VOID {
             TypeId::VOID
         } else {
@@ -8445,16 +8836,56 @@ impl<'a> Analyzer<'a> {
     }
 
     fn is_variably_modified(&self, ty: TypeId) -> bool {
-        match self.types.try_kind(ty) {
-            Some(TypeKind::Array(array)) => {
-                matches!(
-                    array.length,
-                    ArrayLength::Variable(_) | ArrayLength::UnspecifiedVariable(_)
-                ) || self.is_variably_modified(array.element.ty)
+        fn visit(types: &TypeStore, ty: TypeId, active: &mut HashSet<TypeId>) -> bool {
+            if !active.insert(ty) {
+                return false;
             }
-            Some(TypeKind::Pointer(pointer)) => self.is_variably_modified(pointer.pointee.ty),
-            _ => false,
+            let result = match types.try_kind(ty) {
+                Some(TypeKind::Array(array)) => {
+                    matches!(
+                        array.length,
+                        ArrayLength::Variable(_) | ArrayLength::UnspecifiedVariable(_)
+                    ) || visit(types, array.element.ty, active)
+                }
+                Some(TypeKind::Pointer(pointer)) => visit(types, pointer.pointee.ty, active),
+                // Function parameters may have variably modified types in a
+                // prototype. Only a variably modified result makes the
+                // function type itself variably modified for these
+                // declaration constraints.
+                Some(TypeKind::Function(signature)) => visit(types, signature.result.ty, active),
+                Some(TypeKind::AlignmentAdjusted(adjusted)) => {
+                    visit(types, adjusted.underlying, active)
+                }
+                _ => false,
+            };
+            active.remove(&ty);
+            result
         }
+
+        visit(&self.types, ty, &mut HashSet::new())
+    }
+
+    fn has_runtime_and_zero_array_dimensions(&self, ty: TypeId) -> bool {
+        let mut current = ty;
+        let mut has_runtime_bound = false;
+        let mut has_zero_length = false;
+        while let Some(TypeKind::Array(array)) = self
+            .types
+            .try_kind(self.types.without_alignment_adjustment(current))
+        {
+            match array.length {
+                ArrayLength::Constant(0) => has_zero_length = true,
+                ArrayLength::Variable(_) | ArrayLength::UnspecifiedVariable(_) => {
+                    has_runtime_bound = true;
+                }
+                ArrayLength::Constant(_) | ArrayLength::Incomplete => {}
+            }
+            if has_runtime_bound && has_zero_length {
+                return true;
+            }
+            current = array.element.ty;
+        }
+        false
     }
 
     fn requires_runtime_sized_storage(&self, ty: TypeId) -> bool {
@@ -9475,7 +9906,7 @@ impl<'a> Analyzer<'a> {
                     .then_some((jump.span, *definition_span))
             })
             .collect::<Vec<_>>();
-        let computed_gotos = if function.has_variably_modified_local {
+        let computed_gotos = if function.has_variably_modified_declaration {
             function.computed_gotos.clone()
         } else {
             Vec::new()
@@ -9487,7 +9918,7 @@ impl<'a> Analyzer<'a> {
             self.diagnostics.push(
                 Diagnostic::error(
                     "CCC2442",
-                    "a goto cannot enter the scope of a variably modified object",
+                    "a goto cannot enter the scope of an identifier with variably modified type",
                 )
                 .with_primary(jump_span, "this jump bypasses the declaration")
                 .with_secondary(definition_span, "the target is inside that scope"),
@@ -9497,7 +9928,7 @@ impl<'a> Analyzer<'a> {
             self.emit(
                 "CCC2442",
                 span,
-                "a computed goto is not supported in a function with variably modified automatic objects",
+                "a computed goto is not supported in a function with variably modified declarations",
             );
         }
     }
@@ -9516,7 +9947,7 @@ impl<'a> Analyzer<'a> {
             return self.fail(
                 "CCC2442",
                 span,
-                "a switch label cannot bypass the declaration of a variably modified object",
+                "a switch label cannot bypass a declaration with variably modified type",
             );
         }
         Ok(())
@@ -9658,8 +10089,16 @@ impl<'a> Analyzer<'a> {
     }
 
     fn emit(&mut self, code: &'static str, span: Span, message: impl Into<String>) {
+        if self.error_limit_reached() {
+            return;
+        }
         self.diagnostics
             .push(Diagnostic::error(code, message.into()).with_primary_span(span));
+    }
+
+    fn error_limit_reached(&self) -> bool {
+        self.error_limit
+            .is_some_and(|limit| self.diagnostics.len() >= limit)
     }
 
     fn fail<T>(
@@ -9981,6 +10420,49 @@ fn logical_constant_expression_kind(
     }
 }
 
+fn runtime_sized_array(types: &ccc_types::TypeStore, mut ty: TypeId) -> bool {
+    while let Some(TypeKind::Array(array)) = types.try_kind(ty) {
+        if matches!(array.length, ArrayLength::Variable(_)) {
+            return true;
+        }
+        ty = array.element.ty;
+    }
+    false
+}
+
+fn innermost_array_element(types: &ccc_types::TypeStore, mut ty: QualifiedType) -> QualifiedType {
+    while let Some(TypeKind::Array(array)) = types.try_kind(ty.ty) {
+        ty = array.element;
+    }
+    ty
+}
+
+fn runtime_size_bound_ids(
+    types: &ccc_types::TypeStore,
+    mut ty: TypeId,
+) -> HashSet<VariableLengthId> {
+    let mut ids = HashSet::new();
+    while let Some(TypeKind::Array(array)) = types.try_kind(ty) {
+        if let ArrayLength::Variable(id) = array.length {
+            ids.insert(id);
+        }
+        ty = array.element.ty;
+    }
+    ids
+}
+
+fn bounds_for_runtime_type(
+    bounds: Vec<FullTypedVariableLengthBound>,
+    ty: QualifiedType,
+    types: &ccc_types::TypeStore,
+) -> Vec<FullTypedVariableLengthBound> {
+    let required = runtime_size_bound_ids(types, ty.ty);
+    bounds
+        .into_iter()
+        .filter(|bound| required.contains(&bound.id))
+        .collect()
+}
+
 fn conditional_constant_expression_kind(
     condition: &FullTypedExpression,
     then_expression: &FullTypedExpression,
@@ -10016,13 +10498,12 @@ fn builtin_expect_folded_constant(expression: &FullTypedExpression) -> bool {
     use syntax::BinaryOperator as B;
 
     match &expression.kind {
-        E::Constant(_)
-        | E::StringLiteral(_)
-        | E::Sizeof { .. }
-        | E::Alignof { .. }
-        | E::Offsetof { .. } => true,
+        E::Constant(_) | E::StringLiteral(_) | E::Alignof { .. } | E::Offsetof { .. } => true,
+        E::Sizeof { size, .. } => size.is_some(),
         E::DeclRef(SymbolReference::Enumerator { .. }) => true,
         E::DeclRef(_) => false,
+        E::GenericSelection { selected, .. } => builtin_expect_folded_constant(selected),
+        E::VariableLengthBoundEvaluation { .. } => false,
         E::Conversion {
             kind: ConversionKind::LvalueToValue { .. },
             ..
@@ -10108,6 +10589,9 @@ fn builtin_expect_folded_constant(expression: &FullTypedExpression) -> bool {
 fn direct_function_reference(expression: &FullTypedExpression) -> Option<FullFunctionId> {
     match &expression.kind {
         FullTypedExpressionKind::DeclRef(SymbolReference::Function(id)) => Some(*id),
+        FullTypedExpressionKind::GenericSelection { selected, .. } => {
+            direct_function_reference(selected)
+        }
         FullTypedExpressionKind::Conversion {
             kind: ConversionKind::FunctionToPointer,
             expression,
@@ -10123,6 +10607,21 @@ fn initializer_is_static(initializer: &FullTypedInitializer) -> bool {
             .iter()
             .all(|entry| initializer_is_static(&entry.initializer)),
         FullTypedInitializerKind::String(_) | FullTypedInitializerKind::Zero => true,
+    }
+}
+
+fn static_compound_literal_initializer(
+    expression: &FullTypedExpression,
+) -> Option<&FullTypedInitializer> {
+    match &expression.kind {
+        FullTypedExpressionKind::CompoundLiteral {
+            storage: CompoundLiteralStorage::Static(_),
+            initializer,
+        } => Some(initializer),
+        FullTypedExpressionKind::GenericSelection { selected, .. } => {
+            static_compound_literal_initializer(selected)
+        }
+        _ => None,
     }
 }
 
@@ -10553,8 +11052,11 @@ fn evaluate_apfloat_binary<F: Float>(
     }
 }
 
-fn variably_modified_path_enters(source: &[FullLocalId], target: &[FullLocalId]) -> bool {
-    target.iter().any(|local| !source.contains(local))
+fn variably_modified_path_enters(
+    source: &[VariablyModifiedScopeEntry],
+    target: &[VariablyModifiedScopeEntry],
+) -> bool {
+    target.iter().any(|entry| !source.contains(entry))
 }
 
 fn has_direct_label_address_provenance(expression: &FullTypedExpression) -> bool {
@@ -10568,6 +11070,9 @@ fn has_direct_label_address_provenance(expression: &FullTypedExpression) -> bool
         return true;
     }
     match &expression.kind {
+        FullTypedExpressionKind::GenericSelection { selected, .. } => {
+            has_direct_label_address_provenance(selected)
+        }
         FullTypedExpressionKind::Conversion { expression, .. } => {
             has_direct_label_address_provenance(expression)
         }

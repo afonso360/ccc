@@ -12,6 +12,13 @@ pub enum Severity {
     Note,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DiagnosticFormat {
+    #[default]
+    Text,
+    Json,
+}
+
 impl Severity {
     const fn as_str(self) -> &'static str {
         match self {
@@ -58,6 +65,7 @@ pub struct Diagnostic {
     pub primary: Option<Box<PrimarySpan>>,
     pub secondary: Vec<SecondarySpan>,
     pub notes: Vec<String>,
+    warning_option: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -98,6 +106,7 @@ impl Diagnostic {
             primary: None,
             secondary: Vec::new(),
             notes: Vec::new(),
+            warning_option: false,
         }
     }
 
@@ -110,7 +119,9 @@ impl Diagnostic {
         category: impl Into<WarningCategory>,
         message: impl Into<String>,
     ) -> Self {
-        Self::new(Severity::Warning, code, message).with_category(category)
+        let mut diagnostic = Self::new(Severity::Warning, code, message).with_category(category);
+        diagnostic.warning_option = true;
+        diagnostic
     }
 
     pub fn with_category(mut self, category: impl Into<WarningCategory>) -> Self {
@@ -203,11 +214,15 @@ impl Diagnostic {
 }
 
 fn render_header(diagnostic: &Diagnostic) -> String {
-    let category = diagnostic
-        .category
-        .as_ref()
-        .map(|category| format!(" [-W{category}]"))
-        .unwrap_or_default();
+    let category = if diagnostic.warning_option {
+        diagnostic
+            .category
+            .as_ref()
+            .map(|category| format!(" [-W{category}]"))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     format!(
         "{}[{}]{category}: {}\n",
         diagnostic.severity.as_str(),
@@ -525,13 +540,16 @@ impl DiagnosticEngine {
         self.diagnostics.push(diagnostic);
 
         if self.options.error_limit != 0 && self.error_count >= self.options.error_limit {
-            self.diagnostics.push(Diagnostic::error(
-                "CCC0000",
-                format!(
-                    "too many errors emitted; stopping after {}",
-                    self.options.error_limit
-                ),
-            ));
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "CCC0000",
+                    format!(
+                        "too many errors emitted; stopping after {}",
+                        self.options.error_limit
+                    ),
+                )
+                .with_category("diagnostics"),
+            );
             self.halted = true;
         }
 
@@ -564,6 +582,273 @@ impl DiagnosticEngine {
             .map(|diagnostic| diagnostic.render_with_options(sources, self.options.render))
             .collect()
     }
+
+    pub fn render_format(&self, sources: &SourceMap, format: DiagnosticFormat) -> String {
+        match format {
+            DiagnosticFormat::Text => self.render(sources),
+            DiagnosticFormat::Json => {
+                render_json_document(&self.diagnostics, sources, self.options.render)
+            }
+        }
+    }
+}
+
+/// Renders a complete, deterministic machine-readable diagnostic document.
+/// Schema changes require incrementing `schema_version`.
+pub fn render_json_document(
+    diagnostics: &[Diagnostic],
+    sources: &SourceMap,
+    options: RenderOptions,
+) -> String {
+    let mut output = String::from("{\"schema_version\":1,\"diagnostics\":[");
+    for (index, diagnostic) in diagnostics.iter().enumerate() {
+        if index != 0 {
+            output.push(',');
+        }
+        render_json_diagnostic(&mut output, diagnostic, sources, options);
+    }
+    output.push_str("]}\n");
+    output
+}
+
+fn render_json_diagnostic(
+    output: &mut String,
+    diagnostic: &Diagnostic,
+    sources: &SourceMap,
+    options: RenderOptions,
+) {
+    output.push('{');
+    json_field_string(output, "severity", diagnostic.severity.as_str());
+    output.push(',');
+    json_field_string(output, "code", &diagnostic.code);
+    output.push_str(",\"category\":");
+    json_optional_string(
+        output,
+        diagnostic
+            .category
+            .as_ref()
+            .map(|category| category.as_str()),
+    );
+    output.push(',');
+    json_field_string(output, "message", &diagnostic.message);
+    output.push_str(",\"primary\":");
+    if let Some(primary) = &diagnostic.primary {
+        render_json_annotation(output, sources, primary.span, primary.label.as_deref());
+    } else {
+        output.push_str("null");
+    }
+    output.push_str(",\"secondary\":[");
+    for (index, secondary) in diagnostic.secondary.iter().enumerate() {
+        if index != 0 {
+            output.push(',');
+        }
+        render_json_annotation(output, sources, secondary.span, secondary.label.as_deref());
+    }
+    output.push_str("],\"notes\":[");
+    for (index, note) in diagnostic.notes.iter().enumerate() {
+        if index != 0 {
+            output.push(',');
+        }
+        json_string(output, note);
+    }
+    output.push_str("],\"include_trace\":");
+    if let Some(primary) = &diagnostic.primary {
+        render_json_include_trace(output, sources, primary.span, options.include_trace_limit);
+    } else {
+        output.push_str("{\"truncated\":false,\"frames\":[]}");
+    }
+    output.push_str(",\"macro_trace\":");
+    if let Some(primary) = &diagnostic.primary {
+        render_json_macro_trace(output, sources, primary.span, options.macro_backtrace_limit);
+    } else {
+        output.push_str("{\"truncated\":false,\"frames\":[]}");
+    }
+    output.push('}');
+}
+
+fn render_json_annotation(
+    output: &mut String,
+    sources: &SourceMap,
+    span: Span,
+    label: Option<&str>,
+) {
+    output.push_str("{\"label\":");
+    json_optional_string(output, label);
+    output.push_str(",\"location\":");
+    render_json_location(output, sources, span);
+    output.push('}');
+}
+
+fn render_json_location(output: &mut String, sources: &SourceMap, span: Span) {
+    let Some(spec) = sources.file_spec(span.file) else {
+        output.push_str("null");
+        return;
+    };
+    let start = sources.presumed_location(span.file, span.start);
+    let end = sources.presumed_location(span.file, span.end);
+    output.push('{');
+    json_field_string(output, "spelled_path", &spec.spelled_path.to_string_lossy());
+    output.push(',');
+    json_field_string(
+        output,
+        "resolved_path",
+        &spec.resolved_path.to_string_lossy(),
+    );
+    output.push(',');
+    json_field_string(
+        output,
+        "display_path",
+        start.map_or(spec.display_name.as_str(), |location| location.file_name),
+    );
+    output.push_str(",\"start\":");
+    render_json_position(
+        output,
+        span.start,
+        start.map(|location| (location.line, location.column)),
+    );
+    output.push_str(",\"end\":");
+    render_json_position(
+        output,
+        span.end,
+        end.map(|location| (location.line, location.column)),
+    );
+    output.push('}');
+}
+
+fn render_json_position(output: &mut String, byte: usize, position: Option<(usize, usize)>) {
+    output.push_str("{\"byte\":");
+    output.push_str(&byte.to_string());
+    output.push_str(",\"line\":");
+    match position {
+        Some((line, column)) => {
+            output.push_str(&line.to_string());
+            output.push_str(",\"column\":");
+            output.push_str(&column.to_string());
+        }
+        None => output.push_str("null,\"column\":null"),
+    }
+    output.push('}');
+}
+
+fn render_json_include_trace(
+    output: &mut String,
+    sources: &SourceMap,
+    span: Span,
+    max_depth: usize,
+) {
+    let trace = sources.include_trace(span.file, max_depth);
+    output.push_str("{\"truncated\":");
+    output.push_str(if trace.truncated { "true" } else { "false" });
+    output.push_str(",\"frames\":[");
+    for (index, site) in trace.sites.iter().rev().enumerate() {
+        if index != 0 {
+            output.push(',');
+        }
+        render_json_location(output, sources, site.directive);
+    }
+    output.push_str("]}");
+}
+
+fn render_json_macro_trace(output: &mut String, sources: &SourceMap, span: Span, max_depth: usize) {
+    let trace = sources.origin_trace(span.origin, max_depth);
+    output.push_str("{\"truncated\":");
+    output.push_str(if trace.truncated { "true" } else { "false" });
+    output.push_str(",\"frames\":[");
+    for (index, origin) in trace.frames.iter().enumerate() {
+        if index != 0 {
+            output.push(',');
+        }
+        match &origin.kind {
+            OriginKind::MacroExpansion {
+                macro_name,
+                invocation,
+                definition,
+            } => {
+                output.push('{');
+                json_field_string(output, "kind", "macro_expansion");
+                output.push(',');
+                json_field_string(output, "name", macro_name);
+                output.push_str(",\"invocation\":");
+                render_json_location(output, sources, *invocation);
+                output.push_str(",\"definition\":");
+                render_json_location(output, sources, *definition);
+                output.push('}');
+            }
+            OriginKind::ArgumentSubstitution {
+                parameter,
+                argument,
+                replacement,
+            } => {
+                output.push('{');
+                json_field_string(output, "kind", "argument_substitution");
+                output.push(',');
+                json_field_string(output, "name", parameter);
+                output.push_str(",\"argument\":");
+                render_json_location(output, sources, *argument);
+                output.push_str(",\"replacement\":");
+                render_json_location(output, sources, *replacement);
+                output.push('}');
+            }
+            OriginKind::Stringization { operator, argument } => {
+                output.push('{');
+                json_field_string(output, "kind", "stringization");
+                output.push_str(",\"operator\":");
+                render_json_location(output, sources, *operator);
+                output.push_str(",\"argument\":");
+                render_json_location(output, sources, *argument);
+                output.push('}');
+            }
+            OriginKind::TokenPaste {
+                operator,
+                left,
+                right,
+            } => {
+                output.push('{');
+                json_field_string(output, "kind", "token_paste");
+                output.push_str(",\"operator\":");
+                render_json_location(output, sources, *operator);
+                output.push_str(",\"left\":");
+                render_json_location(output, sources, *left);
+                output.push_str(",\"right\":");
+                render_json_location(output, sources, *right);
+                output.push('}');
+            }
+        }
+    }
+    output.push_str("]}");
+}
+
+fn json_field_string(output: &mut String, name: &str, value: &str) {
+    json_string(output, name);
+    output.push(':');
+    json_string(output, value);
+}
+
+fn json_optional_string(output: &mut String, value: Option<&str>) {
+    match value {
+        Some(value) => json_string(output, value),
+        None => output.push_str("null"),
+    }
+}
+
+fn json_string(output: &mut String, value: &str) {
+    output.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '\u{08}' => output.push_str("\\b"),
+            '\u{0c}' => output.push_str("\\f"),
+            '\n' => output.push_str("\\n"),
+            '\r' => output.push_str("\\r"),
+            '\t' => output.push_str("\\t"),
+            character if character <= '\u{1f}' => {
+                output.push_str(&format!("\\u{:04x}", character as u32));
+            }
+            character => output.push(character),
+        }
+    }
+    output.push('"');
 }
 
 #[cfg(test)]
@@ -641,6 +926,18 @@ mod tests {
         assert!(rendered.contains(" included from main.c:1:1\n"));
         assert!(rendered.contains("note: in expansion of macro `VALUE`\n"));
         assert!(rendered.contains("note: macro `VALUE` defined here\n"));
+
+        let json = render_json_document(
+            &[diagnostic],
+            &sources,
+            RenderOptions {
+                include_trace_limit: 0,
+                macro_backtrace_limit: 0,
+            },
+        );
+        assert_eq!(json.matches("\"truncated\":true").count(), 2, "{json}");
+        assert!(json.contains("\"include_trace\":{\"truncated\":true,\"frames\":[]}"));
+        assert!(json.contains("\"macro_trace\":{\"truncated\":true,\"frames\":[]}"));
     }
 
     #[test]
@@ -667,6 +964,11 @@ mod tests {
         );
         assert!(engine.has_errors());
         assert_eq!(engine.diagnostics()[0].severity, Severity::Error);
+        assert!(
+            engine
+                .render(&sources)
+                .contains("error[CCC0100] [-Wunused-macros]")
+        );
         assert!(engine.pop_warning_state());
         assert_eq!(
             engine.warning_level(&WarningCategory::new("unused-macros")),
@@ -727,5 +1029,45 @@ mod tests {
         assert!(engine.is_halted());
         assert_eq!(engine.diagnostics().len(), 3);
         assert_eq!(engine.diagnostics()[2].code, "CCC0000");
+    }
+
+    #[test]
+    fn renders_the_versioned_json_schema_deterministically() {
+        let mut sources = SourceMap::new();
+        let file = sources.add_file_occurrence(
+            SourceFileSpec::new("spelled/input.c")
+                .with_display_name("display/input.c")
+                .with_resolved_path("/resolved/input.c"),
+            "int value;\n",
+        );
+        let diagnostic = Diagnostic::error("CCC1020", "unexpected `value`")
+            .with_category("syntax")
+            .with_primary(Span::new(file, 4, 9), "while parsing")
+            .with_secondary(Span::new(file, 0, 3), "declaration starts here")
+            .with_note("recovered at `;`");
+
+        assert_eq!(
+            render_json_document(&[diagnostic], &sources, RenderOptions::default()),
+            concat!(
+                "{\"schema_version\":1,\"diagnostics\":[{",
+                "\"severity\":\"error\",\"code\":\"CCC1020\",",
+                "\"category\":\"syntax\",\"message\":\"unexpected `value`\",",
+                "\"primary\":{\"label\":\"while parsing\",\"location\":{",
+                "\"spelled_path\":\"spelled/input.c\",",
+                "\"resolved_path\":\"/resolved/input.c\",",
+                "\"display_path\":\"display/input.c\",",
+                "\"start\":{\"byte\":4,\"line\":1,\"column\":5},",
+                "\"end\":{\"byte\":9,\"line\":1,\"column\":10}}},",
+                "\"secondary\":[{\"label\":\"declaration starts here\",\"location\":{",
+                "\"spelled_path\":\"spelled/input.c\",",
+                "\"resolved_path\":\"/resolved/input.c\",",
+                "\"display_path\":\"display/input.c\",",
+                "\"start\":{\"byte\":0,\"line\":1,\"column\":1},",
+                "\"end\":{\"byte\":3,\"line\":1,\"column\":4}}}],",
+                "\"notes\":[\"recovered at `;`\"],",
+                "\"include_trace\":{\"truncated\":false,\"frames\":[]},",
+                "\"macro_trace\":{\"truncated\":false,\"frames\":[]}}]}\n",
+            )
+        );
     }
 }

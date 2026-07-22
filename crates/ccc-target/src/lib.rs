@@ -1974,6 +1974,25 @@ mod tests {
     }
 
     #[test]
+    fn variable_length_arrays_are_advertised_on_enabled_targets() {
+        for config in [
+            EffectiveCompilationConfig::default(),
+            EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+            EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
+            EffectiveCompilationConfig::aarch64_apple_darwin(),
+        ] {
+            assert_eq!(
+                config
+                    .capabilities
+                    .state(CapabilityKind::Feature, "c11-vla"),
+                CapabilityState::Implemented,
+                "{}",
+                config.target.triple
+            );
+        }
+    }
+
+    #[test]
     fn compiler_resources_are_distinct_from_toolchain_resources() {
         let config = EffectiveCompilationConfig::default()
             .with_resource_dir("/opt/ccc/resources")

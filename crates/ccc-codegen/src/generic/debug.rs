@@ -514,17 +514,6 @@ impl<'a> DebugEmitter<'a> {
             let Some(declaration) = declarations.globals.get(&global.id.0) else {
                 continue;
             };
-            let relocation_kind = if declaration.tls {
-                if self.config.target.abi != AbiIdentity::SysvAmd64Lp64 {
-                    return Err(error(format!(
-                        "thread-local debug locations are unsupported for target ABI `{}`",
-                        self.config.target.abi.name()
-                    )));
-                }
-                DwarfRelocationKind::X86TlsOffset
-            } else {
-                DwarfRelocationKind::Absolute
-            };
             let variable = types.unit.add(root, constants::DW_TAG_variable);
             let type_id = types.qualified(global.ty);
             let entry = types.unit.get_mut(variable);
@@ -535,16 +524,43 @@ impl<'a> DebugEmitter<'a> {
                 AttributeValue::Flag(global.linkage == Linkage::External),
             );
             set_decl_location(entry, self.sources, &file_ids, global.span);
+            let darwin_tls = declaration.tls
+                && self.config.target.triple.binary_format == ccc_target::BinaryFormat::Macho;
+            if declaration.tls
+                && self.config.target.abi != AbiIdentity::SysvAmd64Lp64
+                && !darwin_tls
+            {
+                // Keep the definition and its source/type metadata useful to
+                // debuggers even when this ABI's TLS location expression has
+                // not yet been independently certified.
+                continue;
+            }
+            let relocation_kind = if darwin_tls {
+                DwarfRelocationKind::DarwinTlsOffset
+            } else if declaration.tls {
+                DwarfRelocationKind::X86TlsOffset
+            } else {
+                DwarfRelocationKind::Absolute
+            };
             let target = targets.len();
             let symbol = product.data_symbol(declaration.id);
-            targets.push(if relocation_kind == DwarfRelocationKind::Absolute {
-                absolute_relocation_destination(product, symbol)?
-            } else {
-                RelocationDestination {
+            targets.push(match relocation_kind {
+                DwarfRelocationKind::Absolute => absolute_relocation_destination(product, symbol)?,
+                // The generated-support packaging link creates a nested Apple
+                // debug map. A section-relative TLV relocation in the primary
+                // object is then associated with that map's first text atom.
+                // Keep this relocation on the source TLS symbol so dsymutil
+                // resolves the final __thread_vars descriptor instead.
+                DwarfRelocationKind::DarwinTlsOffset => RelocationDestination {
                     symbol,
                     addend: 0,
                     kind: relocation_kind,
-                }
+                },
+                DwarfRelocationKind::X86TlsOffset => RelocationDestination {
+                    symbol,
+                    addend: 0,
+                    kind: relocation_kind,
+                },
             });
             let mut location = Expression::new();
             location.op_addr(Address::Symbol {
@@ -1028,6 +1044,7 @@ struct RelocationDestination {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DwarfRelocationKind {
     Absolute,
+    DarwinTlsOffset,
     X86TlsOffset,
 }
 
@@ -1186,11 +1203,23 @@ fn write_sections(
                 .checked_add(relocation.addend)
                 .ok_or_else(|| "DWARF relocation addend overflow".to_owned())?;
             let flags = match relocation_kind {
-                DwarfRelocationKind::Absolute => RelocationFlags::Generic {
-                    kind: RelocationKind::Absolute,
-                    encoding: RelocationEncoding::Generic,
-                    size: relocation.size.saturating_mul(8),
-                },
+                DwarfRelocationKind::Absolute | DwarfRelocationKind::DarwinTlsOffset => {
+                    if relocation_kind == DwarfRelocationKind::DarwinTlsOffset
+                        && (id != SectionId::DebugInfo
+                            || format != BinaryFormat::MachO
+                            || relocation.size != 8)
+                    {
+                        return Err(
+                            "Darwin TLS debug relocation has an invalid section, format, or width"
+                                .to_owned(),
+                        );
+                    }
+                    RelocationFlags::Generic {
+                        kind: RelocationKind::Absolute,
+                        encoding: RelocationEncoding::Generic,
+                        size: relocation.size.saturating_mul(8),
+                    }
+                }
                 DwarfRelocationKind::X86TlsOffset => {
                     if id != SectionId::DebugInfo
                         || format != BinaryFormat::Elf
@@ -1269,7 +1298,10 @@ fn rewrite_tls_location_opcodes(
         let target = targets
             .get(index)
             .ok_or_else(|| format!("DWARF TLS expression references unknown target {index}"))?;
-        if target.kind != DwarfRelocationKind::X86TlsOffset {
+        if !matches!(
+            target.kind,
+            DwarfRelocationKind::DarwinTlsOffset | DwarfRelocationKind::X86TlsOffset
+        ) {
             continue;
         }
         if relocation.size != 8 || relocation.offset == 0 {

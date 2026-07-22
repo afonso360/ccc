@@ -862,54 +862,59 @@ fn encode_instruction(encoder: &mut Encoder, instruction: &gir::FullInstructionK
             encoder.bool(*write);
             encoder.tag(*locality);
         }
-        I::RuntimeSizedAllocate {
-            storage,
+        I::RuntimeSize {
             extents,
             element,
             constant_factor,
-            requested_alignment,
         } => {
-            encoder.tag(32);
-            encoder.u32(storage.0);
+            encoder.tag(42);
             encoder.len(extents.len());
             for extent in extents {
                 encoder.u32(extent.0);
             }
             encoder.qualified(*element);
             encoder.u64(*constant_factor);
+        }
+        I::RuntimeSizedAllocate {
+            storage,
+            size,
+            element,
+            requested_alignment,
+        } => {
+            // Tags 32 through 34 retain the retired extent-bearing runtime
+            // operation encodings. New operand shapes receive append-only
+            // tags so a historical digest cannot be reinterpreted.
+            encoder.tag(43);
+            encoder.u32(storage.0);
+            encoder.u32(size.0);
+            encoder.qualified(*element);
             encoder.option_u64(*requested_alignment);
         }
         I::RuntimePointerOffset {
             base,
             index,
             element,
-            extents,
+            stride,
             subtract,
         } => {
-            encoder.tag(33);
+            encoder.tag(44);
             encoder.u32(base.0);
             encoder.u32(index.0);
             encoder.qualified(*element);
-            encoder.len(extents.len());
-            for extent in extents {
-                encoder.u32(extent.0);
-            }
+            encoder.u32(stride.0);
             encoder.bool(*subtract);
         }
         I::RuntimePointerDifference {
             left,
             right,
             element,
-            extents,
+            stride,
         } => {
-            encoder.tag(34);
+            encoder.tag(45);
             encoder.u32(left.0);
             encoder.u32(right.0);
             encoder.qualified(*element);
-            encoder.len(extents.len());
-            for extent in extents {
-                encoder.u32(extent.0);
-            }
+            encoder.u32(stride.0);
         }
         I::MemoryCopy {
             destination,

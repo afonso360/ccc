@@ -99,6 +99,11 @@ pub trait DiagnosticSink {
     fn has_errors(&self) -> bool {
         false
     }
+
+    /// Requests that preprocessing stop at the next safe source boundary.
+    fn is_halted(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

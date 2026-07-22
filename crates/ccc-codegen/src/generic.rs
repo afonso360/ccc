@@ -18,8 +18,7 @@ use ccc_target::{
     RelocationModel, RuntimeHelperContract, RuntimeHelperValue,
 };
 use ccc_types::{
-    ArrayLength, BuiltinType, LayoutShape, QualifiedType, TypeId, TypeKind, TypeQualifiers,
-    TypeStore,
+    BuiltinType, LayoutShape, QualifiedType, TypeId, TypeKind, TypeQualifiers, TypeStore,
 };
 use cranelift_codegen::Context;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};

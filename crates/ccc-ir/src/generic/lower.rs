@@ -3,15 +3,15 @@ use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use ccc_pp::StringLiteralPrefix;
 use ccc_sema::generic::{
     AccessSemantics, AtomicReadModifyWriteOperation as TypedAtomicReadModifyWriteOperation,
-    BitfieldPlace, CodeLayoutHint as TypedCodeLayoutHint, CompoundAssignmentPlan, ConstantValue,
-    ConversionKind, FullFunctionId, FullLocalId, FullTypedBlockItem, FullTypedExpression,
-    FullTypedExpressionKind, FullTypedForInitializer, FullTypedFunction, FullTypedInitializer,
-    FullTypedInitializerKind, FullTypedInlineAsm, FullTypedInlineAsmKind,
-    FullTypedLocalDeclaration, FullTypedStatement, FullTypedStatementKind,
-    FullTypedTranslationUnit, GlobalId, InitializerPathElement,
-    IntegerIntrinsicOperation as TypedIntegerIntrinsicOperation, LabelId, Linkage,
-    MemoryOrder as TypedMemoryOrder, Place, PlaceBase, StorageDuration, StringId, SymbolReference,
-    X86CpuidRegister,
+    BitfieldPlace, CodeLayoutHint as TypedCodeLayoutHint, CompoundAssignmentPlan,
+    CompoundLiteralStorage, ConstantValue, ConversionKind, FullFunctionId, FullLocalId,
+    FullTypedBlockItem, FullTypedExpression, FullTypedExpressionKind, FullTypedForInitializer,
+    FullTypedFunction, FullTypedInitializer, FullTypedInitializerKind, FullTypedInlineAsm,
+    FullTypedInlineAsmKind, FullTypedLocalDeclaration, FullTypedStatement, FullTypedStatementKind,
+    FullTypedTranslationUnit, FullTypedTypedef, FullTypedVariableLengthBound, GlobalId,
+    InitializerPathElement, IntegerIntrinsicOperation as TypedIntegerIntrinsicOperation, LabelId,
+    Linkage, MemoryOrder as TypedMemoryOrder, Place, PlaceBase, StorageDuration, StringId,
+    SymbolReference, X86CpuidRegister,
 };
 use ccc_session::Span;
 use ccc_syntax::frontend::{
@@ -630,24 +630,36 @@ fn collect_automatic_local_facts(
         S::Compound(items) => {
             for item in items {
                 match item {
-                    FullTypedBlockItem::Declaration(declaration)
-                        if declaration.duration == StorageDuration::Automatic =>
-                    {
-                        facts.insert(
-                            declaration.local,
-                            make_local_fact(
+                    FullTypedBlockItem::Declaration(declaration) => {
+                        if declaration.duration == StorageDuration::Automatic {
+                            facts.insert(
                                 declaration.local,
-                                declaration.name.clone(),
-                                declaration.ty,
-                                declaration.duration,
-                                declaration.requested_alignment,
-                                declaration.span,
-                                types,
-                            ),
+                                make_local_fact(
+                                    declaration.local,
+                                    declaration.name.clone(),
+                                    declaration.ty,
+                                    declaration.duration,
+                                    declaration.requested_alignment,
+                                    declaration.span,
+                                    types,
+                                ),
+                            );
+                        }
+                        collect_automatic_local_facts_in_bounds(
+                            &declaration.variable_length_bounds,
+                            types,
+                            facts,
                         );
                         if let Some(initializer) = &declaration.initializer {
                             collect_automatic_local_facts_in_initializer(initializer, types, facts);
                         }
+                    }
+                    FullTypedBlockItem::Typedef(declaration) => {
+                        collect_automatic_local_facts_in_bounds(
+                            &declaration.variable_length_bounds,
+                            types,
+                            facts,
+                        );
                     }
                     FullTypedBlockItem::Statement(statement) => {
                         collect_automatic_local_facts(statement, types, facts);
@@ -707,6 +719,17 @@ fn collect_automatic_local_facts(
                                     facts,
                                 );
                             }
+                            collect_automatic_local_facts_in_bounds(
+                                &declaration.variable_length_bounds,
+                                types,
+                                facts,
+                            );
+                        } else if let FullTypedBlockItem::Typedef(declaration) = item {
+                            collect_automatic_local_facts_in_bounds(
+                                &declaration.variable_length_bounds,
+                                types,
+                                facts,
+                            );
                         }
                     }
                 }
@@ -779,6 +802,15 @@ fn collect_automatic_local_facts_in_expression(
 ) {
     use FullTypedExpressionKind as E;
     match &expression.kind {
+        E::GenericSelection { selected, .. } => {
+            collect_automatic_local_facts_in_expression(selected, types, facts);
+        }
+        E::VariableLengthBoundEvaluation { bounds, expression } => {
+            for bound in bounds {
+                collect_automatic_local_facts_in_expression(&bound.expression, types, facts);
+            }
+            collect_automatic_local_facts_in_expression(expression, types, facts);
+        }
         E::Conversion {
             expression: operand,
             ..
@@ -852,6 +884,18 @@ fn collect_automatic_local_facts_in_expression(
                         if let Some(initializer) = &declaration.initializer {
                             collect_automatic_local_facts_in_initializer(initializer, types, facts);
                         }
+                        collect_automatic_local_facts_in_bounds(
+                            &declaration.variable_length_bounds,
+                            types,
+                            facts,
+                        );
+                    }
+                    FullTypedBlockItem::Typedef(declaration) => {
+                        collect_automatic_local_facts_in_bounds(
+                            &declaration.variable_length_bounds,
+                            types,
+                            facts,
+                        );
                     }
                     FullTypedBlockItem::Statement(statement) => {
                         collect_automatic_local_facts(statement, types, facts);
@@ -922,13 +966,27 @@ fn collect_automatic_local_facts_in_expression(
             collect_automatic_local_facts_in_expression(destination, types, facts);
             collect_automatic_local_facts_in_expression(source, types, facts);
         }
+        E::Sizeof {
+            operand: Some(operand),
+            ..
+        } => collect_automatic_local_facts_in_expression(operand, types, facts),
         E::Constant(_)
         | E::StringLiteral(_)
         | E::DeclRef(_)
-        | E::Sizeof { .. }
+        | E::Sizeof { operand: None, .. }
         | E::Alignof { .. }
         | E::Offsetof { .. }
         | E::MemoryFence { .. } => {}
+    }
+}
+
+fn collect_automatic_local_facts_in_bounds(
+    bounds: &[FullTypedVariableLengthBound],
+    types: &TypeStore,
+    facts: &mut BTreeMap<FullLocalId, LocalFact>,
+) {
+    for bound in bounds {
+        collect_automatic_local_facts_in_expression(&bound.expression, types, facts);
     }
 }
 
@@ -969,7 +1027,7 @@ fn runtime_sized_object(types: &TypeStore, ty: TypeId) -> bool {
     }
 }
 
-fn runtime_storage_layout(
+fn runtime_layout_parts(
     types: &TypeStore,
     ty: QualifiedType,
     bounds: &[(VariableLengthId, ValueId)],
@@ -996,6 +1054,7 @@ fn runtime_storage_layout(
                 extents.push(
                     bounds
                         .iter()
+                        .rev()
                         .find_map(|(candidate, value)| (*candidate == id).then_some(*value))
                         .ok_or_else(|| {
                             IrError::lower(
@@ -1018,6 +1077,61 @@ fn runtime_storage_layout(
     }
 }
 
+fn array_dimensions_in_type(types: &TypeStore, ty: TypeId) -> Vec<ArrayLength> {
+    let mut current = types.without_alignment_adjustment(ty);
+    if let Some(TypeKind::Pointer(pointer)) = types.try_kind(current) {
+        current = pointer.pointee.ty;
+    }
+    let mut active = HashSet::new();
+    let mut dimensions = Vec::new();
+    while active.insert(current) {
+        match types.try_kind(types.without_alignment_adjustment(current)) {
+            Some(TypeKind::Array(array)) => {
+                dimensions.push(array.length);
+                current = array.element.ty;
+            }
+            _ => break,
+        }
+    }
+    dimensions
+}
+
+/// Finds the runtime layout carried by a conditional operand before sema's
+/// common-pointer conversion changes its visible type to the left operand's
+/// type. Type-name bound wrappers identify an explicit cast's newly evaluated
+/// layout and therefore take precedence over the wrapped conversion source.
+fn conditional_operand_array_dimensions(
+    expression: &FullTypedExpression,
+    types: &TypeStore,
+) -> Vec<ArrayLength> {
+    match &expression.kind {
+        FullTypedExpressionKind::GenericSelection { selected, .. } => {
+            conditional_operand_array_dimensions(selected, types)
+        }
+        FullTypedExpressionKind::VariableLengthBoundEvaluation {
+            expression: nested, ..
+        } => {
+            let dimensions = array_dimensions_in_type(types, expression.ty.ty);
+            if dimensions.is_empty() {
+                conditional_operand_array_dimensions(nested, types)
+            } else {
+                dimensions
+            }
+        }
+        FullTypedExpressionKind::Conversion {
+            expression: nested, ..
+        } => {
+            let dimensions = conditional_operand_array_dimensions(nested, types);
+            if dimensions.is_empty() {
+                array_dimensions_in_type(types, expression.ty.ty)
+            } else {
+                dimensions
+            }
+        }
+        _ => array_dimensions_in_type(types, expression.ty.ty),
+    }
+}
+
 fn scan_statement_for_address_taken(
     statement: &FullTypedStatement,
     types: &TypeStore,
@@ -1033,9 +1147,21 @@ fn scan_statement_for_address_taken(
             for item in items {
                 match item {
                     FullTypedBlockItem::Declaration(declaration) => {
+                        scan_variable_length_bounds_for_address_taken(
+                            &declaration.variable_length_bounds,
+                            types,
+                            facts,
+                        );
                         if let Some(initializer) = &declaration.initializer {
                             scan_initializer_for_address_taken(initializer, types, facts);
                         }
+                    }
+                    FullTypedBlockItem::Typedef(declaration) => {
+                        scan_variable_length_bounds_for_address_taken(
+                            &declaration.variable_length_bounds,
+                            types,
+                            facts,
+                        );
                     }
                     FullTypedBlockItem::Statement(statement) => {
                         scan_statement_for_address_taken(statement, types, facts);
@@ -1094,10 +1220,21 @@ fn scan_statement_for_address_taken(
                 }
                 FullTypedForInitializer::Declarations(items) => {
                     for item in items {
-                        if let FullTypedBlockItem::Declaration(declaration) = item
-                            && let Some(initializer) = &declaration.initializer
-                        {
-                            scan_initializer_for_address_taken(initializer, types, facts);
+                        if let FullTypedBlockItem::Declaration(declaration) = item {
+                            scan_variable_length_bounds_for_address_taken(
+                                &declaration.variable_length_bounds,
+                                types,
+                                facts,
+                            );
+                            if let Some(initializer) = &declaration.initializer {
+                                scan_initializer_for_address_taken(initializer, types, facts);
+                            }
+                        } else if let FullTypedBlockItem::Typedef(declaration) = item {
+                            scan_variable_length_bounds_for_address_taken(
+                                &declaration.variable_length_bounds,
+                                types,
+                                facts,
+                            );
                         }
                     }
                 }
@@ -1155,6 +1292,15 @@ fn scan_expression_for_address_taken(
 ) {
     use FullTypedExpressionKind as E;
     match &expression.kind {
+        E::GenericSelection { selected, .. } => {
+            scan_expression_for_address_taken(selected, types, facts);
+        }
+        E::VariableLengthBoundEvaluation { bounds, expression } => {
+            for bound in bounds {
+                scan_expression_for_address_taken(&bound.expression, types, facts);
+            }
+            scan_expression_for_address_taken(expression, types, facts);
+        }
         E::AddressOf(operand) => {
             if let Some(place) = &operand.place {
                 mark_place_address_taken(place, facts);
@@ -1178,18 +1324,23 @@ fn scan_expression_for_address_taken(
             scan_expression_for_address_taken(right, types, facts);
         }
         E::Member { base, .. } => scan_expression_for_address_taken(base, types, facts),
-        E::CompoundLiteral { local, initializer } => {
-            let mut fact = make_local_fact(
-                *local,
-                format!("<compound-literal-{}>", local.0),
-                expression.ty,
-                StorageDuration::Automatic,
-                None,
-                expression.span,
-                types,
-            );
-            fact.reasons.insert(MemoryResidencyReason::AddressTaken);
-            facts.insert(*local, fact);
+        E::CompoundLiteral {
+            storage,
+            initializer,
+        } => {
+            if let CompoundLiteralStorage::Automatic(local) = storage {
+                let mut fact = make_local_fact(
+                    *local,
+                    format!("<compound-literal-{}>", local.0),
+                    expression.ty,
+                    StorageDuration::Automatic,
+                    None,
+                    expression.span,
+                    types,
+                );
+                fact.reasons.insert(MemoryResidencyReason::AddressTaken);
+                facts.insert(*local, fact);
+            }
             scan_initializer_for_address_taken(initializer, types, facts);
         }
         E::Assignment { target, value, .. } => {
@@ -1223,9 +1374,21 @@ fn scan_expression_for_address_taken(
             for item in items {
                 match item {
                     FullTypedBlockItem::Declaration(declaration) => {
+                        scan_variable_length_bounds_for_address_taken(
+                            &declaration.variable_length_bounds,
+                            types,
+                            facts,
+                        );
                         if let Some(initializer) = &declaration.initializer {
                             scan_initializer_for_address_taken(initializer, types, facts);
                         }
+                    }
+                    FullTypedBlockItem::Typedef(declaration) => {
+                        scan_variable_length_bounds_for_address_taken(
+                            &declaration.variable_length_bounds,
+                            types,
+                            facts,
+                        );
                     }
                     FullTypedBlockItem::Statement(statement) => {
                         scan_statement_for_address_taken(statement, types, facts);
@@ -1307,13 +1470,27 @@ fn scan_expression_for_address_taken(
                 mark_place_address_taken(place, facts);
             }
         }
+        E::Sizeof {
+            operand: Some(operand),
+            ..
+        } => scan_expression_for_address_taken(operand, types, facts),
         E::Constant(_)
         | E::StringLiteral(_)
         | E::DeclRef(_)
-        | E::Sizeof { .. }
+        | E::Sizeof { operand: None, .. }
         | E::Alignof { .. }
         | E::Offsetof { .. }
         | E::MemoryFence { .. } => {}
+    }
+}
+
+fn scan_variable_length_bounds_for_address_taken(
+    bounds: &[FullTypedVariableLengthBound],
+    types: &TypeStore,
+    facts: &mut BTreeMap<FullLocalId, LocalFact>,
+) {
+    for bound in bounds {
+        scan_expression_for_address_taken(&bound.expression, types, facts);
     }
 }
 
@@ -1383,6 +1560,12 @@ fn collect_aggregate_projection<'a>(
 struct SwitchContext {
     cases: VecDeque<(u128, BlockId)>,
     default: Option<BlockId>,
+}
+
+#[derive(Clone, Copy)]
+enum ConditionalBoundValue {
+    Runtime(ValueId),
+    Constant(u64),
 }
 
 struct FunctionBuilder<'a> {
@@ -1730,31 +1913,27 @@ impl<'a> FunctionBuilder<'a> {
         )
     }
 
-    fn runtime_extents(
-        &self,
-        mut element: QualifiedType,
+    fn runtime_size(
+        &mut self,
+        object: QualifiedType,
+        result_ty: QualifiedType,
         span: Span,
-    ) -> Result<Vec<ValueId>, IrError> {
-        let mut extents = Vec::new();
-        while let Some(TypeKind::Array(array)) = self.types.try_kind(element.ty) {
-            if let ArrayLength::Variable(id) = array.length {
-                extents.push(
-                    self.runtime_bounds
-                        .iter()
-                        .rev()
-                        .find_map(|(candidate, value)| (*candidate == id).then_some(*value))
-                        .ok_or_else(|| {
-                            IrError::lower(
-                                LOWERING_ERROR,
-                                span,
-                                format!("pointer stride is missing runtime bound {}", id.0),
-                            )
-                        })?,
-                );
-            }
-            element = array.element;
+    ) -> Result<Option<ValueId>, IrError> {
+        let (extents, element, constant_factor) =
+            runtime_layout_parts(self.types, object, &self.runtime_bounds, span)?;
+        if extents.is_empty() {
+            return Ok(None);
         }
-        Ok(extents)
+        self.emit_result(
+            FullInstructionKind::RuntimeSize {
+                extents,
+                element,
+                constant_factor,
+            },
+            result_ty,
+            span,
+        )
+        .map(Some)
     }
 
     fn pointer_offset(
@@ -1766,20 +1945,24 @@ impl<'a> FunctionBuilder<'a> {
         result_ty: QualifiedType,
         span: Span,
     ) -> Result<ValueId, IrError> {
-        let extents = self.runtime_extents(element, span)?;
-        let kind = if extents.is_empty() {
-            FullInstructionKind::PointerOffset {
-                base,
-                index,
-                element,
-                subtract,
-            }
-        } else {
+        let stride = self.runtime_size(
+            element,
+            QualifiedType::unqualified(TypeId::UNSIGNED_LONG),
+            span,
+        )?;
+        let kind = if let Some(stride) = stride {
             FullInstructionKind::RuntimePointerOffset {
                 base,
                 index,
                 element,
-                extents,
+                stride,
+                subtract,
+            }
+        } else {
+            FullInstructionKind::PointerOffset {
+                base,
+                index,
+                element,
                 subtract,
             }
         };
@@ -1794,19 +1977,23 @@ impl<'a> FunctionBuilder<'a> {
         result_ty: QualifiedType,
         span: Span,
     ) -> Result<ValueId, IrError> {
-        let extents = self.runtime_extents(element, span)?;
-        let kind = if extents.is_empty() {
-            FullInstructionKind::PointerDifference {
-                left,
-                right,
-                element,
-            }
-        } else {
+        let stride = self.runtime_size(
+            element,
+            QualifiedType::unqualified(TypeId::UNSIGNED_LONG),
+            span,
+        )?;
+        let kind = if let Some(stride) = stride {
             FullInstructionKind::RuntimePointerDifference {
                 left,
                 right,
                 element,
-                extents,
+                stride,
+            }
+        } else {
+            FullInstructionKind::PointerDifference {
+                left,
+                right,
+                element,
             }
         };
         self.emit_result(kind, result_ty, span)
@@ -2168,11 +2355,12 @@ fn remap_instruction_values(
         | FullInstructionKind::MemoryFence { .. }
         | FullInstructionKind::CompilerBarrier { .. }
         | FullInstructionKind::CodeLayoutHint(_) => {}
-        FullInstructionKind::RuntimeSizedAllocate { extents, .. } => {
+        FullInstructionKind::RuntimeSize { extents, .. } => {
             for extent in extents {
                 map(extent)?;
             }
         }
+        FullInstructionKind::RuntimeSizedAllocate { size, .. } => map(size)?,
         FullInstructionKind::ProjectField { base, .. } => map(base)?,
         FullInstructionKind::PointerOffset { base, index, .. } => {
             map(base)?;
@@ -2181,14 +2369,12 @@ fn remap_instruction_values(
         FullInstructionKind::RuntimePointerOffset {
             base,
             index,
-            extents,
+            stride,
             ..
         } => {
             map(base)?;
             map(index)?;
-            for extent in extents {
-                map(extent)?;
-            }
+            map(stride)?;
         }
         FullInstructionKind::PointerDifference { left, right, .. }
         | FullInstructionKind::Binary { left, right, .. } => {
@@ -2198,14 +2384,12 @@ fn remap_instruction_values(
         FullInstructionKind::RuntimePointerDifference {
             left,
             right,
-            extents,
+            stride,
             ..
         } => {
             map(left)?;
             map(right)?;
-            for extent in extents {
-                map(extent)?;
-            }
+            map(stride)?;
         }
         FullInstructionKind::Load { address, .. }
         | FullInstructionKind::BitfieldLoad { address, .. }
@@ -2448,8 +2632,10 @@ impl FunctionBuilder<'_> {
                             self.local_declaration(declaration)?;
                         }
                         FullTypedBlockItem::Statement(statement) => self.statement(statement)?,
-                        FullTypedBlockItem::Typedef(_)
-                        | FullTypedBlockItem::ExternalObject(_)
+                        FullTypedBlockItem::Typedef(declaration) => {
+                            self.typedef_declaration(declaration)?;
+                        }
+                        FullTypedBlockItem::ExternalObject(_)
                         | FullTypedBlockItem::FunctionDeclaration(_)
                         | FullTypedBlockItem::StaticAssert { .. }
                         | FullTypedBlockItem::Pragma(_) => {}
@@ -2723,12 +2909,7 @@ impl FunctionBuilder<'_> {
         if self.current.is_none() {
             return Ok(());
         }
-        let mut bounds = Vec::new();
-        for bound in &declaration.variable_length_bounds {
-            let value = self.expect_value(&bound.expression)?;
-            bounds.push((bound.id, value));
-            self.runtime_bounds.push((bound.id, value));
-        }
+        self.variable_length_bounds(&declaration.variable_length_bounds)?;
 
         if declaration.duration != StorageDuration::Automatic {
             return Ok(());
@@ -2751,15 +2932,31 @@ impl FunctionBuilder<'_> {
                     "a variable-length array cannot have an initializer",
                 ));
             }
-            let (extents, element, constant_factor) =
-                runtime_storage_layout(self.types, declaration.ty, &bounds, declaration.span)?;
+            let size = self
+                .runtime_size(
+                    declaration.ty,
+                    QualifiedType::unqualified(TypeId::UNSIGNED_LONG),
+                    declaration.span,
+                )?
+                .ok_or_else(|| {
+                    IrError::lower(
+                        LOWERING_ERROR,
+                        declaration.span,
+                        "runtime-sized storage has no dynamic extent",
+                    )
+                })?;
+            let (_, element, _) = runtime_layout_parts(
+                self.types,
+                declaration.ty,
+                &self.runtime_bounds,
+                declaration.span,
+            )?;
             let pointer = self.types.pointer(declaration.ty);
             let address = self.emit_result(
                 FullInstructionKind::RuntimeSizedAllocate {
                     storage,
-                    extents,
+                    size,
                     element,
-                    constant_factor,
                     requested_alignment: declaration.requested_alignment,
                 },
                 QualifiedType::unqualified(pointer),
@@ -2779,6 +2976,24 @@ impl FunctionBuilder<'_> {
                 bitfield: None,
             };
             self.runtime_initializer(place, initializer)?;
+        }
+        Ok(())
+    }
+
+    fn variable_length_bounds(
+        &mut self,
+        bounds: &[FullTypedVariableLengthBound],
+    ) -> Result<(), IrError> {
+        for bound in bounds {
+            let value = self.expect_value(&bound.expression)?;
+            self.runtime_bounds.push((bound.id, value));
+        }
+        Ok(())
+    }
+
+    fn typedef_declaration(&mut self, declaration: &FullTypedTypedef) -> Result<(), IrError> {
+        if self.current.is_some() {
+            self.variable_length_bounds(&declaration.variable_length_bounds)?;
         }
         Ok(())
     }
@@ -3158,6 +3373,11 @@ impl FunctionBuilder<'_> {
     fn expression(&mut self, expression: &FullTypedExpression) -> Result<Option<ValueId>, IrError> {
         use FullTypedExpressionKind as E;
         match &expression.kind {
+            E::GenericSelection { selected, .. } => self.expression(selected),
+            E::VariableLengthBoundEvaluation { bounds, expression } => {
+                self.variable_length_bounds(bounds)?;
+                self.expression(expression)
+            }
             E::Constant(constant) => self
                 .constant(*constant, expression.ty, expression.span)
                 .map(Some),
@@ -3338,8 +3558,10 @@ impl FunctionBuilder<'_> {
                             self.local_declaration(declaration)?;
                         }
                         FullTypedBlockItem::Statement(statement) => self.statement(statement)?,
-                        FullTypedBlockItem::Typedef(_)
-                        | FullTypedBlockItem::ExternalObject(_)
+                        FullTypedBlockItem::Typedef(declaration) => {
+                            self.typedef_declaration(declaration)?;
+                        }
+                        FullTypedBlockItem::ExternalObject(_)
                         | FullTypedBlockItem::FunctionDeclaration(_)
                         | FullTypedBlockItem::StaticAssert { .. }
                         | FullTypedBlockItem::Pragma(_) => {}
@@ -3629,13 +3851,33 @@ impl FunctionBuilder<'_> {
                     Ok(Some(old))
                 }
             }
-            E::Sizeof { size, .. } => self
-                .emit_result(
-                    FullInstructionKind::Constant(ScalarConstant::Unsigned(*size as u128)),
-                    expression.ty,
-                    expression.span,
-                )
-                .map(Some),
+            E::Sizeof {
+                operand,
+                operand_ty,
+                size,
+            } => {
+                if let Some(operand) = operand {
+                    let _ = self.place(operand)?;
+                }
+                if let Some(size) = size {
+                    self.emit_result(
+                        FullInstructionKind::Constant(ScalarConstant::Unsigned(u128::from(*size))),
+                        expression.ty,
+                        expression.span,
+                    )
+                    .map(Some)
+                } else {
+                    self.runtime_size(*operand_ty, expression.ty, expression.span)?
+                        .ok_or_else(|| {
+                            IrError::lower(
+                                LOWERING_ERROR,
+                                expression.span,
+                                "runtime sizeof has no dynamic extent",
+                            )
+                        })
+                        .map(Some)
+                }
+            }
             E::Alignof { align, .. } => self
                 .emit_result(
                     FullInstructionKind::Constant(ScalarConstant::Unsigned(*align as u128)),
@@ -3945,6 +4187,15 @@ impl FunctionBuilder<'_> {
     }
 
     fn place(&mut self, expression: &FullTypedExpression) -> Result<LoweredPlace, IrError> {
+        if let FullTypedExpressionKind::GenericSelection { selected, .. } = &expression.kind {
+            return self.place(selected);
+        }
+        if let FullTypedExpressionKind::VariableLengthBoundEvaluation { bounds, expression } =
+            &expression.kind
+        {
+            self.variable_length_bounds(bounds)?;
+            return self.place(expression);
+        }
         if let FullTypedExpressionKind::StatementExpression {
             items,
             result: Some(result),
@@ -3956,8 +4207,10 @@ impl FunctionBuilder<'_> {
                         self.local_declaration(declaration)?;
                     }
                     FullTypedBlockItem::Statement(statement) => self.statement(statement)?,
-                    FullTypedBlockItem::Typedef(_)
-                    | FullTypedBlockItem::ExternalObject(_)
+                    FullTypedBlockItem::Typedef(declaration) => {
+                        self.typedef_declaration(declaration)?;
+                    }
+                    FullTypedBlockItem::ExternalObject(_)
                     | FullTypedBlockItem::FunctionDeclaration(_)
                     | FullTypedBlockItem::StaticAssert { .. }
                     | FullTypedBlockItem::Pragma(_) => {}
@@ -4071,24 +4324,39 @@ impl FunctionBuilder<'_> {
             FullTypedExpressionKind::DeclRef(SymbolReference::PredefinedFunctionName(string)) => {
                 self.address_of_string(*string, expression.ty, expression.span)?
             }
-            FullTypedExpressionKind::CompoundLiteral { local, initializer } => {
-                let storage = *self.storage_by_local.get(local).ok_or_else(|| {
-                    IrError::lower(
-                        LOWERING_ERROR,
-                        expression.span,
-                        format!("reference to unknown compound literal {}", local.0),
-                    )
-                })?;
-                let address = self.address_of_storage(storage, expression.span)?;
-                let destination = LoweredPlace {
-                    address,
-                    object: expression.ty,
-                    access: access_from_qualified(expression.ty),
-                    bitfield: None,
-                };
-                self.runtime_initializer(destination, initializer)?;
-                address
-            }
+            FullTypedExpressionKind::CompoundLiteral {
+                storage,
+                initializer,
+            } => match storage {
+                CompoundLiteralStorage::Automatic(local) => {
+                    let storage = *self.storage_by_local.get(local).ok_or_else(|| {
+                        IrError::lower(
+                            LOWERING_ERROR,
+                            expression.span,
+                            format!("reference to unknown compound literal {}", local.0),
+                        )
+                    })?;
+                    let address = self.address_of_storage(storage, expression.span)?;
+                    let destination = LoweredPlace {
+                        address,
+                        object: expression.ty,
+                        access: access_from_qualified(expression.ty),
+                        bitfield: None,
+                    };
+                    self.runtime_initializer(destination, initializer)?;
+                    address
+                }
+                CompoundLiteralStorage::Static(global) => {
+                    let data = *self.file_data.get(global).ok_or_else(|| {
+                        IrError::lower(
+                            LOWERING_ERROR,
+                            expression.span,
+                            format!("reference to unknown compound literal object {}", global.0),
+                        )
+                    })?;
+                    self.address_of_data(data, expression.ty, expression.span)?
+                }
+            },
             FullTypedExpressionKind::StringLiteral(string) => {
                 self.address_of_string(*string, expression.ty, expression.span)?
             }
@@ -4726,9 +4994,20 @@ impl FunctionBuilder<'_> {
         then_expression: &FullTypedExpression,
         else_expression: &FullTypedExpression,
         result_ty: QualifiedType,
-        _span: Span,
+        span: Span,
     ) -> Result<Option<ValueId>, IrError> {
         let condition = self.expect_value(condition)?;
+        let result_bounds = array_dimensions_in_type(self.types, result_ty.ty)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(dimension, length)| match length {
+                ArrayLength::Variable(id) => Some((dimension, id)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let then_dimensions = conditional_operand_array_dimensions(then_expression, self.types);
+        let else_dimensions = conditional_operand_array_dimensions(else_expression, self.types);
+        let bound_snapshot = self.runtime_bounds.len();
         let then_block = self.new_block();
         let else_block = self.new_block();
         let merge = self.new_block();
@@ -4742,22 +5021,143 @@ impl FunctionBuilder<'_> {
 
         self.current = Some(then_block);
         let then_value = self.expression(then_expression)?;
-        if self.current.is_some() {
-            self.terminate(FullTerminator::Branch(FullEdge {
-                target: merge,
-                arguments: then_value.into_iter().collect(),
-            }))?;
-        }
+        let then_exit = self.current.take();
+        let then_bounds =
+            then_exit.and_then(|_| self.conditional_bound_values(&result_bounds, &then_dimensions));
+        self.runtime_bounds.truncate(bound_snapshot);
+
         self.current = Some(else_block);
         let else_value = self.expression(else_expression)?;
-        if self.current.is_some() {
+        let else_exit = self.current.take();
+        let else_bounds =
+            else_exit.and_then(|_| self.conditional_bound_values(&result_bounds, &else_dimensions));
+        self.runtime_bounds.truncate(bound_snapshot);
+
+        let merge_bounds = if !result_bounds.is_empty()
+            && then_exit.is_none_or(|_| then_bounds.is_some())
+            && else_exit.is_none_or(|_| else_bounds.is_some())
+            && (then_exit.is_some() || else_exit.is_some())
+        {
+            let then_bounds = then_bounds.as_deref().unwrap_or(&[]);
+            let else_bounds = else_bounds.as_deref().unwrap_or(&[]);
+            result_bounds
+                .iter()
+                .enumerate()
+                .map(|(index, (_, id))| {
+                    let then_ty = then_bounds
+                        .get(index)
+                        .map(|value| self.conditional_bound_type(*value));
+                    let else_ty = else_bounds
+                        .get(index)
+                        .map(|value| self.conditional_bound_type(*value));
+                    let ty = match (then_ty, else_ty) {
+                        (Some(left), Some(right)) if left == right => left,
+                        (Some(ty), None) | (None, Some(ty)) => ty,
+                        (Some(_), Some(_)) => TypeId::UNSIGNED_LONG,
+                        (None, None) => unreachable!("a live conditional branch supplies bounds"),
+                    };
+                    let parameter = self.add_block_parameter(merge, QualifiedType::unqualified(ty));
+                    (*id, parameter, ty)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        if let Some(exit) = then_exit {
+            self.current = Some(exit);
+            let mut arguments = then_value.into_iter().collect::<Vec<_>>();
+            if let Some(bounds) = &then_bounds {
+                arguments.extend(self.convert_conditional_bounds(bounds, &merge_bounds, span)?);
+            }
             self.terminate(FullTerminator::Branch(FullEdge {
                 target: merge,
-                arguments: else_value.into_iter().collect(),
+                arguments,
+            }))?;
+        }
+        if let Some(exit) = else_exit {
+            self.current = Some(exit);
+            let mut arguments = else_value.into_iter().collect::<Vec<_>>();
+            if let Some(bounds) = &else_bounds {
+                arguments.extend(self.convert_conditional_bounds(bounds, &merge_bounds, span)?);
+            }
+            self.terminate(FullTerminator::Branch(FullEdge {
+                target: merge,
+                arguments,
             }))?;
         }
         self.current = Some(merge);
+        self.runtime_bounds.extend(
+            merge_bounds
+                .into_iter()
+                .map(|(id, parameter, _)| (id, parameter)),
+        );
         Ok(result)
+    }
+
+    fn conditional_bound_values(
+        &self,
+        result_bounds: &[(usize, VariableLengthId)],
+        operand_dimensions: &[ArrayLength],
+    ) -> Option<Vec<ConditionalBoundValue>> {
+        result_bounds
+            .iter()
+            .map(|(dimension, _)| match operand_dimensions.get(*dimension)? {
+                ArrayLength::Variable(id) => {
+                    self.runtime_bounds
+                        .iter()
+                        .rev()
+                        .find_map(|(candidate, value)| {
+                            (candidate == id).then_some(ConditionalBoundValue::Runtime(*value))
+                        })
+                }
+                ArrayLength::Constant(length) => Some(ConditionalBoundValue::Constant(*length)),
+                ArrayLength::Incomplete | ArrayLength::UnspecifiedVariable(_) => None,
+            })
+            .collect()
+    }
+
+    fn conditional_bound_type(&self, bound: ConditionalBoundValue) -> TypeId {
+        match bound {
+            ConditionalBoundValue::Runtime(value) => self.function.value_types[value.0 as usize],
+            ConditionalBoundValue::Constant(_) => TypeId::UNSIGNED_LONG,
+        }
+    }
+
+    fn convert_conditional_bounds(
+        &mut self,
+        bounds: &[ConditionalBoundValue],
+        merge_bounds: &[(VariableLengthId, ValueId, TypeId)],
+        span: Span,
+    ) -> Result<Vec<ValueId>, IrError> {
+        bounds
+            .iter()
+            .zip(merge_bounds)
+            .map(|(bound, (_, _, target))| match bound {
+                ConditionalBoundValue::Constant(length) => self.emit_result(
+                    FullInstructionKind::Constant(ScalarConstant::Unsigned(u128::from(*length))),
+                    QualifiedType::unqualified(*target),
+                    span,
+                ),
+                ConditionalBoundValue::Runtime(value) => {
+                    let from = self.function.value_types[value.0 as usize];
+                    if from == *target {
+                        Ok(*value)
+                    } else {
+                        self.emit_result(
+                            FullInstructionKind::Convert {
+                                kind: ScalarConversion::IntegerConversion,
+                                operand: *value,
+                                from: QualifiedType::unqualified(from),
+                                to: QualifiedType::unqualified(*target),
+                            },
+                            QualifiedType::unqualified(*target),
+                            span,
+                        )
+                    }
+                }
+            })
+            .collect()
     }
 
     fn call(

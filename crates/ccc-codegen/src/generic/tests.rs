@@ -344,6 +344,88 @@ fn emit_source_with_config(source: &str, config: &EffectiveCompilationConfig) ->
 }
 
 #[test]
+fn file_scope_compound_literals_emit_local_data_and_object_relocations() {
+    let output = emit_source(
+        "struct Pair { int left; int right; };
+         struct Pair *pair = &(struct Pair){ .left = 11, .right = 12 };
+         int *values = (int[]){ 4, 5, 6 };",
+    );
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    let compound_symbols = object
+        .symbols()
+        .filter(|symbol| {
+            symbol
+                .name()
+                .is_ok_and(|name| name.contains("__ccc_file_compound_literal."))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(compound_symbols.len(), 2);
+    assert!(compound_symbols.iter().all(|symbol| {
+        symbol.is_definition() && !symbol.is_global() && symbol.kind() == object::SymbolKind::Data
+    }));
+
+    let mut initialized = compound_symbols
+        .iter()
+        .map(|symbol| symbol_bytes(&output.object, symbol.name().unwrap()))
+        .collect::<Vec<_>>();
+    initialized.sort_by_key(Vec::len);
+    assert_eq!(
+        initialized,
+        vec![
+            [11_i32.to_le_bytes(), 12_i32.to_le_bytes()].concat(),
+            [
+                4_i32.to_le_bytes(),
+                5_i32.to_le_bytes(),
+                6_i32.to_le_bytes(),
+            ]
+            .concat(),
+        ]
+    );
+
+    let relocation_targets = object
+        .sections()
+        .flat_map(|section| section.relocations())
+        .filter_map(|(_, relocation)| match relocation.target() {
+            RelocationTarget::Symbol(index) => object.symbol_by_index(index).ok(),
+            _ => None,
+        })
+        .filter_map(|symbol| symbol.name().ok())
+        .collect::<BTreeSet<_>>();
+    for symbol in compound_symbols {
+        assert!(relocation_targets.contains(symbol.name().unwrap()));
+    }
+}
+
+#[test]
+fn generic_and_file_compound_literals_emit_for_every_enabled_target() {
+    let source = "struct Pair { int left; int right; };
+         struct Pair *pair = &(struct Pair){ .left = 20, .right = 22 };
+         int read(int *value) {
+             _Generic(*value, int: *value, default: *value) = pair->left;
+             return _Generic(pair->right, int: *value, default: 0);
+         }";
+    for config in [
+        EffectiveCompilationConfig::default(),
+        EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+        EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
+        EffectiveCompilationConfig::aarch64_apple_darwin(),
+    ] {
+        let output = emit_source_with_config(source, &config);
+        let object = object::File::parse(output.object.as_slice()).unwrap();
+        assert!(
+            object.symbols().any(|symbol| {
+                symbol.is_definition()
+                    && symbol
+                        .name()
+                        .is_ok_and(|name| name.contains("__ccc_file_compound_literal."))
+            }),
+            "{}",
+            config.target.triple
+        );
+    }
+}
+
+#[test]
 fn indirect_calls_select_the_conservative_returns_twice_codegen_profile() {
     let indirect = lower_source(
         "int invoke(int (*callback)(int), int value) {\n\
@@ -666,16 +748,17 @@ fn enabled_targets_lower_tls_addresses_through_target_accessors() {
 }
 
 #[test]
-fn non_x86_tls_debug_locations_fail_closed() {
-    const SOURCE: &str = "_Thread_local int value;\n\
-         int read(void) { return value; }";
+fn target_tls_debug_information_uses_only_certified_locations() {
+    const SOURCE: &str = "_Thread_local int tls_value = 3;\n\
+         int regular_value = 4;\n\
+         int read_tls(void) { return tls_value + regular_value; }";
     for config in [
         EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
         EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
         EffectiveCompilationConfig::aarch64_apple_darwin(),
     ] {
         let (module, sources) = lower_source_with_map(SOURCE, &config);
-        let error = emit(
+        let output = emit(
             &module,
             &config,
             Options {
@@ -683,10 +766,89 @@ fn non_x86_tls_debug_locations_fail_closed() {
                 debug_info: Some(&sources),
             },
         )
-        .unwrap_err();
-        assert_eq!(error.code, BACKEND_ERROR);
-        assert!(error.message.contains("thread-local debug locations"));
-        assert!(error.message.contains(config.target.abi.name()));
+        .unwrap_or_else(|error| panic!("{}: {error}", config.target.triple));
+        let object = object::File::parse(output.object.as_slice()).unwrap();
+        let section_name = |id: gimli::SectionId| {
+            if object.format() == object::BinaryFormat::MachO {
+                id.name().replacen('.', "__", 1)
+            } else {
+                id.name().to_owned()
+            }
+        };
+        assert!(
+            object
+                .section_by_name(&section_name(gimli::SectionId::DebugLine))
+                .is_some(),
+            "{}",
+            config.target.triple
+        );
+        let sections = gimli::DwarfSections::load(|id| {
+            Ok::<_, gimli::Error>(
+                object
+                    .section_by_name(&section_name(id))
+                    .and_then(|section| section.data().ok())
+                    .unwrap_or_default()
+                    .to_vec(),
+            )
+        })
+        .unwrap();
+        let dwarf =
+            sections.borrow(|section| gimli::EndianSlice::new(section, gimli::LittleEndian));
+        let mut units = dwarf.units();
+        let header = units.next().unwrap().expect("debug compilation unit");
+        let unit = dwarf.unit(header).unwrap();
+        let mut entries = unit.entries();
+        let mut tls_metadata = false;
+        let mut tls_location = false;
+        let mut ordinary_location = false;
+        let mut subprogram = false;
+        while let Some(entry) = entries.next_dfs().unwrap() {
+            let name = entry
+                .attr(gimli::DW_AT_name)
+                .and_then(|attribute| dwarf.attr_string(&unit, attribute.value()).ok())
+                .map(|name| name.to_string_lossy().into_owned());
+            if entry.tag() == gimli::DW_TAG_variable && name.as_deref() == Some("tls_value") {
+                assert!(entry.has_attr(gimli::DW_AT_type));
+                assert!(entry.has_attr(gimli::DW_AT_decl_line));
+                tls_location = entry.has_attr(gimli::DW_AT_location);
+                tls_metadata = true;
+            }
+            if entry.tag() == gimli::DW_TAG_variable && name.as_deref() == Some("regular_value") {
+                ordinary_location = matches!(
+                    entry.attr_value(gimli::DW_AT_location).unwrap(),
+                    gimli::AttributeValue::Exprloc(_)
+                );
+            }
+            if entry.tag() == gimli::DW_TAG_subprogram && name.as_deref() == Some("read_tls") {
+                subprogram = true;
+            }
+        }
+        assert!(tls_metadata, "{}", config.target.triple);
+        assert_eq!(
+            tls_location,
+            object.format() == object::BinaryFormat::MachO,
+            "{}",
+            config.target.triple
+        );
+        if object.format() == object::BinaryFormat::MachO {
+            let debug_info = object.section_by_name("__debug_info").unwrap();
+            let relocation_symbols = debug_info
+                .relocations()
+                .filter_map(|(_, relocation)| match relocation.target() {
+                    RelocationTarget::Symbol(index) => object.symbol_by_index(index).ok(),
+                    _ => None,
+                })
+                .filter_map(|symbol| symbol.name().ok())
+                .collect::<BTreeSet<_>>();
+            assert!(
+                relocation_symbols.contains("_tls_value"),
+                "{}: {relocation_symbols:?}",
+                config.target.triple
+            );
+        }
+        assert!(ordinary_location, "{}", config.target.triple);
+        assert!(subprogram, "{}", config.target.triple);
+        output.into_artifact_bundle().verify().unwrap();
     }
 }
 
@@ -2565,9 +2727,10 @@ fn runtime_sized_storage_uses_checked_arena_growth_and_cleanup() {
     }
 
     let clif = function_clif(&output.clif, "inspect");
-    assert!(clif.contains("umul_overflow"), "{clif}");
-    assert!(clif.contains("uadd_overflow"), "{clif}");
-    assert!(clif.contains("trapnz"), "{clif}");
+    assert!(clif.matches("udiv").count() >= 2, "{clif}");
+    assert!(clif.matches("icmp ne").count() >= 2, "{clif}");
+    assert!(clif.contains("icmp ult"), "{clif}");
+    assert!(clif.matches("trapnz").count() >= 5, "{clif}");
     assert!(clif.contains("iconst.i64 -64"), "{clif}");
     assert!(clif.matches("call").count() >= 2, "{clif}");
 }

@@ -24,7 +24,10 @@ use args::{
     QueryOptions,
 };
 use ccc_codegen::{Options as CodegenOptions, Output as CodegenOutput};
-use ccc_diag::Diagnostic;
+use ccc_diag::{
+    Diagnostic, DiagnosticEngine, DiagnosticFormat, EmitOutcome, RenderOptions,
+    render_json_document,
+};
 use ccc_ir::generic::{FullModule, IrError as FrontendIrError};
 use ccc_link::{RegisteredTemporaryFile, ToolchainRequirements, ToolchainResolver};
 use ccc_pp::{
@@ -32,11 +35,14 @@ use ccc_pp::{
     PpItem, PpToken, PreprocessContext, PreprocessLimits, PreprocessOptions, PreprocessOutput,
     preprocess, render_macro_definitions, render_preprocessed,
 };
-use ccc_sema::generic::{FullTypedTranslationUnit, analyze_frontend, dump_frontend_typed_ast};
+use ccc_sema::generic::{
+    FullTypedTranslationUnit, analyze_frontend_with_recovery_limit, dump_frontend_typed_ast,
+};
 use ccc_session::{Session, SourceFileSpec, SourceMap};
 use ccc_syntax::frontend::{
-    FrontendItem, TokenKind as FrontendTokenKind, TranslationUnit as FrontendTranslationUnit,
-    convert_pp_items, dump_ast as dump_frontend_ast, parse_with_mode as parse_frontend_with_mode,
+    FrontendItem, PoisonedBinding, TokenKind as FrontendTokenKind,
+    TranslationUnit as FrontendTranslationUnit, convert_pp_items, dump_ast as dump_frontend_ast,
+    parse_recovering_with_mode_and_limit as parse_frontend_recovering_with_mode_and_limit,
 };
 use ccc_target::{CompatibilityScope, EffectiveCompilationConfig, SystemIncludeKind};
 
@@ -54,6 +60,7 @@ const HELP: &str = "Usage: ccc [options] <input>...\n\
   -c                         Compile without linking\n\
   -E [-P]                    Preprocess only; -P suppresses linemarkers\n\
   -fsyntax-only              Parse and analyze without emitting an object\n\
+  -fdiagnostics-format=kind  Render diagnostics as text or versioned JSON\n\
   -x language                Select c, c-cpp-output, assembler, assembler-with-cpp, or none\n\
   -O|-O0|-O1|-O2|-O3|-Os|-Oz Select the optimization profile\n\
   -g|-g1|-g2|-g3            Emit source-level DWARF; -g0 disables it\n\
@@ -95,12 +102,21 @@ static TEMPORARY_ID: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Eq, PartialEq)]
 pub struct DriverError {
     message: String,
+    json_document: Option<String>,
 }
 
 impl DriverError {
     fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            json_document: None,
+        }
+    }
+
+    fn with_json_document(message: impl Into<String>, json_document: String) -> Self {
+        Self {
+            message: message.into(),
+            json_document: Some(json_document),
         }
     }
 }
@@ -120,7 +136,12 @@ pub struct DriverOutput {
 }
 
 pub fn run(arguments: impl IntoIterator<Item = String>) -> Result<DriverOutput, DriverError> {
-    match args::parse(arguments).map_err(DriverError::new)? {
+    let arguments = arguments.into_iter().collect::<Vec<_>>();
+    let diagnostic_format = diagnostic_format_hint(&arguments);
+    match args::parse(arguments)
+        .map_err(DriverError::new)
+        .map_err(|error| error_for_format(error, diagnostic_format))?
+    {
         ParsedCommand::Help => Ok(DriverOutput {
             stdout: HELP.to_owned(),
             stderr: String::new(),
@@ -137,14 +158,48 @@ pub fn run(arguments: impl IntoIterator<Item = String>) -> Result<DriverOutput, 
         ParsedCommand::Run(options) => {
             let verbose = options.verbose;
             let hardening_diagnostics = degraded_hardening_diagnostics(&options)?;
-            let mut output = execute(*options)?;
-            output.stderr.insert_str(0, &hardening_diagnostics);
+            let format = options.diagnostic_format;
+            let hardening_json = (format == DiagnosticFormat::Json
+                && !hardening_diagnostics.is_empty())
+            .then(|| degraded_hardening_json_document(&options, false));
+            let mut output = match execute(*options) {
+                Ok(output) => output,
+                Err(error) => {
+                    let mut error = error_for_format(error, format);
+                    if let Some(hardening_json) = hardening_json {
+                        error = prepend_json_to_error(&hardening_json, error);
+                    }
+                    return Err(error);
+                }
+            };
+            if let Some(hardening_json) = hardening_json {
+                output.stderr = if output.stderr.trim().is_empty() {
+                    hardening_json
+                } else {
+                    merge_json_documents(&hardening_json, &output.stderr)
+                        .unwrap_or_else(|| format!("{hardening_json}{}", output.stderr))
+                };
+            } else {
+                output.stderr.insert_str(0, &hardening_diagnostics);
+            }
             if verbose {
                 output.stderr.insert_str(0, &verbose_version());
             }
             Ok(output)
         }
     }
+}
+
+fn diagnostic_format_hint(arguments: &[String]) -> DiagnosticFormat {
+    arguments
+        .iter()
+        .filter_map(|argument| match argument.as_str() {
+            "-fdiagnostics-format=text" => Some(DiagnosticFormat::Text),
+            "-fdiagnostics-format=json" => Some(DiagnosticFormat::Json),
+            _ => None,
+        })
+        .next_back()
+        .unwrap_or(DiagnosticFormat::Text)
 }
 
 fn degraded_hardening_diagnostics(options: &DriverOptions) -> Result<String, DriverError> {
@@ -172,10 +227,40 @@ fn degraded_hardening_diagnostics(options: &DriverOptions) -> Result<String, Dri
         })
         .collect::<String>();
     if disposition == WarningDisposition::Error {
-        Err(DriverError::new(diagnostics))
+        let error = DriverError::new(diagnostics);
+        if options.diagnostic_format == DiagnosticFormat::Json {
+            let json = degraded_hardening_json_document(options, true);
+            Err(DriverError::with_json_document(
+                json.trim_end().to_owned(),
+                json,
+            ))
+        } else {
+            Err(error)
+        }
     } else {
         Ok(diagnostics)
     }
+}
+
+fn degraded_hardening_json_document(options: &DriverOptions, as_error: bool) -> String {
+    let diagnostics = options
+        .degraded_hardening
+        .iter()
+        .map(|option| {
+            let mut diagnostic = Diagnostic::warning(
+                "CCC6009",
+                "degraded-hardening",
+                format!(
+                    "hardening option `{option}` is accepted without its code-generation transform"
+                ),
+            );
+            if as_error {
+                diagnostic.severity = ccc_diag::Severity::Error;
+            }
+            diagnostic
+        })
+        .collect::<Vec<_>>();
+    render_json_document(&diagnostics, &SourceMap::new(), RenderOptions::default())
 }
 
 fn query_driver(query: DriverQuery, options: QueryOptions) -> Result<DriverOutput, DriverError> {
@@ -570,6 +655,9 @@ fn render_ccc_compile_command(
     if let Some(limit) = options.error_limit {
         command.push(format!("-ferror-limit={limit}").into());
     }
+    if options.diagnostic_format == DiagnosticFormat::Json {
+        command.push("-fdiagnostics-format=json".into());
+    }
     command.extend(options.degraded_hardening.iter().map(OsString::from));
     if options.no_standard_includes {
         command.push("-nostdinc".into());
@@ -699,8 +787,7 @@ fn shell_quote(value: &str) -> String {
 }
 
 fn syntax_only_output(prepared: PreparedSource) -> Result<DriverOutput, DriverError> {
-    let prior_stderr = prepared.stderr.clone();
-    let (parsed, _) = analyze_frontend_preprocessed(prepared, &prior_stderr)?;
+    let (parsed, _) = analyze_frontend_preprocessed(prepared)?;
     Ok(DriverOutput {
         stdout: String::new(),
         stderr: parsed.stderr,
@@ -755,26 +842,26 @@ fn compile_multiple_outputs(options: DriverOptions) -> Result<DriverOutput, Driv
                 per_input.input_languages = vec![language];
                 per_input.link_items.clear();
                 per_input.output = Some(output);
-                let prepared = preprocess_source(&per_input)?;
-                compile_output(&per_input, prepared, false)?
+                preprocess_source(&per_input)
+                    .and_then(|prepared| compile_output(&per_input, prepared, false))
             }
             InputKind::Assembly | InputKind::PreprocessedAssembly => {
                 let mut per_input = options.clone();
                 per_input.input = input.clone();
                 per_input.inputs = vec![input.clone()];
                 per_input.input_languages = vec![language];
-                let (config, _) = effective_config(&per_input)?;
-                assemble_input(&per_input, input, language, &output, &config)?
+                effective_config(&per_input).and_then(|(config, _)| {
+                    assemble_input(&per_input, input, language, &output, &config)
+                })
             }
-            InputKind::Linker => {
-                return Err(DriverError::new(format!(
-                    "ccc: `-c` input {} is already a linker input",
-                    input.display()
-                )));
-            }
-        };
+            InputKind::Linker => Err(DriverError::new(format!(
+                "ccc: `-c` input {} is already a linker input",
+                input.display()
+            ))),
+        }
+        .map_err(|error| with_prior_diagnostics(&stderr, error))?;
         stdout.push_str(&result.stdout);
-        stderr.push_str(&result.stderr);
+        append_diagnostic_output(&mut stderr, &result.stderr, options.diagnostic_format);
     }
     Ok(DriverOutput { stdout, stderr })
 }
@@ -803,6 +890,7 @@ fn link_output(options: DriverOptions) -> Result<DriverOutput, DriverError> {
             DriverLinkOutputKind::Relocatable => PathBuf::from("a.o"),
         });
     let mut temporaries = Vec::new();
+    let mut packaging_reports = Vec::new();
     let mut linker_inputs = Vec::<OsString>::new();
     let mut stdout = String::new();
     let mut stderr = String::new();
@@ -815,7 +903,8 @@ fn link_output(options: DriverOptions) -> Result<DriverOutput, DriverError> {
                 language,
             } => match classify_input(input, *language) {
                 InputKind::C | InputKind::PreprocessedC => {
-                    let temporary = TemporaryObject::create()?;
+                    let temporary = TemporaryObject::create()
+                        .map_err(|error| with_prior_diagnostics(&stderr, error))?;
                     let mut per_input = options.clone();
                     per_input.action = PrimaryAction::Compile { link: false };
                     per_input.input = input.clone();
@@ -823,20 +912,38 @@ fn link_output(options: DriverOptions) -> Result<DriverOutput, DriverError> {
                     per_input.input_languages = vec![*language];
                     per_input.link_items.clear();
                     per_input.output = Some(temporary.path().to_path_buf());
-                    let prepared = preprocess_source(&per_input)?;
-                    let result = compile_output(&per_input, prepared, false)?;
+                    let prepared = preprocess_source(&per_input)
+                        .map_err(|error| with_prior_diagnostics(&stderr, error))?;
+                    let (result, packaging) =
+                        compile_output_retaining_packaging(&per_input, prepared, false)
+                            .map_err(|error| with_prior_diagnostics(&stderr, error))?;
+                    packaging_reports.push(packaging);
                     stdout.push_str(&result.stdout);
-                    stderr.push_str(&result.stderr);
+                    append_diagnostic_output(
+                        &mut stderr,
+                        &result.stderr,
+                        options.diagnostic_format,
+                    );
                     linker_inputs.push(temporary.path().as_os_str().to_owned());
                     temporaries.push(temporary);
                 }
                 InputKind::Linker => linker_inputs.push(input.as_os_str().to_owned()),
                 InputKind::Assembly | InputKind::PreprocessedAssembly => {
-                    let temporary = TemporaryObject::create()?;
+                    let mut temporary = TemporaryObject::create()
+                        .map_err(|error| with_prior_diagnostics(&stderr, error))?;
+                    let temporary_path = temporary
+                        .prepare_external_write()
+                        .map_err(|error| with_prior_diagnostics(&stderr, error))?
+                        .to_path_buf();
                     let result =
-                        assemble_input(&options, input, *language, temporary.path(), &config)?;
+                        assemble_input(&options, input, *language, &temporary_path, &config)
+                            .map_err(|error| with_prior_diagnostics(&stderr, error))?;
                     stdout.push_str(&result.stdout);
-                    stderr.push_str(&result.stderr);
+                    append_diagnostic_output(
+                        &mut stderr,
+                        &result.stderr,
+                        options.diagnostic_format,
+                    );
                     linker_inputs.push(temporary.path().as_os_str().to_owned());
                     temporaries.push(temporary);
                 }
@@ -845,16 +952,22 @@ fn link_output(options: DriverOptions) -> Result<DriverOutput, DriverError> {
     }
 
     let mut pending = atomic_output::PendingOutput::create(&output).map_err(|error| {
-        DriverError::new(format!(
-            "ccc: cannot create output {}: {error}",
-            output.display()
-        ))
+        with_prior_diagnostics(
+            &stderr,
+            DriverError::new(format!(
+                "ccc: cannot create output {}: {error}",
+                output.display()
+            )),
+        )
     })?;
     let pending_path = pending.prepare_external_write().map_err(|error| {
-        DriverError::new(format!(
-            "ccc: cannot prepare output {}: {error}",
-            output.display()
-        ))
+        with_prior_diagnostics(
+            &stderr,
+            DriverError::new(format!(
+                "ccc: cannot prepare output {}: {error}",
+                output.display()
+            )),
+        )
     })?;
     let kind = match options.link_output_kind {
         DriverLinkOutputKind::Executable => ccc_link::LinkOutputKind::Executable,
@@ -868,16 +981,22 @@ fn link_output(options: DriverOptions) -> Result<DriverOutput, DriverError> {
         &config,
         &config.toolchain,
     )
-    .map_err(|error| owner_error(error.code, error.message))?;
+    .map_err(|error| with_prior_diagnostics(&stderr, owner_error(error.code, error.message)))?;
     pending.commit(&output).map_err(|error| {
-        DriverError::new(format!(
-            "ccc: cannot replace output {}: {error}",
-            output.display()
-        ))
+        with_prior_diagnostics(
+            &stderr,
+            DriverError::new(format!(
+                "ccc: cannot replace output {}: {error}",
+                output.display()
+            )),
+        )
     })?;
     if should_materialize_darwin_debug_artifact(&options, &config) {
-        stderr.push_str(&materialize_darwin_debug_artifact(&output, &config)?);
+        let debug_stderr = materialize_darwin_debug_artifact(&output, &config)
+            .map_err(|error| with_prior_diagnostics(&stderr, error))?;
+        append_diagnostic_output(&mut stderr, &debug_stderr, options.diagnostic_format);
     }
+    drop(packaging_reports);
     drop(temporaries);
     Ok(DriverOutput { stdout, stderr })
 }
@@ -1062,19 +1181,42 @@ fn assemble_input(
         per_input.link_items.clear();
         per_input.output = None;
         let prepared = preprocess_source(&per_input)?;
-        stderr.push_str(&prepared.stderr);
+        prepared.reject_if_errors()?;
+        append_diagnostic_output(&mut stderr, &prepared.stderr, options.diagnostic_format);
         let source = render_preprocessed(&prepared.output, false);
-        preprocessed = Some(TemporaryAssembly::create(source.as_bytes())?);
+        preprocessed = Some(
+            TemporaryAssembly::create(source.as_bytes())
+                .map_err(|error| with_prior_diagnostics(&stderr, error))?,
+        );
         preprocessed.as_ref().expect("temporary was created").path()
     } else {
         preprocessed = None;
         input
     };
-    let driver = config
-        .toolchain
-        .compiler_driver
-        .as_ref()
-        .ok_or_else(|| DriverError::new("ccc: resolved toolchain has no compiler driver"))?;
+    let driver = config.toolchain.compiler_driver.as_ref().ok_or_else(|| {
+        with_prior_diagnostics(
+            &stderr,
+            DriverError::new("ccc: resolved toolchain has no compiler driver"),
+        )
+    })?;
+    let mut pending = atomic_output::PendingOutput::create(output).map_err(|error| {
+        with_prior_diagnostics(
+            &stderr,
+            DriverError::new(format!(
+                "ccc: cannot create output {}: {error}",
+                output.display()
+            )),
+        )
+    })?;
+    let pending_path = pending.prepare_external_write().map_err(|error| {
+        with_prior_diagnostics(
+            &stderr,
+            DriverError::new(format!(
+                "ccc: cannot prepare output {}: {error}",
+                output.display()
+            )),
+        )
+    })?;
     let result = Command::new(&driver.program)
         .args(&driver.arguments)
         .arg("-x")
@@ -1082,23 +1224,38 @@ fn assemble_input(
         .arg("-c")
         .arg(assembly)
         .arg("-o")
-        .arg(output)
+        .arg(pending_path)
         .output()
         .map_err(|error| {
-            DriverError::new(format!(
-                "ccc: cannot invoke target compiler driver `{}` for assembly input: {error}",
-                driver.display()
-            ))
+            with_prior_diagnostics(
+                &stderr,
+                DriverError::new(format!(
+                    "ccc: cannot invoke target compiler driver `{}` for assembly input: {error}",
+                    driver.display()
+                )),
+            )
         })?;
     drop(preprocessed);
     if !result.status.success() {
-        return Err(DriverError::new(format!(
-            "ccc: target compiler driver `{}` failed to assemble {}: {}",
-            driver.display(),
-            input.display(),
-            String::from_utf8_lossy(&result.stderr).trim()
-        )));
+        return Err(with_prior_diagnostics(
+            &stderr,
+            DriverError::new(format!(
+                "ccc: target compiler driver `{}` failed to assemble {}: {}",
+                driver.display(),
+                input.display(),
+                String::from_utf8_lossy(&result.stderr).trim()
+            )),
+        ));
     }
+    pending.commit(output).map_err(|error| {
+        with_prior_diagnostics(
+            &stderr,
+            DriverError::new(format!(
+                "ccc: cannot replace output {}: {error}",
+                output.display()
+            )),
+        )
+    })?;
     Ok(DriverOutput {
         stdout: String::new(),
         stderr,
@@ -1108,7 +1265,23 @@ fn assemble_input(
 struct PreparedSource {
     session: Session,
     output: PreprocessOutput,
+    diagnostics: DiagnosticEngine,
+    diagnostic_format: DiagnosticFormat,
     stderr: String,
+}
+
+impl PreparedSource {
+    fn reject_if_errors(&self) -> Result<(), DriverError> {
+        if self.diagnostics.has_errors() {
+            Err(diagnostic_engine_error(
+                &self.session.sources,
+                &self.diagnostics,
+                self.diagnostic_format,
+            ))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 fn preprocess_source(options: &DriverOptions) -> Result<PreparedSource, DriverError> {
@@ -1140,7 +1313,14 @@ fn preprocess_source(options: &DriverOptions) -> Result<PreparedSource, DriverEr
         options.warnings_as_errors,
         &options.warning_options,
     );
-    let mut sink = PreprocessorDiagnostics::new(&warning_policy);
+    let warn_in_system_headers = warning_policy.enabled("system-headers");
+    let mut sink = PreprocessorDiagnostics::new(
+        &warning_policy,
+        !options.suppress_warnings,
+        options.warnings_as_errors,
+        warn_in_system_headers,
+        options.error_limit.unwrap_or(20),
+    );
     let output = preprocess(
         &mut PreprocessContext {
             session: &mut session,
@@ -1151,20 +1331,13 @@ fn preprocess_source(options: &DriverOptions) -> Result<PreparedSource, DriverEr
         main_file,
     );
 
-    let warn_in_system_headers = warning_policy.enabled("system-headers");
-    let diagnostics = sink.finish(
-        &session.sources,
-        !options.suppress_warnings,
-        options.warnings_as_errors,
-        warn_in_system_headers,
-        options.error_limit.unwrap_or(20),
-    );
-    let stderr = diagnostics.render(&session.sources);
-    if output.had_errors || diagnostics.has_errors() {
-        return Err(rendered_driver_error(stderr));
-    }
+    let diagnostics = sink.finish();
+    debug_assert!(!output.had_errors || diagnostics.has_errors());
+    let stderr = successful_diagnostics(&session.sources, &diagnostics, options.diagnostic_format);
 
-    if let Some(header) = unsupported_hosted_header(&options.action, &session.config, &output) {
+    if !diagnostics.has_errors()
+        && let Some(header) = unsupported_hosted_header(&options.action, &session.config, &output)
+    {
         let required = required_compatibility_scope(&options.action);
         let available = session
             .config
@@ -1172,7 +1345,11 @@ fn preprocess_source(options: &DriverOptions) -> Result<PreparedSource, DriverEr
             .as_ref()
             .map_or(CompatibilityScope::Preprocessing, |profile| profile.scope);
         return Err(with_prior_diagnostics(
-            &stderr,
+            &render_diagnostics_for_error(
+                &session.sources,
+                &diagnostics,
+                options.diagnostic_format,
+            ),
             owner_error(
                 "CCC6004",
                 format!(
@@ -1193,6 +1370,8 @@ fn preprocess_source(options: &DriverOptions) -> Result<PreparedSource, DriverEr
     Ok(PreparedSource {
         session,
         output,
+        diagnostics,
+        diagnostic_format: options.diagnostic_format,
         stderr,
     })
 }
@@ -1485,6 +1664,7 @@ fn dependency_only_output(
     options: &DriverOptions,
     prepared: PreparedSource,
 ) -> Result<DriverOutput, DriverError> {
+    prepared.reject_if_errors()?;
     let rendered = rendered_dependencies(options, &prepared.output, None);
     let destination = options
         .dependencies
@@ -1515,6 +1695,7 @@ fn preprocess_output(
     options: &DriverOptions,
     prepared: PreparedSource,
 ) -> Result<DriverOutput, DriverError> {
+    prepared.reject_if_errors()?;
     let mut stdout = if options.dump_macros {
         render_macro_definitions(&prepared.output.macros)
     } else {
@@ -1563,76 +1744,73 @@ fn dump_output(
     prepared: PreparedSource,
     kind: DumpKind,
 ) -> Result<DriverOutput, DriverError> {
-    let prior_stderr = prepared.stderr.clone();
-    let dependency_stdout = if matches!(
-        options.dependencies.mode,
-        DriverDependencyMode::SideEffect { .. }
-    ) {
-        write_side_effect_dependencies(options, &prepared.output, None)
-            .map_err(|error| with_prior_diagnostics(&prior_stderr, error))?
-    } else {
-        String::new()
-    };
+    let deferred_dependencies = defer_side_effect_dependencies(options, &prepared.output, None);
 
-    let stdout = match kind {
-        DumpKind::PpTokens => dump_pp_tokens(&prepared.session.sources, &prepared.output.tokens()),
+    let (mut stdout, stderr) = match kind {
+        DumpKind::PpTokens => {
+            prepared.reject_if_errors()?;
+            (
+                dump_pp_tokens(&prepared.session.sources, &prepared.output.tokens()),
+                prepared.stderr,
+            )
+        }
         DumpKind::Tokens => {
-            let items = convert_pp_items(prepared.output.items).map_err(|error| {
-                with_prior_diagnostics(
-                    &prior_stderr,
-                    diagnostic_error(
+            let mut prepared = prepared;
+            prepared.reject_if_errors()?;
+            let items = match convert_pp_items(prepared.output.items) {
+                Ok(items) => items,
+                Err(error) => {
+                    let _ = prepared.diagnostics.emit(
                         &prepared.session.sources,
                         Diagnostic::error(error.code, error.message)
+                            .with_category("lexical")
                             .with_primary(error.span, "while converting preprocessing tokens"),
-                    ),
-                )
-            })?;
-            dump_frontend_tokens(&prepared.session.sources, &items)
+                    );
+                    return Err(diagnostic_engine_error(
+                        &prepared.session.sources,
+                        &prepared.diagnostics,
+                        prepared.diagnostic_format,
+                    ));
+                }
+            };
+            (
+                dump_frontend_tokens(&prepared.session.sources, &items),
+                prepared.stderr,
+            )
         }
         DumpKind::Ast => {
-            let parsed =
-                parse_frontend_preprocessed(prepared.session, prepared.output, &prior_stderr)?;
-            let mut stdout = dump_frontend_ast(&parsed.ast);
-            stdout.push_str(&dependency_stdout);
-            return Ok(DriverOutput {
-                stdout,
-                stderr: parsed.stderr,
-            });
+            let mut parsed = parse_frontend_preprocessed(prepared)?;
+            parsed.reject_if_errors()?;
+            (dump_frontend_ast(&parsed.ast), parsed.stderr)
         }
         DumpKind::TypedAst => {
-            let (parsed, typed) = analyze_frontend_preprocessed(prepared, &prior_stderr)?;
-            let mut stdout = dump_frontend_typed_ast(&typed);
-            stdout.push_str(&dependency_stdout);
-            return Ok(DriverOutput {
-                stdout,
-                stderr: parsed.stderr,
-            });
+            let (parsed, typed) = analyze_frontend_preprocessed(prepared)?;
+            (dump_frontend_typed_ast(&typed), parsed.stderr)
         }
         DumpKind::Ir => {
-            let (parsed, ir) = lower_frontend_preprocessed(prepared, &prior_stderr)?;
-            let mut stdout = ccc_ir::generic::dump_frontend_ir(&ir);
-            stdout.push_str(&dependency_stdout);
-            return Ok(DriverOutput {
-                stdout,
-                stderr: parsed.stderr,
-            });
+            let (parsed, ir) = lower_frontend_preprocessed(prepared)?;
+            (ccc_ir::generic::dump_frontend_ir(&ir), parsed.stderr)
         }
         DumpKind::Abi => {
-            let (parsed, ir) = lower_frontend_preprocessed(prepared, &prior_stderr)?;
-            let plan = ccc_abi::plan_module(&ir, &parsed.session.config)
-                .map_err(|error| abi_driver_error(&parsed.session.sources, error))?;
+            let (parsed, ir) = lower_frontend_preprocessed(prepared)?;
+            let plan = ccc_abi::plan_module(&ir, &parsed.session.config).map_err(|error| {
+                with_prior_diagnostics(
+                    &parsed.stderr,
+                    abi_driver_error(&parsed.session.sources, error),
+                )
+            })?;
             let verified = plan
                 .verify_against(&ir, &parsed.session.config)
-                .map_err(|error| abi_driver_error(&parsed.session.sources, error))?;
-            let mut stdout = ccc_abi::dump_module_plan(verified);
-            stdout.push_str(&dependency_stdout);
-            return Ok(DriverOutput {
-                stdout,
-                stderr: parsed.stderr,
-            });
+                .map_err(|error| {
+                    with_prior_diagnostics(
+                        &parsed.stderr,
+                        abi_driver_error(&parsed.session.sources, error),
+                    )
+                })?;
+            (ccc_abi::dump_module_plan(verified), parsed.stderr)
         }
         DumpKind::Clif => {
-            let (parsed, ir) = lower_frontend_preprocessed(prepared, &prior_stderr)?;
+            let (parsed, ir) = lower_frontend_preprocessed(prepared)?;
             let generated = codegen_frontend(
                 &ir,
                 &parsed.session.config,
@@ -1641,20 +1819,13 @@ fn dump_output(
                 false,
             )
             .map_err(|error| with_prior_diagnostics(&parsed.stderr, error))?;
-            let mut stdout = generated.clif;
-            stdout.push_str(&dependency_stdout);
-            return Ok(DriverOutput {
-                stdout,
-                stderr: parsed.stderr,
-            });
+            (generated.clif, parsed.stderr)
         }
     };
-    let mut stdout = stdout;
+    let dependency_stdout = publish_deferred_dependencies(deferred_dependencies)
+        .map_err(|error| with_prior_diagnostics(&stderr, error))?;
     stdout.push_str(&dependency_stdout);
-    Ok(DriverOutput {
-        stdout,
-        stderr: prepared.stderr,
-    })
+    Ok(DriverOutput { stdout, stderr })
 }
 
 fn compile_output(
@@ -1662,6 +1833,15 @@ fn compile_output(
     prepared: PreparedSource,
     link: bool,
 ) -> Result<DriverOutput, DriverError> {
+    let (output, _packaging) = compile_output_retaining_packaging(options, prepared, link)?;
+    Ok(output)
+}
+
+fn compile_output_retaining_packaging(
+    options: &DriverOptions,
+    prepared: PreparedSource,
+    link: bool,
+) -> Result<(DriverOutput, ccc_link::PackagingReport), DriverError> {
     let output = options.output.clone().unwrap_or_else(|| {
         if link {
             PathBuf::from("a.out")
@@ -1669,18 +1849,10 @@ fn compile_output(
             compile_output_path(&options.input)
         }
     });
-    let dependency_stdout = if matches!(
-        options.dependencies.mode,
-        DriverDependencyMode::SideEffect { .. }
-    ) {
-        write_side_effect_dependencies(options, &prepared.output, options.output.as_deref())
-            .map_err(|error| with_prior_diagnostics(&prepared.stderr, error))?
-    } else {
-        String::new()
-    };
+    let deferred_dependencies =
+        defer_side_effect_dependencies(options, &prepared.output, options.output.as_deref());
 
-    let prior_stderr = prepared.stderr.clone();
-    let (parsed, ir) = lower_frontend_preprocessed(prepared, &prior_stderr)?;
+    let (parsed, ir) = lower_frontend_preprocessed(prepared)?;
     let generated = codegen_frontend(
         &ir,
         &parsed.session.config,
@@ -1690,6 +1862,8 @@ fn compile_output(
     )
     .map_err(|error| with_prior_diagnostics(&parsed.stderr, error))?;
     let artifact = generated.into_artifact_bundle();
+    let dependency_stdout;
+    let packaging;
     if link {
         let mut temporary = TemporaryObject::create()
             .map_err(|error| with_prior_diagnostics(&parsed.stderr, error))?;
@@ -1697,10 +1871,11 @@ fn compile_output(
             .prepare_external_write()
             .map_err(|error| with_prior_diagnostics(&parsed.stderr, error))?
             .to_path_buf();
-        ccc_link::package_artifact_bundle(artifact, &artifact_path, &parsed.session.config)
-            .map_err(|error| {
-                with_prior_diagnostics(&parsed.stderr, owner_error(error.code, error.message))
-            })?;
+        packaging =
+            ccc_link::package_artifact_bundle(artifact, &artifact_path, &parsed.session.config)
+                .map_err(|error| {
+                    with_prior_diagnostics(&parsed.stderr, owner_error(error.code, error.message))
+                })?;
         let mut pending = atomic_output::PendingOutput::create(&output).map_err(|error| {
             with_prior_diagnostics(
                 &parsed.stderr,
@@ -1731,6 +1906,8 @@ fn compile_output(
         .map_err(|error| {
             with_prior_diagnostics(&parsed.stderr, owner_error(error.code, error.message))
         })?;
+        dependency_stdout = publish_deferred_dependencies(deferred_dependencies)
+            .map_err(|error| with_prior_diagnostics(&parsed.stderr, error))?;
         pending.commit(&output).map_err(|error| {
             with_prior_diagnostics(
                 &parsed.stderr,
@@ -1741,14 +1918,51 @@ fn compile_output(
             )
         })?;
     } else {
-        ccc_link::package_artifact_bundle(artifact, &output, &parsed.session.config).map_err(
-            |error| with_prior_diagnostics(&parsed.stderr, owner_error(error.code, error.message)),
-        )?;
+        let mut pending = atomic_output::PendingOutput::create(&output).map_err(|error| {
+            with_prior_diagnostics(
+                &parsed.stderr,
+                DriverError::new(format!(
+                    "ccc: cannot create output {}: {error}",
+                    output.display()
+                )),
+            )
+        })?;
+        let package_output = pending
+            .prepare_external_write()
+            .map_err(|error| {
+                with_prior_diagnostics(
+                    &parsed.stderr,
+                    DriverError::new(format!(
+                        "ccc: cannot prepare output {}: {error}",
+                        output.display()
+                    )),
+                )
+            })?
+            .to_path_buf();
+        packaging =
+            ccc_link::package_artifact_bundle(artifact, &package_output, &parsed.session.config)
+                .map_err(|error| {
+                    with_prior_diagnostics(&parsed.stderr, owner_error(error.code, error.message))
+                })?;
+        dependency_stdout = publish_deferred_dependencies(deferred_dependencies)
+            .map_err(|error| with_prior_diagnostics(&parsed.stderr, error))?;
+        pending.commit(&output).map_err(|error| {
+            with_prior_diagnostics(
+                &parsed.stderr,
+                DriverError::new(format!(
+                    "ccc: cannot replace output {}: {error}",
+                    output.display()
+                )),
+            )
+        })?;
     }
-    Ok(DriverOutput {
-        stdout: dependency_stdout,
-        stderr: parsed.stderr,
-    })
+    Ok((
+        DriverOutput {
+            stdout: dependency_stdout,
+            stderr: parsed.stderr,
+        },
+        packaging,
+    ))
 }
 
 fn rendered_dependencies(
@@ -1788,11 +2002,22 @@ fn rendered_dependencies(
     )
 }
 
-fn write_side_effect_dependencies(
+struct DeferredDependencyPublication {
+    rendered: dependency::RenderedDependencies,
+    destination: PathBuf,
+}
+
+fn defer_side_effect_dependencies(
     options: &DriverOptions,
     output: &PreprocessOutput,
     output_target: Option<&Path>,
-) -> Result<String, DriverError> {
+) -> Option<DeferredDependencyPublication> {
+    if !matches!(
+        options.dependencies.mode,
+        DriverDependencyMode::SideEffect { .. }
+    ) {
+        return None;
+    }
     let rendered = rendered_dependencies(options, output, output_target);
     let destination = options
         .dependencies
@@ -1806,86 +2031,216 @@ fn write_side_effect_dependencies(
             }
         })
         .unwrap_or_else(|| default_dependency_path(&options.input, output_target));
-    if destination == Path::new("-") {
-        return Ok(rendered.contents);
+    Some(DeferredDependencyPublication {
+        rendered,
+        destination,
+    })
+}
+
+fn publish_deferred_dependencies(
+    publication: Option<DeferredDependencyPublication>,
+) -> Result<String, DriverError> {
+    let Some(publication) = publication else {
+        return Ok(String::new());
+    };
+    if publication.destination == Path::new("-") {
+        return Ok(publication.rendered.contents);
     }
-    atomic_output::write_atomic(&destination, rendered.as_bytes())
+    atomic_output::write_atomic(&publication.destination, publication.rendered.as_bytes())
         .map_err(|error| {
             DriverError::new(format!(
                 "ccc: cannot write dependency file {}: {error}",
-                destination.display()
+                publication.destination.display()
             ))
         })
         .map(|()| String::new())
 }
 
+fn write_side_effect_dependencies(
+    options: &DriverOptions,
+    output: &PreprocessOutput,
+    output_target: Option<&Path>,
+) -> Result<String, DriverError> {
+    publish_deferred_dependencies(defer_side_effect_dependencies(
+        options,
+        output,
+        output_target,
+    ))
+}
+
 struct FrontendParsedSource {
     session: Session,
     ast: FrontendTranslationUnit,
+    diagnostics: DiagnosticEngine,
+    diagnostic_format: DiagnosticFormat,
     stderr: String,
+    poisoned_bindings: Vec<PoisonedBinding>,
+}
+
+impl FrontendParsedSource {
+    fn reject_if_errors(&mut self) -> Result<(), DriverError> {
+        if self.diagnostics.has_errors() {
+            return Err(diagnostic_engine_error(
+                &self.session.sources,
+                &self.diagnostics,
+                self.diagnostic_format,
+            ));
+        }
+        self.stderr = successful_diagnostics(
+            &self.session.sources,
+            &self.diagnostics,
+            self.diagnostic_format,
+        );
+        Ok(())
+    }
 }
 
 fn parse_frontend_preprocessed(
-    session: Session,
-    output: PreprocessOutput,
-    prior_stderr: &str,
+    prepared: PreparedSource,
 ) -> Result<FrontendParsedSource, DriverError> {
-    let items = convert_pp_items(output.items).map_err(|error| {
-        with_prior_diagnostics(
-            prior_stderr,
-            diagnostic_error(
+    let PreparedSource {
+        session,
+        output,
+        mut diagnostics,
+        diagnostic_format,
+        stderr,
+    } = prepared;
+    if diagnostics.is_halted() {
+        return Err(diagnostic_engine_error(
+            &session.sources,
+            &diagnostics,
+            diagnostic_format,
+        ));
+    }
+    let items = match convert_pp_items(output.items) {
+        Ok(items) => items,
+        Err(error) => {
+            let _ = diagnostics.emit(
                 &session.sources,
                 Diagnostic::error(error.code, error.message)
+                    .with_category("lexical")
                     .with_primary(error.span, "while converting preprocessing tokens"),
-            ),
-        )
-    })?;
-    let ast = parse_frontend_with_mode(&items, session.config.language.mode).map_err(|error| {
-        with_prior_diagnostics(
-            prior_stderr,
-            diagnostic_error(
+            );
+            return Err(diagnostic_engine_error(
                 &session.sources,
-                Diagnostic::error(error.code, error.message)
-                    .with_primary(error.span, "while parsing"),
-            ),
-        )
-    })?;
+                &diagnostics,
+                diagnostic_format,
+            ));
+        }
+    };
+    let remaining = remaining_error_budget(&diagnostics);
+    let recovered = parse_frontend_recovering_with_mode_and_limit(
+        &items,
+        session.config.language.mode,
+        remaining,
+    );
+    for error in recovered.diagnostics {
+        let outcome = diagnostics.emit(
+            &session.sources,
+            Diagnostic::error(error.code, error.message)
+                .with_category("syntax")
+                .with_primary(error.span, "while parsing"),
+        );
+        if outcome == EmitOutcome::Halted || diagnostics.is_halted() {
+            break;
+        }
+    }
     Ok(FrontendParsedSource {
         session,
-        ast,
-        stderr: prior_stderr.to_owned(),
+        ast: recovered.ast,
+        diagnostics,
+        diagnostic_format,
+        stderr,
+        poisoned_bindings: recovered.poisoned_bindings,
     })
 }
 
 fn analyze_frontend_preprocessed(
     prepared: PreparedSource,
-    prior_stderr: &str,
 ) -> Result<(FrontendParsedSource, FullTypedTranslationUnit), DriverError> {
-    let parsed = parse_frontend_preprocessed(prepared.session, prepared.output, prior_stderr)?;
-    let typed = analyze_frontend(&parsed.ast, &parsed.session.config).map_err(|diagnostics| {
-        with_prior_diagnostics(
-            prior_stderr,
-            diagnostics_error(&parsed.session.sources, diagnostics),
-        )
-    })?;
+    let mut parsed = parse_frontend_preprocessed(prepared)?;
+    let typed = if parsed.diagnostics.is_halted() {
+        None
+    } else {
+        let remaining = remaining_error_budget(&parsed.diagnostics);
+        match analyze_frontend_with_recovery_limit(
+            &parsed.ast,
+            &parsed.session.config,
+            remaining,
+            &parsed.poisoned_bindings,
+        ) {
+            Ok(typed) => Some(typed),
+            Err(diagnostics) => {
+                for mut diagnostic in diagnostics {
+                    if diagnostic_depends_on_recovery(
+                        &diagnostic,
+                        &parsed.poisoned_bindings,
+                        &parsed.session.sources,
+                    ) {
+                        continue;
+                    }
+                    if diagnostic.category.is_none() {
+                        diagnostic = diagnostic.with_category("semantic");
+                    }
+                    let outcome = parsed.diagnostics.emit(&parsed.session.sources, diagnostic);
+                    if outcome == EmitOutcome::Halted || parsed.diagnostics.is_halted() {
+                        break;
+                    }
+                }
+                None
+            }
+        }
+    };
+    parsed.reject_if_errors()?;
+    let typed = typed.expect("error-free semantic analysis returns a typed translation unit");
     Ok((parsed, typed))
+}
+
+fn remaining_error_budget(diagnostics: &DiagnosticEngine) -> Option<usize> {
+    let limit = diagnostics.options().error_limit;
+    (limit != 0).then(|| limit.saturating_sub(diagnostics.error_count()))
+}
+
+fn diagnostic_depends_on_recovery(
+    diagnostic: &Diagnostic,
+    bindings: &[PoisonedBinding],
+    sources: &SourceMap,
+) -> bool {
+    if diagnostic.code != "CCC2274" {
+        return false;
+    }
+    let Some(primary) = diagnostic.primary.as_ref() else {
+        return false;
+    };
+    let use_span = primary.span;
+    let Some(spelling) = sources
+        .source(use_span.file)
+        .and_then(|source| source.get(use_span.start..use_span.end))
+    else {
+        return false;
+    };
+    bindings.iter().any(|binding| {
+        binding.name == spelling
+            && binding.binding.file == use_span.file
+            && use_span.start >= binding.binding.end
+            && use_span.start < binding.scope_end
+    })
 }
 
 fn lower_frontend_preprocessed(
     prepared: PreparedSource,
-    prior_stderr: &str,
 ) -> Result<(FrontendParsedSource, FullModule), DriverError> {
-    let (parsed, typed) = analyze_frontend_preprocessed(prepared, prior_stderr)?;
+    let (parsed, typed) = analyze_frontend_preprocessed(prepared)?;
     let mut ir = ccc_ir::generic::lower_frontend(&typed).map_err(|error| {
         with_prior_diagnostics(
-            prior_stderr,
+            &parsed.stderr,
             frontend_ir_error(&parsed.session.sources, error),
         )
     })?;
-    ccc_ir::generic::optimize_frontend(&mut ir, parsed.session.config.optimization).map_err(
+    ccc_ir::generic::optimize_frontend_for_config(&mut ir, &parsed.session.config).map_err(
         |error| {
             with_prior_diagnostics(
-                prior_stderr,
+                &parsed.stderr,
                 frontend_ir_error(&parsed.session.sources, error),
             )
         },
@@ -2099,26 +2454,64 @@ fn rendered_driver_error(rendered: String) -> DriverError {
     }
 }
 
+fn successful_diagnostics(
+    sources: &SourceMap,
+    diagnostics: &DiagnosticEngine,
+    format: DiagnosticFormat,
+) -> String {
+    if diagnostics.diagnostics().is_empty() {
+        String::new()
+    } else {
+        diagnostics.render_format(sources, format)
+    }
+}
+
+fn render_diagnostics_for_error(
+    sources: &SourceMap,
+    diagnostics: &DiagnosticEngine,
+    format: DiagnosticFormat,
+) -> String {
+    diagnostics.render_format(sources, format)
+}
+
+fn diagnostic_engine_error(
+    sources: &SourceMap,
+    diagnostics: &DiagnosticEngine,
+    format: DiagnosticFormat,
+) -> DriverError {
+    let rendered = render_diagnostics_for_error(sources, diagnostics, format);
+    match format {
+        DiagnosticFormat::Text => rendered_driver_error(rendered),
+        DiagnosticFormat::Json => {
+            DriverError::with_json_document(rendered.trim_end(), rendered.clone())
+        }
+    }
+}
+
 fn diagnostic_error(sources: &SourceMap, diagnostic: Diagnostic) -> DriverError {
-    DriverError::new(format!("ccc: {}", diagnostic.render(sources).trim_end()))
+    let message = format!("ccc: {}", diagnostic.render(sources).trim_end());
+    let json = render_json_document(&[diagnostic], sources, RenderOptions::default());
+    DriverError::with_json_document(message, json)
 }
 
 fn owner_error(code: &'static str, message: impl Into<String>) -> DriverError {
     diagnostic_error(&SourceMap::new(), Diagnostic::error(code, message))
 }
 
-fn diagnostics_error(sources: &SourceMap, diagnostics: Vec<Diagnostic>) -> DriverError {
-    let rendered = diagnostics
-        .iter()
-        .map(|diagnostic| diagnostic.render(sources))
-        .collect::<Vec<_>>()
-        .join("");
-    DriverError::new(format!("ccc: {}", rendered.trim_end()))
-}
-
 fn with_prior_diagnostics(prior: &str, error: DriverError) -> DriverError {
     if prior.trim().is_empty() {
         error
+    } else if is_json_diagnostic_document(prior) {
+        let error = error_for_format(error, DiagnosticFormat::Json);
+        let merged = merge_json_documents(
+            prior,
+            error
+                .json_document
+                .as_deref()
+                .expect("JSON-formatted driver errors carry a document"),
+        )
+        .unwrap_or_else(|| format!("{prior}{}", error.message));
+        DriverError::with_json_document(merged.trim_end(), merged.clone())
     } else {
         let mut combined = prior.to_owned();
         if !combined.ends_with('\n') {
@@ -2127,6 +2520,90 @@ fn with_prior_diagnostics(prior: &str, error: DriverError) -> DriverError {
         combined.push_str(&error.to_string());
         DriverError::new(combined)
     }
+}
+
+fn error_for_format(error: DriverError, format: DiagnosticFormat) -> DriverError {
+    if format == DiagnosticFormat::Text {
+        return error;
+    }
+    if let Some(json) = &error.json_document {
+        return DriverError::with_json_document(json.trim_end(), json.clone());
+    }
+    let message = error
+        .message
+        .strip_prefix("ccc: ")
+        .unwrap_or(&error.message)
+        .to_owned();
+    let diagnostic = Diagnostic::error("CCC6000", message).with_category("driver");
+    let json = render_json_document(&[diagnostic], &SourceMap::new(), RenderOptions::default());
+    DriverError::with_json_document(json.trim_end(), json.clone())
+}
+
+fn prepend_json_to_error(document: &str, error: DriverError) -> DriverError {
+    let error = error_for_format(error, DiagnosticFormat::Json);
+    let merged = merge_json_documents(
+        document,
+        error
+            .json_document
+            .as_deref()
+            .expect("JSON-formatted driver errors carry a document"),
+    )
+    .unwrap_or_else(|| format!("{document}{}", error.message));
+    DriverError::with_json_document(merged.trim_end(), merged.clone())
+}
+
+fn is_json_diagnostic_document(document: &str) -> bool {
+    document
+        .trim()
+        .starts_with("{\"schema_version\":1,\"diagnostics\":[")
+}
+
+fn append_diagnostic_output(accumulated: &mut String, next: &str, format: DiagnosticFormat) {
+    if next.trim().is_empty() {
+        return;
+    }
+    if format == DiagnosticFormat::Text {
+        accumulated.push_str(next);
+        return;
+    }
+
+    let as_document = |output: &str| {
+        if is_json_diagnostic_document(output) {
+            output.to_owned()
+        } else {
+            render_json_document(
+                &[Diagnostic::warning("CCC6006", "driver", output.trim())],
+                &SourceMap::new(),
+                RenderOptions::default(),
+            )
+        }
+    };
+    let next = as_document(next);
+    if accumulated.trim().is_empty() {
+        *accumulated = next;
+        return;
+    }
+    let current = as_document(accumulated);
+    *accumulated = merge_json_documents(&current, &next)
+        .expect("normalized diagnostic outputs are valid JSON documents");
+}
+
+fn merge_json_documents(first: &str, second: &str) -> Option<String> {
+    const PREFIX: &str = "{\"schema_version\":1,\"diagnostics\":[";
+    const SUFFIX: &str = "]}";
+    let first = first.trim();
+    let second = second.trim();
+    let first_items = first.strip_prefix(PREFIX)?.strip_suffix(SUFFIX)?;
+    let second_items = second.strip_prefix(PREFIX)?.strip_suffix(SUFFIX)?;
+    let separator = (!first_items.is_empty() && !second_items.is_empty()).then_some(',');
+    let mut merged = String::from(PREFIX);
+    merged.push_str(first_items);
+    if let Some(separator) = separator {
+        merged.push(separator);
+    }
+    merged.push_str(second_items);
+    merged.push_str("]}\n");
+    Some(merged)
 }
 
 #[cfg(test)]

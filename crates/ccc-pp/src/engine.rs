@@ -338,25 +338,33 @@ impl Engine<'_> {
 
         if !self.options.preprocessed_input {
             for path in self.options.imacros.clone() {
+                if self.diagnostics.is_halted() {
+                    break;
+                }
                 self.process_forced_path(&path, main_file, false);
             }
             for path in self.options.forced_includes.clone() {
+                if self.diagnostics.is_halted() {
+                    break;
+                }
                 self.process_forced_path(&path, main_file, true);
             }
         }
-        self.process_file(
-            FileFrame {
-                file: main_file,
-                path: main_path,
-                identity: main_identity,
-                found_entry: None,
-                system: false,
-                dependency_index: main_dependency,
-                dependency_edge: None,
-                is_main: true,
-            },
-            true,
-        );
+        if !self.diagnostics.is_halted() {
+            self.process_file(
+                FileFrame {
+                    file: main_file,
+                    path: main_path,
+                    identity: main_identity,
+                    found_entry: None,
+                    system: false,
+                    dependency_index: main_dependency,
+                    dependency_edge: None,
+                    is_main: true,
+                },
+                true,
+            );
+        }
 
         let macros = MacroSnapshot {
             definitions: self
@@ -641,6 +649,9 @@ impl Engine<'_> {
         for (line_index, (mut line, line_errors)) in
             lexed.lines.into_iter().zip(lexed.line_errors).enumerate()
         {
+            if self.diagnostics.is_halted() {
+                break;
+            }
             let physical_line = line
                 .iter()
                 .filter_map(|token| {
@@ -1803,6 +1814,9 @@ impl Engine<'_> {
     }
 
     fn emit(&mut self, mut diagnostic: PpDiagnostic) {
+        if self.diagnostics.is_halted() {
+            return;
+        }
         if let Some(span) = diagnostic.span {
             diagnostic.is_system_header |= self.session.sources.is_system_header(span);
         }

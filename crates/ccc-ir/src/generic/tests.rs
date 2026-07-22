@@ -1,7 +1,7 @@
 use ccc_pp::{PpItem, lex};
 use ccc_sema::generic::{
     ConstantValue, FullTypedBlockItem, FullTypedInitializer, FullTypedInitializerKind,
-    FullTypedStatementKind, analyze_frontend,
+    FullTypedStatementKind, Linkage, StorageDuration, analyze_frontend,
 };
 use ccc_session::SourceMap;
 use ccc_syntax::frontend as syntax;
@@ -51,6 +51,12 @@ fn lowers_runtime_sized_objects_and_dynamic_pointer_strides_explicitly() {
     assert_eq!(function.storage[0].location, StorageLocation::RuntimeSized);
     assert_eq!(function.storage[0].requested_alignment, Some(64));
     assert!(function.blocks.iter().any(|block| {
+        block
+            .instructions
+            .iter()
+            .any(|instruction| matches!(instruction.kind, FullInstructionKind::RuntimeSize { .. }))
+    }));
+    assert!(function.blocks.iter().any(|block| {
         block.instructions.iter().any(|instruction| {
             matches!(
                 instruction.kind,
@@ -67,8 +73,233 @@ fn lowers_runtime_sized_objects_and_dynamic_pointer_strides_explicitly() {
         })
     }));
     let dump = dump_frontend_ir(&module);
+    assert!(dump.contains("runtime.size"), "{dump}");
     assert!(dump.contains("runtime.allocate"), "{dump}");
     assert!(dump.contains("pointer.offset.runtime"), "{dump}");
+}
+
+#[test]
+fn verifier_requires_size_t_for_runtime_sizes_and_strides() {
+    let module = lower_source(
+        "long inspect(int rows, int columns) {
+             int matrix[rows][columns];
+             return matrix[rows - 1][columns - 1] + (&matrix[rows] - &matrix[0]);
+         }",
+    );
+    verify_frontend(&module).unwrap();
+
+    let (runtime_result, extent) = module.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .find_map(|instruction| match &instruction.kind {
+            FullInstructionKind::RuntimeSize { extents, .. } => {
+                Some((instruction.result.unwrap(), extents[0]))
+            }
+            _ => None,
+        })
+        .unwrap();
+
+    let mut wrong_result = module.clone();
+    wrong_result.functions[0].value_types[runtime_result.0 as usize] = TypeId::UNSIGNED_INT;
+    let error = verify_frontend(&wrong_result).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("runtime size result does not have size_t type"),
+        "{error}"
+    );
+
+    let mut wrong_allocation = module.clone();
+    let allocation_size = wrong_allocation.functions[0]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match &mut instruction.kind {
+            FullInstructionKind::RuntimeSizedAllocate { size, .. } => Some(size),
+            _ => None,
+        })
+        .unwrap();
+    *allocation_size = extent;
+    let error = verify_frontend(&wrong_allocation).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("runtime allocation size does not have size_t type"),
+        "{error}"
+    );
+
+    let mut wrong_offset = module.clone();
+    let offset_stride = wrong_offset.functions[0]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match &mut instruction.kind {
+            FullInstructionKind::RuntimePointerOffset { stride, .. } => Some(stride),
+            _ => None,
+        })
+        .unwrap();
+    *offset_stride = extent;
+    let error = verify_frontend(&wrong_offset).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("runtime pointer offset stride does not have size_t type"),
+        "{error}"
+    );
+
+    let mut wrong_difference = module;
+    let difference_stride = wrong_difference.functions[0]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match &mut instruction.kind {
+            FullInstructionKind::RuntimePointerDifference { stride, .. } => Some(stride),
+            _ => None,
+        })
+        .unwrap();
+    *difference_stride = extent;
+    let error = verify_frontend(&wrong_difference).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("runtime pointer difference stride does not have size_t type"),
+        "{error}"
+    );
+}
+
+#[test]
+fn lowers_typedef_and_type_name_bounds_before_runtime_sizeof() {
+    let module = lower_source(
+        "unsigned long inspect(int n, void *address) {
+             typedef int Row[n++];
+             Row values;
+             unsigned long from_typedef = sizeof(Row);
+             unsigned long from_expression = sizeof *(int (*)[n++])address;
+             return from_typedef + from_expression + sizeof(values) + n;
+         }",
+    );
+    verify_frontend(&module).unwrap();
+    let function = &module.functions[0];
+    let runtime_sizes = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| matches!(instruction.kind, FullInstructionKind::RuntimeSize { .. }))
+        .count();
+    assert_eq!(runtime_sizes, 4, "{}", dump_frontend_ir(&module));
+    assert!(function.blocks.iter().any(|block| {
+        block.instructions.iter().any(|instruction| {
+            matches!(
+                instruction.kind,
+                FullInstructionKind::RuntimeSizedAllocate { .. }
+            )
+        })
+    }));
+}
+
+#[test]
+fn merges_conditional_pointer_to_vla_bounds_by_array_dimension() {
+    let module = lower_source(
+        "unsigned long constant_true(int left, int right, int *address) {
+             return sizeof *(1
+                 ? (int (*)[left++])address
+                 : (int (*)[right++])address);
+         }
+         unsigned long dynamic(int choose, int left, int right, int *address) {
+             return sizeof *(choose
+                 ? (int (*)[left++])address
+                 : (int (*)[right++])address);
+         }
+         char *mixed(int choose, int n, int *left, int *right) {
+             return (char *)((choose ? (int (*)[n])left : (int (*)[4])right) + 1);
+         }
+         unsigned long nested(
+             int choose, int n, int m, int k, int *left, int *right) {
+             return sizeof *(choose
+                 ? (int (*)[n][m])left
+                 : (int (*)[3][k])right);
+         }
+         char *nested_pointer(int choose, int n, int m, void *left, void *right) {
+             return (char *)((choose
+                 ? (int (*(*)[n])[m])left
+                 : (int (*(*)[n])[m])right) + 1);
+         }",
+    );
+    verify_frontend(&module).unwrap();
+
+    for name in ["constant_true", "dynamic", "nested", "nested_pointer"] {
+        let function = module
+            .functions
+            .iter()
+            .find(|function| function.name == name)
+            .unwrap();
+        let parameter_values = function
+            .blocks
+            .iter()
+            .flat_map(|block| block.parameters.iter().copied())
+            .collect::<std::collections::BTreeSet<_>>();
+        let extents = function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instructions)
+            .find_map(|instruction| match &instruction.kind {
+                FullInstructionKind::RuntimeSize { extents, .. } => Some(extents),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            extents
+                .iter()
+                .all(|extent| parameter_values.contains(extent)),
+            "{}",
+            dump_frontend_ir(&module)
+        );
+        if name == "nested_pointer" {
+            assert_eq!(extents.len(), 1, "{}", dump_frontend_ir(&module));
+        }
+    }
+    let mixed = module
+        .functions
+        .iter()
+        .find(|function| function.name == "mixed")
+        .unwrap();
+    assert!(mixed.blocks.iter().all(|block| {
+        block
+            .instructions
+            .iter()
+            .all(|instruction| !matches!(instruction.kind, FullInstructionKind::RuntimeSize { .. }))
+    }));
+}
+
+#[test]
+fn evaluates_runtime_sizeof_expression_operands_before_computing_size() {
+    let module = lower_source(
+        "extern int observe(void);
+         unsigned long inspect(int n, int (*rows)[n]) {
+             return sizeof *((observe(), rows));
+         }",
+    );
+    verify_frontend(&module).unwrap();
+    let inspect = module
+        .functions
+        .iter()
+        .find(|function| function.name == "inspect")
+        .unwrap();
+    let instructions = inspect
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .collect::<Vec<_>>();
+    let call = instructions
+        .iter()
+        .position(|instruction| matches!(instruction.kind, FullInstructionKind::DirectCall { .. }))
+        .expect("evaluated sizeof operand call");
+    let size = instructions
+        .iter()
+        .position(|instruction| matches!(instruction.kind, FullInstructionKind::RuntimeSize { .. }))
+        .expect("runtime sizeof instruction");
+    assert!(call < size, "{}", dump_frontend_ir(&module));
 }
 
 #[test]
@@ -1282,6 +1513,73 @@ fn verifier_rejects_inconsistent_atomic_rmw_value_types() {
 }
 
 #[test]
+fn verifier_rejects_malformed_unary_and_binary_operator_types() {
+    let mut unary = lower_source("double negate(double value) { return -value; }");
+    let operator = unary.functions[0]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match &mut instruction.kind {
+            FullInstructionKind::Unary { operator, .. } => Some(operator),
+            _ => None,
+        })
+        .unwrap();
+    *operator = UnaryOperation::BitwiseNot;
+    let error = verify_frontend(&unary).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("bitwise unary operation has inconsistent types"),
+        "{error}"
+    );
+
+    let mut binary =
+        lower_source("double remainder(double left, double right) { return left + right; }");
+    let operator = binary.functions[0]
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match &mut instruction.kind {
+            FullInstructionKind::Binary { operator, .. } => Some(operator),
+            _ => None,
+        })
+        .unwrap();
+    *operator = BinaryOperation::Remainder;
+    let error = verify_frontend(&binary).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("integer binary operation has inconsistent types"),
+        "{error}"
+    );
+
+    let mut comparison = lower_source("int compare(int value) { return value < 2; }");
+    let result = comparison.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .find_map(|instruction| {
+            matches!(
+                instruction.kind,
+                FullInstructionKind::Binary {
+                    operator: BinaryOperation::Less,
+                    ..
+                }
+            )
+            .then_some(instruction.result.unwrap())
+        })
+        .unwrap();
+    comparison.functions[0].value_types[result.0 as usize] = TypeId::DOUBLE;
+    let error = verify_frontend(&comparison).unwrap_err();
+    assert!(
+        error
+            .message
+            .contains("comparison operation has inconsistent scalar types"),
+        "{error}"
+    );
+}
+
+#[test]
 fn verifier_rejects_return_new_atomic_exchange() {
     let mut module = lower_source(
         "void *pointer; void *exchange(void *value) {\n\
@@ -1646,6 +1944,109 @@ fn lowers_block_scope_compound_literals_at_their_evaluation_point() {
             "}\n",
         )
     );
+}
+
+#[test]
+fn generic_selection_lowers_only_the_selected_association() {
+    let module = lower_source(
+        "int side_effect(void);
+         int write(int *value) {
+             _Generic(side_effect(), int: *value, default: *value) = 41;
+             return _Generic(side_effect(), int: *value, default: 0) + 1;
+         }",
+    );
+    verify_frontend(&module).unwrap();
+    let write = module
+        .functions
+        .iter()
+        .find(|function| function.name == "write")
+        .unwrap();
+    assert!(!write.blocks.iter().any(|block| {
+        block.instructions.iter().any(|instruction| {
+            matches!(
+                instruction.kind,
+                FullInstructionKind::DirectCall { .. } | FullInstructionKind::IndirectCall { .. }
+            )
+        })
+    }));
+    let stores = write
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| matches!(instruction.kind, FullInstructionKind::Store { .. }))
+        .count();
+    let loads = write
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| matches!(instruction.kind, FullInstructionKind::Load { .. }))
+        .count();
+    assert_eq!(stores, 1);
+    assert_eq!(loads, 1);
+}
+
+#[test]
+fn file_scope_compound_literals_reuse_static_initializer_and_relocation_graphs() {
+    let module = lower_source(
+        "struct Pair { int left; int right; };
+         struct Pair *first = &(struct Pair){ .left = 11, .right = 12 };
+         struct Pair *second = &(struct Pair){ .left = 11, .right = 12 };
+         int *values = (int[]){ 4, 5, 6 };",
+    );
+    verify_frontend(&module).unwrap();
+    assert_eq!(module.globals.len(), 6);
+
+    for index in [0_usize, 2, 4] {
+        let object = &module.globals[index];
+        assert_eq!(object.linkage, Linkage::Internal);
+        assert_eq!(object.duration, StorageDuration::Static);
+        assert!(
+            object
+                .emission
+                .symbol_name
+                .starts_with("__ccc_file_compound_literal.")
+        );
+        assert!(object.initializer.is_some());
+    }
+    for (pointer_index, object_index) in [(1_usize, 0_u32), (3, 2), (5, 4)] {
+        let initializer = module.globals[pointer_index].initializer.as_ref().unwrap();
+        assert_eq!(
+            initializer.nodes[initializer.root.0 as usize].kind,
+            InitializerNodeKind::Relocation {
+                target: RelocationTarget::Object(DataId(object_index)),
+                addend: 0,
+                one_past: false,
+                kind: RelocationKind::ObjectAddress,
+            }
+        );
+    }
+    assert_ne!(
+        module.globals[1].initializer.as_ref().unwrap().nodes[0].kind,
+        module.globals[3].initializer.as_ref().unwrap().nodes[0].kind
+    );
+}
+
+#[test]
+fn static_compound_literal_copies_reuse_nested_relocation_graphs() {
+    let module = lower_source(
+        "struct Holder { int *pointer; };
+         struct Holder copied =
+             (struct Holder){ .pointer = &(int){ 27 } };",
+    );
+    verify_frontend(&module).unwrap();
+    assert_eq!(module.globals.len(), 3);
+    assert_eq!(module.globals[1].initializer, module.globals[2].initializer);
+    let graph = module.globals[2].initializer.as_ref().unwrap();
+    assert!(graph.nodes.iter().any(|node| {
+        matches!(
+            node.kind,
+            InitializerNodeKind::Relocation {
+                target: RelocationTarget::Object(DataId(0)),
+                kind: RelocationKind::ObjectAddress,
+                ..
+            }
+        )
+    }));
 }
 
 #[test]

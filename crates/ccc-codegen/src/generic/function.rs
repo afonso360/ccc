@@ -151,6 +151,93 @@ pub(super) fn declare_function_references(
     }
 }
 
+fn blocks_in_reverse_postorder(
+    function: &gir::FullFunction,
+    entry: gir::BlockId,
+) -> Result<Vec<&gir::FullBlock>, CodegenError> {
+    let by_id = function
+        .blocks
+        .iter()
+        .map(|block| (block.id.0, block))
+        .collect::<HashMap<_, _>>();
+    let mut visited = HashSet::with_capacity(function.blocks.len());
+    let mut ordered = Vec::with_capacity(function.blocks.len());
+
+    for root in std::iter::once(entry).chain(function.blocks.iter().map(|block| block.id)) {
+        if visited.contains(&root.0) {
+            continue;
+        }
+        if !by_id.contains_key(&root.0) {
+            return Err(error(format!(
+                "function `{}` references absent entry block {}",
+                function.symbol_name, root.0
+            )));
+        }
+
+        let mut postorder = Vec::new();
+        let mut pending = vec![(root, false)];
+        while let Some((block, expanded)) = pending.pop() {
+            if expanded {
+                postorder.push(block);
+                continue;
+            }
+            if !visited.insert(block.0) {
+                continue;
+            }
+            pending.push((block, true));
+            let definition = by_id.get(&block.0).copied().ok_or_else(|| {
+                error(format!(
+                    "function `{}` targets absent block {}",
+                    function.symbol_name, block.0
+                ))
+            })?;
+            let mut successors = definition
+                .terminator
+                .as_ref()
+                .map(terminator_successors)
+                .unwrap_or_default();
+            successors.reverse();
+            pending.extend(
+                successors
+                    .into_iter()
+                    .filter(|successor| !visited.contains(&successor.0))
+                    .map(|successor| (successor, false)),
+            );
+        }
+        postorder.reverse();
+        for block in postorder {
+            let definition = by_id.get(&block.0).copied().ok_or_else(|| {
+                error(format!(
+                    "function `{}` targets absent block {}",
+                    function.symbol_name, block.0
+                ))
+            })?;
+            ordered.push(definition);
+        }
+    }
+    Ok(ordered)
+}
+
+fn terminator_successors(terminator: &gir::FullTerminator) -> Vec<gir::BlockId> {
+    match terminator {
+        gir::FullTerminator::Branch(edge) => vec![edge.target],
+        gir::FullTerminator::Conditional {
+            then_edge,
+            else_edge,
+            ..
+        } => vec![then_edge.target, else_edge.target],
+        gir::FullTerminator::Switch { cases, default, .. } => cases
+            .iter()
+            .map(|case| case.edge.target)
+            .chain(std::iter::once(default.target))
+            .collect(),
+        gir::FullTerminator::IndirectBranch { targets, .. } => {
+            targets.iter().map(|edge| edge.target).collect()
+        }
+        gir::FullTerminator::Return(_) | gir::FullTerminator::Unreachable => Vec::new(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn lower_function(
     module: &gir::FullModule,
@@ -295,14 +382,7 @@ pub(super) fn lower_function(
         }
     }
 
-    let entry_block = function
-        .blocks
-        .iter()
-        .find(|block| block.id == entry)
-        .ok_or_else(|| error(format!("entry block {} is absent", entry.0)))?;
-    let ordered_blocks = std::iter::once(entry_block)
-        .chain(function.blocks.iter().filter(|block| block.id != entry))
-        .collect::<Vec<_>>();
+    let ordered_blocks = blocks_in_reverse_postorder(function, entry)?;
     for block in ordered_blocks {
         builder.switch_to_block(state.block(block.id.0)?);
         if block.id == entry {
@@ -1041,18 +1121,26 @@ impl FunctionState<'_> {
                         .iconst(ir::types::I64, alignment.wrapping_neg() as i64);
                     Ok(Some(builder.ins().band(biased, mask)))
                 }
-                I::RuntimeSizedAllocate {
-                    storage,
+                I::RuntimeSize {
                     extents,
                     element,
                     constant_factor,
+                } => Ok(Some(self.runtime_size(
+                    builder,
+                    extents,
+                    *element,
+                    *constant_factor,
+                )?)),
+                I::RuntimeSizedAllocate {
+                    storage,
+                    size,
+                    element,
                     requested_alignment,
                 } => Ok(Some(self.runtime_sized_allocate(
                     builder,
                     *storage,
-                    extents,
+                    *size,
                     *element,
-                    *constant_factor,
                     *requested_alignment,
                 )?)),
                 I::ProjectField {
@@ -1124,8 +1212,8 @@ impl FunctionState<'_> {
                 I::RuntimePointerOffset {
                     base,
                     index,
-                    element,
-                    extents,
+                    element: _,
+                    stride,
                     subtract,
                 } => {
                     let index_value = self.value(*index)?;
@@ -1137,7 +1225,7 @@ impl FunctionState<'_> {
                         ir::types::I64,
                         is_signed(&self.module.types, self.value_ty(*index)?, self.config)?,
                     );
-                    let stride = self.runtime_element_stride(builder, *element, extents)?;
+                    let stride = self.value(*stride)?;
                     let displacement = builder.ins().imul(index, stride);
                     let base = self.value(*base)?;
                     Ok(Some(if *subtract {
@@ -1179,11 +1267,11 @@ impl FunctionState<'_> {
                 I::RuntimePointerDifference {
                     left,
                     right,
-                    element,
-                    extents,
+                    stride,
+                    ..
                 } => {
                     let bytes = builder.ins().isub(self.value(*left)?, self.value(*right)?);
-                    let stride = self.runtime_element_stride(builder, *element, extents)?;
+                    let stride = self.value(*stride)?;
                     let difference = builder.ins().sdiv(bytes, stride);
                     let destination = scalar_type(
                         &self.module.types,
@@ -2924,9 +3012,8 @@ impl FunctionState<'_> {
         &self,
         builder: &mut FunctionBuilder<'_>,
         storage: gir::StorageId,
-        extents: &[gir::ValueId],
+        size: gir::ValueId,
         element: QualifiedType,
-        constant_factor: u64,
         requested_alignment: Option<u64>,
     ) -> Result<ir::Value, CodegenError> {
         let slot = self
@@ -2944,13 +3031,6 @@ impl FunctionState<'_> {
             .runtime_realloc
             .ok_or_else(|| error("runtime-sized storage has no realloc declaration"))?;
         let layout = object_layout(&self.module.types, element, self.config)?;
-        let fixed_size = layout
-            .size
-            .checked_mul(constant_factor)
-            .ok_or_else(|| error("variable-length array constant size overflow"))?;
-        if fixed_size == 0 {
-            return Err(error("variable-length array has a zero-sized element"));
-        }
         const HOSTED_VLA_MINIMUM_ALIGNMENT: u64 = 16;
         let alignment = requested_alignment
             .map_or(layout.align.max(HOSTED_VLA_MINIMUM_ALIGNMENT), |value| {
@@ -2961,34 +3041,14 @@ impl FunctionState<'_> {
         }
 
         let trap = TrapCode::unwrap_user(2);
-        let mut size = builder.ins().iconst(
-            ir::types::I64,
-            i64::try_from(fixed_size)
-                .map_err(|_| error("variable-length array element size exceeds size_t"))?,
-        );
-        for extent in extents {
-            let value = self.value(*extent)?;
-            let source_ty = builder.func.dfg.value_type(value);
-            let signed = is_signed(&self.module.types, self.value_ty(*extent)?, self.config)?;
-            let value = coerce_integer(builder, value, source_ty, ir::types::I64, signed);
-            let invalid = if signed {
-                builder
-                    .ins()
-                    .icmp_imm(IntCC::SignedLessThanOrEqual, value, 0)
-            } else {
-                builder.ins().icmp_imm(IntCC::Equal, value, 0)
-            };
-            builder.ins().trapnz(invalid, trap);
-            let (product, overflow) = builder.ins().umul_overflow(size, value);
-            builder.ins().trapnz(overflow, trap);
-            size = product;
-        }
+        let size = self.value(size)?;
         let padding = builder.ins().iconst(
             ir::types::I64,
             i64::try_from(alignment - 1)
                 .map_err(|_| error("variable-length array alignment exceeds size_t"))?,
         );
-        let (required, overflow) = builder.ins().uadd_overflow(size, padding);
+        let required = builder.ins().iadd(size, padding);
+        let overflow = builder.ins().icmp(IntCC::UnsignedLessThan, required, size);
         builder.ins().trapnz(overflow, trap);
 
         let state = builder.ins().stack_addr(ir::types::I64, slot, 0);
@@ -3030,53 +3090,53 @@ impl FunctionState<'_> {
         Ok(builder.ins().band(biased, mask))
     }
 
-    fn runtime_element_stride(
+    fn runtime_size(
         &self,
         builder: &mut FunctionBuilder<'_>,
-        mut element: QualifiedType,
         extents: &[gir::ValueId],
+        element: QualifiedType,
+        constant_factor: u64,
     ) -> Result<ir::Value, CodegenError> {
-        let mut constant_factor = 1_u64;
-        while let Some(TypeKind::Array(array)) = self.module.types.try_kind(element.ty) {
-            if let ArrayLength::Constant(length) = array.length {
-                constant_factor = constant_factor
-                    .checked_mul(length)
-                    .ok_or_else(|| error("runtime pointer stride constant overflow"))?;
-            }
-            element = array.element;
-        }
         let layout = object_layout(&self.module.types, element, self.config)?;
         let fixed_size = layout
             .size
             .checked_mul(constant_factor)
-            .ok_or_else(|| error("runtime pointer stride constant overflow"))?;
+            .ok_or_else(|| error("runtime size constant overflow"))?;
         if fixed_size == 0 {
-            return Err(error("runtime pointer stride is zero"));
+            return Err(error("runtime size has a zero-sized element"));
         }
         let trap = TrapCode::unwrap_user(2);
-        let mut stride = builder.ins().iconst(
-            ir::types::I64,
-            i64::try_from(fixed_size)
-                .map_err(|_| error("runtime pointer stride exceeds size_t"))?,
-        );
+        // `iconst` takes a signed immediate but preserves its two's-complement
+        // bit pattern. Every u64 value is therefore representable as size_t.
+        let mut size = builder.ins().iconst(ir::types::I64, fixed_size as i64);
         for extent in extents {
-            let value = self.value(*extent)?;
-            let source_ty = builder.func.dfg.value_type(value);
+            let source = self.value(*extent)?;
+            let source_ty = builder.func.dfg.value_type(source);
             let signed = is_signed(&self.module.types, self.value_ty(*extent)?, self.config)?;
-            let value = coerce_integer(builder, value, source_ty, ir::types::I64, signed);
             let invalid = if signed {
                 builder
                     .ins()
-                    .icmp_imm(IntCC::SignedLessThanOrEqual, value, 0)
+                    .icmp_imm(IntCC::SignedLessThanOrEqual, source, 0)
             } else {
-                builder.ins().icmp_imm(IntCC::Equal, value, 0)
+                builder.ins().icmp_imm(IntCC::Equal, source, 0)
             };
             builder.ins().trapnz(invalid, trap);
-            let (product, overflow) = builder.ins().umul_overflow(stride, value);
+            let value = if source_ty.bits() > ir::types::I64.bits() {
+                let narrowed = builder.ins().ireduce(ir::types::I64, source);
+                let restored = builder.ins().uextend(source_ty, narrowed);
+                let truncated = builder.ins().icmp(IntCC::NotEqual, restored, source);
+                builder.ins().trapnz(truncated, trap);
+                narrowed
+            } else {
+                coerce_integer(builder, source, source_ty, ir::types::I64, signed)
+            };
+            let product = builder.ins().imul(size, value);
+            let recovered = builder.ins().udiv(product, value);
+            let overflow = builder.ins().icmp(IntCC::NotEqual, recovered, size);
             builder.ins().trapnz(overflow, trap);
-            stride = product;
+            size = product;
         }
-        Ok(stride)
+        Ok(size)
     }
 
     fn release_runtime_storage(
