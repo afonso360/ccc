@@ -194,12 +194,66 @@ fn optimization_profiles_emit_valid_objects_and_o0_preserves_default() {
         fs::read(&baseline).unwrap(),
         fs::read(&unoptimized).unwrap()
     );
+    let mut optimized_objects = std::collections::BTreeMap::new();
     for optimization in ["-O", "-O1", "-O2", "-O3", "-Os", "-Oz"] {
         let output = directory.join(format!("{}.o", &optimization[1..]));
         compile_ccc_with_options(&source, &output, &[optimization]);
         let bytes = fs::read(output).unwrap();
         object::File::parse(bytes.as_slice()).unwrap();
+        optimized_objects.insert(optimization, bytes);
     }
+    for (left, right) in [("-O", "-O1"), ("-O2", "-O3"), ("-Os", "-Oz")] {
+        assert_eq!(
+            optimized_objects[left], optimized_objects[right],
+            "{left} and {right} promise the same pass set"
+        );
+    }
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[test]
+fn objects_built_at_different_optimization_levels_link_and_execute_together() {
+    let directory = test_directory("mixed-optimization-link");
+    let library_source = directory.join("optimized-library.c");
+    let main_source = directory.join("unoptimized-main.c");
+    let library_object = directory.join("optimized-library.o");
+    let main_object = directory.join("unoptimized-main.o");
+    let executable = directory.join("mixed-optimization");
+    fs::write(
+        &library_source,
+        "int optimized_answer(int value) { return (value + 1) + (value + 1); }\n",
+    )
+    .unwrap();
+    fs::write(
+        &main_source,
+        "extern int optimized_answer(int);\n\
+         int main(void) { return optimized_answer(20) == 42 ? 0 : 1; }\n",
+    )
+    .unwrap();
+
+    compile_ccc_with_options(&library_source, &library_object, &["-Oz"]);
+    compile_ccc_with_options(&main_source, &main_object, &["-O0"]);
+    let link = Command::new("gcc")
+        .args(["-pie", "-o"])
+        .arg(&executable)
+        .arg(&main_object)
+        .arg(&library_object)
+        .output()
+        .unwrap();
+    assert!(
+        link.status.success(),
+        "gcc failed:\n{}",
+        render_output(&link)
+    );
+    let execution = Command::new(&executable).output().unwrap();
+    assert_eq!(
+        execution.status.code(),
+        Some(0),
+        "mixed-profile executable failed:\n{}",
+        render_output(&execution)
+    );
 
     fs::remove_dir_all(directory).unwrap();
 }
