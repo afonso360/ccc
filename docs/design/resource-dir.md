@@ -108,9 +108,10 @@ provided with the required ABI by the selected toolchain. The
 provider for each such symbol. The hosted scoped-arena provider is different:
 its allocation and cleanup logic lowers directly into each affected function,
 with ordinary `realloc` and `free` imports outside the compiler-builtins helper
-manifest. It does not require a resource-owned runtime object. A freestanding
-arena provider may be resource-owned and is enabled only for the exact targets
-listed by its provider contract. ABI bridge assembly is not a resource template:
+manifest. Runtime layout operations that allocate no automatic object do not
+import that provider. It does not require a resource-owned runtime object. A
+freestanding arena provider may be resource-owned and is enabled only for the
+exact targets listed by its provider contract. ABI bridge assembly is not a resource template:
 `ccc-link` renders it from the verified `ModuleAbiPlan` for each compilation,
 then assembles, partially links, and exactly localizes it as specified by
 [ADR-0010](../adr/0010-generate-abi-bridges-as-assembly.md).

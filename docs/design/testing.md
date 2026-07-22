@@ -15,13 +15,15 @@ requires `.debug_info`, `.debug_abbrev`, `.debug_line`, range data, and the
 existing call-frame section, and parses the emitted DWARF independently. It
 checks compilation-unit, subprogram, core-type, member, parameter, variable,
 and single function-wide lexical-block DIEs. Fixed frame locations, ordinary
-data addresses, x86-64 ELF TLS address expressions, prototype markers,
+data addresses, x86-64 ELF and Darwin TLV TLS address expressions, prototype markers,
 multiple source rows, and object-format relocations from debug sections to
 code, data, TLS data, and other debug sections are inspected directly.
 Register/SSA value tracking and nested lexical ranges are not claimed.
-The native Darwin gate also performs a one-step `-g` compile and link, requires
+The native Darwin gate also performs a one-step `-g` compile and link through a
+generated TLS accessor, requires
 the executable and staged `.dSYM` UUIDs to match, then uses LLDB to stop on a C
-source line and recover a fixed-frame local value. A command/cleanup fixture
+source line, recover a fixed-frame local value, and confirm the TLS definition's
+certified location expression. A command/cleanup fixture
 separately proves that `dsymutil` runs before registered link objects are
 released and that incomplete bundle trees never replace an existing bundle.
 
@@ -155,24 +157,22 @@ fails the harness invocation.
 ## Runtime-sized automatic storage
 
 Provider-independent tests first prove that nonconstant array extents are
-evaluated once and retained in the typed AST, including parameter-order binding,
-and multidimensional pointer strides. Diagnostics distinguish prototype-scope
+evaluated once and retained in the typed AST for parameters, declarations,
+typedefs, and evaluated type names, including parameter-order binding and
+multidimensional pointer strides. Diagnostics distinguish prototype-scope
 `[*]`, legal fixed-size objects with variably modified types, nonautomatic VLA
-objects, invalid bounds, and illegal storage classes. Runtime `sizeof` and
-several variably modified typedef/type-name contexts remain explicit gates
-before the complete VLA capability can be advertised. Named-goto and switch
+objects, invalid bounds, and illegal storage classes. Named-goto and switch
 tests reject ingress that bypasses a declaration, and a computed goto is
-rejected conservatively in any function that also declares a variably modified
-automatic object.
+rejected conservatively in any function that also has a variably modified
+declaration.
 
 CCC-IR tests pin runtime storage identities, allocation effects, retained
-extents, dynamic pointer strides, verifier type/dominance checks, and append-only
-digest tags. Execution fixtures cover bound-once evaluation, multidimensional
-access, normal return cleanup, recursion, concurrent invocations, and
-over-alignment. Aggregate returns sourced from arena storage are copied before
-the provider is released. Named/switch/computed-goto ingress diagnostics and
-runtime `sizeof` remain negative capability gates rather than silently
-approximated behavior.
+extents, explicit checked `RuntimeSize` operations, runtime `sizeof`, dynamic
+pointer strides, verifier type/dominance checks, and append-only digest tags.
+Execution fixtures cover bound-once evaluation, multidimensional access,
+normal return cleanup, recursion, concurrent invocations, and over-alignment.
+Aggregate returns sourced from arena storage are copied before the provider is
+released.
 
 Provider tests inject nonpositive bounds, extent and alignment overflow,
 allocation failure, and alignments through over-aligned `_Alignas` declarations.
@@ -180,10 +180,11 @@ On System V AMD64 every VLA allocation is checked for the target's 16-byte
 minimum as well as stronger declared alignment. An instrumented descending-size
 loop proves that one growth serves every later execution of the declaration and
 that normal return releases it once. An external GCC default-PIE link runs the
-same provider surface under AddressSanitizer and LeakSanitizer. Native x86 tests
-execute the nonpositive and overflow traps; object inspection verifies their
-`ud2` failure paths when the development host's amd64 emulator cannot deliver
-those trap signals correctly.
+same provider surface under AddressSanitizer and LeakSanitizer. Every enabled
+native host profile executes the nonpositive, overflow, and provider-failure
+traps. Object inspection additionally verifies the System V AMD64 `ud2`
+failure paths when a development host's amd64 emulator cannot deliver those
+trap signals correctly.
 
 Returns-twice and cross-language unwinding remain separate hard gates. A
 nonlocal exit may strand the abandoned invocation's cached allocations, as C
@@ -193,8 +194,12 @@ The provider is not async-signal-safe because growth calls the hosted allocator.
 Object and disassembly checks prove that affected user functions keep their
 ordinary Cranelift frame and import only the declared hosted dependencies. A
 mixed-link test links a CCC-produced object with an external GCC-compatible
-driver as PIE. Negative feature-predicate tests keep `__builtin_alloca`
-unavailable for an arena-only profile.
+driver as PIE. Runtime layout without an automatic object, such as VLA
+`sizeof`, is checked separately and must not import the allocation provider.
+The target-oracle runner compiles, links against the real hosted provider, and
+executes the VLA bound/`sizeof` fixture and its provider-failure companion at
+`-O0` and `-O2` for every enabled target. Negative feature-predicate tests keep
+`__builtin_alloca` unavailable for an arena-only profile.
 
 ## C11 and GNU capability fixtures
 
@@ -258,22 +263,29 @@ Hosted CI runs the Rust workspace test suite on native x86-64 Linux, AArch64
 Linux, and AArch64 macOS runners. The RISC-V64 workspace tests are
 cross-compiled with Rust's `riscv64gc-unknown-linux-gnu` target and executed
 through QEMU user mode with the matching GNU sysroot. The same Rust suite is
-the only required CI command on every matrix row.
+required on every matrix row, followed by that row's matching target oracle.
 
 The standalone ABI, target-oracle, differential, and exhaustive real-code
 corpus harnesses remain available for focused local qualification. A separate
 x86-64 Linux job runs the bounded SQLite, Lua, bzip2, zlib, Redis, and zstd
-profiles. Compile-only object inspection supplements execution but never
-substitutes for a claimed runnable target.
+profiles. Dedicated AArch64 Linux, RISC-V Linux, and arm64 Darwin jobs run the
+complete bzip2 target contract, including target-object inspection and the
+upstream and extended execution suites. Compile-only object inspection
+supplements execution but never substitutes for a claimed runnable target.
 
 ## Real-code corpus
 
-SQLite, Lua, Redis, bzip2, zstd, zlib, musl, tcc, selected libc-header
-fixtures, and c-testsuite exercise drop-in compatibility. Each integration
+The implemented SQLite, Lua, Redis, bzip2, zstd, zlib, and selected
+libc-header gates exercise drop-in compatibility. Each integration
 records the exact build command, enabled features, patches if any, expected
 exclusions, and whether success means preprocess, compile, link, or run.
 “Builds unmodified” is used
 only when no source or build-system patch is applied.
+
+musl, tcc, and c-testsuite remain catalog-only, non-blocking candidates. They
+do not count as supported integrations until each has a pinned source and
+hash, a target-applicability entry, a deterministic adapter, and an explicit
+compile/link/run contract.
 
 Hosted-header preprocessing, parsing, and code generation are separate gates.
 A licensed, pinned glibc-like fixture has both a deterministic preprocessing
@@ -339,7 +351,7 @@ module-path variables, and requires its `final OK !!!` marker. This integration
 does not replace focused computed-goto or nonlocal-control tests. The official
 complete and internal profiles remain distinct contracts because they add
 position-independent shared test modules, GNU assertion statement expressions,
-and an instrumented runtime. musl feeds `$CC` assembly files.
+and an instrumented runtime.
 
 Redis is pinned by its [corpus manifest](../../test-corpus/redis/manifest.toml)
 to the official 8.8.0 core archive. The selected upstream build produces

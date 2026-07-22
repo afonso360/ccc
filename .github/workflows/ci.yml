@@ -103,6 +103,79 @@ jobs:
           path: ${{ runner.temp }}/ccc-target-oracle-${{ matrix.oracle }}
           if-no-files-found: ignore
 
+  bzip2-targets:
+    name: bzip2 corpus (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux AArch64
+            runner: ubuntu-24.04
+            target: aarch64-unknown-linux-gnu
+            packages: >-
+              binutils-aarch64-linux-gnu build-essential curl
+              gcc-aarch64-linux-gnu git libc6-dev-arm64-cross make openssl
+              qemu-user
+            qemu_root: /usr/aarch64-linux-gnu
+          - name: Linux RISC-V64
+            runner: ubuntu-24.04
+            target: riscv64-unknown-linux-gnu
+            packages: >-
+              binutils-riscv64-linux-gnu build-essential curl
+              gcc-riscv64-linux-gnu git libc6-dev-riscv64-cross make openssl
+              qemu-user
+            qemu_root: /usr/riscv64-linux-gnu
+          - name: macOS AArch64
+            runner: macos-26
+            target: aarch64-apple-darwin
+            packages: coreutils openssl@3
+            qemu_root: ""
+    env:
+      CCC: ${{ github.workspace }}/target/debug/ccc
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ${{ matrix.packages }}
+
+      - name: Install Darwin dependencies
+        if: runner.os == 'macOS'
+        run: brew install ${{ matrix.packages }}
+
+      - name: Configure target execution tools
+        if: runner.os == 'Linux'
+        run: echo 'BZIP2_QEMU_ROOT=${{ matrix.qemu_root }}' >> "$GITHUB_ENV"
+
+      - name: Configure Darwin checksum tools
+        if: runner.os == 'macOS'
+        run: |
+          echo "BZIP2_OPENSSL=$(brew --prefix openssl@3)/bin/openssl" >> "$GITHUB_ENV"
+          echo "BZIP2_MD5SUM=$(command -v gmd5sum)" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Build CCC
+        run: cargo build --locked -p ccc-driver
+
+      - name: Test bzip2
+        run: >-
+          test-corpus/bzip2/run.sh --target ${{ matrix.target }}
+          --work-dir "$RUNNER_TEMP/ccc-corpus/bzip2-${{ matrix.target }}"
+
+      - name: Upload bzip2 evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bzip2-${{ matrix.target }}
+          path: ${{ runner.temp }}/ccc-corpus/bzip2-${{ matrix.target }}
+          if-no-files-found: ignore
+
   corpus:
     name: Test corpus (Linux x86-64)
     runs-on: ubuntu-24.04

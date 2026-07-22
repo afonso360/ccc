@@ -112,7 +112,10 @@ Target-specific prerequisites are:
 The Linux cross runners execute through QEMU rather than treating a successful
 cross-link as execution evidence. They inspect the target ELF interpreter
 before launch. Fixed and variadic ABI boundaries, TLS in both link directions,
-unwind behavior, and runtime semantics execute at both `-O0` and `-O2`.
+unwind behavior, scalar atomics, and runtime semantics execute at both `-O0`
+and `-O2`. The same loop checks VLA bound evaluation and runtime `sizeof`,
+requires hosted `realloc`/`free` imports only for allocating functions, and
+proves that allocation failure reaches the target trap path.
 Predefined target identity, object relocations, and debugger backtraces are
 checked once using the retained `-O0` artifacts.
 
@@ -268,6 +271,11 @@ QEMU executable, and target runtime root. Darwin requires native arm64 macOS,
 Xcode Command Line Tools, an SDK, and GNU-compatible checksum tools. Use
 `--source-archive` and `--test-repository` for offline inputs. The complete
 override names are documented in `test-corpus/bzip2/README.md`.
+
+Hosted CI runs this complete bzip2 contract on all four enabled targets. The
+x86-64 profile shares the full corpus job; the other three profiles have
+dedicated target-matrix jobs and retain their object, toolchain, and execution
+evidence as artifacts.
 
 ## Csmith differential suite
 

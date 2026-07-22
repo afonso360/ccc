@@ -29,7 +29,7 @@ facts:
 | CCC identity            | `__CCC__` and the `__CCC_{MAJOR,MINOR,PATCHLEVEL}__` tuple identify the actual compiler.                                                                                                                                                                                  |
 | Target facts            | Width, limit, byte-order, data-model, object-format, architecture, and operating-system macros come from the effective target configuration. They are not copied from the host compiler.                                                                                  |
 | Target symbol spelling  | `__USER_LABEL_PREFIX__` is empty for the x86-64 ELF SysV target, matching its external-symbol ABI and allowing libc redirect declarations to form their linker names.                                                                                                     |
-| Capability denials      | `__STDC_NO_ATOMICS__`, `__STDC_NO_COMPLEX__`, `__STDC_NO_THREADS__`, and `__STDC_NO_VLA__` are derived from the registry and disappear only when the corresponding complete capability is active.                                                                         |
+| Capability denials      | `__STDC_NO_ATOMICS__`, `__STDC_NO_COMPLEX__`, `__STDC_NO_THREADS__`, and `__STDC_NO_VLA__` are derived from the registry. The complete VLA capability is active on every enabled target, so `__STDC_NO_VLA__` is absent there; the other unavailable optional capabilities remain denied.                                                                         |
 | Dynamic predicates      | `__has_include`, `__has_include_next`, `__has_attribute`, `__has_builtin`, `__has_feature`, and `__has_extension` are CCC-provided operators. Their existence is an intentional deviation from GCC 4.2.1, and each answer comes from the resolver or capability registry. |
 | Dynamic counter         | `__COUNTER__` is provided even though it postdates GCC 4.2.1. Its monotonic translation-unit-local behavior is part of CCC's identity.                                                                                                                                    |
 | Wide-integer fact       | `__SIZEOF_INT128__` is absent until the complete `__int128` syntax, arithmetic, conversion, layout, ABI, varargs, and helper-link contract is active. Defining it is another intentional deviation from GCC 4.2.1.                                                        |
@@ -163,9 +163,12 @@ storage duration associated with the enclosing block. The expression is an
 lvalue designating that object, and repeated evaluation of the same occurrence
 reinitializes and designates the same object. Initializer checking, zero-fill,
 qualifiers, volatile access, aggregate copy, array-bound completion, and nested
-designators reuse the ordinary object-initialization and place rules.
-File-scope compound literals require static-object lowering and are rejected
-with `CCC2430` until that path is implemented.
+designators reuse the ordinary object-initialization and place rules. Each
+file-scope occurrence creates a distinct deterministic internal object with
+static storage duration. Its data, padding, nested initializers, and symbol
+relocations use the same initializer graph as an ordinary static definition.
+The expression remains an lvalue with the occurrence's completed type and
+qualifiers.
 
 ### Flexible array members
 
@@ -184,12 +187,14 @@ allocation, and multidimensional strides follow the provider-independent type
 contract in [the conformance policy](conformance.md#variable-length-arrays).
 Automatic VLA objects use the hosted arena in
 [ADR-0011](../adr/0011-arena-backed-runtime-sized-automatic-storage.md).
-Runtime `sizeof` and several variably modified typedef/type-name contexts remain
-explicit boundaries, so the complete VLA capability is not yet advertised.
+Variably modified typedefs and evaluated type names retain their bound effects
+at the declaration or expression site. Runtime `sizeof`, allocation sizes, and
+dynamic pointer strides reuse those saved values through checked CCC-IR size
+operations. The complete VLA capability is advertised on every enabled target.
 Arena storage neither implies native-stack mutation nor enables GNU `alloca`.
 Named and switch jumps cannot enter a variably modified declaration path;
-computed goto is conservatively rejected when such an automatic object exists
-in the same function.
+computed goto is conservatively rejected when such a declaration exists in the
+same function.
 
 ## GNU C semantics
 

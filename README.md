@@ -49,8 +49,8 @@ Currently supported:
   unions, enums, bit-fields, initializers, and flexible array members.
 - Fixed and variadic function calls, aggregates passed by value, function
   pointers, and `setjmp`/`longjmp`-style control flow.
-- Block-scope compound literals, `_Static_assert`, `_Alignas`, `_Noreturn`, and
-  a subset of runtime-sized automatic arrays.
+- Compound literals, `_Generic`, `_Static_assert`, `_Alignas`, `_Noreturn`,
+  variably modified types, runtime `sizeof`, and hosted automatic VLAs.
 - Selected GNU extensions, including statement expressions, computed goto,
   declaration assembly labels, attributes, builtins, and certified x86-64
   inline-assembly forms.
@@ -62,9 +62,7 @@ Currently supported:
 
 Not currently supported:
 
-- `_Generic`, `_Complex`, `_Imaginary`, or value operations on `_Float16`.
-- File-scope compound literals or the complete set of variably modified type
-  contexts, including runtime `sizeof` on variable-length arrays.
+- `_Complex`, `_Imaginary`, or value operations on `_Float16`.
 - Binary128 `long double` arithmetic or ABI transport on AArch64 and RISC-V
   Linux.
 - Aggregate, floating-point, 128-bit, or known-misaligned atomics.
@@ -91,7 +89,8 @@ cargo test --workspace --all-targets
 Hosted CI runs the Rust test suite natively on x86-64 Linux, AArch64 Linux, and
 AArch64 macOS. The RISC-V Rust tests are cross-compiled and run under QEMU.
 A separate x86-64 Linux job builds and runs the bounded SQLite, Lua, bzip2,
-zlib, Redis, and zstd corpus profiles.
+zlib, Redis, and zstd corpus profiles. Additional AArch64 Linux, RISC-V Linux,
+and arm64 Darwin jobs run bzip2's complete target-specific corpus contract.
 
 The complete local commands and target-specific prerequisites are in
 [Test commands and prerequisites](docs/testing.md).

@@ -94,19 +94,27 @@ C11 makes runtime-sized automatic VLA objects optional and does not require
 their physical storage to reside on the machine stack. Variably modified types
 remain representable independently of that storage capability. Semantic
 analysis distinguishes an expression-bound array from prototype-scope `[*]`,
-retains supported parameter and local-declaration extents, permits fixed-size
-objects such as pointers to VLA where C permits them, and diagnoses illegal
-storage classes. Variably modified typedef and type-name bounds remain explicit
-frontend boundaries until their effects can be represented without loss.
+retains parameter, local-declaration, typedef, and evaluated type-name extents
+exactly once, permits fixed-size objects such as pointers to VLA where C permits
+them, and diagnoses the storage classes that C forbids for variably modified
+types. Named and switch jumps cannot bypass a declaration whose saved bound is
+in scope; computed goto remains conservatively incompatible with such a
+declaration in the same function. Conditional expressions over compatible
+pointers to runtime-sized arrays evaluate only the selected operand's bounds
+and merge that selected layout for later `sizeof` and pointer arithmetic.
+GNU fixed zero-length arrays remain available, while mixing a zero-length
+dimension with a runtime dimension is a deliberate `CCC2456` semantic boundary
+because such a layout cannot produce a valid checked runtime size.
 
 The hosted profile implements automatic VLA object allocation through the
 [runtime-sized automatic storage contract](cranelift-risks.md#runtime-sized-automatic-storage-contract),
 including checked extents, multidimensional strides, alignment, bounded reuse,
-and normal-return cleanup. It still defines `__STDC_NO_VLA__` to `1` until the
-remaining runtime-layout and variably modified type contexts have complete
-semantic, CCC-IR, provider, failure, and execution evidence. The macro describes
-the complete optional C11 capability; it does not prevent a documented subset
-from being accepted as an extension and does not promise native-stack storage.
+runtime `sizeof`, and normal-return cleanup. `RuntimeSize` makes checked extent
+multiplication explicit in CCC-IR and is shared by allocation, layout, and
+dynamic pointer strides. Semantic, verifier, provider-success/failure, native
+execution, and O0/O2 target-oracle tests cover every enabled target. The
+`c11-vla` registry capability is therefore implemented and
+`__STDC_NO_VLA__` is absent. This does not promise native-stack storage.
 
 The selected hosted provider is the scoped arena in
 [ADR-0011](../adr/0011-arena-backed-runtime-sized-automatic-storage.md). It

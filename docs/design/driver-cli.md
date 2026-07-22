@@ -18,14 +18,16 @@ reconstructed. Fixed frame slots are described relative to the target frame
 pointer; values retained only in SSA/register form, runtime-sized objects, and
 dynamically realigned objects omit a location rather than publishing a false
 one. Defined x86-64 ELF TLS objects use a DTP-relative relocation followed by
-`DW_OP_form_tls_address`; declaration-only objects have no DIE. The ordinary
-System V call-frame section is retained alongside source-level debug sections.
+`DW_OP_form_tls_address`; Darwin arm64 uses the corresponding TLV descriptor
+offset expression. Declaration-only objects have no DIE. The ordinary System V
+call-frame section is retained alongside source-level debug sections.
 Unsupported debug dialects and levels are rejected instead of being treated as
 no-ops. For a Darwin executable or dynamic-library link, the driver resolves
 `dsymutil` through the selected compiler driver, publishes the linked binary,
-and materializes a staged `.dSYM` while every registered object input is still
-available. The completed bundle then replaces its destination before temporary
-objects are released. Relocatable links and `-g0` do not create a bundle.
+and materializes a staged `.dSYM` while every registered object and Mach-O OSO
+debug-map input is still available. The completed bundle then replaces its
+destination before temporary objects are released. Relocatable links and `-g0`
+do not create a bundle.
 
 `-DNAME`, `-DNAME=value`, and function-like definitions such as
 `-D'F(x)=x'` use the same tokenization and definition checks as source
@@ -109,7 +111,8 @@ add assembler, partial-link, or object-copy steps. An external compatible
 compiler driver can therefore link that object using its ordinary hosted libc
 because no CCC runtime archive remains to be supplied. `-###` shows the compile
 and link commands but does not claim source-specific helper selection without
-compiling the source.
+compiling the source. A runtime layout operation that does not allocate an
+automatic object, such as VLA `sizeof`, emits no `realloc` or `free` reference.
 
 CCC validates the architecture and format of primary and generated objects
 while packaging them. Direct user objects, archives, dynamic libraries, and

@@ -93,11 +93,15 @@ directly into each affected function. Its external ABI is exactly
 `realloc(void *, size_t)` plus `free(void *)`; those ordinary libc imports are
 separate from the compiler-builtins helper manifest above. Invalid extents,
 size overflow, and allocation failure take an explicit backend trap. A
-compile-only object may retain the two libc references, but enabling the
-provider requires a hosted link profile that resolves them. Runtime-sized
-automatic storage alone does not trigger generated assembly, a relocatable
-partial link, or object-copy tooling. A freestanding profile must select and
-test another allocator or leave the capability unavailable.
+compile-only object containing an automatic runtime-sized object retains the
+two libc references, but enabling the provider requires a hosted link profile
+that resolves them. Runtime layout operations without such an object, including
+VLA `sizeof`, do not import the allocation provider. Runtime-sized automatic
+storage alone does not trigger generated assembly, a relocatable partial link,
+or object-copy tooling. A freestanding profile must select and test another
+allocator or leave the capability unavailable. Each enabled hosted target is
+compiled, externally linked, and executed at `-O0` and `-O2` by the target
+oracle so provider resolution is not inferred from object emission alone.
 
 The object and executable link plan expose these provider requirements. An external
 GCC- or Clang-compatible driver can link a CCC object directly because the

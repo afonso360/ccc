@@ -62,6 +62,7 @@ The fully annotated pipeline — which crate owns each stage, the component brea
 | [Resource directory](design/resource-dir.md)                  | Shipped builtin headers, include search, runtime helper strategy                                        |
 | [Driver & CLI](design/driver-cli.md)                          | Flag surface, unknown-flag policy, observability dumps                                                  |
 | [Diagnostics](design/diagnostics.md)                          | Spans, macro/include backtraces, parser recovery, warning control                                       |
+| [Optimization](design/optimization.md)                        | Driver profiles, CCC-IR passes, Cranelift ownership, and validation                                      |
 | [Cranelift risk register](design/cranelift-risks.md)          | The hard backend problems (ABI, varargs, `long double`, inline asm, TLS, …)                             |
 | [Testing strategy](design/testing.md)                         | Snapshot/execution/differential tiers, the ABI oracle, corpus licensing                                 |
 | [Toolchain & policy](design/toolchain.md)                     | Dependencies, Cranelift pinning, MSRV, lint/dep policy                                                  |

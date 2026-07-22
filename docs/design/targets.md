@@ -54,17 +54,14 @@ adds only compiler identity and capability-denial macros. Builtin headers and
 `-dM` consume that same final environment rather than maintaining parallel
 tables.
 
-An automatic-storage provider is enabled per effective target profile. Its
-versioned descriptor records the provider kind, arena and mark record layouts,
-allocator requirements, target VLA minimum alignment, failure behavior,
-returns-twice and cross-language-unwind compatibility, async-signal-safety
-stance, and committed performance budgets. Generated callers and local support
-definitions consume the same record layouts. These facts drive semantic
-diagnostics, `__STDC_NO_VLA__`, `__has_builtin`, CCC-IR lowering, helper
-selection, link planning, and provider tests together. Arena-backed ISO VLA
-support never implies native-stack builtin support. The descriptor revision and
-record layouts enter both the effective-configuration hash and object
-compatibility metadata.
+Every enabled hosted target uses the scoped automatic-storage provider described
+by ADR-0011. Allocation state lowers directly into the affected function and
+depends only on the target's ordinary `realloc` and `free` ABI; runtime layout
+without an automatic VLA object has no allocator dependency. The `c11-vla`
+feature entry drives `__STDC_NO_VLA__`, while semantic, IR, object, provider,
+failure, and O0/O2 target-oracle tests keep that advertisement aligned across
+all four profiles. Arena-backed ISO VLA support never implies native-stack
+builtin support.
 
 ## Relocation and output models
 

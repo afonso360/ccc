@@ -9,14 +9,14 @@ separate immutable [module ABI plan](abi-and-varargs.md#module-abi-plan).
 
 - **Places vs values.** A place is an address expression plus type, qualifiers, and an optional bitfield descriptor. Every read is an explicit load and every write an explicit store; lvalue-to-rvalue conversion is never implicit. A transparent GNU statement expression may forward an eligible top-level-unqualified ordinary place or an eligible bit-field place whose ordinary expression type is top-level-unqualified. A forwarded aggregate retains nested member qualifications; a forwarded bit-field retains qualification declared on the field as descriptor access metadata and remains non-addressable. Top-level qualification on an ordinary final, including qualification inherited by a bit-field through its containing aggregate, instead causes an explicit value conversion and any required volatile read. A body that requires sequencing or scoped declarations likewise captures its result as a value before cleanup. `_Generic` independently forwards the selected association's place or value and does not use that materialization rule.
 - **Object identity and address-taking.** Address-taken, volatile, aggregate, atomic, and variably modified objects are materialized in memory. A pre-lowering scan classifies locals before any SSA value is emitted, so later `&local` cannot require retroactive materialization.
-- **Runtime-sized automatic storage.** Runtime extents are explicit values, and
-  `AutomaticStorageBegin`/`AutomaticStorageEnd`-class effects delimit each
-  dynamic object's lifetime without naming a physical provider. Begin carries
-  checked byte size and required alignment; address formation is valid only
-  while the storage is active. The verifier propagates a LIFO active-region
-  stack, requires equal stacks at CFG merges, and rejects an ordinary return
-  with active storage. Provider-specific arena marks or native stack-save tokens
-  exist only below CCC-IR, as required by
+- **Runtime-sized layout and automatic storage.** Runtime extents are explicit
+  SSA values. `RuntimeSize` records the dynamic extents, constant dimension
+  factor, and final element type; codegen rejects nonpositive extents and checks
+  each `size_t` multiplication. `RuntimeSizedAllocate` consumes that size and a
+  provider-neutral storage identity, while runtime `sizeof` and pointer
+  operations reuse the same checked-size form without implying allocation.
+  Hosted codegen keeps one `{base, capacity}` cache per runtime-sized object and
+  releases every cache on ordinary return, as required by
   [ADR-0011](../adr/0011-arena-backed-runtime-sized-automatic-storage.md).
 - **Pointer operations.** Scaled pointer arithmetic, pointer difference, array/member offsets, null values, and integer/pointer conversions are explicit operations with the source C rules attached. Codegen does not infer pointee size or signedness.
 - **Aggregate value semantics.** Every aggregate rvalue is an immutable owned
@@ -33,7 +33,11 @@ separate immutable [module ABI plan](abi-and-varargs.md#module-abi-plan).
   type; its immutable target fetch plan and control-flow expansion belong to
   `ccc-abi` and codegen respectively.
 - **Bitfields.** A bitfield place carries storage unit, bit offset, width, signedness, and volatility/atomic restrictions. Layout is computed during semantic analysis by the shared `ccc-types` layout engine from the effective configuration.
-- **Compound literals.** The IR creates an anonymous object with the correct block or static storage duration and makes initialization explicit.
+- **Compound literals.** A block-scope occurrence has an addressable automatic
+  storage object and explicit initialization at each evaluation. A file-scope
+  occurrence has its own deterministic internal data object; its initializer
+  is lowered through the ordinary `InitializerGraph` path, including nested
+  object relocations. Distinct occurrences are never pooled.
 
 ## Memory effects
 
@@ -62,8 +66,8 @@ Before lowering, semantic analysis guarantees:
 
 - names, tags, linkage, storage duration, and type qualifiers are resolved;
 - every expression has a type and every implicit conversion is explicit;
-- complete object types have a known target layout, VLA extents remain explicit runtime values, and legal incomplete types remain marked incomplete;
-- an operation that requires a complete or constant-sized type has already been checked;
+- complete fixed-size object types have a known target layout, VLA extents remain explicit runtime values, and legal incomplete types remain marked incomplete;
+- an operation that requires a complete fixed-size type has already been checked, while runtime VLA layout reaches `RuntimeSize` with every bound available;
 - constant expressions required by C have been evaluated without erasing relocation-bearing address constants;
 - declarations that require an unavailable target/backend capability have a diagnostic path and cannot reach silent fallback codegen.
 

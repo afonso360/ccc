@@ -49,7 +49,7 @@ labels and switch targets. It rejects control-flow ingress that bypasses a
 declaration. Named jumps may remain within a path or leave it, and switch labels
 may not enter a path deeper than the switch entry. Because an arbitrary computed
 target cannot yet prove its destination path, a function may not combine a
-computed goto with a variably modified automatic object. The arena retains
+computed goto with a variably modified declaration. The arena retains
 physical capacity across scope exits but exposes no address after the C lifetime
 ends. A return operand, including an aggregate, is fully evaluated and copied
 before the cached bases are released.
@@ -123,8 +123,9 @@ refers to the object is invalid outside the statement expression.
   stack observability or probing claim for the arena provider.
 - The hosted provider is enabled for automatic VLA objects after semantic, IR,
   runtime, link, failure-path, leak, alignment, recursion, and thread tests.
-  `__STDC_NO_VLA__` remains defined until the broader runtime-layout and
-  variably modified type surface is complete.
+  Runtime layout, variably modified typedef and type-name bounds, control-flow
+  ingress, provider failure, and execution are verified on every enabled
+  target; `__STDC_NO_VLA__` is therefore absent for those configurations.
 - Provider-neutral CCC-IR permits a future verified native Cranelift operation
   without redesigning semantic analysis or control-flow cleanup.
 
