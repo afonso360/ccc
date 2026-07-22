@@ -1046,16 +1046,16 @@ fn absolute_relocation_destination(
         let symbol = product.object.symbol(symbol);
         (symbol.section, symbol.value)
     };
-    if product.object.format() == BinaryFormat::MachO {
-        if let SymbolSection::Section(section) = section {
-            let addend = i64::try_from(value)
-                .map_err(|_| error("Mach-O debug symbol offset exceeds signed relocation range"))?;
-            return Ok(RelocationDestination {
-                symbol: product.object.section_symbol(section),
-                addend,
-                kind: DwarfRelocationKind::Absolute,
-            });
-        }
+    if product.object.format() == BinaryFormat::MachO
+        && let SymbolSection::Section(section) = section
+    {
+        let addend = i64::try_from(value)
+            .map_err(|_| error("Mach-O debug symbol offset exceeds signed relocation range"))?;
+        return Ok(RelocationDestination {
+            symbol: product.object.section_symbol(section),
+            addend,
+            kind: DwarfRelocationKind::Absolute,
+        });
     }
     Ok(RelocationDestination {
         symbol,
