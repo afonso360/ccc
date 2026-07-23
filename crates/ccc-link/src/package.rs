@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
@@ -18,6 +19,7 @@ use crate::artifact::{
     VerifiedArtifactBundle, canonical_symbol_name, parse_relocatable,
 };
 use crate::bridge::is_bridge_generated_symbol;
+use crate::temp_cleanup::RegisteredTemporaryDirectory;
 use crate::{
     LinkError, ProbeRequest, ProbeRunner, ProcessProbeRunner, ToolchainRequirements,
     ToolchainResolver, artifact_error,
@@ -33,10 +35,27 @@ pub struct PackagingToolIdentity {
 }
 
 /// Details of a successfully materialized relocatable artifact.
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PackagingReport {
     pub used_generated_assembly: bool,
     pub symbol_localizer: Option<PackagingToolIdentity>,
+    // Apple's relocatable linker replaces embedded DWARF with an OSO debug
+    // map. Keep the registered workspace containing that map's primary object
+    // alive until the caller has finished its final link and `dsymutil` pass.
+    _debug_workspace: Option<ArtifactWorkspace>,
+}
+
+impl fmt::Debug for PackagingReport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PackagingReport")
+            .field("used_generated_assembly", &self.used_generated_assembly)
+            .field("symbol_localizer", &self.symbol_localizer)
+            .field(
+                "retains_macho_debug_inputs",
+                &self._debug_workspace.is_some(),
+            )
+            .finish()
+    }
 }
 
 /// Verifies and atomically materializes an artifact. Tool discovery is skipped
@@ -52,6 +71,7 @@ pub fn package_artifact_bundle(
         return Ok(PackagingReport {
             used_generated_assembly: false,
             symbol_localizer: None,
+            _debug_workspace: None,
         });
     }
 
@@ -90,6 +110,7 @@ pub fn package_artifact_bundle_with_runner<R: ProbeRunner>(
         return Ok(PackagingReport {
             used_generated_assembly: false,
             symbol_localizer: None,
+            _debug_workspace: None,
         });
     }
     let candidates = if config.target.triple.binary_format == BinaryFormat::Macho {
@@ -108,7 +129,7 @@ fn publish_bridge_free(bundle: &VerifiedArtifactBundle, output: &Path) -> Result
     let final_object = workspace.path().join("final.o");
     write_file(&final_object, bundle.primary_object())?;
     inspect_final_object(&final_object, bundle)?;
-    workspace.publish(&final_object, output)
+    workspace.publish(&final_object, output, false).map(|_| ())
 }
 
 fn package_with_runner<R: ProbeRunner>(
@@ -193,11 +214,21 @@ fn package_with_runner<R: ProbeRunner>(
         macho,
     )?;
     inspect_combined_object(&final_object, bundle, true)?;
-    workspace.publish(&final_object, output)?;
+    let retain_debug_workspace = macho && primary_contains_debug_sections(bundle)?;
+    let debug_workspace = workspace.publish(&final_object, output, retain_debug_workspace)?;
     Ok(PackagingReport {
         used_generated_assembly: true,
         symbol_localizer: localizer,
+        _debug_workspace: debug_workspace,
     })
+}
+
+fn primary_contains_debug_sections(bundle: &VerifiedArtifactBundle) -> Result<bool, LinkError> {
+    let object = parse_relocatable(bundle.primary_object(), "primary object")?;
+    Ok(object
+        .sections()
+        .filter_map(|section| section.name().ok())
+        .any(|name| name.starts_with(".debug") || name.starts_with("__debug_")))
 }
 
 fn probe_packaging_capabilities<R: ProbeRunner>(
@@ -838,8 +869,7 @@ fn write_file(path: &Path, contents: &[u8]) -> Result<(), LinkError> {
 }
 
 struct ArtifactWorkspace {
-    path: PathBuf,
-    published: bool,
+    temporary: RegisteredTemporaryDirectory,
 }
 
 impl ArtifactWorkspace {
@@ -852,13 +882,8 @@ impl ArtifactWorkspace {
         for _ in 0..100 {
             let id = WORKSPACE_ID.fetch_add(1, Ordering::Relaxed);
             let path = directory.join(format!(".{stem}.ccc-artifact-{}-{id}", std::process::id()));
-            match fs::create_dir(&path) {
-                Ok(()) => {
-                    return Ok(Self {
-                        path,
-                        published: false,
-                    });
-                }
+            match RegisteredTemporaryDirectory::create(path) {
+                Ok(temporary) => return Ok(Self { temporary }),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(error) => {
                     return Err(artifact_error(format!(
@@ -874,10 +899,15 @@ impl ArtifactWorkspace {
     }
 
     fn path(&self) -> &Path {
-        &self.path
+        self.temporary.path()
     }
 
-    fn publish(mut self, source: &Path, destination: &Path) -> Result<(), LinkError> {
+    fn publish(
+        mut self,
+        source: &Path,
+        destination: &Path,
+        preserve_workspace: bool,
+    ) -> Result<Option<Self>, LinkError> {
         File::open(source)
             .and_then(|file| file.sync_all())
             .map_err(|error| artifact_error(format!("cannot sync packaged object: {error}")))?;
@@ -887,19 +917,14 @@ impl ArtifactWorkspace {
                 destination.display()
             ))
         })?;
-        self.published = true;
-        // Publication is the commit point. A best-effort cleanup failure must
-        // not turn a successfully replaced, fully verified destination into a
-        // reported compilation failure.
-        let _ = fs::remove_dir_all(&self.path);
-        Ok(())
-    }
-}
-
-impl Drop for ArtifactWorkspace {
-    fn drop(&mut self) {
-        if !self.published {
-            let _ = fs::remove_dir_all(&self.path);
+        if preserve_workspace {
+            Ok(Some(self))
+        } else {
+            // Publication is the commit point. A best-effort cleanup failure
+            // must not turn a successfully replaced, fully verified
+            // destination into a reported compilation failure.
+            self.temporary.cleanup();
+            Ok(None)
         }
     }
 }
@@ -1432,6 +1457,7 @@ mod tests {
                 overflow_arg_offset: 0,
                 gp_results: 1,
                 xmm_results: 0,
+                x87_result: false,
                 hidden_return: false,
                 logical_line: 1,
             };
@@ -1702,6 +1728,7 @@ mod tests {
             overflow_arg_offset: 0,
             gp_results: 0,
             xmm_results: 0,
+            x87_result: false,
             hidden_return: false,
             logical_line: 1,
         })

@@ -12,8 +12,8 @@ pub use compat::{
     CompatibilityScope, CompatibilityVersion, GnuCompatibilityProfile,
 };
 pub use layout::{
-    BitfieldLayoutPolicy, BitfieldOrder, ByteOrder, PackingPolicy, ScalarLayout, TargetDataLayout,
-    TargetScalarKind,
+    BitfieldLayoutPolicy, BitfieldOrder, ByteOrder, LongDoubleFormat, PackingPolicy, ScalarLayout,
+    TargetDataLayout, TargetScalarKind,
 };
 pub use target_lexicon::{
     Aarch64Architecture, Architecture, BinaryFormat, CallingConvention, Environment,
@@ -41,6 +41,11 @@ pub enum RuntimeHelperValue {
     UnsignedInt128,
     Float32,
     Float64,
+    /// System V AMD64 `XFmode`, transported through the native x87 ABI.
+    ///
+    /// Cranelift never sees this carrier. CCC's generated assembly support
+    /// unit is the caller or callee for every contract containing it.
+    Float80,
 }
 
 /// The link-time provider selected for target runtime helpers.
@@ -72,6 +77,7 @@ const I128: &[RuntimeHelperValue] = &[RuntimeHelperValue::SignedInt128];
 const U128: &[RuntimeHelperValue] = &[RuntimeHelperValue::UnsignedInt128];
 const F32: &[RuntimeHelperValue] = &[RuntimeHelperValue::Float32];
 const F64: &[RuntimeHelperValue] = &[RuntimeHelperValue::Float64];
+const F80: &[RuntimeHelperValue] = &[RuntimeHelperValue::Float80];
 
 /// Complete helper manifest for the x86-64 GNU wide-integer capability.
 pub const SYSV_AMD64_INT128_RUNTIME_HELPERS: &[RuntimeHelperContract] = &[
@@ -147,6 +153,30 @@ pub const SYSV_AMD64_INT128_RUNTIME_HELPERS: &[RuntimeHelperContract] = &[
         parameters: F64,
         provider: RuntimeHelperProvider::CompilerBuiltins,
     },
+    RuntimeHelperContract {
+        symbol: "__floattixf",
+        result: RuntimeHelperValue::Float80,
+        parameters: I128,
+        provider: RuntimeHelperProvider::CompilerBuiltins,
+    },
+    RuntimeHelperContract {
+        symbol: "__floatuntixf",
+        result: RuntimeHelperValue::Float80,
+        parameters: U128,
+        provider: RuntimeHelperProvider::CompilerBuiltins,
+    },
+    RuntimeHelperContract {
+        symbol: "__fixxfti",
+        result: RuntimeHelperValue::SignedInt128,
+        parameters: F80,
+        provider: RuntimeHelperProvider::CompilerBuiltins,
+    },
+    RuntimeHelperContract {
+        symbol: "__fixunsxfti",
+        result: RuntimeHelperValue::UnsignedInt128,
+        parameters: F80,
+        provider: RuntimeHelperProvider::CompilerBuiltins,
+    },
 ];
 
 impl AbiIdentity {
@@ -178,7 +208,10 @@ impl AbiIdentity {
     /// Whether CCC has complete object, link, and execution evidence for
     /// thread-local storage under this ABI profile.
     pub const fn supports_tls_codegen(self) -> bool {
-        matches!(self, Self::SysvAmd64Lp64)
+        matches!(
+            self,
+            Self::SysvAmd64Lp64 | Self::Aapcs64Lp64 | Self::RiscvLp64d | Self::DarwinArm64
+        )
     }
 
     /// Whether this ABI profile has the complete scalar, boundary, varargs,
@@ -204,6 +237,48 @@ pub enum RelocationModel {
     Pic,
     /// Generate position-independent code and advertise a PIE compilation.
     Pie,
+}
+
+/// The user-visible optimization profile carried through the compiler.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum OptimizationLevel {
+    /// Disable optional optimization while retaining validation.
+    #[default]
+    O0,
+    /// Enable the standard optimization pipeline at its least aggressive level.
+    O1,
+    /// Enable the standard optimization pipeline.
+    O2,
+    /// Enable the standard optimization pipeline at its most aggressive level.
+    O3,
+    /// Optimize for both execution speed and code size.
+    Size,
+    /// Prefer minimum code size.
+    SizeMin,
+}
+
+impl OptimizationLevel {
+    /// Returns the canonical driver spelling for this profile.
+    pub const fn flag(self) -> &'static str {
+        match self {
+            Self::O0 => "-O0",
+            Self::O1 => "-O1",
+            Self::O2 => "-O2",
+            Self::O3 => "-O3",
+            Self::Size => "-Os",
+            Self::SizeMin => "-Oz",
+        }
+    }
+
+    /// Whether optional CCC IR cleanup is enabled.
+    pub const fn optimizes(self) -> bool {
+        !matches!(self, Self::O0)
+    }
+
+    /// Whether code size is an explicit optimization objective.
+    pub const fn optimizes_for_size(self) -> bool {
+        matches!(self, Self::Size | Self::SizeMin)
+    }
 }
 
 /// Compiler-provided C types whose representation is selected by the target
@@ -391,6 +466,7 @@ impl TargetSpec {
         if self.data_layout.float_width == 32 {
             insert_binary32_compatibility_facts(&mut facts);
         }
+        insert_binary16_compatibility_facts(&mut facts);
         // A 64-bit double in the enabled target data-layout contract uses the
         // IEEE 754 binary64 representation. Keep the hosted `float.h` family
         // together so its precision, ranges, and exact boundary values agree.
@@ -522,6 +598,29 @@ impl TargetSpec {
             facts.insert("_LP64", "1");
         }
         facts
+    }
+}
+
+fn insert_binary16_compatibility_facts(facts: &mut PredefinedMacroFacts) {
+    facts.insert("__SIZEOF_FLOAT16__", "2");
+    for (suffix, replacement) in [
+        ("MANT_DIG", "11"),
+        ("DIG", "3"),
+        ("MIN_EXP", "(-13)"),
+        ("MIN_10_EXP", "(-4)"),
+        ("MAX_EXP", "16"),
+        ("MAX_10_EXP", "4"),
+        ("DECIMAL_DIG", "5"),
+        ("HAS_DENORM", "1"),
+        ("HAS_INFINITY", "1"),
+        ("HAS_QUIET_NAN", "1"),
+        ("MAX", "0x1.ffcp+15"),
+        ("NORM_MAX", "0x1.ffcp+15"),
+        ("EPSILON", "0x1p-10"),
+        ("MIN", "0x1p-14"),
+        ("DENORM_MIN", "0x1p-24"),
+    ] {
+        facts.insert(format!("__FLT16_{suffix}__"), replacement);
     }
 }
 
@@ -983,6 +1082,7 @@ pub struct EffectiveCompilationConfig {
     pub resource_dir: Option<PathBuf>,
     pub toolchain: ToolchainSpec,
     pub relocation_model: RelocationModel,
+    pub optimization: OptimizationLevel,
     pub target_arch: Option<String>,
     pub target_cpu: Option<String>,
     pub target_abi: Option<String>,
@@ -1036,7 +1136,9 @@ impl EffectiveCompilationConfig {
                 Environment::Gnu,
             ) => AARCH64_UNKNOWN_LINUX_GNU,
             (
-                Architecture::Riscv64(Riscv64Architecture::Riscv64),
+                Architecture::Riscv64(
+                    Riscv64Architecture::Riscv64 | Riscv64Architecture::Riscv64gc,
+                ),
                 _,
                 OperatingSystem::Linux,
                 Environment::Gnu,
@@ -1067,6 +1169,7 @@ impl EffectiveCompilationConfig {
             resource_dir: None,
             toolchain: ToolchainSpec::default(),
             relocation_model: RelocationModel::Pie,
+            optimization: OptimizationLevel::O0,
             target_arch: None,
             target_cpu: None,
             target_abi: None,
@@ -1087,6 +1190,11 @@ impl EffectiveCompilationConfig {
 
     pub fn with_resource_dir(mut self, resource_dir: impl Into<PathBuf>) -> Self {
         self.resource_dir = Some(resource_dir.into());
+        self
+    }
+
+    pub fn with_optimization_level(mut self, optimization: OptimizationLevel) -> Self {
+        self.optimization = optimization;
         self
     }
 
@@ -1298,6 +1406,7 @@ pub const X86_64_UNKNOWN_LINUX_GNU: TargetSpec = TargetSpec {
         double_align: 8,
         long_double_width: 128,
         long_double_align: 16,
+        long_double_format: LongDoubleFormat::X87Extended,
         wchar_width: 32,
         wchar_is_signed: true,
         wint_width: 32,
@@ -1363,6 +1472,7 @@ pub const AARCH64_APPLE_DARWIN: TargetSpec = TargetSpec {
         char_is_signed: true,
         long_double_width: 64,
         long_double_align: 8,
+        long_double_format: LongDoubleFormat::Binary64,
         wint_is_signed: true,
         ..LINUX_LP64_BINARY128_LAYOUT
     },
@@ -1391,6 +1501,7 @@ const LINUX_LP64_BINARY128_LAYOUT: TargetDataLayout = TargetDataLayout {
     double_align: 8,
     long_double_width: 128,
     long_double_align: 16,
+    long_double_format: LongDoubleFormat::IeeeBinary128,
     wchar_width: 32,
     wchar_is_signed: true,
     wint_width: 32,
@@ -1434,6 +1545,7 @@ mod tests {
         assert_eq!(config.language.mode, LanguageMode::Gnu11);
         assert!(!config.language.trigraphs_enabled());
         assert_eq!(config.relocation_model, RelocationModel::Pie);
+        assert_eq!(config.optimization, OptimizationLevel::O0);
         assert_eq!(
             config.gnu_profile.as_ref().map(|profile| profile.version),
             Some(CompatibilityVersion::new(4, 2, 1))
@@ -1445,31 +1557,51 @@ mod tests {
     }
 
     #[test]
+    fn optimization_profiles_have_canonical_driver_spellings() {
+        for (optimization, flag, optimizes, size) in [
+            (OptimizationLevel::O0, "-O0", false, false),
+            (OptimizationLevel::O1, "-O1", true, false),
+            (OptimizationLevel::O2, "-O2", true, false),
+            (OptimizationLevel::O3, "-O3", true, false),
+            (OptimizationLevel::Size, "-Os", true, true),
+            (OptimizationLevel::SizeMin, "-Oz", true, true),
+        ] {
+            assert_eq!(optimization.flag(), flag);
+            assert_eq!(optimization.optimizes(), optimizes);
+            assert_eq!(optimization.optimizes_for_size(), size);
+        }
+    }
+
+    #[test]
     fn enabled_profiles_have_distinct_abi_identities_and_formats() {
-        for (spelling, abi, format, long_double_width) in [
+        for (spelling, abi, format, long_double_width, long_double_format) in [
             (
                 "x86_64-unknown-linux-gnu",
                 AbiIdentity::SysvAmd64Lp64,
                 BinaryFormat::Elf,
                 128,
+                LongDoubleFormat::X87Extended,
             ),
             (
                 "aarch64-unknown-linux-gnu",
                 AbiIdentity::Aapcs64Lp64,
                 BinaryFormat::Elf,
                 128,
+                LongDoubleFormat::IeeeBinary128,
             ),
             (
                 "riscv64-unknown-linux-gnu",
                 AbiIdentity::RiscvLp64d,
                 BinaryFormat::Elf,
                 128,
+                LongDoubleFormat::IeeeBinary128,
             ),
             (
                 "aarch64-apple-darwin",
                 AbiIdentity::DarwinArm64,
                 BinaryFormat::Macho,
                 64,
+                LongDoubleFormat::Binary64,
             ),
         ] {
             let triple = spelling.parse().unwrap();
@@ -1479,6 +1611,10 @@ mod tests {
             assert_eq!(
                 config.target.data_layout.long_double_width,
                 long_double_width
+            );
+            assert_eq!(
+                config.target.data_layout.long_double_format,
+                long_double_format
             );
         }
     }
@@ -1506,6 +1642,7 @@ mod tests {
             ("x86_64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"),
             ("aarch64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"),
             ("riscv64-unknown-linux-gnu", "riscv64-unknown-linux-gnu"),
+            ("riscv64gc-unknown-linux-gnu", "riscv64-unknown-linux-gnu"),
             ("aarch64-apple-darwin25.5.0", "aarch64-apple-darwin"),
             ("aarch64-apple-macosx15.0.0", "aarch64-apple-darwin"),
         ] {
@@ -1725,6 +1862,38 @@ mod tests {
     }
 
     #[test]
+    fn x87_wide_conversion_runtime_contracts_use_native_xfmode_boundaries() {
+        let manifest = AbiIdentity::SysvAmd64Lp64.runtime_helper_manifest();
+        let contract = |symbol| {
+            manifest
+                .iter()
+                .find(|contract| contract.symbol == symbol)
+                .unwrap()
+        };
+        assert_eq!(contract("__floattixf").result, RuntimeHelperValue::Float80);
+        assert_eq!(
+            contract("__floattixf").parameters,
+            [RuntimeHelperValue::SignedInt128]
+        );
+        assert_eq!(
+            contract("__floatuntixf").parameters,
+            [RuntimeHelperValue::UnsignedInt128]
+        );
+        assert_eq!(
+            contract("__fixxfti").parameters,
+            [RuntimeHelperValue::Float80]
+        );
+        assert_eq!(
+            contract("__fixxfti").result,
+            RuntimeHelperValue::SignedInt128
+        );
+        assert_eq!(
+            contract("__fixunsxfti").result,
+            RuntimeHelperValue::UnsignedInt128
+        );
+    }
+
+    #[test]
     fn target_macro_facts_follow_the_data_layout_and_triple() {
         let facts = &EffectiveCompilationConfig::default().target_macros;
         assert_eq!(facts.get("__SIZEOF_POINTER__"), Some("8"));
@@ -1783,19 +1952,41 @@ mod tests {
     }
 
     #[test]
-    fn layout_only_float16_support_does_not_advertise_value_capabilities() {
+    fn float16_value_capabilities_are_advertised_on_enabled_targets() {
         for config in [
             EffectiveCompilationConfig::default(),
             EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
             EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
             EffectiveCompilationConfig::aarch64_apple_darwin(),
         ] {
-            assert!(
+            assert_eq!(config.target_macros.get("__SIZEOF_FLOAT16__"), Some("2"));
+            assert_eq!(config.target_macros.get("__FLT16_MANT_DIG__"), Some("11"));
+            assert_eq!(
+                config.target_macros.get("__FLT16_MAX__"),
+                Some("0x1.ffcp+15")
+            );
+            assert_eq!(config.target_macros.get("__FLT16_MIN__"), Some("0x1p-14"));
+            assert_eq!(
+                config.target_macros.get("__FLT16_DENORM_MIN__"),
+                Some("0x1p-24")
+            );
+        }
+    }
+
+    #[test]
+    fn variable_length_arrays_are_advertised_on_enabled_targets() {
+        for config in [
+            EffectiveCompilationConfig::default(),
+            EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+            EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
+            EffectiveCompilationConfig::aarch64_apple_darwin(),
+        ] {
+            assert_eq!(
                 config
-                    .target_macros
-                    .iter()
-                    .all(|(name, _)| !name.starts_with("__FLT16_")),
-                "{} advertises an unsupported `_Float16` value capability",
+                    .capabilities
+                    .state(CapabilityKind::Feature, "c11-vla"),
+                CapabilityState::Implemented,
+                "{}",
                 config.target.triple
             );
         }

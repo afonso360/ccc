@@ -1,6 +1,7 @@
 //! Cranelift lowering for the typed control-flow IR.
 
 mod data;
+mod debug;
 mod function;
 #[cfg(test)]
 mod tests;
@@ -13,16 +14,15 @@ use ccc_sema::generic::{
     Linkage as CLinkage, ObjectDefinitionPolicy, StorageDuration, SymbolBinding, SymbolVisibility,
 };
 use ccc_target::{
-    AbiIdentity, BinaryFormat, EffectiveCompilationConfig, RelocationModel, RuntimeHelperContract,
-    RuntimeHelperValue,
+    AbiIdentity, BinaryFormat, EffectiveCompilationConfig, LongDoubleFormat, OptimizationLevel,
+    RelocationModel, RuntimeHelperContract, RuntimeHelperValue,
 };
 use ccc_types::{
-    ArrayLength, BuiltinType, LayoutShape, QualifiedType, TypeId, TypeKind, TypeQualifiers,
-    TypeStore,
+    BuiltinType, LayoutShape, QualifiedType, TypeId, TypeKind, TypeQualifiers, TypeStore,
 };
 use cranelift_codegen::Context;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-use cranelift_codegen::ir::immediates::{Ieee32, Ieee64};
+use cranelift_codegen::ir::immediates::{Ieee16, Ieee32, Ieee64};
 use cranelift_codegen::ir::{
     self, BlockArg, InstBuilder, MemFlags, StackSlot, StackSlotData, StackSlotKind, TrapCode,
     UserFuncName,
@@ -43,6 +43,45 @@ use crate::{CodegenError, Options, Output};
 const BACKEND_ERROR: &str = "CCC4002";
 const ATOMIC_ERROR: &str = "CCC4011";
 
+fn f64_to_f16_bits(value: f64) -> u16 {
+    let raw = value.to_bits();
+    let sign = ((raw >> 48) & 0x8000) as u16;
+    let magnitude = raw & 0x7fff_ffff_ffff_ffff;
+    let exponent = ((magnitude >> 52) & 0x7ff) as i32;
+    let fraction = magnitude & 0x000f_ffff_ffff_ffff;
+
+    let rounded = if exponent == 0x7ff {
+        if fraction == 0 {
+            0x7c00
+        } else {
+            let payload = (fraction >> 42) as u16;
+            0x7c00 | payload | u16::from(payload == 0)
+        }
+    } else {
+        let unbiased = exponent - 1023;
+        if unbiased > 15 {
+            0x7c00
+        } else if unbiased >= -14 {
+            let base = (((unbiased + 15) as u64) << 10) | (fraction >> 42);
+            let remainder = fraction & ((1u64 << 42) - 1);
+            let halfway = 1u64 << 41;
+            let increment = remainder > halfway || remainder == halfway && base & 1 != 0;
+            (base + u64::from(increment)).min(0x7c00) as u16
+        } else if unbiased >= -25 {
+            let significand = fraction | (1u64 << 52);
+            let shift = (28 - unbiased) as u32;
+            let base = significand >> shift;
+            let remainder = significand & ((1u64 << shift) - 1);
+            let halfway = 1u64 << (shift - 1);
+            let increment = remainder > halfway || remainder == halfway && base & 1 != 0;
+            (base + u64::from(increment)) as u16
+        } else {
+            0
+        }
+    };
+    sign | rounded
+}
+
 /// Emits an ELF object from the typed control-flow IR.
 ///
 /// Function ABI plans are derived from each canonical function type, so the
@@ -51,7 +90,7 @@ const ATOMIC_ERROR: &str = "CCC4011";
 pub fn emit(
     module: &gir::FullModule,
     config: &EffectiveCompilationConfig,
-    options: Options,
+    options: Options<'_>,
 ) -> Result<Output, CodegenError> {
     let plan = ccc_abi::plan_module(module, config).map_err(abi_error)?;
     emit_with_plan(module, config, &plan, options)
@@ -61,7 +100,7 @@ pub fn emit_with_plan(
     module: &gir::FullModule,
     config: &EffectiveCompilationConfig,
     plan: &ccc_abi::ModuleAbiPlan,
-    options: Options,
+    options: Options<'_>,
 ) -> Result<Output, CodegenError> {
     let verified = plan.verify_against(module, config).map_err(abi_error)?;
     emit_inner(module, config, verified, options)
@@ -71,7 +110,7 @@ fn emit_inner(
     module: &gir::FullModule,
     config: &EffectiveCompilationConfig,
     abi_plan: ccc_abi::VerifiedModuleAbiPlan<'_>,
-    options: Options,
+    options: Options<'_>,
 ) -> Result<Output, CodegenError> {
     super::validate_target(config).map_err(error)?;
     if !config.target.abi.supports_tls_codegen()
@@ -102,6 +141,9 @@ fn emit_inner(
         }
     }
     let mut flag_builder = settings::builder();
+    flag_builder
+        .set("opt_level", cranelift_opt_level(config.optimization))
+        .map_err(module_error)?;
     match config.relocation_model {
         RelocationModel::Static => flag_builder.set("is_pic", "false").map_err(module_error)?,
         RelocationModel::Pic | RelocationModel::Pie => {
@@ -124,6 +166,14 @@ fn emit_inner(
     flag_builder
         .set("unwind_info", "true")
         .map_err(module_error)?;
+    if module_contains_returns_twice_call(module) || options.debug_info.is_some() {
+        // Resuming a saved environment requires a stable native frame. Scalar
+        // locals are already forced to stack storage by IR lowering; retain
+        // the frame pointer as the matching machine-code side of that contract.
+        flag_builder
+            .set("preserve_frame_pointers", "true")
+            .map_err(module_error)?;
+    }
     let isa = isa_builder
         .finish(settings::Flags::new(flag_builder))
         .map_err(module_error)?;
@@ -139,9 +189,12 @@ fn emit_inner(
         .verify_against(module, config)
         .map_err(abi_error)?;
     let declarations = declare_module(module, config, abi_plan, &mut object_module)?;
+    let mut debug = options
+        .debug_info
+        .map(|sources| debug::DebugEmitter::new(module, config, sources));
 
     let mut clif = String::new();
-    for function in &module.functions {
+    for (function_index, function) in module.functions.iter().enumerate() {
         let Some(_) = function.entry else {
             continue;
         };
@@ -168,7 +221,7 @@ fn emit_inner(
             ccc_abi::BoundaryPlan::Native(plan) => function::DefinitionAbi::Native(plan),
             ccc_abi::BoundaryPlan::Bridge(plan) => function::DefinitionAbi::Variadic(plan),
         };
-        function::lower_function(
+        let debug_layout = function::lower_function(
             module,
             function,
             config,
@@ -177,6 +230,7 @@ fn emit_inner(
             &references,
             frontend_config,
             &mut context.func,
+            debug.as_mut().map(|emitter| &mut emitter.locations),
         )
         .map_err(|error| error.with_span_if_none(function.span))?;
         if options.emit_clif {
@@ -202,6 +256,15 @@ fn emit_inner(
         object_module
             .define_function(id, &mut context)
             .map_err(module_error)?;
+        if let Some(debug) = debug.as_mut() {
+            debug.record_function(
+                function_index,
+                id,
+                &context,
+                &debug_layout,
+                object_module.isa(),
+            )?;
+        }
         unwind
             .record_function(id, &context, object_module.isa())
             .map_err(error)?;
@@ -313,12 +376,16 @@ fn emit_inner(
         }
     }
     unwind.emit(&mut product).map_err(error)?;
+    if let Some(debug) = debug {
+        debug.emit(&mut product, &declarations)?;
+    }
     let object = product.emit().map_err(module_error)?;
+    let required_runtime_helpers = required_runtime_helper_symbols(module, config);
     validate_runtime_helper_symbols(
         &object,
         module,
         config,
-        declarations.runtime_helpers.keys().copied(),
+        required_runtime_helpers.iter().copied(),
     )?;
     let (assemblies, manifest) = generated_bridge_artifacts(
         module,
@@ -335,6 +402,29 @@ fn emit_inner(
     })
 }
 
+const fn cranelift_opt_level(optimization: OptimizationLevel) -> &'static str {
+    match optimization {
+        OptimizationLevel::O0 => "none",
+        OptimizationLevel::O1 | OptimizationLevel::O2 | OptimizationLevel::O3 => "speed",
+        OptimizationLevel::Size | OptimizationLevel::SizeMin => "speed_and_size",
+    }
+}
+
+fn module_contains_returns_twice_call(module: &gir::FullModule) -> bool {
+    module.functions.iter().any(|function| {
+        function.blocks.iter().any(|block| {
+            block.instructions.iter().any(|instruction| {
+                matches!(
+                    &instruction.kind,
+                    gir::FullInstructionKind::DirectCall { effects, .. }
+                        | gir::FullInstructionKind::IndirectCall { effects, .. }
+                        if effects.returns_twice
+                )
+            })
+        })
+    })
+}
+
 fn validate_runtime_helper_symbols<'a>(
     object_bytes: &[u8],
     module: &gir::FullModule,
@@ -347,8 +437,8 @@ fn validate_runtime_helper_symbols<'a>(
         .abi
         .runtime_helper_manifest()
         .iter()
-        .map(|entry| entry.symbol)
-        .collect::<HashSet<_>>();
+        .map(|entry| (entry.symbol, entry))
+        .collect::<HashMap<_, _>>();
     let source_symbols = module
         .functions
         .iter()
@@ -361,7 +451,7 @@ fn validate_runtime_helper_symbols<'a>(
         .filter_map(|symbol| symbol.name().ok())
         .collect::<HashSet<_>>();
     for symbol in &undefined {
-        let looks_like_wide_helper = manifest.contains(symbol)
+        let looks_like_wide_helper = manifest.contains_key(symbol)
             || (symbol.starts_with("__")
                 && (symbol.ends_with("ti2") || symbol.ends_with("ti3") || symbol.contains("tif")));
         if looks_like_wide_helper && !selected.contains(symbol) && !source_symbols.contains(symbol)
@@ -372,10 +462,16 @@ fn validate_runtime_helper_symbols<'a>(
         }
     }
     for symbol in selected {
-        if !manifest.contains(symbol) {
+        let Some(contract) = manifest.get(symbol).copied() else {
             return Err(error(format!(
                 "selected runtime helper `{symbol}` is absent from the target manifest"
             )));
+        };
+        if runtime_helper_uses_f80(contract) {
+            // This reference is emitted by the generated x87 assembly unit,
+            // not by the primary Cranelift object validated here. The
+            // packaged object is inspected again by the final link planner.
+            continue;
         }
         if !undefined.contains(symbol) && !source_symbols.contains(symbol) {
             return Err(error(format!(
@@ -448,9 +544,10 @@ fn generated_bridge_artifacts(
 > {
     use ccc_link::artifact::{BridgeManifestV2, GeneratedSymbol, GeneratedSymbolOwner};
     use ccc_link::bridge::{
-        AssemblyFunctionLinkage, BridgeEntryPlan, ElfTlsAccessModel, ElfTlsSymbolVisibility,
-        GeneratedSymbolKind, TlsAccessorPlan, render_target_call_helper, render_target_fixed_entry,
-        render_target_variadic_entry, render_tls_accessor,
+        AssemblyFunctionLinkage, BridgeEntryPlan, F80RuntimeHelperPlan, GeneratedSymbolKind,
+        InlineAsmSupportPlan, TlsAccessModel, TlsAccessorPlan, TlsSymbolVisibility,
+        render_f80_support, render_inline_asm_support, render_target_call_helper,
+        render_target_fixed_entry, render_target_tls_accessor, render_target_variadic_entry,
     };
 
     let mut assemblies = Vec::new();
@@ -463,6 +560,45 @@ fn generated_bridge_artifacts(
             GeneratedSymbolKind::CallHelper,
             GeneratedSymbolOwner::AssemblyUnit(assembly.stem().to_owned()),
         ));
+        assemblies.push(assembly);
+    }
+    if let Some(support) = &abi_plan.plan().artifacts.f80_support {
+        let required = required_runtime_helper_symbols(module, config);
+        let assembly = render_f80_support(
+            &support.helper_symbol,
+            F80RuntimeHelperPlan {
+                from_i128: required.contains("__floattixf"),
+                from_u128: required.contains("__floatuntixf"),
+                to_i128: required.contains("__fixxfti"),
+                to_u128: required.contains("__fixunsxfti"),
+            },
+        )
+        .map_err(module_error)?;
+        symbols.push(GeneratedSymbol::internal(
+            &support.helper_symbol,
+            GeneratedSymbolKind::Support,
+            GeneratedSymbolOwner::AssemblyUnit(assembly.stem().to_owned()),
+        ));
+        assemblies.push(assembly);
+    }
+    if let Some(support) = &abi_plan.plan().artifacts.inline_asm_support {
+        let assembly = render_inline_asm_support(&InlineAsmSupportPlan {
+            cpuid_symbol: support.cpuid_symbol.clone(),
+            rdtsc_symbol: support.rdtsc_symbol.clone(),
+        })
+        .map_err(module_error)?;
+        let owner = GeneratedSymbolOwner::AssemblyUnit(assembly.stem().to_owned());
+        for helper in support
+            .cpuid_symbol
+            .iter()
+            .chain(support.rdtsc_symbol.iter())
+        {
+            symbols.push(GeneratedSymbol::internal(
+                helper,
+                GeneratedSymbolKind::Support,
+                owner.clone(),
+            ));
+        }
         assemblies.push(assembly);
     }
     for (function, artifact) in &abi_plan.plan().artifacts.bridge_entries {
@@ -503,7 +639,20 @@ fn generated_bridge_artifacts(
             .iter()
             .filter(|piece| piece.piece.class == ccc_abi::AbiClass::Integer)
             .count() as u8;
-        let xmm_results = plan.result_pieces.len() as u8 - gp_results;
+        let xmm_results = plan
+            .result_pieces
+            .iter()
+            .filter(|piece| {
+                matches!(
+                    piece.piece.class,
+                    ccc_abi::AbiClass::Sse | ccc_abi::AbiClass::SseUp
+                )
+            })
+            .count() as u8;
+        let x87_result = plan
+            .result_pieces
+            .iter()
+            .any(|piece| piece.piece.class == ccc_abi::AbiClass::X87);
         let entry_plan = BridgeEntryPlan {
             public_symbol: public_symbol.clone(),
             public_symbol_is_exact: artifact.public_symbol_is_exact,
@@ -515,6 +664,7 @@ fn generated_bridge_artifacts(
             overflow_arg_offset: plan.overflow_arg_offset,
             gp_results,
             xmm_results,
+            x87_result,
             hidden_return: plan.hidden_return,
             logical_line: 1,
         };
@@ -601,28 +751,35 @@ fn generated_bridge_artifacts(
                 "TLS accessor source symbol differs from the module ABI plan",
             ));
         }
+        if global.emission.symbol_name_is_exact != artifact.object_symbol_is_exact {
+            return Err(error(
+                "TLS accessor source symbol exactness differs from the module ABI plan",
+            ));
+        }
         let model = match artifact.model {
-            ccc_sema::generic::TlsModel::GeneralDynamic => ElfTlsAccessModel::GeneralDynamic,
-            ccc_sema::generic::TlsModel::LocalDynamic => ElfTlsAccessModel::LocalDynamic,
-            ccc_sema::generic::TlsModel::InitialExec => ElfTlsAccessModel::InitialExec,
-            ccc_sema::generic::TlsModel::LocalExec => ElfTlsAccessModel::LocalExec,
+            ccc_sema::generic::TlsModel::GeneralDynamic => TlsAccessModel::GeneralDynamic,
+            ccc_sema::generic::TlsModel::LocalDynamic => TlsAccessModel::LocalDynamic,
+            ccc_sema::generic::TlsModel::InitialExec => TlsAccessModel::InitialExec,
+            ccc_sema::generic::TlsModel::LocalExec => TlsAccessModel::LocalExec,
         };
         let object_visibility = if matches!(
             artifact.source_linkage,
             ccc_abi::SourceLinkage::None | ccc_abi::SourceLinkage::Internal
         ) {
-            ElfTlsSymbolVisibility::Hidden
+            TlsSymbolVisibility::Hidden
         } else {
             match artifact.source_visibility {
-                ccc_abi::SourceVisibility::Default => ElfTlsSymbolVisibility::Default,
-                ccc_abi::SourceVisibility::Hidden => ElfTlsSymbolVisibility::Hidden,
-                ccc_abi::SourceVisibility::Protected => ElfTlsSymbolVisibility::Protected,
-                ccc_abi::SourceVisibility::Internal => ElfTlsSymbolVisibility::Internal,
+                ccc_abi::SourceVisibility::Default => TlsSymbolVisibility::Default,
+                ccc_abi::SourceVisibility::Hidden => TlsSymbolVisibility::Hidden,
+                ccc_abi::SourceVisibility::Protected => TlsSymbolVisibility::Protected,
+                ccc_abi::SourceVisibility::Internal => TlsSymbolVisibility::Internal,
             }
         };
-        let assembly = render_tls_accessor(&TlsAccessorPlan {
+        let assembly = render_target_tls_accessor(&TlsAccessorPlan {
+            abi: config.target.abi,
             helper_symbol: artifact.helper_symbol.clone(),
             object_symbol: artifact.object_symbol.clone(),
+            object_symbol_is_exact: artifact.object_symbol_is_exact,
             model,
             object_visibility,
             logical_line: 1,
@@ -639,11 +796,15 @@ fn generated_bridge_artifacts(
                 ccc_abi::SourceLinkage::None | ccc_abi::SourceLinkage::Internal
             )
         {
-            symbols.push(GeneratedSymbol::source_internal(
+            let mut symbol = GeneratedSymbol::source_internal(
                 &artifact.object_symbol,
                 GeneratedSymbolKind::TlsObject,
                 GeneratedSymbolOwner::PrimaryObject,
-            ));
+            );
+            if artifact.object_symbol_is_exact {
+                symbol = symbol.with_exact_object_name();
+            }
+            symbols.push(symbol);
         }
         assemblies.push(assembly);
     }
@@ -682,6 +843,9 @@ struct Declarations {
     runtime_realloc: Option<FuncId>,
     runtime_free: Option<FuncId>,
     runtime_helpers: HashMap<&'static str, FuncId>,
+    f80_support: Option<FuncId>,
+    inline_cpuid_support: Option<FuncId>,
+    inline_rdtsc_support: Option<FuncId>,
     globals: HashMap<u32, DataDeclaration>,
     strings: HashMap<u32, ClifDataId>,
     commons: Vec<CommonDefinition>,
@@ -841,16 +1005,18 @@ fn declare_module(
         (None, None)
     };
 
-    let required_runtime_helpers = required_runtime_helper_symbols(module);
+    let required_runtime_helpers = required_runtime_helper_symbols(module, config);
     let mut runtime_helpers = HashMap::new();
     for contract in config
         .target
         .abi
         .runtime_helper_manifest()
         .iter()
-        .filter(|contract| required_runtime_helpers.contains(contract.symbol))
+        .filter(|contract| {
+            required_runtime_helpers.contains(contract.symbol) && !runtime_helper_uses_f80(contract)
+        })
     {
-        let signature = runtime_helper_signature(object_module, contract);
+        let signature = runtime_helper_signature(object_module, contract)?;
         let id = object_module
             .declare_function(contract.symbol, Linkage::Import, &signature)
             .map_err(module_error)?;
@@ -861,6 +1027,55 @@ fn declare_module(
             )));
         }
     }
+
+    let f80_support = if let Some(support) = &abi_plan.plan().artifacts.f80_support {
+        let signature = variadic_body_signature(config)?;
+        let id = object_module
+            .declare_function(&support.helper_symbol, Linkage::Import, &signature)
+            .map_err(module_error)?;
+        Some(id)
+    } else {
+        None
+    };
+
+    let (inline_cpuid_support, inline_rdtsc_support) =
+        if let Some(support) = &abi_plan.plan().artifacts.inline_asm_support {
+            let cpuid = if let Some(symbol) = &support.cpuid_symbol {
+                let mut signature = object_module.make_signature();
+                signature.params.extend([
+                    ir::AbiParam::new(ir::types::I32),
+                    ir::AbiParam::new(ir::types::I32),
+                    ir::AbiParam::new(ir::types::I64),
+                    ir::AbiParam::new(ir::types::I64),
+                    ir::AbiParam::new(ir::types::I64),
+                    ir::AbiParam::new(ir::types::I64),
+                ]);
+                Some(
+                    object_module
+                        .declare_function(symbol, Linkage::Import, &signature)
+                        .map_err(module_error)?,
+                )
+            } else {
+                None
+            };
+            let rdtsc = if let Some(symbol) = &support.rdtsc_symbol {
+                let mut signature = object_module.make_signature();
+                signature.params.extend([
+                    ir::AbiParam::new(ir::types::I64),
+                    ir::AbiParam::new(ir::types::I64),
+                ]);
+                Some(
+                    object_module
+                        .declare_function(symbol, Linkage::Import, &signature)
+                        .map_err(module_error)?,
+                )
+            } else {
+                None
+            };
+            (cpuid, rdtsc)
+        } else {
+            (None, None)
+        };
 
     let tls_accessor_signature = tls_accessor_signature(config)?;
     let mut tls_accessors = HashMap::with_capacity(abi_plan.plan().artifacts.tls_accessors.len());
@@ -970,6 +1185,9 @@ fn declare_module(
         runtime_realloc,
         runtime_free,
         runtime_helpers,
+        f80_support,
+        inline_cpuid_support,
+        inline_rdtsc_support,
         globals,
         strings,
         commons,
@@ -979,30 +1197,40 @@ fn declare_module(
 fn runtime_helper_signature(
     object_module: &ObjectModule,
     contract: &RuntimeHelperContract,
-) -> ir::Signature {
+) -> Result<ir::Signature, CodegenError> {
     let mut signature = object_module.make_signature();
-    signature.params.extend(
-        contract
-            .parameters
-            .iter()
-            .copied()
-            .map(runtime_helper_abi_param),
-    );
+    for parameter in contract.parameters {
+        signature.params.push(runtime_helper_abi_param(*parameter)?);
+    }
     signature
         .returns
-        .push(runtime_helper_abi_param(contract.result));
-    signature
+        .push(runtime_helper_abi_param(contract.result)?);
+    Ok(signature)
 }
 
-fn runtime_helper_abi_param(value: RuntimeHelperValue) -> ir::AbiParam {
-    ir::AbiParam::new(match value {
+fn runtime_helper_abi_param(value: RuntimeHelperValue) -> Result<ir::AbiParam, CodegenError> {
+    let ty = match value {
         RuntimeHelperValue::SignedInt128 | RuntimeHelperValue::UnsignedInt128 => ir::types::I128,
         RuntimeHelperValue::Float32 => ir::types::F32,
         RuntimeHelperValue::Float64 => ir::types::F64,
-    })
+        RuntimeHelperValue::Float80 => {
+            return Err(error(
+                "an x87 runtime helper cannot be declared through Cranelift",
+            ));
+        }
+    };
+    Ok(ir::AbiParam::new(ty))
 }
 
-fn required_runtime_helper_symbols(module: &gir::FullModule) -> HashSet<&'static str> {
+fn runtime_helper_uses_f80(contract: &RuntimeHelperContract) -> bool {
+    contract.result == RuntimeHelperValue::Float80
+        || contract.parameters.contains(&RuntimeHelperValue::Float80)
+}
+
+fn required_runtime_helper_symbols(
+    module: &gir::FullModule,
+    config: &EffectiveCompilationConfig,
+) -> HashSet<&'static str> {
     let mut required = HashSet::new();
     for function in &module.functions {
         for instruction in function.blocks.iter().flat_map(|block| &block.instructions) {
@@ -1049,8 +1277,17 @@ fn required_runtime_helper_symbols(module: &gir::FullModule) -> HashSet<&'static
                         (
                             gir::ScalarConversion::IntegerToFloating,
                             Some(BuiltinType::Int128),
-                            Some(BuiltinType::Double | BuiltinType::LongDouble),
+                            Some(BuiltinType::Double),
                         ) => "__floattidf",
+                        (
+                            gir::ScalarConversion::IntegerToFloating,
+                            Some(BuiltinType::Int128),
+                            Some(BuiltinType::LongDouble),
+                        ) => match config.target.data_layout.long_double_format {
+                            LongDoubleFormat::Binary64 => "__floattidf",
+                            LongDoubleFormat::X87Extended => "__floattixf",
+                            LongDoubleFormat::IeeeBinary128 => continue,
+                        },
                         (
                             gir::ScalarConversion::IntegerToFloating,
                             Some(BuiltinType::UnsignedInt128),
@@ -1059,8 +1296,17 @@ fn required_runtime_helper_symbols(module: &gir::FullModule) -> HashSet<&'static
                         (
                             gir::ScalarConversion::IntegerToFloating,
                             Some(BuiltinType::UnsignedInt128),
-                            Some(BuiltinType::Double | BuiltinType::LongDouble),
+                            Some(BuiltinType::Double),
                         ) => "__floatuntidf",
+                        (
+                            gir::ScalarConversion::IntegerToFloating,
+                            Some(BuiltinType::UnsignedInt128),
+                            Some(BuiltinType::LongDouble),
+                        ) => match config.target.data_layout.long_double_format {
+                            LongDoubleFormat::Binary64 => "__floatuntidf",
+                            LongDoubleFormat::X87Extended => "__floatuntixf",
+                            LongDoubleFormat::IeeeBinary128 => continue,
+                        },
                         (
                             gir::ScalarConversion::FloatingToInteger,
                             Some(BuiltinType::Float),
@@ -1068,9 +1314,18 @@ fn required_runtime_helper_symbols(module: &gir::FullModule) -> HashSet<&'static
                         ) => "__fixsfti",
                         (
                             gir::ScalarConversion::FloatingToInteger,
-                            Some(BuiltinType::Double | BuiltinType::LongDouble),
+                            Some(BuiltinType::Double),
                             Some(BuiltinType::Int128),
                         ) => "__fixdfti",
+                        (
+                            gir::ScalarConversion::FloatingToInteger,
+                            Some(BuiltinType::LongDouble),
+                            Some(BuiltinType::Int128),
+                        ) => match config.target.data_layout.long_double_format {
+                            LongDoubleFormat::Binary64 => "__fixdfti",
+                            LongDoubleFormat::X87Extended => "__fixxfti",
+                            LongDoubleFormat::IeeeBinary128 => continue,
+                        },
                         (
                             gir::ScalarConversion::FloatingToInteger,
                             Some(BuiltinType::Float),
@@ -1078,9 +1333,18 @@ fn required_runtime_helper_symbols(module: &gir::FullModule) -> HashSet<&'static
                         ) => "__fixunssfti",
                         (
                             gir::ScalarConversion::FloatingToInteger,
-                            Some(BuiltinType::Double | BuiltinType::LongDouble),
+                            Some(BuiltinType::Double),
                             Some(BuiltinType::UnsignedInt128),
                         ) => "__fixunsdfti",
+                        (
+                            gir::ScalarConversion::FloatingToInteger,
+                            Some(BuiltinType::LongDouble),
+                            Some(BuiltinType::UnsignedInt128),
+                        ) => match config.target.data_layout.long_double_format {
+                            LongDoubleFormat::Binary64 => "__fixunsdfti",
+                            LongDoubleFormat::X87Extended => "__fixunsxfti",
+                            LongDoubleFormat::IeeeBinary128 => continue,
+                        },
                         _ => continue,
                     };
                     required.insert(symbol);

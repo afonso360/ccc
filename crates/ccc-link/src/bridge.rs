@@ -14,6 +14,8 @@ use crate::{LinkError, artifact_error};
 pub const BRIDGE_FRAME_MAGIC: u32 = 0x4642_4343;
 /// Magic identifying compiler-owned variadic state in diagnostic output.
 pub const VA_STATE_MAGIC: u32 = 0x4156_4343;
+/// The call target returns an x87 value which must be captured into the frame.
+pub const BRIDGE_FLAG_X87_RESULT: u8 = 1;
 
 /// The fixed portion of the call-helper protocol.
 ///
@@ -23,7 +25,7 @@ pub const VA_STATE_MAGIC: u32 = 0x4156_4343;
 /// dispatch.
 #[repr(C, align(16))]
 #[derive(Clone)]
-pub struct BridgeFrameV1 {
+pub struct BridgeFrameV2 {
     pub magic: u32,
     pub version: u16,
     pub header_size: u16,
@@ -41,12 +43,13 @@ pub struct BridgeFrameV1 {
     pub xmm_slots: [[u8; 16]; 8],
     pub gp_result_slots: [[u8; 8]; 2],
     pub xmm_result_slots: [[u8; 16]; 2],
+    pub x87_result_slot: [u8; 16],
 }
 
-impl BridgeFrameV1 {
-    pub const VERSION: u16 = 1;
+impl BridgeFrameV2 {
+    pub const VERSION: u16 = 2;
     pub const HEADER_SIZE: u16 = 32;
-    pub const FIXED_SIZE: usize = 256;
+    pub const FIXED_SIZE: usize = 272;
     pub const ALIGNMENT: usize = 16;
 
     /// Creates a zeroed frame header. The caller owns any trailing stack area.
@@ -73,6 +76,7 @@ impl BridgeFrameV1 {
             xmm_slots: [[0; 16]; 8],
             gp_result_slots: [[0; 8]; 2],
             xmm_result_slots: [[0; 16]; 2],
+            x87_result_slot: [0; 16],
         }
     }
 
@@ -119,40 +123,45 @@ impl VaStateV1 {
 /// nonvariadic CLIF body.
 #[repr(C, align(16))]
 #[derive(Clone)]
-pub struct VariadicEntryFrameV1 {
+pub struct VariadicEntryFrameV2 {
     pub va_state: VaStateV1,
     pub gp_result_slots: [[u8; 8]; 2],
     pub xmm_result_slots: [[u8; 16]; 2],
+    pub x87_result_slot: [u8; 16],
 }
 
-impl VariadicEntryFrameV1 {
-    pub const SIZE: usize = 256;
+impl VariadicEntryFrameV2 {
+    pub const SIZE: usize = 272;
     pub const GP_RESULTS_OFFSET: usize = 208;
     pub const XMM_RESULTS_OFFSET: usize = 224;
+    pub const X87_RESULT_OFFSET: usize = 256;
 
     pub fn zeroed() -> Self {
         Self {
             va_state: VaStateV1::zeroed(),
             gp_result_slots: [[0; 8]; 2],
             xmm_result_slots: [[0; 16]; 2],
+            x87_result_slot: [0; 16],
         }
     }
 }
 
 const _: () = {
-    assert!(size_of::<BridgeFrameV1>() == BridgeFrameV1::FIXED_SIZE);
-    assert!(align_of::<BridgeFrameV1>() == BridgeFrameV1::ALIGNMENT);
-    assert!(offset_of!(BridgeFrameV1, target_address) == 8);
-    assert!(offset_of!(BridgeFrameV1, gp_slots) == 32);
-    assert!(offset_of!(BridgeFrameV1, xmm_slots) == 80);
-    assert!(offset_of!(BridgeFrameV1, gp_result_slots) == 208);
-    assert!(offset_of!(BridgeFrameV1, xmm_result_slots) == 224);
+    assert!(size_of::<BridgeFrameV2>() == BridgeFrameV2::FIXED_SIZE);
+    assert!(align_of::<BridgeFrameV2>() == BridgeFrameV2::ALIGNMENT);
+    assert!(offset_of!(BridgeFrameV2, target_address) == 8);
+    assert!(offset_of!(BridgeFrameV2, gp_slots) == 32);
+    assert!(offset_of!(BridgeFrameV2, xmm_slots) == 80);
+    assert!(offset_of!(BridgeFrameV2, gp_result_slots) == 208);
+    assert!(offset_of!(BridgeFrameV2, xmm_result_slots) == 224);
+    assert!(offset_of!(BridgeFrameV2, x87_result_slot) == 256);
     assert!(size_of::<VaStateV1>() == VaStateV1::SIZE);
     assert!(offset_of!(VaStateV1, gp_offset) == VaStateV1::VA_LIST_OFFSET);
     assert!(offset_of!(VaStateV1, register_save_area) == 32);
-    assert!(size_of::<VariadicEntryFrameV1>() == VariadicEntryFrameV1::SIZE);
-    assert!(offset_of!(VariadicEntryFrameV1, gp_result_slots) == 208);
-    assert!(offset_of!(VariadicEntryFrameV1, xmm_result_slots) == 224);
+    assert!(size_of::<VariadicEntryFrameV2>() == VariadicEntryFrameV2::SIZE);
+    assert!(offset_of!(VariadicEntryFrameV2, gp_result_slots) == 208);
+    assert!(offset_of!(VariadicEntryFrameV2, xmm_result_slots) == 224);
+    assert!(offset_of!(VariadicEntryFrameV2, x87_result_slot) == 256);
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -339,9 +348,9 @@ pub(crate) fn is_bridge_generated_symbol(symbol: &str) -> bool {
     .any(|prefix| symbol.starts_with(prefix))
 }
 
-/// ELF x86-64 TLS address sequence selected by the source-level TLS model.
+/// Target TLS address sequence selected by the source-level TLS model.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ElfTlsAccessModel {
+pub enum TlsAccessModel {
     GeneralDynamic,
     LocalDynamic,
     InitialExec,
@@ -350,7 +359,7 @@ pub enum ElfTlsAccessModel {
 
 /// Visibility that the generated accessor must attach to its TLS reference.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ElfTlsSymbolVisibility {
+pub enum TlsSymbolVisibility {
     Default,
     Hidden,
     Protected,
@@ -360,10 +369,13 @@ pub enum ElfTlsSymbolVisibility {
 /// Canonical inputs for one compiler-generated TLS address accessor.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TlsAccessorPlan {
+    pub abi: AbiIdentity,
     pub helper_symbol: String,
     pub object_symbol: String,
-    pub model: ElfTlsAccessModel,
-    pub object_visibility: ElfTlsSymbolVisibility,
+    /// Whether the object spelling is already the physical object-file name.
+    pub object_symbol_is_exact: bool,
+    pub model: TlsAccessModel,
+    pub object_visibility: TlsSymbolVisibility,
     pub logical_line: u32,
 }
 
@@ -385,25 +397,44 @@ impl TlsAccessorPlan {
     }
 }
 
-/// Renders a hidden SysV AMD64 function that returns the calling thread's
-/// address for one ELF TLS object. Dynamic-model calls use a canonical,
-/// linker-relaxable sequence and preserve the ABI stack-alignment contract.
-pub fn render_tls_accessor(plan: &TlsAccessorPlan) -> Result<GeneratedAssembly, LinkError> {
+/// Renders a hidden function that returns the calling thread's address for one
+/// TLS object. Resolver calls preserve the target ABI's stack and unwind
+/// contracts, and every Linux sequence uses linker-relaxable relocations.
+pub fn render_target_tls_accessor(plan: &TlsAccessorPlan) -> Result<GeneratedAssembly, LinkError> {
     plan.validate()?;
-    let mut source = String::new();
-    assembly_prelude(&mut source);
-    match plan.object_visibility {
-        ElfTlsSymbolVisibility::Default => {}
-        ElfTlsSymbolVisibility::Hidden => {
-            writeln!(source, ".hidden {}", plan.object_symbol).unwrap();
+    let source = match plan.abi {
+        AbiIdentity::SysvAmd64Lp64 => render_x86_64_tls_accessor(plan),
+        AbiIdentity::Aapcs64Lp64 => render_aarch64_tls_accessor(plan),
+        AbiIdentity::RiscvLp64d => render_riscv64_tls_accessor(plan),
+        AbiIdentity::DarwinArm64 => render_darwin_arm64_tls_accessor(plan),
+    };
+    GeneratedAssembly::new(
+        format!("tls-accessor-{}", plan.helper_symbol),
+        source,
+        vec![plan.helper_symbol.clone()],
+        vec![LogicalDebugLocation::generated(plan.logical_line.max(1))],
+    )
+}
+
+fn render_elf_tls_visibility(symbol: &str, visibility: TlsSymbolVisibility, source: &mut String) {
+    match visibility {
+        TlsSymbolVisibility::Default => {}
+        TlsSymbolVisibility::Hidden => {
+            writeln!(source, ".hidden {symbol}").unwrap();
         }
-        ElfTlsSymbolVisibility::Protected => {
-            writeln!(source, ".protected {}", plan.object_symbol).unwrap();
+        TlsSymbolVisibility::Protected => {
+            writeln!(source, ".protected {symbol}").unwrap();
         }
-        ElfTlsSymbolVisibility::Internal => {
-            writeln!(source, ".internal {}", plan.object_symbol).unwrap();
+        TlsSymbolVisibility::Internal => {
+            writeln!(source, ".internal {symbol}").unwrap();
         }
     }
+}
+
+fn render_x86_64_tls_accessor(plan: &TlsAccessorPlan) -> String {
+    let mut source = String::new();
+    assembly_prelude(&mut source);
+    render_elf_tls_visibility(&plan.object_symbol, plan.object_visibility, &mut source);
     function_header(
         &plan.helper_symbol,
         AssemblyFunctionLinkage::ExternalHidden,
@@ -411,7 +442,7 @@ pub fn render_tls_accessor(plan: &TlsAccessorPlan) -> Result<GeneratedAssembly, 
         &mut source,
     );
     match plan.model {
-        ElfTlsAccessModel::GeneralDynamic => {
+        TlsAccessModel::GeneralDynamic => {
             source.push_str("subq $8, %rsp\n.cfi_def_cfa_offset 16\n");
             writeln!(
                 source,
@@ -422,31 +453,170 @@ pub fn render_tls_accessor(plan: &TlsAccessorPlan) -> Result<GeneratedAssembly, 
             source.push_str(".value 0x6666\nrex64\ncall __tls_get_addr@PLT\n");
             source.push_str("addq $8, %rsp\n.cfi_def_cfa_offset 8\nret\n");
         }
-        ElfTlsAccessModel::LocalDynamic => {
+        TlsAccessModel::LocalDynamic => {
             source.push_str("subq $8, %rsp\n.cfi_def_cfa_offset 16\n");
             writeln!(source, "leaq {}@TLSLD(%rip), %rdi", plan.object_symbol).unwrap();
             source.push_str("call __tls_get_addr@PLT\n");
             writeln!(source, "leaq {}@DTPOFF(%rax), %rax", plan.object_symbol).unwrap();
             source.push_str("addq $8, %rsp\n.cfi_def_cfa_offset 8\nret\n");
         }
-        ElfTlsAccessModel::InitialExec => {
+        TlsAccessModel::InitialExec => {
             source.push_str("movq %fs:0, %rax\n");
             writeln!(source, "addq {}@GOTTPOFF(%rip), %rax", plan.object_symbol).unwrap();
             source.push_str("ret\n");
         }
-        ElfTlsAccessModel::LocalExec => {
+        TlsAccessModel::LocalExec => {
             source.push_str("movq %fs:0, %rax\n");
             writeln!(source, "leaq {}@TPOFF(%rax), %rax", plan.object_symbol).unwrap();
             source.push_str("ret\n");
         }
     }
     function_footer(&plan.helper_symbol, &mut source);
-    GeneratedAssembly::new(
-        format!("tls-accessor-{}", plan.helper_symbol),
-        source,
-        vec![plan.helper_symbol.clone()],
-        vec![LogicalDebugLocation::generated(plan.logical_line.max(1))],
-    )
+    source
+}
+
+fn render_aarch64_tls_accessor(plan: &TlsAccessorPlan) -> String {
+    let mut source = String::new();
+    render_elf_tls_visibility(&plan.object_symbol, plan.object_visibility, &mut source);
+    target_function_header(
+        &plan.helper_symbol,
+        false,
+        AssemblyFunctionLinkage::ExternalHidden,
+        false,
+        plan.abi,
+        &mut source,
+    );
+    match plan.model {
+        TlsAccessModel::GeneralDynamic | TlsAccessModel::LocalDynamic => {
+            source.push_str(
+                "stp x29, x30, [sp, #-16]!\n\
+                 .cfi_def_cfa_offset 16\n\
+                 mov x29, sp\n\
+                 .cfi_def_cfa w29, 16\n\
+                 .cfi_offset w30, -8\n\
+                 .cfi_offset w29, -16\n",
+            );
+            writeln!(source, "adrp x0, :tlsdesc:{}", plan.object_symbol).unwrap();
+            writeln!(source, "ldr x1, [x0, :tlsdesc_lo12:{}]", plan.object_symbol).unwrap();
+            writeln!(source, "add x0, x0, :tlsdesc_lo12:{}", plan.object_symbol).unwrap();
+            writeln!(source, ".tlsdesccall {}", plan.object_symbol).unwrap();
+            source.push_str(
+                "blr x1\n\
+                 mrs x8, TPIDR_EL0\n\
+                 add x0, x8, x0\n\
+                 .cfi_def_cfa wsp, 16\n\
+                 ldp x29, x30, [sp], #16\n\
+                 .cfi_def_cfa_offset 0\n\
+                 .cfi_restore w30\n\
+                 .cfi_restore w29\n\
+                 ret\n",
+            );
+        }
+        TlsAccessModel::InitialExec => {
+            writeln!(source, "adrp x9, :gottprel:{}", plan.object_symbol).unwrap();
+            writeln!(
+                source,
+                "ldr x9, [x9, :gottprel_lo12:{}]",
+                plan.object_symbol
+            )
+            .unwrap();
+            source.push_str("mrs x8, TPIDR_EL0\nadd x0, x8, x9\nret\n");
+        }
+        TlsAccessModel::LocalExec => {
+            source.push_str("mrs x8, TPIDR_EL0\n");
+            writeln!(source, "add x8, x8, :tprel_hi12:{}", plan.object_symbol).unwrap();
+            writeln!(source, "add x0, x8, :tprel_lo12_nc:{}", plan.object_symbol).unwrap();
+            source.push_str("ret\n");
+        }
+    }
+    target_function_footer(&plan.helper_symbol, false, plan.abi, &mut source);
+    source
+}
+
+fn render_riscv64_tls_accessor(plan: &TlsAccessorPlan) -> String {
+    let mut source = String::new();
+    render_elf_tls_visibility(&plan.object_symbol, plan.object_visibility, &mut source);
+    target_function_header(
+        &plan.helper_symbol,
+        false,
+        AssemblyFunctionLinkage::ExternalHidden,
+        false,
+        plan.abi,
+        &mut source,
+    );
+    match plan.model {
+        TlsAccessModel::GeneralDynamic | TlsAccessModel::LocalDynamic => {
+            source.push_str(
+                "addi sp, sp, -16\n\
+                 .cfi_def_cfa_offset 16\n\
+                 sd ra, 8(sp)\n\
+                 .cfi_offset ra, -8\n\
+                 .Lccc_tls_dynamic:\n",
+            );
+            writeln!(source, "auipc a0, %tls_gd_pcrel_hi({})", plan.object_symbol).unwrap();
+            source.push_str("addi a0, a0, %pcrel_lo(.Lccc_tls_dynamic)\ncall __tls_get_addr\n");
+            source.push_str(
+                "ld ra, 8(sp)\n\
+                 .cfi_restore ra\n\
+                 addi sp, sp, 16\n\
+                 .cfi_def_cfa_offset 0\n\
+                 ret\n",
+            );
+        }
+        TlsAccessModel::InitialExec => {
+            source.push_str(".Lccc_tls_initial_exec:\n");
+            writeln!(source, "auipc a0, %tls_ie_pcrel_hi({})", plan.object_symbol).unwrap();
+            source.push_str(
+                "ld a0, %pcrel_lo(.Lccc_tls_initial_exec)(a0)\n\
+                 add a0, a0, tp\n\
+                 ret\n",
+            );
+        }
+        TlsAccessModel::LocalExec => {
+            writeln!(source, "lui a0, %tprel_hi({})", plan.object_symbol).unwrap();
+            writeln!(source, "add a0, a0, tp, %tprel_add({})", plan.object_symbol).unwrap();
+            writeln!(source, "addi a0, a0, %tprel_lo({})", plan.object_symbol).unwrap();
+            source.push_str("ret\n");
+        }
+    }
+    target_function_footer(&plan.helper_symbol, false, plan.abi, &mut source);
+    source
+}
+
+fn render_darwin_arm64_tls_accessor(plan: &TlsAccessorPlan) -> String {
+    let mut source = String::new();
+    target_function_header(
+        &plan.helper_symbol,
+        false,
+        AssemblyFunctionLinkage::ExternalHidden,
+        false,
+        plan.abi,
+        &mut source,
+    );
+    let object_symbol =
+        target_symbol_with_exactness(&plan.object_symbol, plan.abi, plan.object_symbol_is_exact);
+    source.push_str(
+        "stp x29, x30, [sp, #-16]!\n\
+         .cfi_def_cfa_offset 16\n\
+         mov x29, sp\n\
+         .cfi_def_cfa w29, 16\n\
+         .cfi_offset w30, -8\n\
+         .cfi_offset w29, -16\n",
+    );
+    writeln!(source, "adrp x0, {object_symbol}@TLVPPAGE").unwrap();
+    writeln!(source, "ldr x0, [x0, {object_symbol}@TLVPPAGEOFF]").unwrap();
+    source.push_str(
+        "ldr x8, [x0]\n\
+         blr x8\n\
+         .cfi_def_cfa wsp, 16\n\
+         ldp x29, x30, [sp], #16\n\
+         .cfi_def_cfa_offset 0\n\
+         .cfi_restore w30\n\
+         .cfi_restore w29\n\
+         ret\n",
+    );
+    target_function_footer(&plan.helper_symbol, false, plan.abi, &mut source);
+    source
 }
 
 fn assembly_prelude(output: &mut String) {
@@ -631,7 +801,7 @@ pub fn render_generic_call_helper(symbol: &str) -> Result<GeneratedAssembly, Lin
          andq $-16, %r13\n\
          subq %r13, %rsp\n\
          movq %rsp, %rdi\n\
-         leaq 256(%r12), %rsi\n\
+         leaq 272(%r12), %rsi\n\
          movl 16(%r12), %ecx\n\
          rep movsb\n\
          movq 8(%r12), %r11\n\
@@ -655,6 +825,10 @@ pub fn render_generic_call_helper(symbol: &str) -> Result<GeneratedAssembly, Lin
          movq %rdx, 216(%r12)\n\
          movdqu %xmm0, 224(%r12)\n\
          movdqu %xmm1, 240(%r12)\n\
+         testb $1, 29(%r12)\n\
+         jz .Lccc_call_no_x87_result\n\
+         fstpt 256(%r12)\n\
+         .Lccc_call_no_x87_result:\n\
          leaq -16(%rbp), %rsp\n\
          popq %r13\n\
          popq %r12\n\
@@ -683,6 +857,415 @@ pub fn render_target_call_helper(
         }
         AbiIdentity::RiscvLp64d => render_riscv64_call_helper(symbol),
     }
+}
+
+/// Compiler-runtime conversions referenced by the x87 operation dispatcher.
+///
+/// Each flag controls both the accepted dispatcher opcode and the matching
+/// undefined compiler-runtime symbol. This keeps helper selection
+/// operation-sensitive even though all x87 operations share one generated
+/// assembly unit.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct F80RuntimeHelperPlan {
+    pub from_i128: bool,
+    pub from_u128: bool,
+    pub to_i128: bool,
+    pub to_u128: bool,
+}
+
+/// Renders the translation-unit-local x87 operation dispatcher.
+///
+/// The dispatcher accepts one pointer to a four-field frame containing an
+/// opcode followed by output, left-input, and right-input pointers. Every
+/// extended value is a pointer to a 16-byte object containing the 10-byte x87
+/// payload. This keeps x87 registers entirely inside generated assembly.
+pub fn render_f80_support(
+    symbol: &str,
+    runtime_helpers: F80RuntimeHelperPlan,
+) -> Result<GeneratedAssembly, LinkError> {
+    validate_symbol(symbol)?;
+    let mut source = String::new();
+    assembly_prelude(&mut source);
+    function_header(
+        symbol,
+        AssemblyFunctionLinkage::ExternalHidden,
+        false,
+        &mut source,
+    );
+    source.push_str(
+        "movl 0(%rdi), %eax\n\
+         movq 8(%rdi), %r8\n\
+         movq 16(%rdi), %r9\n\
+         movq 24(%rdi), %r10\n\
+         cmpl $1, %eax\n\
+         je .Lccc_f80_add\n\
+         cmpl $2, %eax\n\
+         je .Lccc_f80_sub\n\
+         cmpl $3, %eax\n\
+         je .Lccc_f80_mul\n\
+         cmpl $4, %eax\n\
+         je .Lccc_f80_div\n\
+         cmpl $5, %eax\n\
+         je .Lccc_f80_cmp\n\
+         cmpl $6, %eax\n\
+         je .Lccc_f80_neg\n\
+         cmpl $7, %eax\n\
+         je .Lccc_f80_from_i64\n\
+         cmpl $8, %eax\n\
+         je .Lccc_f80_from_u64\n\
+         cmpl $9, %eax\n\
+         je .Lccc_f80_from_f32\n\
+         cmpl $10, %eax\n\
+         je .Lccc_f80_from_f64\n\
+         cmpl $11, %eax\n\
+         je .Lccc_f80_to_i64\n\
+         cmpl $12, %eax\n\
+         je .Lccc_f80_to_u64\n\
+         cmpl $13, %eax\n\
+         je .Lccc_f80_to_f32\n\
+         cmpl $14, %eax\n\
+         je .Lccc_f80_to_f64\n\
+         cmpl $15, %eax\n\
+         je .Lccc_f80_copy_x87\n\
+         cmpl $16, %eax\n\
+         je .Lccc_f80_copy_x87\n\
+         cmpl $21, %eax\n\
+         je .Lccc_f80_cmp_signaling\n\
+",
+    );
+    if runtime_helpers.from_i128 {
+        source.push_str("cmpl $17, %eax\nje .Lccc_f80_from_i128\n");
+    }
+    if runtime_helpers.from_u128 {
+        source.push_str("cmpl $18, %eax\nje .Lccc_f80_from_u128\n");
+    }
+    if runtime_helpers.to_i128 {
+        source.push_str("cmpl $19, %eax\nje .Lccc_f80_to_i128\n");
+    }
+    if runtime_helpers.to_u128 {
+        source.push_str("cmpl $20, %eax\nje .Lccc_f80_to_u128\n");
+    }
+    source.push_str(
+        "ud2\n\
+         .Lccc_f80_add:\n\
+         fldt (%r9)\n\
+         fldt (%r10)\n\
+         faddp %st, %st(1)\n\
+         fstpt (%r8)\n\
+         ret\n\
+         .Lccc_f80_sub:\n\
+         fldt (%r9)\n\
+         fldt (%r10)\n\
+         fsubrp %st, %st(1)\n\
+         fstpt (%r8)\n\
+         ret\n\
+         .Lccc_f80_mul:\n\
+         fldt (%r9)\n\
+         fldt (%r10)\n\
+         fmulp %st, %st(1)\n\
+         fstpt (%r8)\n\
+         ret\n\
+         .Lccc_f80_div:\n\
+         fldt (%r9)\n\
+         fldt (%r10)\n\
+         fdivrp %st, %st(1)\n\
+         fstpt (%r8)\n\
+         ret\n\
+         .Lccc_f80_cmp:\n\
+         fldt (%r10)\n\
+         fldt (%r9)\n\
+         fucomip %st(1), %st\n\
+         fstp %st(0)\n\
+         jmp .Lccc_f80_cmp_flags\n\
+         .Lccc_f80_cmp_signaling:\n\
+         fldt (%r10)\n\
+         fldt (%r9)\n\
+         fcomip %st(1), %st\n\
+         fstp %st(0)\n\
+         .Lccc_f80_cmp_flags:\n\
+         jp .Lccc_f80_cmp_unordered\n\
+         je .Lccc_f80_cmp_equal\n\
+         jb .Lccc_f80_cmp_less\n\
+         movl $1, (%r8)\n\
+         ret\n\
+         .Lccc_f80_cmp_less:\n\
+         movl $-1, (%r8)\n\
+         ret\n\
+         .Lccc_f80_cmp_equal:\n\
+         movl $0, (%r8)\n\
+         ret\n\
+         .Lccc_f80_cmp_unordered:\n\
+         movl $2, (%r8)\n\
+         ret\n\
+         .Lccc_f80_neg:\n\
+         movq 0(%r9), %rax\n\
+         movq %rax, 0(%r8)\n\
+         movzwl 8(%r9), %eax\n\
+         xorl $32768, %eax\n\
+         movw %ax, 8(%r8)\n\
+         ret\n\
+         .Lccc_f80_from_i64:\n\
+         fildq (%r9)\n\
+         fstpt (%r8)\n\
+         ret\n\
+         .Lccc_f80_from_u64:\n\
+         movq (%r9), %rax\n\
+         testq %rax, %rax\n\
+         js .Lccc_f80_from_u64_high\n\
+         fildq (%r9)\n\
+         fstpt (%r8)\n\
+         ret\n\
+         .Lccc_f80_from_u64_high:\n\
+         movq %rax, %rcx\n\
+         andl $1, %ecx\n\
+         shrq $1, %rax\n\
+         movq %rax, -8(%rsp)\n\
+         fildq -8(%rsp)\n\
+         fildq -8(%rsp)\n\
+         faddp %st, %st(1)\n\
+         testl %ecx, %ecx\n\
+         jz .Lccc_f80_from_u64_store\n\
+         fld1\n\
+         faddp %st, %st(1)\n\
+         .Lccc_f80_from_u64_store:\n\
+         fstpt (%r8)\n\
+         ret\n\
+         .Lccc_f80_from_f32:\n\
+         flds (%r9)\n\
+         fstpt (%r8)\n\
+         ret\n\
+         .Lccc_f80_from_f64:\n\
+         fldl (%r9)\n\
+         fstpt (%r8)\n\
+         ret\n\
+         .Lccc_f80_to_i64:\n\
+         subq $16, %rsp\n\
+         fnstcw 8(%rsp)\n\
+         movzwl 8(%rsp), %eax\n\
+         andl $62463, %eax\n\
+         orl $3072, %eax\n\
+         movw %ax, 10(%rsp)\n\
+         fldcw 10(%rsp)\n\
+         fldt (%r9)\n\
+         fistpq (%r8)\n\
+         fldcw 8(%rsp)\n\
+         addq $16, %rsp\n\
+         ret\n\
+         .Lccc_f80_to_u64:\n\
+         subq $16, %rsp\n\
+         fnstcw 8(%rsp)\n\
+         movzwl 8(%rsp), %eax\n\
+         andl $62463, %eax\n\
+         orl $3072, %eax\n\
+         movw %ax, 10(%rsp)\n\
+         fldcw 10(%rsp)\n\
+         fldt (%r9)\n\
+         fldt .Lccc_f80_two63(%rip)\n\
+         fucomip %st(1), %st\n\
+         jbe .Lccc_f80_to_u64_high\n\
+         fistpq (%r8)\n\
+         jmp .Lccc_f80_to_u64_done\n\
+         .Lccc_f80_to_u64_high:\n\
+         fldt .Lccc_f80_two63(%rip)\n\
+         fsubrp %st, %st(1)\n\
+         fistpq (%r8)\n\
+         btcq $63, (%r8)\n\
+         .Lccc_f80_to_u64_done:\n\
+         fldcw 8(%rsp)\n\
+         addq $16, %rsp\n\
+         ret\n\
+         .Lccc_f80_to_f32:\n\
+         fldt (%r9)\n\
+         fstps (%r8)\n\
+         ret\n\
+         .Lccc_f80_to_f64:\n\
+         fldt (%r9)\n\
+         fstpl (%r8)\n\
+         ret\n\
+         .Lccc_f80_copy_x87:\n\
+         fldt (%r9)\n\
+         fstpt (%r8)\n\
+         ret\n\
+",
+    );
+    if runtime_helpers.from_i128 {
+        source.push_str(
+            ".Lccc_f80_from_i128:\n\
+             pushq %r12\n\
+             .cfi_def_cfa_offset 16\n\
+             .cfi_offset %r12, -16\n\
+             movq %r8, %r12\n\
+             movq 0(%r9), %rdi\n\
+             movq 8(%r9), %rsi\n\
+             call __floattixf@PLT\n\
+             fstpt (%r12)\n\
+             popq %r12\n\
+             .cfi_def_cfa_offset 8\n\
+             .cfi_restore %r12\n\
+             ret\n",
+        );
+    }
+    if runtime_helpers.from_u128 {
+        source.push_str(
+            ".Lccc_f80_from_u128:\n\
+             pushq %r12\n\
+             .cfi_def_cfa_offset 16\n\
+             .cfi_offset %r12, -16\n\
+             movq %r8, %r12\n\
+             movq 0(%r9), %rdi\n\
+             movq 8(%r9), %rsi\n\
+             call __floatuntixf@PLT\n\
+             fstpt (%r12)\n\
+             popq %r12\n\
+             .cfi_def_cfa_offset 8\n\
+             .cfi_restore %r12\n\
+             ret\n",
+        );
+    }
+    if runtime_helpers.to_i128 {
+        source.push_str(&render_f80_to_i128_helper(".Lccc_f80_to_i128", "__fixxfti"));
+    }
+    if runtime_helpers.to_u128 {
+        source.push_str(&render_f80_to_i128_helper(
+            ".Lccc_f80_to_u128",
+            "__fixunsxfti",
+        ));
+    }
+    source.push_str(
+        ".pushsection .rodata\n\
+         .p2align 4\n\
+         .Lccc_f80_two63:\n\
+         .quad 0x8000000000000000\n\
+         .word 0x403e\n\
+         .zero 6\n\
+         .popsection\n",
+    );
+    function_footer(symbol, &mut source);
+    GeneratedAssembly::new(
+        "f80-support",
+        source,
+        vec![symbol.to_owned()],
+        vec![LogicalDebugLocation::generated(1)],
+    )
+}
+
+fn render_f80_to_i128_helper(label: &str, runtime_symbol: &str) -> String {
+    format!(
+        "{label}:\n\
+         pushq %r12\n\
+         .cfi_def_cfa_offset 16\n\
+         .cfi_offset %r12, -16\n\
+         movq %r8, %r12\n\
+         subq $16, %rsp\n\
+         .cfi_def_cfa_offset 32\n\
+         movq 0(%r9), %rax\n\
+         movq 8(%r9), %rdx\n\
+         movq %rax, 0(%rsp)\n\
+         movq %rdx, 8(%rsp)\n\
+         call {runtime_symbol}@PLT\n\
+         addq $16, %rsp\n\
+         .cfi_def_cfa_offset 16\n\
+         movq %rax, 0(%r12)\n\
+         movq %rdx, 8(%r12)\n\
+         popq %r12\n\
+         .cfi_def_cfa_offset 8\n\
+         .cfi_restore %r12\n\
+         ret\n"
+    )
+}
+
+/// Exact helper symbols selected by retained x86 inline-assembly operations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InlineAsmSupportPlan {
+    pub cpuid_symbol: Option<String>,
+    pub rdtsc_symbol: Option<String>,
+}
+
+/// Renders one translation-unit-local support unit for CPUID and RDTSC.
+///
+/// CPUID accepts `(leaf, subleaf, eax*, ebx*, ecx*, edx*)` and stores every
+/// requested output from one instruction execution. RDTSC accepts `(low*,
+/// high*)` and likewise executes exactly once. Null CPUID outputs are allowed
+/// so source forms can retain only selected registers.
+pub fn render_inline_asm_support(
+    plan: &InlineAsmSupportPlan,
+) -> Result<GeneratedAssembly, LinkError> {
+    if plan.cpuid_symbol.is_none() && plan.rdtsc_symbol.is_none() {
+        return Err(artifact_error(
+            "an inline assembly support unit must define at least one helper",
+        ));
+    }
+    let mut source = String::new();
+    let mut symbols = Vec::new();
+    let mut locations = Vec::new();
+    if let Some(symbol) = &plan.cpuid_symbol {
+        validate_symbol(symbol)?;
+        if !symbol.starts_with("__ccc_support_cpuid_") {
+            return Err(artifact_error(
+                "a CPUID helper must use the reserved compiler namespace",
+            ));
+        }
+        assembly_prelude(&mut source);
+        function_header(
+            symbol,
+            AssemblyFunctionLinkage::ExternalHidden,
+            false,
+            &mut source,
+        );
+        source.push_str(
+            "pushq %rbx\n\
+             .cfi_def_cfa_offset 16\n\
+             .cfi_offset %rbx, -16\n\
+             movq %rdx, %r10\n\
+             movq %rcx, %r11\n\
+             movl %edi, %eax\n\
+             movl %esi, %ecx\n\
+             cpuid\n\
+             testq %r10, %r10\n\
+             je 1f\n\
+             movl %eax, (%r10)\n\
+             1:\n\
+             testq %r11, %r11\n\
+             je 2f\n\
+             movl %ebx, (%r11)\n\
+             2:\n\
+             testq %r8, %r8\n\
+             je 3f\n\
+             movl %ecx, (%r8)\n\
+             3:\n\
+             testq %r9, %r9\n\
+             je 4f\n\
+             movl %edx, (%r9)\n\
+             4:\n\
+             popq %rbx\n\
+             .cfi_def_cfa_offset 8\n\
+             .cfi_restore %rbx\n\
+             ret\n",
+        );
+        function_footer(symbol, &mut source);
+        symbols.push(symbol.clone());
+        locations.push(LogicalDebugLocation::generated(1));
+    }
+    if let Some(symbol) = &plan.rdtsc_symbol {
+        validate_symbol(symbol)?;
+        if !symbol.starts_with("__ccc_support_rdtsc_") {
+            return Err(artifact_error(
+                "an RDTSC helper must use the reserved compiler namespace",
+            ));
+        }
+        assembly_prelude(&mut source);
+        function_header(
+            symbol,
+            AssemblyFunctionLinkage::ExternalHidden,
+            false,
+            &mut source,
+        );
+        source.push_str("rdtsc\nmovl %eax, (%rdi)\nmovl %edx, (%rsi)\nret\n");
+        function_footer(symbol, &mut source);
+        symbols.push(symbol.clone());
+        locations.push(LogicalDebugLocation::generated(2));
+    }
+    GeneratedAssembly::new("inline-asm-support", source, symbols, locations)
 }
 
 fn render_arm64_call_helper(
@@ -874,6 +1457,8 @@ pub struct BridgeEntryPlan {
     pub gp_results: u8,
     /// Number of SSE result registers populated by the hidden body.
     pub xmm_results: u8,
+    /// Restore one x87 long-double result from the hidden body frame.
+    pub x87_result: bool,
     /// Echo the saved incoming structure-return pointer in `%rax`.
     pub hidden_return: bool,
     pub logical_line: u32,
@@ -919,7 +1504,15 @@ impl BridgeEntryPlan {
                 "a bridge-entry result exceeds the target register banks",
             ));
         }
-        if self.hidden_return && (self.gp_results != 0 || self.xmm_results != 0) {
+        if self.x87_result
+            && (abi != AbiIdentity::SysvAmd64Lp64 || self.gp_results != 0 || self.xmm_results != 0)
+        {
+            return Err(artifact_error(
+                "an x87 bridge-entry result must be the sole System V AMD64 result",
+            ));
+        }
+        if self.hidden_return && (self.gp_results != 0 || self.xmm_results != 0 || self.x87_result)
+        {
             return Err(artifact_error(
                 "an indirect bridge-entry result cannot also request register results",
             ));
@@ -989,7 +1582,7 @@ fn render_sysv_amd64_entry(
     // The public entry calls one uniform hidden signature: `fn(frame*) ->
     // void`. The body reconstructs fixed values from this frame, so assembly
     // never has to duplicate Cranelift's native aggregate signature.
-    source.push_str("subq $256, %rsp\n");
+    source.push_str("subq $272, %rsp\n");
     if kind == EntryKind::Variadic {
         // `%al` is caller-owned variadic metadata and must be captured before
         // any instruction reuses `%rax`.
@@ -1065,6 +1658,8 @@ fn render_sysv_amd64_entry(
          movq %r11, 232(%rsp)\n\
          movq %r11, 240(%rsp)\n\
          movq %r11, 248(%rsp)\n\
+         movq %r11, 256(%rsp)\n\
+         movq %r11, 264(%rsp)\n\
          movq %rsp, %rdi\n",
     );
     writeln!(source, "call {}", plan.hidden_body_symbol).unwrap();
@@ -1082,6 +1677,9 @@ fn render_sysv_amd64_entry(
         }
         if plan.xmm_results >= 2 {
             source.push_str("movdqu 240(%rsp), %xmm1\n");
+        }
+        if plan.x87_result {
+            source.push_str("fldt 256(%rsp)\n");
         }
     }
     source.push_str("leave\n.cfi_def_cfa %rsp, 8\nret\n");
@@ -1351,12 +1949,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn inline_assembly_support_is_exact_deterministic_and_abi_safe() {
+        let plan = InlineAsmSupportPlan {
+            cpuid_symbol: Some("__ccc_support_cpuid_test".to_owned()),
+            rdtsc_symbol: Some("__ccc_support_rdtsc_test".to_owned()),
+        };
+        let assembly = render_inline_asm_support(&plan).unwrap();
+        let source = assembly.source();
+
+        assert_eq!(assembly.stem(), "inline-asm-support");
+        assert_eq!(
+            assembly.defined_symbols(),
+            ["__ccc_support_cpuid_test", "__ccc_support_rdtsc_test"]
+        );
+        assert_eq!(assembly, render_inline_asm_support(&plan).unwrap());
+        assert!(source.contains(".hidden __ccc_support_cpuid_test"));
+        assert!(source.contains(".hidden __ccc_support_rdtsc_test"));
+        assert!(source.contains("pushq %rbx\n.cfi_def_cfa_offset 16"));
+        assert!(source.contains(".cfi_offset %rbx, -16"));
+        assert!(source.contains("movq %rdx, %r10\nmovq %rcx, %r11"));
+        assert!(source.contains("movl %edi, %eax\nmovl %esi, %ecx\ncpuid"));
+        assert!(source.contains("rdtsc\nmovl %eax, (%rdi)\nmovl %edx, (%rsi)"));
+        assert!(source.contains(".section .note.GNU-stack,\"\",@progbits"));
+    }
+
+    #[test]
+    fn inline_assembly_support_rejects_empty_or_foreign_plans() {
+        let error = render_inline_asm_support(&InlineAsmSupportPlan {
+            cpuid_symbol: None,
+            rdtsc_symbol: None,
+        })
+        .unwrap_err();
+        assert!(error.message.contains("at least one helper"));
+
+        for plan in [
+            InlineAsmSupportPlan {
+                cpuid_symbol: Some("cpuid".to_owned()),
+                rdtsc_symbol: None,
+            },
+            InlineAsmSupportPlan {
+                cpuid_symbol: None,
+                rdtsc_symbol: Some("rdtsc".to_owned()),
+            },
+        ] {
+            let error = render_inline_asm_support(&plan).unwrap_err();
+            assert!(error.message.contains("reserved compiler namespace"));
+        }
+    }
+
+    #[test]
     fn protocol_layouts_are_exact() {
-        assert_eq!(size_of::<BridgeFrameV1>(), 256);
-        assert_eq!(offset_of!(BridgeFrameV1, gp_slots), 32);
-        assert_eq!(offset_of!(BridgeFrameV1, xmm_slots), 80);
-        assert_eq!(offset_of!(BridgeFrameV1, gp_result_slots), 208);
-        assert_eq!(offset_of!(BridgeFrameV1, xmm_result_slots), 224);
+        assert_eq!(size_of::<BridgeFrameV2>(), 272);
+        assert_eq!(offset_of!(BridgeFrameV2, gp_slots), 32);
+        assert_eq!(offset_of!(BridgeFrameV2, xmm_slots), 80);
+        assert_eq!(offset_of!(BridgeFrameV2, gp_result_slots), 208);
+        assert_eq!(offset_of!(BridgeFrameV2, xmm_result_slots), 224);
+        assert_eq!(offset_of!(BridgeFrameV2, x87_result_slot), 256);
         assert_eq!(size_of::<VaStateV1>(), 208);
         assert_eq!(offset_of!(VaStateV1, gp_offset), 8);
         assert_eq!(offset_of!(VaStateV1, register_save_area), 32);
@@ -1365,7 +2013,7 @@ mod tests {
     #[test]
     fn variadic_sse_count_saturates_at_eight() {
         for (actual, expected) in [(0, 0), (1, 1), (8, 8), (9, 8), (u8::MAX, 8)] {
-            let mut frame = BridgeFrameV1::zeroed(0, 0);
+            let mut frame = BridgeFrameV2::zeroed(0, 0);
             frame.set_variadic_sse_count(actual);
             assert_eq!(frame.variadic_sse_count, expected);
         }
@@ -1406,14 +2054,14 @@ mod tests {
         let helper = "__ccc_tls_accessor_0123456789abcdef";
         for (model, required) in [
             (
-                ElfTlsAccessModel::GeneralDynamic,
+                TlsAccessModel::GeneralDynamic,
                 &[
                     "data16 leaq tls_value@TLSGD(%rip), %rdi",
                     ".value 0x6666\nrex64\ncall __tls_get_addr@PLT",
                 ][..],
             ),
             (
-                ElfTlsAccessModel::LocalDynamic,
+                TlsAccessModel::LocalDynamic,
                 &[
                     "leaq tls_value@TLSLD(%rip), %rdi",
                     "call __tls_get_addr@PLT",
@@ -1421,19 +2069,21 @@ mod tests {
                 ][..],
             ),
             (
-                ElfTlsAccessModel::InitialExec,
+                TlsAccessModel::InitialExec,
                 &["movq %fs:0, %rax", "addq tls_value@GOTTPOFF(%rip), %rax"][..],
             ),
             (
-                ElfTlsAccessModel::LocalExec,
+                TlsAccessModel::LocalExec,
                 &["movq %fs:0, %rax", "leaq tls_value@TPOFF(%rax), %rax"][..],
             ),
         ] {
-            let assembly = render_tls_accessor(&TlsAccessorPlan {
+            let assembly = render_target_tls_accessor(&TlsAccessorPlan {
+                abi: AbiIdentity::SysvAmd64Lp64,
                 helper_symbol: helper.to_owned(),
                 object_symbol: "tls_value".to_owned(),
+                object_symbol_is_exact: false,
                 model,
-                object_visibility: ElfTlsSymbolVisibility::Default,
+                object_visibility: TlsSymbolVisibility::Default,
                 logical_line: 19,
             })
             .unwrap();
@@ -1454,11 +2104,13 @@ mod tests {
 
     #[test]
     fn dynamic_tls_accessors_align_calls_and_general_dynamic_is_relaxable() {
-        let assembly = render_tls_accessor(&TlsAccessorPlan {
+        let assembly = render_target_tls_accessor(&TlsAccessorPlan {
+            abi: AbiIdentity::SysvAmd64Lp64,
             helper_symbol: "__ccc_tls_accessor_dynamic".to_owned(),
             object_symbol: "value".to_owned(),
-            model: ElfTlsAccessModel::GeneralDynamic,
-            object_visibility: ElfTlsSymbolVisibility::Hidden,
+            object_symbol_is_exact: false,
+            model: TlsAccessModel::GeneralDynamic,
+            object_visibility: TlsSymbolVisibility::Hidden,
             logical_line: 1,
         })
         .unwrap();
@@ -1472,6 +2124,120 @@ mod tests {
         assert!(source.contains(".hidden value"));
         assert!(source.contains("data16 leaq"));
         assert!(source.contains(".value 0x6666\nrex64\ncall"));
+    }
+
+    #[test]
+    fn linux_arm64_tls_accessors_use_target_relocation_families() {
+        for (model, required) in [
+            (
+                TlsAccessModel::GeneralDynamic,
+                &[":tlsdesc:value", ".tlsdesccall value", "mrs x8, TPIDR_EL0"][..],
+            ),
+            (
+                TlsAccessModel::LocalDynamic,
+                &[":tlsdesc:value", ".tlsdesccall value", "mrs x8, TPIDR_EL0"][..],
+            ),
+            (
+                TlsAccessModel::InitialExec,
+                &[":gottprel:value", ":gottprel_lo12:value"][..],
+            ),
+            (
+                TlsAccessModel::LocalExec,
+                &[":tprel_hi12:value", ":tprel_lo12_nc:value"][..],
+            ),
+        ] {
+            let assembly = render_target_tls_accessor(&TlsAccessorPlan {
+                abi: AbiIdentity::Aapcs64Lp64,
+                helper_symbol: "__ccc_tls_accessor_arm64".to_owned(),
+                object_symbol: "value".to_owned(),
+                object_symbol_is_exact: false,
+                model,
+                object_visibility: TlsSymbolVisibility::Protected,
+                logical_line: 1,
+            })
+            .unwrap();
+            for fragment in required {
+                assert!(
+                    assembly.source().contains(fragment),
+                    "{}",
+                    assembly.source()
+                );
+            }
+            assert!(assembly.source().contains(".protected value"));
+            assert!(assembly.source().contains(".note.GNU-stack"));
+        }
+    }
+
+    #[test]
+    fn linux_riscv64_tls_accessors_use_target_relocation_families() {
+        for (model, required) in [
+            (
+                TlsAccessModel::GeneralDynamic,
+                &["%tls_gd_pcrel_hi(value)", "call __tls_get_addr"][..],
+            ),
+            (
+                TlsAccessModel::LocalDynamic,
+                &["%tls_gd_pcrel_hi(value)", "call __tls_get_addr"][..],
+            ),
+            (
+                TlsAccessModel::InitialExec,
+                &["%tls_ie_pcrel_hi(value)", "add a0, a0, tp"][..],
+            ),
+            (
+                TlsAccessModel::LocalExec,
+                &["%tprel_hi(value)", "%tprel_add(value)", "%tprel_lo(value)"][..],
+            ),
+        ] {
+            let assembly = render_target_tls_accessor(&TlsAccessorPlan {
+                abi: AbiIdentity::RiscvLp64d,
+                helper_symbol: "__ccc_tls_accessor_riscv64".to_owned(),
+                object_symbol: "value".to_owned(),
+                object_symbol_is_exact: false,
+                model,
+                object_visibility: TlsSymbolVisibility::Internal,
+                logical_line: 1,
+            })
+            .unwrap();
+            for fragment in required {
+                assert!(
+                    assembly.source().contains(fragment),
+                    "{}",
+                    assembly.source()
+                );
+            }
+            assert!(assembly.source().contains(".internal value"));
+            assert!(assembly.source().contains(".note.GNU-stack"));
+        }
+    }
+
+    #[test]
+    fn darwin_arm64_tls_accessor_uses_tlv_and_respects_exact_symbols() {
+        for (exact, reference) in [(false, "_value@TLVPPAGE"), (true, "value@TLVPPAGE")] {
+            let assembly = render_target_tls_accessor(&TlsAccessorPlan {
+                abi: AbiIdentity::DarwinArm64,
+                helper_symbol: "__ccc_tls_accessor_darwin".to_owned(),
+                object_symbol: "value".to_owned(),
+                object_symbol_is_exact: exact,
+                model: TlsAccessModel::InitialExec,
+                object_visibility: TlsSymbolVisibility::Hidden,
+                logical_line: 1,
+            })
+            .unwrap();
+            assert!(
+                assembly.source().contains(reference),
+                "{}",
+                assembly.source()
+            );
+            assert!(assembly.source().contains("ldr x8, [x0]\nblr x8"));
+            assert!(assembly.source().contains("___ccc_tls_accessor_darwin:"));
+            assert!(
+                assembly
+                    .source()
+                    .contains(".private_extern ___ccc_tls_accessor_darwin")
+            );
+            assert!(assembly.source().contains(".subsections_via_symbols"));
+            assert!(!assembly.source().contains(".note.GNU-stack"));
+        }
     }
 
     #[test]
@@ -1496,6 +2262,77 @@ mod tests {
         assert!(!source.contains("ldmxcsr"));
         assert!(!source.contains("fldcw"));
         assert!(!source.contains("cld"));
+        assert!(source.contains("leaq 272(%r12), %rsi"));
+        assert!(source.contains("testb $1, 29(%r12)"));
+        assert!(source.contains("fstpt 256(%r12)"));
+    }
+
+    #[test]
+    fn f80_support_keeps_ordered_operations_and_control_word_changes_local() {
+        let assembly =
+            render_f80_support("__ccc_support_f80_test", F80RuntimeHelperPlan::default()).unwrap();
+        let source = assembly.source();
+        assert_eq!(assembly.defined_symbols(), ["__ccc_support_f80_test"]);
+        assert!(source.contains("fsubrp %st, %st(1)"), "{source}");
+        assert!(source.contains("fdivrp %st, %st(1)"), "{source}");
+        assert!(!source.contains("fsubp %st, %st(1)"), "{source}");
+        assert!(!source.contains("fdivp %st, %st(1)"), "{source}");
+        assert!(source.contains("fucomip %st(1), %st"), "{source}");
+        assert!(source.contains("fcomip %st(1), %st"), "{source}");
+        assert!(source.contains("cmpl $21, %eax"), "{source}");
+        assert!(source.contains("fnstcw 8(%rsp)"), "{source}");
+        assert!(source.contains("fldcw 8(%rsp)"), "{source}");
+        assert!(source.contains(".Lccc_f80_two63:"), "{source}");
+        assert!(source.contains(".note.GNU-stack"), "{source}");
+    }
+
+    #[test]
+    fn f80_wide_conversions_select_only_the_requested_runtime_helpers() {
+        let assembly = render_f80_support(
+            "__ccc_support_f80_test",
+            F80RuntimeHelperPlan {
+                from_i128: true,
+                from_u128: false,
+                to_i128: false,
+                to_u128: true,
+            },
+        )
+        .unwrap();
+        let source = assembly.source();
+        assert!(source.contains("call __floattixf@PLT"), "{source}");
+        assert!(source.contains("call __fixunsxfti@PLT"), "{source}");
+        assert!(!source.contains("__floatuntixf"), "{source}");
+        assert!(!source.contains("__fixxfti"), "{source}");
+        assert!(source.contains(".cfi_offset %r12, -16"), "{source}");
+        assert!(source.contains("movq %rdx, 8(%r12)"), "{source}");
+    }
+
+    #[test]
+    fn fixed_entry_restores_an_x87_result_immediately_before_return() {
+        let assembly = render_target_fixed_entry(
+            &BridgeEntryPlan {
+                public_symbol: "x87_identity".to_owned(),
+                public_symbol_is_exact: false,
+                hidden_body_symbol: "__ccc_fixed_body_x87".to_owned(),
+                linkage: AssemblyFunctionLinkage::ExternalDefault,
+                weak: false,
+                fixed_gp_used: 0,
+                fixed_sse_used: 0,
+                overflow_arg_offset: 16,
+                gp_results: 0,
+                xmm_results: 0,
+                x87_result: true,
+                hidden_return: false,
+                logical_line: 1,
+            },
+            AbiIdentity::SysvAmd64Lp64,
+        )
+        .unwrap();
+        let source = assembly.source();
+        let call = source.find("call __ccc_fixed_body_x87").unwrap();
+        let load = source.find("fldt 256(%rsp)").unwrap();
+        let leave = source.find("leave").unwrap();
+        assert!(call < load && load < leave, "{source}");
     }
 
     #[test]
@@ -1528,12 +2365,13 @@ mod tests {
             overflow_arg_offset: 16,
             gp_results: 1,
             xmm_results: 0,
+            x87_result: false,
             hidden_return: false,
             logical_line: 27,
         })
         .unwrap();
         let source = assembly.source();
-        assert!(source.contains("subq $256, %rsp"));
+        assert!(source.contains("subq $272, %rsp"));
         assert!(source.contains("movl $16, 8(%rsp)"));
         assert!(source.contains("movl $64, 12(%rsp)"));
         assert!(source.contains("leaq 32(%rsp), %r10"));
@@ -1561,6 +2399,7 @@ mod tests {
                 overflow_arg_offset: 0,
                 gp_results: 2,
                 xmm_results: 0,
+                x87_result: false,
                 hidden_return: false,
                 logical_line: 1,
             },
@@ -1590,6 +2429,7 @@ mod tests {
             overflow_arg_offset: 0,
             gp_results: 1,
             xmm_results: 0,
+            x87_result: false,
             hidden_return: true,
             logical_line: 1,
         })
@@ -1599,6 +2439,32 @@ mod tests {
                 .message
                 .contains("cannot also request register results")
         );
+    }
+
+    #[test]
+    fn bridge_entries_reject_x87_results_outside_the_x86_scalar_contract() {
+        let plan = BridgeEntryPlan {
+            public_symbol: "consume".to_owned(),
+            public_symbol_is_exact: false,
+            hidden_body_symbol: "hidden".to_owned(),
+            linkage: AssemblyFunctionLinkage::Internal,
+            weak: false,
+            fixed_gp_used: 0,
+            fixed_sse_used: 0,
+            overflow_arg_offset: 0,
+            gp_results: 0,
+            xmm_results: 0,
+            x87_result: true,
+            hidden_return: false,
+            logical_line: 1,
+        };
+        let error = render_target_variadic_entry(&plan, AbiIdentity::Aapcs64Lp64).unwrap_err();
+        assert!(error.message.contains("sole System V AMD64 result"));
+
+        let mut mixed = plan;
+        mixed.gp_results = 1;
+        let error = render_variadic_entry(&mixed).unwrap_err();
+        assert!(error.message.contains("sole System V AMD64 result"));
     }
 
     #[test]
@@ -1614,6 +2480,7 @@ mod tests {
             overflow_arg_offset: 0,
             gp_results: 0,
             xmm_results: 0,
+            x87_result: false,
             hidden_return: false,
             logical_line: 1,
         })
@@ -1650,6 +2517,7 @@ mod tests {
                 overflow_arg_offset: 0,
                 gp_results: 1,
                 xmm_results: 0,
+                x87_result: false,
                 hidden_return: false,
                 logical_line: 1,
             })
@@ -1681,6 +2549,7 @@ mod tests {
                     overflow_arg_offset: 0,
                     gp_results: 1,
                     xmm_results: 0,
+                    x87_result: false,
                     hidden_return: false,
                     logical_line: 1,
                 },
@@ -1725,6 +2594,7 @@ mod tests {
             overflow_arg_offset: 0,
             gp_results: 1,
             xmm_results: 0,
+            x87_result: false,
             hidden_return: false,
             logical_line: 1,
         })

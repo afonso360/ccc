@@ -588,6 +588,7 @@ pub(super) fn scalar_constant_bits(
             gir::ScalarConstant::Signed(value) => value != 0,
             gir::ScalarConstant::Unsigned(value) => value != 0,
             gir::ScalarConstant::Floating(value) => value != 0.0,
+            gir::ScalarConstant::LongDouble(value) => !value.is_zero(),
             gir::ScalarConstant::NullPointer => false,
         }));
     }
@@ -595,6 +596,9 @@ pub(super) fn scalar_constant_bits(
         gir::ScalarConstant::Signed(value) => Ok(value as u128),
         gir::ScalarConstant::Unsigned(value) => Ok(value),
         gir::ScalarConstant::Floating(value) => match scalar_type(types, ty, config)? {
+            ir::types::I16 if types.builtin_type(ty.ty) == Some(BuiltinType::Float16) => {
+                Ok(u128::from(f64_to_f16_bits(value)))
+            }
             ir::types::F32 => Ok(u128::from((value as f32).to_bits())),
             ir::types::F64 => Ok(u128::from(value.to_bits())),
             _ => Err(error(format!(
@@ -602,6 +606,20 @@ pub(super) fn scalar_constant_bits(
                 types.display(ty.ty)
             ))),
         },
+        gir::ScalarConstant::LongDouble(value) => {
+            if types.builtin_type(ty.ty) != Some(BuiltinType::LongDouble) {
+                return Err(error(format!(
+                    "long-double initializer targets `{}`",
+                    types.display(ty.ty)
+                )));
+            }
+            if value.format != config.target.data_layout.long_double_format {
+                return Err(error(
+                    "long-double initializer format differs from the target",
+                ));
+            }
+            Ok(value.bits())
+        }
         gir::ScalarConstant::NullPointer => match types.try_kind(ty.ty) {
             Some(TypeKind::Pointer(_)) => Ok(0),
             _ => Err(error(format!(

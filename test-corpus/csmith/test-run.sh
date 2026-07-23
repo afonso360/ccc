@@ -206,6 +206,11 @@ if ((syntax_only)); then
 fi
 [[ -n "$output" ]]
 if [[ "$input_file" == *.o ]]; then
+  if [[ "${FAKE_HOST_OS:-Linux}" == Darwin &&
+    "$input_file" == */ccc-*.o ]]; then
+    echo 'CCC Darwin objects must link through Apple Clang' >&2
+    exit 64
+  fi
   cp "$input_file" "$output"
   chmod +x "$output"
   exit 0
@@ -326,6 +331,7 @@ fi
 [[ "${CCC_CC:-}" == "$expected_cc" ]]
 output=
 source_file=
+optimization=
 while (($#)); do
   case "$1" in
     -o)
@@ -336,12 +342,16 @@ while (($#)); do
       source_file=$1
       shift
       ;;
+    -O0 | -O2 | -Oz)
+      optimization=$1
+      shift
+      ;;
     *)
       shift
       ;;
   esac
 done
-[[ -n "$output" && -n "$source_file" ]]
+[[ -n "$output" && -n "$source_file" && -n "$optimization" ]]
 seed=$(sed -n 's/.*Seed:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$source_file")
 [[ -n "$seed" ]]
 checksum=$seed
@@ -425,10 +435,12 @@ grep -Fq 'target=x86_64-unknown-linux-gnu' "$pass_directory/run-config.txt"
 grep -Fq 'ccc_symbol_localizer=objcopy' "$pass_directory/run-config.txt"
 grep -Fq "ccc_symbol_localizer_executable=$fake_bin/objcopy" \
   "$pass_directory/run-config.txt"
+grep -Fq 'ccc_matrix= o0 o2 oz' "$pass_directory/run-config.txt"
 cmp -s "$fake_bin/ccc" "$pass_directory/tool-identities/ccc-executable"
 cmp -s "$resource_directory/manifest.toml" \
   "$pass_directory/tool-identities/ccc-resource-dir/manifest.toml"
 [[ "$(find "$pass_directory/cases" -name program.c | wc -l | tr -d '[:space:]')" == 3 ]]
+[[ "$(find "$pass_directory/cases" -name 'ccc-*.compile.status' | wc -l | tr -d '[:space:]')" == 9 ]]
 ! grep -R -E -- '-fno-pie|-no-pie' "$pass_directory/cases"/*/commands.txt
 
 darwin_arguments=(
@@ -457,6 +469,7 @@ darwin_output=$(FAKE_HOST_OS=Darwin FAKE_HOST_ARCH=arm64 \
 [[ "$darwin_output" == *"Csmith differential suite: 2/2 completed, 2 passed, 0 failures; 2 attempted"* ]]
 grep -Fq 'target=aarch64-apple-darwin' "$darwin_directory/run-config.txt"
 grep -Fq 'ccc_symbol_localizer=nmedit' "$darwin_directory/run-config.txt"
+grep -Fq 'ccc_matrix= o0 o2 oz' "$darwin_directory/run-config.txt"
 grep -Fq "ccc_symbol_localizer_executable=$fake_bin/nmedit" \
   "$darwin_directory/run-config.txt"
 grep -Fq "sdk_root=$darwin_sdk_absolute" "$darwin_directory/run-config.txt"
@@ -468,6 +481,7 @@ grep -R -Fq -- '--target=aarch64-apple-darwin' \
   "$darwin_directory/cases"/*/commands.txt
 grep -R -Fq -- '-mmacosx-version-min=11.0' \
   "$darwin_directory/cases"/*/commands.txt
+[[ "$(find "$darwin_directory/cases" -name 'ccc-*.compile.status' | wc -l | tr -d '[:space:]')" == 6 ]]
 
 mismatch_directory="$temporary_directory/mismatch results"
 set +e
@@ -485,9 +499,9 @@ grep -Fq $'23\toutput-mismatch\t' "$mismatch_directory/summary.tsv"
 mismatch_case=$(find "$mismatch_directory/cases" -mindepth 1 -maxdepth 1 -type d)
 [[ -f "$mismatch_case/program.c" ]]
 [[ -f "$mismatch_case/commands.txt" ]]
-[[ "$(tr -d '[:space:]' <"$mismatch_case/ccc.run.status")" == 0 ]]
+[[ "$(tr -d '[:space:]' <"$mismatch_case/ccc-o0.run.status")" == 0 ]]
 ! cmp -s "$mismatch_case/reference-gcc-o0.run.stdout" \
-  "$mismatch_case/ccc.run.stdout"
+  "$mismatch_case/ccc-o0.run.stdout"
 
 generator_directory="$temporary_directory/generator results"
 set +e

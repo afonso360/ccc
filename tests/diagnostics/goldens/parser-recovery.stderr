@@ -1,0 +1,25 @@
+ccc: error[CCC1020]: expected a primary expression
+ --> tests/diagnostics/cases/parser-recovery.c:1:26
+   |
+ 1 | int malformed_external = ;
+   |                          ^ while parsing
+error[CCC1020]: expected a primary expression
+ --> tests/diagnostics/cases/parser-recovery.c:4:26
+   |
+ 4 |     typedef int Leaked = ;
+   |                          ^ while parsing
+error[CCC1020]: expected a primary expression
+ --> tests/diagnostics/cases/parser-recovery.c:6:27
+   |
+ 6 |     int malformed_local = ;
+   |                           ^ while parsing
+error[CCC1020]: expected a primary expression
+ --> tests/diagnostics/cases/parser-recovery.c:11:34
+    |
+ 11 | int another_malformed_external = ;
+    |                                  ^ while parsing
+error[CCC2274]: use of undeclared identifier `missing_name`
+ --> tests/diagnostics/cases/parser-recovery.c:7:12
+   |
+ 7 |     return missing_name + retained_local;
+   |            ^^^^^^^^^^^^

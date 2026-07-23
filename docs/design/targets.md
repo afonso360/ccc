@@ -19,6 +19,11 @@ target tools, and rejects contradictory or unknown values before preprocessing.
 `generic` is CCC's own fixed feature baseline: it is not forwarded to another
 driver whose interpretation of that spelling could differ.
 
+Rust names its standard RV64GC Linux host
+`riscv64gc-unknown-linux-gnu`. Native-host discovery accepts that spelling and
+normalizes it to CCC's `riscv64-unknown-linux-gnu` profile; the user-facing CCC
+target spelling remains unchanged.
+
 The compiler-owned ABI identities are `sysv-amd64-lp64`, `aapcs64-lp64`,
 `riscv-lp64d`, and `darwin-arm64`. Backend calling-convention enums are derived
 from these identities and are never used as classifier or digest keys. The
@@ -36,7 +41,7 @@ The `EffectiveCompilationConfig` type and per-target defaults are defined in `cc
 
 - `TargetSpec`: triple defaults, data layout, object format, default ABI, default CPU features, and native `long double` representation;
 - `LanguageOptions`: language/GNU profile, character set, overflow, enum, character-signedness, and diagnostic-affecting choices;
-- `AbiOptions`: calling convention, packing, long-double mode, vector ABI, TLS model, and target ABI flags;
+- `AbiOptions`: calling convention, packing, vector ABI, TLS model, and target ABI flags;
 - `CodegenOptions`: CPU/ISA features, relocation model, code model, optimization contract, debug information, stack policy, and automatic-storage provider;
 - `ToolchainSpec`: resolved compiler driver, assembler, linker, archiver, sysroot/SDK, runtime libraries, system includes, deployment target, and a probe fingerprint. Components are resolved [per selected phase](toolchain.md#target-toolchain-resolution); compile-only invocations do not require a resolved linker.
 
@@ -49,17 +54,14 @@ adds only compiler identity and capability-denial macros. Builtin headers and
 `-dM` consume that same final environment rather than maintaining parallel
 tables.
 
-An automatic-storage provider is enabled per effective target profile. Its
-versioned descriptor records the provider kind, arena and mark record layouts,
-allocator requirements, target VLA minimum alignment, failure behavior,
-returns-twice and cross-language-unwind compatibility, async-signal-safety
-stance, and committed performance budgets. Generated callers and local support
-definitions consume the same record layouts. These facts drive semantic
-diagnostics, `__STDC_NO_VLA__`, `__has_builtin`, CCC-IR lowering, helper
-selection, link planning, and provider tests together. Arena-backed ISO VLA
-support never implies native-stack builtin support. The descriptor revision and
-record layouts enter both the effective-configuration hash and object
-compatibility metadata.
+Every enabled hosted target uses the scoped automatic-storage provider described
+by ADR-0011. Allocation state lowers directly into the affected function and
+depends only on the target's ordinary `realloc` and `free` ABI; runtime layout
+without an automatic VLA object has no allocator dependency. The `c11-vla`
+feature entry drives `__STDC_NO_VLA__`, while semantic, IR, object, provider,
+failure, and O0/O2 target-oracle tests keep that advertisement aligned across
+all four profiles. Arena-backed ISO VLA support never implies native-stack
+builtin support.
 
 ## Relocation and output models
 

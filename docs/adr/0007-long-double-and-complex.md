@@ -10,7 +10,8 @@ Platform C ABIs use x87 extended precision, IEEE binary128, or binary64 for `lon
 
 - The default configuration always reports and preserves the target's native `long double` size, alignment, macros, object representation, and ABI.
 - CCC uses verified backend support, runtime arithmetic, and generated ABI bridges as described in [Conformance](../design/conformance.md#long-double). If an operation or boundary lacks a complete capability, CCC emits a hard diagnostic; it never silently substitutes `double`.
-- `-mlong-double-64` is an explicit, warned-about compatibility mode on targets whose native ABI is wider. It coherently changes representation, macros, headers, lowering, and CCC object metadata.
+- ABI-changing `long double` overrides such as `-mlong-double-64` are rejected;
+  every enabled profile uses its target-native representation coherently.
 - When complex support is unavailable, CCC defines `__STDC_NO_COMPLEX__`, feature predicates report false, and semantic use is a hard error. Parsing the type spelling is not a claim of support.
 
 ## Alternatives

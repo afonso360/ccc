@@ -21,6 +21,6 @@ set -e
 [[ "$unknown_status" == 2 ]]
 [[ "$unknown_output" == *"usage:"* ]]
 
-"$script_directory/test-source-adjustment.sh"
+"$script_directory/test-ccc-cc.sh"
 
 echo "zstd runner tests passed"

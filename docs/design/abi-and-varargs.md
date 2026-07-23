@@ -78,6 +78,16 @@ calls, returns, aggregate boundaries, and `va_arg` with `CCC2343`, `CCC2404`,
 or `CCC3509`. Darwin `long double` is binary64 and uses the same carriers as
 `double`. Vectors and `_BitInt` remain outside every enabled boundary profile.
 
+SysV AMD64 f80 values are 16-byte address-backed snapshots whose low ten bytes
+contain the x87 representation. Scalar arguments occupy 16-byte-aligned stack
+slots and scalar results use `%st(0)`. Aggregates containing f80 are classified
+as `MEMORY`; fixed and variadic direct or indirect boundaries use generated
+assembly bridges. The same classification plan drives the 16-byte overflow
+path for `va_arg`. Runtime f80 operations call a localized assembly dispatcher
+through a uniform pointer-only frame, keeping x87 registers out of CLIF. The
+dispatcher performs arithmetic under the current x87 control word and restores
+that word after the conversion paths that temporarily select truncation.
+
 ## Aggregate values and fixed calls
 
 Every aggregate rvalue in CCC-IR is an immutable owned snapshot. Parameter
@@ -99,13 +109,13 @@ returns that exact pointer in `%rax`.
 
 ## Generated call bridge
 
-The x86 bridge retains its byte-stable version-one frame. The arm64 and
-RISC-V adapters use version-two target layouts with indexed integer and
-floating register banks. Each renderer owns exact physical locations; the
-target-neutral plan contains no x86 register enum.
+The x86 bridge uses its version-two frame. The arm64 and RISC-V adapters also
+use version-two target layouts with indexed integer and floating register
+banks. Each renderer owns exact physical locations; the target-neutral plan
+contains no x86 register enum.
 
-Every bridged call uses a versioned `BridgeFrameV1` passed to a nonvariadic
-assembly helper. The 16-byte-aligned fixed area is 256 bytes:
+Every bridged call uses a `BridgeFrameV2` passed to a nonvariadic assembly
+helper. Its 16-byte-aligned fixed area is 272 bytes:
 
 | Offset | Field                                                               |
 | -----: | ------------------------------------------------------------------- |
@@ -117,13 +127,16 @@ assembly helper. The 16-byte-aligned fixed area is 256 bytes:
 |     80 | eight sixteen-byte XMM argument slots                               |
 |    208 | `%rax` and `%rdx` result slots                                      |
 |    224 | `%xmm0` and `%xmm1` result slots                                    |
-|    256 | outgoing stack payload                                              |
+|    256 | 16-byte x87 result slot; the low ten bytes contain the f80 value     |
+|    272 | outgoing stack payload                                              |
 
 The producer zeroes the complete fixed area. The helper holds the target in
 `%r11`, preserves the frame pointer across the target call, copies the stack
 payload with the required alignment, unconditionally loads all GP and XMM
-slots, and writes `%al` last. It unconditionally captures the supported result
-registers. Header counts are diagnostic metadata, not dispatch inputs.
+slots, and writes `%al` last. It unconditionally captures the supported
+integer and SSE result registers, and captures `%st(0)` when the frame flag
+requests an x87 result. Header counts are diagnostic metadata, not dispatch
+inputs.
 
 The helper does not use the red zone and does not modify the x87 control word,
 MXCSR control bits, or direction flag. It carries explicit CFI and a
@@ -134,8 +147,8 @@ provide source-level stepping within them. Same-compilation magic and version
 validation happens in Rust before assembly materialization; production bridge
 code does not contain an unreachable protocol trap.
 
-A fixed wide-integer definition uses the same uniform frame layout but a
-distinct public-entry renderer. Ordinary fixed calls do not define `%al`, so
+A fixed wide-integer or f80 definition uses the same uniform frame layout but
+a distinct public-entry renderer. Ordinary fixed calls do not define `%al`, so
 that entry saves every planned XMM input unconditionally. Only a variadic entry
 consults the incoming `%al` bound before saving XMM registers. Both entry forms
 preserve source linkage, weak binding, and ELF visibility through assembly and
@@ -191,6 +204,11 @@ Promotion-invalid requests such as `va_arg(ap, float)` are rejected with a
 stable semantic diagnostic. Ordinary dynamic type mismatch remains C undefined
 behavior and is not checked at runtime.
 
+SysV f80 never consumes a GP or SSE register-save slot. Its `va_arg` plan
+aligns the overflow cursor to 16 bytes, copies one 16-byte object, and advances
+the cursor by 16. A bridged variadic definition uses the same rule as a GCC
+caller, so `va_copy` and repeated traversal retain ordinary cursor semantics.
+
 ## Header contract
 
 `stdarg.h` is compiler-owned, target-invariant interface text. It defines
@@ -224,6 +242,9 @@ can still require cross-object resolution.
 - canonical classifier cases and exact plan/digest snapshots;
 - semantic C-to-IR aggregate snapshot goldens that do not freeze copy counts;
 - fixed aggregate cross-linking with GCC and Clang in both directions;
+- x86 f80 fixed and variadic scalars, `%st(0)` returns, memory-class
+  aggregates, direct and function-pointer calls, `va_arg`, arithmetic,
+  conversions, and volatile access cross-linked with GCC in both directions;
 - register- and memory-class aggregates containing 128-bit integers,
   mixed SSE/wide fixed signatures, pair rollback with reuse of the stranded GP
   register, TLS values, weak definitions, and direct/indirect calls in both

@@ -3,7 +3,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use object::{Object as _, ObjectSymbol as _};
+
 static TEST_ID: AtomicU64 = AtomicU64::new(0);
+const ENABLED_TARGETS: [&str; 4] = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "riscv64-unknown-linux-gnu",
+    "aarch64-apple-darwin",
+];
 
 struct TestDirectory {
     path: PathBuf,
@@ -35,10 +43,14 @@ impl TestDirectory {
     }
 
     fn command(&self) -> Command {
+        self.command_for_target("x86_64-unknown-linux-gnu")
+    }
+
+    fn command_for_target(&self, target: &str) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_ccc"));
         command
             .current_dir(&self.path)
-            .arg("--target=x86_64-unknown-linux-gnu")
+            .arg(format!("--target={target}"))
             .env("LC_ALL", "C")
             .env("LANG", "C")
             .env_remove("SOURCE_DATE_EPOCH");
@@ -620,6 +632,9 @@ fn emits_predefined_dynamic_and_reproducible_macros() {
             "int translation_line = __LINE__;\n",
             "int double_mantissa_bits = __DBL_MANT_DIG__;\n",
             "int float_mantissa_bits = __FLT_MANT_DIG__;\n",
+            "int float16_mantissa_bits = __FLT16_MANT_DIG__;\n",
+            "_Float16 float16_maximum = __FLT16_MAX__;\n",
+            "_Float16 float16_epsilon = __FLT16_EPSILON__;\n",
             "float float_maximum = __FLT_MAX__;\n",
             "float float_epsilon = __FLT_EPSILON__;\n",
             "int double_decimal_digits = __DBL_DIG__;\n",
@@ -654,6 +669,15 @@ fn emits_predefined_dynamic_and_reproducible_macros() {
     assert!(output.contains("intpointer_size=8;"), "{output}");
     assert!(output.contains("intdouble_mantissa_bits=53;"), "{output}");
     assert!(output.contains("intfloat_mantissa_bits=24;"), "{output}");
+    assert!(output.contains("intfloat16_mantissa_bits=11;"), "{output}");
+    assert!(
+        output.contains("_Float16float16_maximum=0x1.ffcp+15;"),
+        "{output}"
+    );
+    assert!(
+        output.contains("_Float16float16_epsilon=0x1p-10;"),
+        "{output}"
+    );
     assert!(
         output.contains("floatfloat_maximum=0x1.fffffep+127F;"),
         "{output}"
@@ -705,6 +729,21 @@ fn emits_predefined_dynamic_and_reproducible_macros() {
         "#define __DBL_MIN__ 0x1p-1022",
         "#define __DBL_NORM_MAX__ 0x1.fffffffffffffp+1023",
         "#define __FLT_EVAL_METHOD__ 0",
+        "#define __FLT16_DECIMAL_DIG__ 5",
+        "#define __FLT16_DENORM_MIN__ 0x1p-24",
+        "#define __FLT16_DIG__ 3",
+        "#define __FLT16_EPSILON__ 0x1p-10",
+        "#define __FLT16_HAS_DENORM__ 1",
+        "#define __FLT16_HAS_INFINITY__ 1",
+        "#define __FLT16_HAS_QUIET_NAN__ 1",
+        "#define __FLT16_MANT_DIG__ 11",
+        "#define __FLT16_MAX_10_EXP__ 4",
+        "#define __FLT16_MAX_EXP__ 16",
+        "#define __FLT16_MAX__ 0x1.ffcp+15",
+        "#define __FLT16_MIN_10_EXP__ (-4)",
+        "#define __FLT16_MIN_EXP__ (-13)",
+        "#define __FLT16_MIN__ 0x1p-14",
+        "#define __FLT16_NORM_MAX__ 0x1.ffcp+15",
         "#define __FLT_DECIMAL_DIG__ 9",
         "#define __FLT_DENORM_MIN__ 0x1p-149F",
         "#define __FLT_DIG__ 6",
@@ -725,6 +764,7 @@ fn emits_predefined_dynamic_and_reproducible_macros() {
         "#define __INTMAX_TYPE__ long int",
         "#define __PTRDIFF_TYPE__ long int",
         "#define __SIZE_MAX__ 18446744073709551615UL",
+        "#define __SIZEOF_FLOAT16__ 2",
         "#define __SIZEOF_POINTER__ 8",
         "#define __SIZE_TYPE__ long unsigned int",
         "#define __STDC__ 1",
@@ -749,6 +789,35 @@ fn emits_predefined_dynamic_and_reproducible_macros() {
         "macro dump is not sorted:\n{}",
         macros.stdout
     );
+}
+
+#[test]
+fn optimization_profiles_control_the_predefined_macro_contract() {
+    let directory = TestDirectory::new("optimization-macros");
+    let source = directory.write("empty.c", "\n");
+
+    for (optimization, optimize, size) in [
+        (None, false, false),
+        (Some("-O0"), false, false),
+        (Some("-O2"), true, false),
+        (Some("-Os"), true, true),
+        (Some("-Oz"), true, true),
+    ] {
+        let mut command = directory.command();
+        command.args(["-dM", "-E", "-nostdinc"]);
+        if let Some(optimization) = optimization {
+            command.arg(optimization);
+        }
+        command.arg(&source);
+        let macros = run(command);
+        macros.assert_success();
+        assert_eq!(macros.stdout.contains("#define __OPTIMIZE__ 1\n"), optimize);
+        assert_eq!(
+            macros.stdout.contains("#define __OPTIMIZE_SIZE__ 1\n"),
+            size
+        );
+        assert!(!macros.stdout.contains("#define __NO_INLINE__ 1\n"));
+    }
 }
 
 #[test]
@@ -813,13 +882,62 @@ fn warning_controls_promote_and_suppress_preprocessor_warnings() {
     assert!(promoted.stderr.contains("error"), "{}", promoted.stderr);
 
     let mut command = directory.command();
-    command.args(["-E", "-P", "-nostdinc", "-w"]).arg(source);
+    command.args(["-E", "-P", "-nostdinc", "-w"]).arg(&source);
     let suppressed = run(command);
     suppressed.assert_success();
     assert!(
         !suppressed.stderr.contains("intentional warning"),
         "{}",
         suppressed.stderr
+    );
+
+    for arguments in [
+        vec!["-Wno-cpp", "-Wcpp"],
+        vec!["-Werror", "-Wno-error=cpp"],
+        vec!["-Wno-error=cpp", "-Werror"],
+    ] {
+        let mut command = directory.command();
+        command
+            .args(["-E", "-P", "-nostdinc"])
+            .args(&arguments)
+            .arg(&source);
+        let demoted = run(command);
+        demoted.assert_success();
+        assert!(
+            demoted.stderr.contains("intentional warning"),
+            "{arguments:?}: {}",
+            demoted.stderr
+        );
+    }
+
+    for arguments in [
+        vec!["-Wcpp", "-Wno-cpp"],
+        vec!["-Wno-cpp", "-Wno-error=cpp"],
+    ] {
+        let mut command = directory.command();
+        command
+            .args(["-E", "-P", "-nostdinc"])
+            .args(&arguments)
+            .arg(&source);
+        let category_suppressed = run(command);
+        category_suppressed.assert_success();
+        assert!(
+            !category_suppressed.stderr.contains("intentional warning"),
+            "{arguments:?}: {}",
+            category_suppressed.stderr
+        );
+    }
+
+    let mut command = directory.command();
+    command
+        .args(["-E", "-P", "-nostdinc", "-Werror=cpp"])
+        .arg(source);
+    let category_promoted = run(command);
+    category_promoted.assert_failure();
+    assert!(
+        category_promoted.stderr.contains("intentional warning"),
+        "{}",
+        category_promoted.stderr
     );
 }
 
@@ -1230,29 +1348,42 @@ fn preprocesses_the_curated_hosted_header_tree_as_system_headers() {
     let source = include_directory.join("probe.c");
     let directory = TestDirectory::new("curated-hosted-headers");
 
-    let mut command = directory.command();
-    command
-        .args(["-E", "-P", "-nostdinc", "-isystem"])
-        .arg(&include_directory)
-        .arg(source);
-    let result = run(command);
-    result.assert_success();
-    assert!(result.stderr.trim().is_empty(), "{}", result.stderr);
-    assert_eq!(
-        normalize_fixture_snapshot(&result.stdout),
-        include_str!("../../../tests/preprocessing/goldens/hosted-header.out")
-    );
-    let output = squash_whitespace(&result.stdout);
-    assert!(output.contains("typedefunsignedlongintsize_t;"), "{output}");
-    assert!(output.contains("typedeflongintssize_t;"), "{output}");
-    assert!(
-        output.contains("externssize_tfixture_read(int,void*__restrict,size_t)"),
-        "{output}"
-    );
-    assert!(
-        output.contains("inthosted_header_preprocessing_sentinel;"),
-        "{output}"
-    );
+    for target in ENABLED_TARGETS {
+        let mut command = directory.command_for_target(target);
+        command
+            .args(["-E", "-P", "-nostdinc", "-isystem"])
+            .arg(&include_directory)
+            .arg(&source);
+        let result = run(command);
+        result.assert_success();
+        assert!(
+            result.stderr.trim().is_empty(),
+            "{target}: {}",
+            result.stderr
+        );
+        assert_eq!(
+            normalize_fixture_snapshot(&result.stdout),
+            include_str!("../../../tests/preprocessing/goldens/hosted-header.out"),
+            "{target}"
+        );
+        let output = squash_whitespace(&result.stdout);
+        assert!(
+            output.contains("typedefunsignedlongintsize_t;"),
+            "{target}: {output}"
+        );
+        assert!(
+            output.contains("typedeflongintssize_t;"),
+            "{target}: {output}"
+        );
+        assert!(
+            output.contains("externssize_tfixture_read(int,void*__restrict,size_t)"),
+            "{target}: {output}"
+        );
+        assert!(
+            output.contains("inthosted_header_preprocessing_sentinel;"),
+            "{target}: {output}"
+        );
+    }
 }
 
 #[test]
@@ -1261,27 +1392,33 @@ fn parses_the_curated_hosted_header_tree_as_system_headers() {
     let source = include_directory.join("probe.c");
     let directory = TestDirectory::new("curated-hosted-header-parse");
 
-    let mut command = directory.command();
-    command
-        .args(["--dump-ast", "-nostdinc", "-isystem"])
-        .arg(&include_directory)
-        .arg(source);
-    let result = run(command);
-    result.assert_success();
-    assert!(result.stderr.trim().is_empty(), "{}", result.stderr);
-    for sentinel in [
-        "declarator fixture_record_t",
-        "declarator fixture_read",
-        "attribute __attribute__ __nothrow__",
-        "asm-label __asm",
-        "function-definition fixture_identity",
-        "declarator hosted_header_preprocessing_sentinel",
-    ] {
+    for target in ENABLED_TARGETS {
+        let mut command = directory.command_for_target(target);
+        command
+            .args(["--dump-ast", "-nostdinc", "-isystem"])
+            .arg(&include_directory)
+            .arg(&source);
+        let result = run(command);
+        result.assert_success();
         assert!(
-            result.stdout.contains(sentinel),
-            "AST dump is missing {sentinel:?}:\n{}",
-            result.stdout
+            result.stderr.trim().is_empty(),
+            "{target}: {}",
+            result.stderr
         );
+        for sentinel in [
+            "declarator fixture_record_t",
+            "declarator fixture_read",
+            "attribute __attribute__ __nothrow__",
+            "asm-label __asm",
+            "function-definition fixture_identity",
+            "declarator hosted_header_preprocessing_sentinel",
+        ] {
+            assert!(
+                result.stdout.contains(sentinel),
+                "{target} AST dump is missing {sentinel:?}:\n{}",
+                result.stdout
+            );
+        }
     }
 }
 
@@ -1459,6 +1596,35 @@ fn recompiles_saved_preprocessor_output_with_numeric_linemarkers() {
         fs::metadata(object).unwrap().len() > 0,
         "recompilation produced an empty object"
     );
+}
+
+#[test]
+fn preprocessed_c_inputs_are_not_macro_expanded_again() {
+    let directory = TestDirectory::new("preprocessed-c-language");
+    for (name, language) in [
+        ("implicit.i", None),
+        ("extensionless", Some("c-cpp-output")),
+    ] {
+        let source = directory.write(name, "int SELECTED(void) { return 42; }\n");
+        let object_path = directory.path(format!("{name}.o"));
+        let mut command = directory.command();
+        command.args(["-c", "-nostdinc", "-DSELECTED=reexpanded"]);
+        if let Some(language) = language {
+            command.args(["-x", language]);
+        }
+        command.arg(&source).arg("-o").arg(&object_path);
+        let compiled = run(command);
+        compiled.assert_success();
+
+        let bytes = fs::read(&object_path).unwrap();
+        let object = object::File::parse(bytes.as_slice()).unwrap();
+        let symbols = object
+            .symbols()
+            .filter_map(|symbol| symbol.name().ok())
+            .collect::<Vec<_>>();
+        assert!(symbols.contains(&"SELECTED"), "{name}: {symbols:?}");
+        assert!(!symbols.contains(&"reexpanded"), "{name}: {symbols:?}");
+    }
 }
 
 #[test]
@@ -1782,6 +1948,36 @@ fn language_mode_controls_default_trigraph_conversion() {
 }
 
 #[test]
+fn c99_build_profile_aliases_retain_the_c11_macro_identity() {
+    let directory = TestDirectory::new("c99-alias-macro-identity");
+    let source = directory.write("identity.c", "int identity;\n");
+
+    for (mode, strict) in [("-std=gnu99", false), ("-std=c99", true)] {
+        let mut command = directory.command();
+        command.args(["-dM", "-E", "-nostdinc", mode]).arg(&source);
+        let macros = run(command);
+        macros.assert_success();
+        assert!(
+            macros
+                .stdout
+                .lines()
+                .any(|line| line == "#define __STDC_VERSION__ 201112L"),
+            "{mode}: {}",
+            macros.stdout
+        );
+        assert_eq!(
+            macros
+                .stdout
+                .lines()
+                .any(|line| line == "#define __STRICT_ANSI__ 1"),
+            strict,
+            "{mode}: {}",
+            macros.stdout
+        );
+    }
+}
+
+#[test]
 fn discovers_and_preprocesses_compiler_resource_headers() {
     let directory = TestDirectory::new("compiler-resource-headers");
     let source = directory.write(
@@ -1816,6 +2012,76 @@ fn discovers_and_preprocesses_compiler_resource_headers() {
         "{output}"
     );
     assert!(output.contains("intresource_false=0;"), "{output}");
+}
+
+#[test]
+fn float_resource_header_exposes_binary16_limits_on_request() {
+    let directory = TestDirectory::new("float16-resource-header");
+    let source = directory.write(
+        "float16.c",
+        concat!(
+            "#define __STDC_WANT_IEC_60559_TYPES_EXT__ 1\n",
+            "#include <float.h>\n",
+            "#if FLT16_MANT_DIG != 11 || FLT16_MAX_EXP != 16\n",
+            "#error binary16 precision facts are unavailable\n",
+            "#endif\n",
+            "_Float16 maximum = FLT16_MAX;\n",
+            "_Float16 epsilon = FLT16_EPSILON;\n",
+            "_Float16 true_minimum = FLT16_TRUE_MIN;\n",
+        ),
+    );
+    let resources = repository_fixture("resource-dir");
+
+    let mut command = directory.host_command();
+    command
+        .args(["-E", "-P", "-resource-dir"])
+        .arg(resources)
+        .arg(source);
+    let result = run(command);
+    result.assert_success();
+    let output = squash_whitespace(&result.stdout);
+    assert!(output.contains("_Float16maximum="), "{output}");
+    assert!(output.contains("_Float16epsilon="), "{output}");
+    assert!(output.contains("_Float16true_minimum="), "{output}");
+}
+
+#[test]
+fn stdatomic_resource_header_exposes_native_scalar_operations_without_overclaiming() {
+    let directory = TestDirectory::new("stdatomic-resource-header");
+    let source = directory.write(
+        "stdatomic.c",
+        concat!(
+            "#include <stdatomic.h>\n",
+            "#ifndef __STDC_NO_ATOMICS__\n",
+            "#error partial scalar atomics must not claim every atomic type\n",
+            "#endif\n",
+            "#if !__has_builtin(__atomic_load_n)\n",
+            "#error scalar atomic load builtin is unavailable\n",
+            "#endif\n",
+            "atomic_int value = ATOMIC_VAR_INIT(3);\n",
+            "int read(void) { return atomic_load_explicit(&value, memory_order_relaxed); }\n",
+            "int lock_free = ATOMIC_INT_LOCK_FREE;\n",
+        ),
+    );
+    let resources = repository_fixture("resource-dir");
+
+    let mut command = directory.host_command();
+    command
+        .args(["-E", "-P", "-resource-dir"])
+        .arg(resources)
+        .arg(source);
+    let result = run(command);
+    result.assert_success();
+    let output = squash_whitespace(&result.stdout);
+    assert!(
+        output.contains("typedef_Atomic(int)atomic_int;"),
+        "{output}"
+    );
+    assert!(
+        output.contains("return__atomic_load_n((&value),(memory_order_relaxed));"),
+        "{output}"
+    );
+    assert!(output.contains("intlock_free=2;"), "{output}");
 }
 
 #[test]

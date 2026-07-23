@@ -1,0 +1,9 @@
+function f0 @optimized(v0 %value: int -> ssa) -> int [signature=int (int) linkage=External visibility=Default inline=false noreturn=false] {
+  b0(v0: int):
+    i0: v1: int = const signed:3
+    i1: v2: int = add v0, v1
+    branch b1()
+  b1():
+    i2: v3: int = bitwise-xor v2, v2
+    return v3
+}

@@ -7,31 +7,42 @@ mod diagnostics;
 mod empty_object;
 mod predefined;
 mod resource;
+mod warnings;
 
+use std::ffi::OsString;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use args::{
-    DependencyMode as DriverDependencyMode, DependencyTarget, DriverOptions, DumpKind,
-    ForcedInputKind, IncludePathKind as DriverIncludePathKind, MacroAction, ParsedCommand,
-    PrimaryAction,
+    DependencyMode as DriverDependencyMode, DependencyTarget, DriverInputLanguage, DriverOptions,
+    DriverQuery, DumpKind, ForcedInputKind, IncludePathKind as DriverIncludePathKind, LinkItem,
+    LinkOutputKind as DriverLinkOutputKind, MacroAction, ParsedCommand, PrimaryAction,
+    QueryOptions,
 };
 use ccc_codegen::{Options as CodegenOptions, Output as CodegenOutput};
-use ccc_diag::Diagnostic;
+use ccc_diag::{
+    Diagnostic, DiagnosticEngine, DiagnosticFormat, EmitOutcome, RenderOptions,
+    render_json_document,
+};
 use ccc_ir::generic::{FullModule, IrError as FrontendIrError};
-use ccc_link::{ToolchainRequirements, ToolchainResolver};
+use ccc_link::{RegisteredTemporaryFile, ToolchainRequirements, ToolchainResolver};
 use ccc_pp::{
     CommandLineMacro, DependencyMode, FileProvider, FsFileProvider, IncludePath, IncludePathKind,
     PpItem, PpToken, PreprocessContext, PreprocessLimits, PreprocessOptions, PreprocessOutput,
     preprocess, render_macro_definitions, render_preprocessed,
 };
-use ccc_sema::generic::{FullTypedTranslationUnit, analyze_frontend, dump_frontend_typed_ast};
+use ccc_sema::generic::{
+    FullTypedTranslationUnit, analyze_frontend_with_recovery_limit, dump_frontend_typed_ast,
+};
 use ccc_session::{Session, SourceFileSpec, SourceMap};
 use ccc_syntax::frontend::{
-    FrontendItem, TokenKind as FrontendTokenKind, TranslationUnit as FrontendTranslationUnit,
-    convert_pp_items, dump_ast as dump_frontend_ast, parse_with_mode as parse_frontend_with_mode,
+    FrontendItem, PoisonedBinding, TokenKind as FrontendTokenKind,
+    TranslationUnit as FrontendTranslationUnit, convert_pp_items, dump_ast as dump_frontend_ast,
+    parse_recovering_with_mode_and_limit as parse_frontend_recovering_with_mode_and_limit,
 };
 use ccc_target::{CompatibilityScope, EffectiveCompilationConfig, SystemIncludeKind};
 
@@ -41,16 +52,25 @@ use dependency::{
 };
 use diagnostics::PreprocessorDiagnostics;
 use resource::ResourceDirectory;
+use warnings::{WarningDisposition, WarningPolicy};
 
 pub use empty_object::is_empty_elf64_relocatable;
 
-const HELP: &str = "Usage: ccc [options] <input.c>\n\
+const HELP: &str = "Usage: ccc [options] <input>...\n\
   -c                         Compile without linking\n\
   -E [-P]                    Preprocess only; -P suppresses linemarkers\n\
-  -O|-O0|-O1|-O2|-O3|-Os|-Oz\n\
-  -g|-gN                     Accepted compatibility options; currently no code-generation effect\n\
+  -fsyntax-only              Parse and analyze without emitting an object\n\
+  -fdiagnostics-format=kind  Render diagnostics as text or versioned JSON\n\
+  -x language                Select c, c-cpp-output, assembler, assembler-with-cpp, or none\n\
+  -O|-O0|-O1|-O2|-O3|-Os|-Oz Select the optimization profile\n\
+  -g|-g1|-g2|-g3            Emit source-level DWARF; -g0 disables it\n\
   -fPIC|-fPIE|-pie           Select position-independent code and PIE linking (default)\n\
   -fno-pic|-fno-pie|-no-pie Select static-model code and non-PIE linking\n\
+  -shared|-dynamiclib        Link a shared library\n\
+  -r                         Produce a relocatable linked object\n\
+  -L dir -lname             Add an ordered library search path or library\n\
+  -Wl,arg -Xlinker arg       Pass an ordered option to the target linker driver\n\
+  -pthread                   Select the threaded compile and link profile\n\
   -Dname[=value] -Uname      Define or undefine a macro\n\
   -I dir -iquote dir         Add user include search paths\n\
   -isystem dir -idirafter dir Add system include search paths\n\
@@ -67,6 +87,12 @@ const HELP: &str = "Usage: ccc [options] <input.c>\n\
   --dump-ast|--dump-typed-ast|--dump-ir|--dump-abi\n\
                              Dump frontend representations\n\
   --emit=clif                Dump Cranelift IR\n\
+  -###                       Print replayable phase commands without executing\n\
+  -dumpmachine|-dumpversion  Print build-system compiler identity\n\
+  -print-prog-name=name|-print-file-name=name|-print-search-dirs\n\
+                             Query the resolved target toolchain\n\
+  --print-effective-config   Print normalized target, language, and toolchain facts\n\
+  @file                      Read nested command arguments from a response file\n\
   --version                  Print the CCC driver version\n";
 
 const VERSION: &str = concat!("ccc ", env!("CARGO_PKG_VERSION"), "\n");
@@ -76,12 +102,21 @@ static TEMPORARY_ID: AtomicU64 = AtomicU64::new(0);
 #[derive(Debug, Eq, PartialEq)]
 pub struct DriverError {
     message: String,
+    json_document: Option<String>,
 }
 
 impl DriverError {
     fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            json_document: None,
+        }
+    }
+
+    fn with_json_document(message: impl Into<String>, json_document: String) -> Self {
+        Self {
+            message: message.into(),
+            json_document: Some(json_document),
         }
     }
 }
@@ -101,7 +136,12 @@ pub struct DriverOutput {
 }
 
 pub fn run(arguments: impl IntoIterator<Item = String>) -> Result<DriverOutput, DriverError> {
-    match args::parse(arguments).map_err(DriverError::new)? {
+    let arguments = arguments.into_iter().collect::<Vec<_>>();
+    let diagnostic_format = diagnostic_format_hint(&arguments);
+    match args::parse(arguments)
+        .map_err(DriverError::new)
+        .map_err(|error| error_for_format(error, diagnostic_format))?
+    {
         ParsedCommand::Help => Ok(DriverOutput {
             stdout: HELP.to_owned(),
             stderr: String::new(),
@@ -110,11 +150,362 @@ pub fn run(arguments: impl IntoIterator<Item = String>) -> Result<DriverOutput, 
             stdout: VERSION.to_owned(),
             stderr: String::new(),
         }),
-        ParsedCommand::Run(options) => execute(*options),
+        ParsedCommand::VerboseVersion => Ok(DriverOutput {
+            stdout: String::new(),
+            stderr: verbose_version(),
+        }),
+        ParsedCommand::Query(query, options) => query_driver(query, *options),
+        ParsedCommand::Run(options) => {
+            let verbose = options.verbose;
+            let hardening_diagnostics = degraded_hardening_diagnostics(&options)?;
+            let format = options.diagnostic_format;
+            let hardening_json = (format == DiagnosticFormat::Json
+                && !hardening_diagnostics.is_empty())
+            .then(|| degraded_hardening_json_document(&options, false));
+            let mut output = match execute(*options) {
+                Ok(output) => output,
+                Err(error) => {
+                    let mut error = error_for_format(error, format);
+                    if let Some(hardening_json) = hardening_json {
+                        error = prepend_json_to_error(&hardening_json, error);
+                    }
+                    return Err(error);
+                }
+            };
+            if let Some(hardening_json) = hardening_json {
+                output.stderr = if output.stderr.trim().is_empty() {
+                    hardening_json
+                } else {
+                    merge_json_documents(&hardening_json, &output.stderr)
+                        .unwrap_or_else(|| format!("{hardening_json}{}", output.stderr))
+                };
+            } else {
+                output.stderr.insert_str(0, &hardening_diagnostics);
+            }
+            if verbose {
+                output.stderr.insert_str(0, &verbose_version());
+            }
+            Ok(output)
+        }
     }
 }
 
+fn diagnostic_format_hint(arguments: &[String]) -> DiagnosticFormat {
+    arguments
+        .iter()
+        .filter_map(|argument| match argument.as_str() {
+            "-fdiagnostics-format=text" => Some(DiagnosticFormat::Text),
+            "-fdiagnostics-format=json" => Some(DiagnosticFormat::Json),
+            _ => None,
+        })
+        .next_back()
+        .unwrap_or(DiagnosticFormat::Text)
+}
+
+fn degraded_hardening_diagnostics(options: &DriverOptions) -> Result<String, DriverError> {
+    if options.degraded_hardening.is_empty() {
+        return Ok(String::new());
+    }
+    let policy = WarningPolicy::new(
+        options.suppress_warnings,
+        options.warnings_as_errors,
+        &options.warning_options,
+    );
+    let disposition = policy.disposition("degraded-hardening");
+    let severity = match disposition {
+        WarningDisposition::Suppressed => return Ok(String::new()),
+        WarningDisposition::Warning => "warning",
+        WarningDisposition::Error => "error",
+    };
+    let diagnostics = options
+        .degraded_hardening
+        .iter()
+        .map(|option| {
+            format!(
+                "ccc: {severity}: hardening option `{option}` is accepted without its code-generation transform [-Wdegraded-hardening]\n"
+            )
+        })
+        .collect::<String>();
+    if disposition == WarningDisposition::Error {
+        let error = DriverError::new(diagnostics);
+        if options.diagnostic_format == DiagnosticFormat::Json {
+            let json = degraded_hardening_json_document(options, true);
+            Err(DriverError::with_json_document(
+                json.trim_end().to_owned(),
+                json,
+            ))
+        } else {
+            Err(error)
+        }
+    } else {
+        Ok(diagnostics)
+    }
+}
+
+fn degraded_hardening_json_document(options: &DriverOptions, as_error: bool) -> String {
+    let diagnostics = options
+        .degraded_hardening
+        .iter()
+        .map(|option| {
+            let mut diagnostic = Diagnostic::warning(
+                "CCC6009",
+                "degraded-hardening",
+                format!(
+                    "hardening option `{option}` is accepted without its code-generation transform"
+                ),
+            );
+            if as_error {
+                diagnostic.severity = ccc_diag::Severity::Error;
+            }
+            diagnostic
+        })
+        .collect::<Vec<_>>();
+    render_json_document(&diagnostics, &SourceMap::new(), RenderOptions::default())
+}
+
+fn query_driver(query: DriverQuery, options: QueryOptions) -> Result<DriverOutput, DriverError> {
+    let config = query_config(&options)?;
+    let stdout = match query {
+        DriverQuery::DumpMachine => format!("{}\n", config.target.triple),
+        DriverQuery::DumpVersion => "4.2.1\n".to_owned(),
+        DriverQuery::PrintFile(name) if name == "include" => {
+            let resources = ResourceDirectory::discover(options.resource_dir.as_deref())
+                .map_err(|message| owner_error("CCC6003", message))?;
+            format!("{}\n", resources.root().join("include").display())
+        }
+        DriverQuery::PrintProgram(name) => {
+            let requirements = match name.as_str() {
+                "as" => ToolchainRequirements {
+                    assembler: true,
+                    ..ToolchainRequirements::default()
+                },
+                "ar" | "ranlib" => ToolchainRequirements::archive(),
+                _ => ToolchainRequirements::default(),
+            };
+            let toolchain = resolve_query_toolchain(&config, &options, requirements)?;
+            let selected = match name.as_str() {
+                "as" => toolchain.assembler.as_ref(),
+                "ar" => toolchain.archiver.as_ref(),
+                "ranlib" => toolchain.ranlib.as_ref(),
+                _ => None,
+            };
+            if let Some(selected) = selected {
+                format!("{}\n", selected.display())
+            } else {
+                run_toolchain_query(
+                    toolchain.compiler_driver.as_ref(),
+                    &format!("-print-prog-name={name}"),
+                )?
+            }
+        }
+        DriverQuery::PrintFile(name) => {
+            let toolchain =
+                resolve_query_toolchain(&config, &options, ToolchainRequirements::default())?;
+            run_toolchain_query(
+                toolchain.compiler_driver.as_ref(),
+                &format!("-print-file-name={name}"),
+            )?
+        }
+        DriverQuery::PrintSearchDirectories => {
+            let toolchain =
+                resolve_query_toolchain(&config, &options, ToolchainRequirements::default())?;
+            run_toolchain_query(toolchain.compiler_driver.as_ref(), "-print-search-dirs")?
+        }
+        DriverQuery::PrintEffectiveConfig => {
+            let resources = ResourceDirectory::discover(options.resource_dir.as_deref())
+                .map_err(|message| owner_error("CCC6003", message))?;
+            let toolchain = resolve_query_toolchain(
+                &config,
+                &options,
+                ToolchainRequirements::preprocess(true),
+            )?;
+            let relocation = match config.relocation_model {
+                ccc_target::RelocationModel::Static => "static",
+                ccc_target::RelocationModel::Pic => "pic",
+                ccc_target::RelocationModel::Pie => "pie",
+            };
+            let mut output = format!(
+                "target={}\narchitecture={}\ncpu={}\nabi={}\nlanguage={}\ngnu-profile={}\nrelocation={}\noptimization={}\nresource-dir={}\n",
+                config.target.triple,
+                config.normalized_target_arch(),
+                config.normalized_target_cpu(),
+                config.normalized_target_abi(),
+                config.language.mode.name(),
+                config.gnu_profile.as_ref().map_or_else(
+                    || "none".to_owned(),
+                    |profile| {
+                        format!(
+                            "{}.{}.{}",
+                            profile.version.major, profile.version.minor, profile.version.patch
+                        )
+                    },
+                ),
+                relocation,
+                config.optimization.flag(),
+                resources.root().display(),
+            );
+            output.push_str(&format!(
+                "compiler-driver={}\nsysroot={}\n",
+                toolchain
+                    .compiler_driver
+                    .as_ref()
+                    .map_or_else(|| "none".to_owned(), ccc_target::ToolCommandSpec::display),
+                toolchain
+                    .sysroot
+                    .as_deref()
+                    .map_or_else(|| "none".to_owned(), |path| path.display().to_string()),
+            ));
+            for include in &toolchain.system_includes {
+                output.push_str(&format!(
+                    "system-include={:?}:{}\n",
+                    include.kind,
+                    include.path.display()
+                ));
+            }
+            output
+        }
+    };
+    Ok(DriverOutput {
+        stdout,
+        stderr: String::new(),
+    })
+}
+
+fn query_config(options: &QueryOptions) -> Result<EffectiveCompilationConfig, DriverError> {
+    let mut config = (if let Some(target) = &options.target {
+        let triple = target.parse().map_err(|error| {
+            owner_error(
+                "CCC6005",
+                format!("invalid target triple `{target}`: {error}"),
+            )
+        })?;
+        EffectiveCompilationConfig::for_target(triple)
+            .map_err(|message| owner_error("CCC6005", message))?
+    } else {
+        EffectiveCompilationConfig::host().map_err(|message| owner_error("CCC6005", message))?
+    })
+    .with_language_mode(options.language_mode);
+    if let Some(architecture) = &options.target_arch {
+        config = config.with_target_arch(architecture);
+    }
+    if let Some(cpu) = &options.target_cpu {
+        config = config.with_target_cpu(cpu);
+    }
+    if let Some(abi) = &options.target_abi {
+        config = config.with_target_abi(abi);
+    }
+    if let Some(sdk_root) = &options.sdk_root {
+        config = config.with_sdk_root(sdk_root);
+    }
+    if let Some(version) = &options.deployment_target {
+        config = config.with_deployment_target(version);
+    }
+    config.relocation_model = options.relocation_model;
+    config.optimization = options.optimization;
+    if options.sdk_root.is_some() && config.target.abi != ccc_target::AbiIdentity::DarwinArm64 {
+        return Err(owner_error(
+            "CCC6005",
+            "`--sdk-root` is valid only for the Darwin arm64 target",
+        ));
+    }
+    config
+        .validate_target_profile_options()
+        .map_err(|message| owner_error("CCC6005", message))?;
+    Ok(config)
+}
+
+fn resolve_query_toolchain(
+    config: &EffectiveCompilationConfig,
+    options: &QueryOptions,
+    requirements: ToolchainRequirements,
+) -> Result<ccc_target::ToolchainSpec, DriverError> {
+    let mut resolver = ToolchainResolver::new(config);
+    if let Some(sysroot) = options.sysroot.as_ref().or(options.sdk_root.as_ref()) {
+        resolver = resolver.sysroot(sysroot);
+    }
+    resolver
+        .resolve(requirements)
+        .map_err(|error| owner_error(error.code, error.message))
+}
+
+fn run_toolchain_query(
+    driver: Option<&ccc_target::ToolCommandSpec>,
+    argument: &str,
+) -> Result<String, DriverError> {
+    let driver = driver.ok_or_else(|| owner_error("CCC6005", "no target compiler driver"))?;
+    let output = Command::new(&driver.program)
+        .args(&driver.arguments)
+        .arg(argument)
+        .output()
+        .map_err(|error| {
+            owner_error(
+                "CCC6005",
+                format!(
+                    "cannot run target compiler driver `{}`: {error}",
+                    driver.display()
+                ),
+            )
+        })?;
+    if !output.status.success() {
+        return Err(owner_error(
+            "CCC6005",
+            format!(
+                "target compiler driver `{}` rejected `{argument}`: {}",
+                driver.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ));
+    }
+    let mut stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    if !stdout.ends_with('\n') {
+        stdout.push('\n');
+    }
+    Ok(stdout)
+}
+
+fn verbose_version() -> String {
+    let target = ccc_target::EffectiveCompilationConfig::host()
+        .map(|config| config.target.triple.to_string())
+        .unwrap_or_else(|_| "unknown-target".to_owned());
+    format!(
+        "ccc {} (gcc-compatible profile 4.2.1)\nTarget: {target}\n",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
 fn execute(options: DriverOptions) -> Result<DriverOutput, DriverError> {
+    if options.print_commands_only {
+        return print_command_plan(&options);
+    }
+    if matches!(options.action, PrimaryAction::Compile { link: true }) {
+        return link_output(options);
+    }
+    if matches!(options.action, PrimaryAction::Compile { link: false }) && options.inputs.len() > 1
+    {
+        return compile_multiple_outputs(options);
+    }
+    if matches!(options.action, PrimaryAction::Compile { link: false })
+        && matches!(
+            classify_input(
+                &options.input,
+                options.input_languages.first().copied().flatten()
+            ),
+            InputKind::Assembly | InputKind::PreprocessedAssembly
+        )
+    {
+        let (config, _) = effective_config(&options)?;
+        let output = options
+            .output
+            .clone()
+            .unwrap_or_else(|| compile_output_path(&options.input));
+        return assemble_input(
+            &options,
+            &options.input,
+            options.input_languages.first().copied().flatten(),
+            &output,
+            &config,
+        );
+    }
     let prepared = preprocess_source(&options)?;
 
     if matches!(options.dependencies.mode, DriverDependencyMode::Only { .. }) {
@@ -123,15 +514,774 @@ fn execute(options: DriverOptions) -> Result<DriverOutput, DriverError> {
 
     match options.action {
         PrimaryAction::Preprocess => preprocess_output(&options, prepared),
+        PrimaryAction::SyntaxOnly => syntax_only_output(prepared),
         PrimaryAction::Dump(kind) => dump_output(&options, prepared, kind),
         PrimaryAction::Compile { link } => compile_output(&options, prepared, link),
     }
 }
 
+fn print_command_plan(options: &DriverOptions) -> Result<DriverOutput, DriverError> {
+    if !matches!(options.action, PrimaryAction::Compile { .. }) {
+        return Err(DriverError::new(
+            "ccc: `-###` currently requires a compile or link action",
+        ));
+    }
+    // Resolve the same target/toolchain contract as a real invocation, but do
+    // not create outputs or start compilation phases.
+    let (config, _) = effective_config(options)?;
+    let executable = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("ccc"));
+    let mut lines = Vec::new();
+
+    if matches!(options.action, PrimaryAction::Compile { link: false }) {
+        for (index, input) in options.inputs.iter().enumerate() {
+            let output = options
+                .output
+                .clone()
+                .unwrap_or_else(|| compile_output_path(input));
+            lines.push(render_ccc_compile_command(
+                &executable,
+                options,
+                input,
+                options.input_languages[index],
+                &output,
+            ));
+        }
+    } else {
+        let output = options
+            .output
+            .clone()
+            .unwrap_or_else(|| match options.link_output_kind {
+                DriverLinkOutputKind::Executable => PathBuf::from("a.out"),
+                DriverLinkOutputKind::Shared => PathBuf::from("a.so"),
+                DriverLinkOutputKind::Relocatable => PathBuf::from("a.o"),
+            });
+        let plan_directory = output
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let mut linked = Vec::<OsString>::new();
+        let mut compiled_index = 0usize;
+        for item in &options.link_items {
+            match item {
+                LinkItem::Argument(argument) => linked.push(argument.into()),
+                LinkItem::Input { path, language } => {
+                    if classify_input(path, *language) == InputKind::Linker {
+                        linked.push(path.as_os_str().to_owned());
+                    } else {
+                        let temporary =
+                            plan_directory.join(format!(".ccc-command-plan-{compiled_index}.o"));
+                        compiled_index += 1;
+                        lines.push(render_ccc_compile_command(
+                            &executable,
+                            options,
+                            path,
+                            *language,
+                            &temporary,
+                        ));
+                        linked.push(temporary.into_os_string());
+                    }
+                }
+            }
+        }
+        let mut command = vec![executable.as_os_str().to_owned()];
+        append_target_command_arguments(&mut command, options);
+        match options.link_output_kind {
+            DriverLinkOutputKind::Executable => command.push(
+                match options.relocation_model {
+                    ccc_target::RelocationModel::Static => "-no-pie",
+                    ccc_target::RelocationModel::Pic => "-fPIC",
+                    ccc_target::RelocationModel::Pie => "-pie",
+                }
+                .into(),
+            ),
+            DriverLinkOutputKind::Shared => command.push("-shared".into()),
+            DriverLinkOutputKind::Relocatable => command.push("-r".into()),
+        }
+        command.extend(linked);
+        command.push("-o".into());
+        command.push(output.as_os_str().to_owned());
+        lines.push(render_shell_command(&command));
+        if should_materialize_darwin_debug_artifact(options, &config) {
+            let tool = resolve_dsymutil(&config)?;
+            let debug_bundle = darwin_debug_artifact_path(&output);
+            let command = [
+                tool.as_os_str().to_owned(),
+                output.into_os_string(),
+                OsString::from("-o"),
+                debug_bundle.into_os_string(),
+            ];
+            lines.push(render_shell_command(&command));
+        }
+    }
+
+    Ok(DriverOutput {
+        stdout: String::new(),
+        stderr: format!("{}\n", lines.join("\n")),
+    })
+}
+
+fn render_ccc_compile_command(
+    executable: &Path,
+    options: &DriverOptions,
+    input: &Path,
+    language: Option<DriverInputLanguage>,
+    output: &Path,
+) -> String {
+    let mut command = vec![executable.as_os_str().to_owned(), "-c".into()];
+    append_target_command_arguments(&mut command, options);
+    command.push(match options.language_mode {
+        ccc_target::LanguageMode::C11 => "-std=c11".into(),
+        ccc_target::LanguageMode::Gnu11 => "-std=gnu11".into(),
+    });
+    command.push(match options.relocation_model {
+        ccc_target::RelocationModel::Static => "-fno-pic".into(),
+        ccc_target::RelocationModel::Pic => "-fPIC".into(),
+        ccc_target::RelocationModel::Pie => "-fPIE".into(),
+    });
+    command.push(options.optimization.flag().into());
+    if options.debug_info {
+        command.push("-g".into());
+    }
+    if options.trigraphs == ccc_target::TrigraphPolicy::Enabled {
+        command.push("-trigraphs".into());
+    }
+    if options.suppress_warnings {
+        command.push("-w".into());
+    }
+    if options.warnings_as_errors {
+        command.push("-Werror".into());
+    }
+    command.extend(options.warning_options.iter().map(OsString::from));
+    if let Some(limit) = options.error_limit {
+        command.push(format!("-ferror-limit={limit}").into());
+    }
+    if options.diagnostic_format == DiagnosticFormat::Json {
+        command.push("-fdiagnostics-format=json".into());
+    }
+    command.extend(options.degraded_hardening.iter().map(OsString::from));
+    if options.no_standard_includes {
+        command.push("-nostdinc".into());
+    }
+    if options.no_builtin_includes {
+        command.push("-nobuiltininc".into());
+    }
+    for action in &options.macro_actions {
+        match action {
+            MacroAction::Define(definition) => command.push(format!("-D{definition}").into()),
+            MacroAction::Undefine(name) => command.push(format!("-U{name}").into()),
+        }
+    }
+    for include in &options.include_paths {
+        let spelling = match include.kind {
+            DriverIncludePathKind::Quote => "-iquote",
+            DriverIncludePathKind::User => "-I",
+            DriverIncludePathKind::System => "-isystem",
+            DriverIncludePathKind::After => "-idirafter",
+        };
+        command.push(spelling.into());
+        command.push(include.path.as_os_str().to_owned());
+    }
+    for forced in &options.forced_inputs {
+        command.push(match forced.kind {
+            ForcedInputKind::Macros => "-imacros".into(),
+            ForcedInputKind::Include => "-include".into(),
+        });
+        command.push(forced.path.as_os_str().to_owned());
+    }
+    match options.dependencies.mode {
+        DriverDependencyMode::None | DriverDependencyMode::Only { .. } => {}
+        DriverDependencyMode::SideEffect {
+            include_system: true,
+        } => command.push("-MD".into()),
+        DriverDependencyMode::SideEffect {
+            include_system: false,
+        } => command.push("-MMD".into()),
+    }
+    if options.dependencies.phony_targets {
+        command.push("-MP".into());
+    }
+    if let Some(output) = &options.dependencies.output {
+        command.push("-MF".into());
+        command.push(output.as_os_str().to_owned());
+    }
+    for target in &options.dependencies.targets {
+        command.push(
+            match target {
+                DependencyTarget::Literal(_) => "-MT",
+                DependencyTarget::Quoted(_) => "-MQ",
+            }
+            .into(),
+        );
+        command.push(
+            match target {
+                DependencyTarget::Literal(value) | DependencyTarget::Quoted(value) => value,
+            }
+            .into(),
+        );
+    }
+    if let Some(language) = language {
+        command.push("-x".into());
+        command.push(
+            match language {
+                DriverInputLanguage::C => "c",
+                DriverInputLanguage::PreprocessedC => "c-cpp-output",
+                DriverInputLanguage::Assembly => "assembler",
+                DriverInputLanguage::PreprocessedAssembly => "assembler-with-cpp",
+            }
+            .into(),
+        );
+    }
+    command.push(input.as_os_str().to_owned());
+    command.push("-o".into());
+    command.push(output.as_os_str().to_owned());
+    render_shell_command(&command)
+}
+
+fn append_target_command_arguments(command: &mut Vec<OsString>, options: &DriverOptions) {
+    if let Some(target) = &options.target {
+        command.push(format!("--target={target}").into());
+    }
+    if let Some(architecture) = &options.target_arch {
+        command.push(format!("-march={architecture}").into());
+    }
+    if let Some(cpu) = &options.target_cpu {
+        command.push(format!("-mcpu={cpu}").into());
+    }
+    if let Some(abi) = &options.target_abi {
+        command.push(format!("-mabi={abi}").into());
+    }
+    if let Some(sysroot) = &options.sysroot {
+        command.push(format!("--sysroot={}", sysroot.display()).into());
+    }
+    if let Some(resource_dir) = &options.resource_dir {
+        command.push("-resource-dir".into());
+        command.push(resource_dir.as_os_str().to_owned());
+    }
+    if let Some(sdk_root) = &options.sdk_root {
+        command.push("--sdk-root".into());
+        command.push(sdk_root.as_os_str().to_owned());
+    }
+    if let Some(version) = &options.deployment_target {
+        command.push(format!("-mmacosx-version-min={version}").into());
+    }
+}
+
+fn render_shell_command(arguments: &[OsString]) -> String {
+    arguments
+        .iter()
+        .map(|argument| shell_quote(&argument.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_quote(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_+-./:=,@".contains(&byte))
+    {
+        value.to_owned()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+fn syntax_only_output(prepared: PreparedSource) -> Result<DriverOutput, DriverError> {
+    let (parsed, _) = analyze_frontend_preprocessed(prepared)?;
+    Ok(DriverOutput {
+        stdout: String::new(),
+        stderr: parsed.stderr,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InputKind {
+    C,
+    PreprocessedC,
+    Assembly,
+    PreprocessedAssembly,
+    Linker,
+}
+
+fn classify_input(path: &Path, language: Option<DriverInputLanguage>) -> InputKind {
+    if let Some(language) = language {
+        return match language {
+            DriverInputLanguage::C => InputKind::C,
+            DriverInputLanguage::PreprocessedC => InputKind::PreprocessedC,
+            DriverInputLanguage::Assembly => InputKind::Assembly,
+            DriverInputLanguage::PreprocessedAssembly => InputKind::PreprocessedAssembly,
+        };
+    }
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.contains(".so."))
+    {
+        return InputKind::Linker;
+    }
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some("i") => InputKind::PreprocessedC,
+        Some("s") => InputKind::Assembly,
+        Some("S") => InputKind::PreprocessedAssembly,
+        Some("o" | "lo" | "obj" | "a" | "so" | "dylib") => InputKind::Linker,
+        _ => InputKind::C,
+    }
+}
+
+fn compile_multiple_outputs(options: DriverOptions) -> Result<DriverOutput, DriverError> {
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    for (index, input) in options.inputs.iter().enumerate() {
+        let language = options.input_languages[index];
+        let output = compile_output_path(input);
+        let result = match classify_input(input, language) {
+            InputKind::C | InputKind::PreprocessedC => {
+                let mut per_input = options.clone();
+                per_input.input = input.clone();
+                per_input.inputs = vec![input.clone()];
+                per_input.input_languages = vec![language];
+                per_input.link_items.clear();
+                per_input.output = Some(output);
+                preprocess_source(&per_input)
+                    .and_then(|prepared| compile_output(&per_input, prepared, false))
+            }
+            InputKind::Assembly | InputKind::PreprocessedAssembly => {
+                let mut per_input = options.clone();
+                per_input.input = input.clone();
+                per_input.inputs = vec![input.clone()];
+                per_input.input_languages = vec![language];
+                effective_config(&per_input).and_then(|(config, _)| {
+                    assemble_input(&per_input, input, language, &output, &config)
+                })
+            }
+            InputKind::Linker => Err(DriverError::new(format!(
+                "ccc: `-c` input {} is already a linker input",
+                input.display()
+            ))),
+        }
+        .map_err(|error| with_prior_diagnostics(&stderr, error))?;
+        stdout.push_str(&result.stdout);
+        append_diagnostic_output(&mut stderr, &result.stderr, options.diagnostic_format);
+    }
+    Ok(DriverOutput { stdout, stderr })
+}
+
+fn compile_output_path(input: &Path) -> PathBuf {
+    input
+        .file_name()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| input.to_path_buf())
+        .with_extension("o")
+}
+
+fn link_output(options: DriverOptions) -> Result<DriverOutput, DriverError> {
+    let (config, _) = effective_config(&options)?;
+    let output = options
+        .output
+        .clone()
+        .unwrap_or_else(|| match options.link_output_kind {
+            DriverLinkOutputKind::Executable => PathBuf::from("a.out"),
+            DriverLinkOutputKind::Shared
+                if config.target.triple.binary_format == ccc_target::BinaryFormat::Macho =>
+            {
+                PathBuf::from("a.dylib")
+            }
+            DriverLinkOutputKind::Shared => PathBuf::from("a.so"),
+            DriverLinkOutputKind::Relocatable => PathBuf::from("a.o"),
+        });
+    let mut temporaries = Vec::new();
+    let mut packaging_reports = Vec::new();
+    let mut linker_inputs = Vec::<OsString>::new();
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+
+    for item in &options.link_items {
+        match item {
+            LinkItem::Argument(argument) => linker_inputs.push(OsString::from(argument.as_str())),
+            LinkItem::Input {
+                path: input,
+                language,
+            } => match classify_input(input, *language) {
+                InputKind::C | InputKind::PreprocessedC => {
+                    let temporary = TemporaryObject::create()
+                        .map_err(|error| with_prior_diagnostics(&stderr, error))?;
+                    let mut per_input = options.clone();
+                    per_input.action = PrimaryAction::Compile { link: false };
+                    per_input.input = input.clone();
+                    per_input.inputs = vec![input.clone()];
+                    per_input.input_languages = vec![*language];
+                    per_input.link_items.clear();
+                    per_input.output = Some(temporary.path().to_path_buf());
+                    let prepared = preprocess_source(&per_input)
+                        .map_err(|error| with_prior_diagnostics(&stderr, error))?;
+                    let (result, packaging) =
+                        compile_output_retaining_packaging(&per_input, prepared, false)
+                            .map_err(|error| with_prior_diagnostics(&stderr, error))?;
+                    packaging_reports.push(packaging);
+                    stdout.push_str(&result.stdout);
+                    append_diagnostic_output(
+                        &mut stderr,
+                        &result.stderr,
+                        options.diagnostic_format,
+                    );
+                    linker_inputs.push(temporary.path().as_os_str().to_owned());
+                    temporaries.push(temporary);
+                }
+                InputKind::Linker => linker_inputs.push(input.as_os_str().to_owned()),
+                InputKind::Assembly | InputKind::PreprocessedAssembly => {
+                    let mut temporary = TemporaryObject::create()
+                        .map_err(|error| with_prior_diagnostics(&stderr, error))?;
+                    let temporary_path = temporary
+                        .prepare_external_write()
+                        .map_err(|error| with_prior_diagnostics(&stderr, error))?
+                        .to_path_buf();
+                    let result =
+                        assemble_input(&options, input, *language, &temporary_path, &config)
+                            .map_err(|error| with_prior_diagnostics(&stderr, error))?;
+                    stdout.push_str(&result.stdout);
+                    append_diagnostic_output(
+                        &mut stderr,
+                        &result.stderr,
+                        options.diagnostic_format,
+                    );
+                    linker_inputs.push(temporary.path().as_os_str().to_owned());
+                    temporaries.push(temporary);
+                }
+            },
+        }
+    }
+
+    let mut pending = atomic_output::PendingOutput::create(&output).map_err(|error| {
+        with_prior_diagnostics(
+            &stderr,
+            DriverError::new(format!(
+                "ccc: cannot create output {}: {error}",
+                output.display()
+            )),
+        )
+    })?;
+    let pending_path = pending.prepare_external_write().map_err(|error| {
+        with_prior_diagnostics(
+            &stderr,
+            DriverError::new(format!(
+                "ccc: cannot prepare output {}: {error}",
+                output.display()
+            )),
+        )
+    })?;
+    let kind = match options.link_output_kind {
+        DriverLinkOutputKind::Executable => ccc_link::LinkOutputKind::Executable,
+        DriverLinkOutputKind::Shared => ccc_link::LinkOutputKind::Shared,
+        DriverLinkOutputKind::Relocatable => ccc_link::LinkOutputKind::Relocatable,
+    };
+    ccc_link::link_inputs_with_toolchain(
+        &linker_inputs,
+        pending_path,
+        kind,
+        &config,
+        &config.toolchain,
+    )
+    .map_err(|error| with_prior_diagnostics(&stderr, owner_error(error.code, error.message)))?;
+    pending.commit(&output).map_err(|error| {
+        with_prior_diagnostics(
+            &stderr,
+            DriverError::new(format!(
+                "ccc: cannot replace output {}: {error}",
+                output.display()
+            )),
+        )
+    })?;
+    if should_materialize_darwin_debug_artifact(&options, &config) {
+        let debug_stderr = materialize_darwin_debug_artifact(&output, &config)
+            .map_err(|error| with_prior_diagnostics(&stderr, error))?;
+        append_diagnostic_output(&mut stderr, &debug_stderr, options.diagnostic_format);
+    }
+    drop(packaging_reports);
+    drop(temporaries);
+    Ok(DriverOutput { stdout, stderr })
+}
+
+fn should_materialize_darwin_debug_artifact(
+    options: &DriverOptions,
+    config: &EffectiveCompilationConfig,
+) -> bool {
+    options.debug_info
+        && options.link_output_kind != DriverLinkOutputKind::Relocatable
+        && config.target.triple.binary_format == ccc_target::BinaryFormat::Macho
+}
+
+fn darwin_debug_artifact_path(output: &Path) -> PathBuf {
+    let mut path = output.as_os_str().to_owned();
+    path.push(".dSYM");
+    PathBuf::from(path)
+}
+
+fn resolve_dsymutil(config: &EffectiveCompilationConfig) -> Result<PathBuf, DriverError> {
+    let driver =
+        config.toolchain.compiler_driver.as_ref().ok_or_else(|| {
+            owner_error("CCC6006", "no target compiler driver can resolve dsymutil")
+        })?;
+    let result = Command::new(&driver.program)
+        .args(&driver.arguments)
+        .arg("-print-prog-name=dsymutil")
+        .output()
+        .map_err(|error| {
+            owner_error(
+                "CCC6006",
+                format!(
+                    "cannot ask target compiler driver `{}` for dsymutil: {error}",
+                    driver.display()
+                ),
+            )
+        })?;
+    if !result.status.success() {
+        return Err(owner_error(
+            "CCC6006",
+            format!(
+                "target compiler driver `{}` could not resolve dsymutil: {}",
+                driver.display(),
+                String::from_utf8_lossy(&result.stderr).trim()
+            ),
+        ));
+    }
+    let reported = String::from_utf8(result.stdout).map_err(|error| {
+        owner_error(
+            "CCC6006",
+            format!(
+                "target compiler driver `{}` returned a non-UTF-8 dsymutil path: {error}",
+                driver.display()
+            ),
+        )
+    })?;
+    let mut lines = reported.lines();
+    let path = lines.next().map(str::trim).filter(|path| !path.is_empty());
+    if path.is_none() || lines.any(|line| !line.trim().is_empty()) {
+        return Err(owner_error(
+            "CCC6006",
+            format!(
+                "target compiler driver `{}` returned an invalid dsymutil path `{}`",
+                driver.display(),
+                reported.trim()
+            ),
+        ));
+    }
+    let path = PathBuf::from(path.expect("nonempty path was checked"));
+    if !path.is_absolute() {
+        return Err(owner_error(
+            "CCC6006",
+            format!(
+                "target compiler driver `{}` did not report an absolute dsymutil path: `{}`",
+                driver.display(),
+                path.display()
+            ),
+        ));
+    }
+    let metadata = fs::metadata(&path).map_err(|error| {
+        owner_error(
+            "CCC6006",
+            format!(
+                "target compiler driver `{}` reported unusable dsymutil path `{}`: {error}",
+                driver.display(),
+                path.display()
+            ),
+        )
+    })?;
+    if !metadata.is_file() || !is_executable(&metadata) {
+        return Err(owner_error(
+            "CCC6006",
+            format!(
+                "target compiler driver `{}` did not report an absolute executable dsymutil path: `{}`",
+                driver.display(),
+                path.display()
+            ),
+        ));
+    }
+    Ok(path)
+}
+
+#[cfg(unix)]
+fn is_executable(metadata: &fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn is_executable(_metadata: &fs::Metadata) -> bool {
+    true
+}
+
+fn materialize_darwin_debug_artifact(
+    output: &Path,
+    config: &EffectiveCompilationConfig,
+) -> Result<String, DriverError> {
+    let tool = resolve_dsymutil(config)?;
+    let destination = darwin_debug_artifact_path(output);
+    let pending = atomic_output::PendingDirectory::create(&destination).map_err(|error| {
+        owner_error(
+            "CCC6006",
+            format!(
+                "cannot prepare debug artifact {}: {error}",
+                destination.display()
+            ),
+        )
+    })?;
+    let result = Command::new(&tool)
+        .arg(output)
+        .arg("-o")
+        .arg(pending.path())
+        .output()
+        .map_err(|error| {
+            owner_error(
+                "CCC6006",
+                format!("cannot invoke dsymutil `{}`: {error}", tool.display()),
+            )
+        })?;
+    if !result.status.success() {
+        return Err(owner_error(
+            "CCC6006",
+            format!(
+                "dsymutil `{}` failed for {}: {}",
+                tool.display(),
+                output.display(),
+                String::from_utf8_lossy(&result.stderr).trim()
+            ),
+        ));
+    }
+    pending.commit(&destination).map_err(|error| {
+        owner_error(
+            "CCC6006",
+            format!(
+                "cannot publish debug artifact {}: {error}",
+                destination.display()
+            ),
+        )
+    })?;
+    let mut stderr = String::from_utf8_lossy(&result.stderr).into_owned();
+    if !stderr.is_empty() && !stderr.ends_with('\n') {
+        stderr.push('\n');
+    }
+    Ok(stderr)
+}
+
+fn assemble_input(
+    options: &DriverOptions,
+    input: &Path,
+    language: Option<DriverInputLanguage>,
+    output: &Path,
+    config: &EffectiveCompilationConfig,
+) -> Result<DriverOutput, DriverError> {
+    let mut stderr = String::new();
+    let preprocessed;
+    let assembly = if classify_input(input, language) == InputKind::PreprocessedAssembly {
+        let mut per_input = options.clone();
+        per_input.action = PrimaryAction::Preprocess;
+        per_input.input = input.to_path_buf();
+        per_input.inputs = vec![input.to_path_buf()];
+        per_input.link_items.clear();
+        per_input.output = None;
+        let prepared = preprocess_source(&per_input)?;
+        prepared.reject_if_errors()?;
+        append_diagnostic_output(&mut stderr, &prepared.stderr, options.diagnostic_format);
+        let source = render_preprocessed(&prepared.output, false);
+        preprocessed = Some(
+            TemporaryAssembly::create(source.as_bytes())
+                .map_err(|error| with_prior_diagnostics(&stderr, error))?,
+        );
+        preprocessed.as_ref().expect("temporary was created").path()
+    } else {
+        preprocessed = None;
+        input
+    };
+    let driver = config.toolchain.compiler_driver.as_ref().ok_or_else(|| {
+        with_prior_diagnostics(
+            &stderr,
+            DriverError::new("ccc: resolved toolchain has no compiler driver"),
+        )
+    })?;
+    let mut pending = atomic_output::PendingOutput::create(output).map_err(|error| {
+        with_prior_diagnostics(
+            &stderr,
+            DriverError::new(format!(
+                "ccc: cannot create output {}: {error}",
+                output.display()
+            )),
+        )
+    })?;
+    let pending_path = pending.prepare_external_write().map_err(|error| {
+        with_prior_diagnostics(
+            &stderr,
+            DriverError::new(format!(
+                "ccc: cannot prepare output {}: {error}",
+                output.display()
+            )),
+        )
+    })?;
+    let result = Command::new(&driver.program)
+        .args(&driver.arguments)
+        .arg("-x")
+        .arg("assembler")
+        .arg("-c")
+        .arg(assembly)
+        .arg("-o")
+        .arg(pending_path)
+        .output()
+        .map_err(|error| {
+            with_prior_diagnostics(
+                &stderr,
+                DriverError::new(format!(
+                    "ccc: cannot invoke target compiler driver `{}` for assembly input: {error}",
+                    driver.display()
+                )),
+            )
+        })?;
+    drop(preprocessed);
+    if !result.status.success() {
+        return Err(with_prior_diagnostics(
+            &stderr,
+            DriverError::new(format!(
+                "ccc: target compiler driver `{}` failed to assemble {}: {}",
+                driver.display(),
+                input.display(),
+                String::from_utf8_lossy(&result.stderr).trim()
+            )),
+        ));
+    }
+    pending.commit(output).map_err(|error| {
+        with_prior_diagnostics(
+            &stderr,
+            DriverError::new(format!(
+                "ccc: cannot replace output {}: {error}",
+                output.display()
+            )),
+        )
+    })?;
+    Ok(DriverOutput {
+        stdout: String::new(),
+        stderr,
+    })
+}
+
 struct PreparedSource {
     session: Session,
     output: PreprocessOutput,
+    diagnostics: DiagnosticEngine,
+    diagnostic_format: DiagnosticFormat,
     stderr: String,
+}
+
+impl PreparedSource {
+    fn reject_if_errors(&self) -> Result<(), DriverError> {
+        if self.diagnostics.has_errors() {
+            Err(diagnostic_engine_error(
+                &self.session.sources,
+                &self.diagnostics,
+                self.diagnostic_format,
+            ))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 fn preprocess_source(options: &DriverOptions) -> Result<PreparedSource, DriverError> {
@@ -158,7 +1308,19 @@ fn preprocess_source(options: &DriverOptions) -> Result<PreparedSource, DriverEr
         .sources
         .add_file_occurrence(main_spec, loaded.source);
     let pp_options = preprocessing_options(options, &session.config, resources.as_ref());
-    let mut sink = PreprocessorDiagnostics::new(&options.warning_options);
+    let warning_policy = WarningPolicy::new(
+        options.suppress_warnings,
+        options.warnings_as_errors,
+        &options.warning_options,
+    );
+    let warn_in_system_headers = warning_policy.enabled("system-headers");
+    let mut sink = PreprocessorDiagnostics::new(
+        &warning_policy,
+        !options.suppress_warnings,
+        options.warnings_as_errors,
+        warn_in_system_headers,
+        options.error_limit.unwrap_or(20),
+    );
     let output = preprocess(
         &mut PreprocessContext {
             session: &mut session,
@@ -169,25 +1331,13 @@ fn preprocess_source(options: &DriverOptions) -> Result<PreparedSource, DriverEr
         main_file,
     );
 
-    let warn_in_system_headers = warning_toggle(
-        &options.warning_options,
-        "-Wsystem-headers",
-        "-Wno-system-headers",
-        false,
-    );
-    let diagnostics = sink.finish(
-        &session.sources,
-        !options.suppress_warnings,
-        options.warnings_as_errors,
-        warn_in_system_headers,
-        options.error_limit.unwrap_or(20),
-    );
-    let stderr = diagnostics.render(&session.sources);
-    if output.had_errors || diagnostics.has_errors() {
-        return Err(rendered_driver_error(stderr));
-    }
+    let diagnostics = sink.finish();
+    debug_assert!(!output.had_errors || diagnostics.has_errors());
+    let stderr = successful_diagnostics(&session.sources, &diagnostics, options.diagnostic_format);
 
-    if let Some(header) = unsupported_hosted_header(&options.action, &session.config, &output) {
+    if !diagnostics.has_errors()
+        && let Some(header) = unsupported_hosted_header(&options.action, &session.config, &output)
+    {
         let required = required_compatibility_scope(&options.action);
         let available = session
             .config
@@ -195,7 +1345,11 @@ fn preprocess_source(options: &DriverOptions) -> Result<PreparedSource, DriverEr
             .as_ref()
             .map_or(CompatibilityScope::Preprocessing, |profile| profile.scope);
         return Err(with_prior_diagnostics(
-            &stderr,
+            &render_diagnostics_for_error(
+                &session.sources,
+                &diagnostics,
+                options.diagnostic_format,
+            ),
             owner_error(
                 "CCC6004",
                 format!(
@@ -216,6 +1370,8 @@ fn preprocess_source(options: &DriverOptions) -> Result<PreparedSource, DriverEr
     Ok(PreparedSource {
         session,
         output,
+        diagnostics,
+        diagnostic_format: options.diagnostic_format,
         stderr,
     })
 }
@@ -267,6 +1423,7 @@ fn effective_config(
         ));
     }
     config.relocation_model = options.relocation_model;
+    config.optimization = options.optimization;
     config
         .validate_target_profile_options()
         .map_err(|message| owner_error("CCC6005", message))?;
@@ -304,7 +1461,12 @@ fn effective_config(
         let requirements = ToolchainRequirements {
             system_headers: resolve_system_headers,
             disable_system_headers: options.no_standard_includes,
-            assembler: false,
+            assembler: options.inputs.iter().enumerate().any(|(index, input)| {
+                matches!(
+                    classify_input(input, options.input_languages[index]),
+                    InputKind::Assembly | InputKind::PreprocessedAssembly
+                )
+            }),
             linker: link,
             object_copier: false,
             archiver: false,
@@ -362,7 +1524,9 @@ fn required_compatibility_scope(action: &PrimaryAction) -> CompatibilityScope {
             CompatibilityScope::Preprocessing
         }
         PrimaryAction::Dump(DumpKind::Tokens | DumpKind::Ast) => CompatibilityScope::Parsing,
-        PrimaryAction::Dump(DumpKind::TypedAst) => CompatibilityScope::SemanticAnalysis,
+        PrimaryAction::SyntaxOnly | PrimaryAction::Dump(DumpKind::TypedAst) => {
+            CompatibilityScope::SemanticAnalysis
+        }
         PrimaryAction::Compile { .. }
         | PrimaryAction::Dump(DumpKind::Ir | DumpKind::Abi | DumpKind::Clif) => {
             CompatibilityScope::CodeGeneration
@@ -460,6 +1624,10 @@ fn preprocessing_options(
 
     PreprocessOptions {
         language_mode: options.language_mode,
+        preprocessed_input: classify_input(
+            &options.input,
+            options.input_languages.first().copied().flatten(),
+        ) == InputKind::PreprocessedC,
         trigraphs: Some(config.language.trigraphs_enabled()),
         warn_trigraphs: true,
         include_paths,
@@ -496,6 +1664,7 @@ fn dependency_only_output(
     options: &DriverOptions,
     prepared: PreparedSource,
 ) -> Result<DriverOutput, DriverError> {
+    prepared.reject_if_errors()?;
     let rendered = rendered_dependencies(options, &prepared.output, None);
     let destination = options
         .dependencies
@@ -526,6 +1695,7 @@ fn preprocess_output(
     options: &DriverOptions,
     prepared: PreparedSource,
 ) -> Result<DriverOutput, DriverError> {
+    prepared.reject_if_errors()?;
     let mut stdout = if options.dump_macros {
         render_macro_definitions(&prepared.output.macros)
     } else {
@@ -574,93 +1744,88 @@ fn dump_output(
     prepared: PreparedSource,
     kind: DumpKind,
 ) -> Result<DriverOutput, DriverError> {
-    let prior_stderr = prepared.stderr.clone();
-    let dependency_stdout = if matches!(
-        options.dependencies.mode,
-        DriverDependencyMode::SideEffect { .. }
-    ) {
-        write_side_effect_dependencies(options, &prepared.output, None)
-            .map_err(|error| with_prior_diagnostics(&prior_stderr, error))?
-    } else {
-        String::new()
-    };
+    let deferred_dependencies = defer_side_effect_dependencies(options, &prepared.output, None);
 
-    let stdout = match kind {
-        DumpKind::PpTokens => dump_pp_tokens(&prepared.session.sources, &prepared.output.tokens()),
+    let (mut stdout, stderr) = match kind {
+        DumpKind::PpTokens => {
+            prepared.reject_if_errors()?;
+            (
+                dump_pp_tokens(&prepared.session.sources, &prepared.output.tokens()),
+                prepared.stderr,
+            )
+        }
         DumpKind::Tokens => {
-            let items = convert_pp_items(prepared.output.items).map_err(|error| {
-                with_prior_diagnostics(
-                    &prior_stderr,
-                    diagnostic_error(
+            let mut prepared = prepared;
+            prepared.reject_if_errors()?;
+            let items = match convert_pp_items(prepared.output.items) {
+                Ok(items) => items,
+                Err(error) => {
+                    let _ = prepared.diagnostics.emit(
                         &prepared.session.sources,
                         Diagnostic::error(error.code, error.message)
+                            .with_category("lexical")
                             .with_primary(error.span, "while converting preprocessing tokens"),
-                    ),
-                )
-            })?;
-            dump_frontend_tokens(&prepared.session.sources, &items)
+                    );
+                    return Err(diagnostic_engine_error(
+                        &prepared.session.sources,
+                        &prepared.diagnostics,
+                        prepared.diagnostic_format,
+                    ));
+                }
+            };
+            (
+                dump_frontend_tokens(&prepared.session.sources, &items),
+                prepared.stderr,
+            )
         }
         DumpKind::Ast => {
-            let parsed =
-                parse_frontend_preprocessed(prepared.session, prepared.output, &prior_stderr)?;
-            let mut stdout = dump_frontend_ast(&parsed.ast);
-            stdout.push_str(&dependency_stdout);
-            return Ok(DriverOutput {
-                stdout,
-                stderr: parsed.stderr,
-            });
+            let mut parsed = parse_frontend_preprocessed(prepared)?;
+            parsed.reject_if_errors()?;
+            (dump_frontend_ast(&parsed.ast), parsed.stderr)
         }
         DumpKind::TypedAst => {
-            let (parsed, typed) = analyze_frontend_preprocessed(prepared, &prior_stderr)?;
-            let mut stdout = dump_frontend_typed_ast(&typed);
-            stdout.push_str(&dependency_stdout);
-            return Ok(DriverOutput {
-                stdout,
-                stderr: parsed.stderr,
-            });
+            let (parsed, typed) = analyze_frontend_preprocessed(prepared)?;
+            (dump_frontend_typed_ast(&typed), parsed.stderr)
         }
         DumpKind::Ir => {
-            let (parsed, ir) = lower_frontend_preprocessed(prepared, &prior_stderr)?;
-            let mut stdout = ccc_ir::generic::dump_frontend_ir(&ir);
-            stdout.push_str(&dependency_stdout);
-            return Ok(DriverOutput {
-                stdout,
-                stderr: parsed.stderr,
-            });
+            let (parsed, ir) = lower_frontend_preprocessed(prepared)?;
+            (ccc_ir::generic::dump_frontend_ir(&ir), parsed.stderr)
         }
         DumpKind::Abi => {
-            let (parsed, ir) = lower_frontend_preprocessed(prepared, &prior_stderr)?;
-            let plan = ccc_abi::plan_module(&ir, &parsed.session.config)
-                .map_err(|error| abi_driver_error(&parsed.session.sources, error))?;
+            let (parsed, ir) = lower_frontend_preprocessed(prepared)?;
+            let plan = ccc_abi::plan_module(&ir, &parsed.session.config).map_err(|error| {
+                with_prior_diagnostics(
+                    &parsed.stderr,
+                    abi_driver_error(&parsed.session.sources, error),
+                )
+            })?;
             let verified = plan
                 .verify_against(&ir, &parsed.session.config)
-                .map_err(|error| abi_driver_error(&parsed.session.sources, error))?;
-            let mut stdout = ccc_abi::dump_module_plan(verified);
-            stdout.push_str(&dependency_stdout);
-            return Ok(DriverOutput {
-                stdout,
-                stderr: parsed.stderr,
-            });
+                .map_err(|error| {
+                    with_prior_diagnostics(
+                        &parsed.stderr,
+                        abi_driver_error(&parsed.session.sources, error),
+                    )
+                })?;
+            (ccc_abi::dump_module_plan(verified), parsed.stderr)
         }
         DumpKind::Clif => {
-            let (parsed, ir) = lower_frontend_preprocessed(prepared, &prior_stderr)?;
-            let generated =
-                codegen_frontend(&ir, &parsed.session.config, &parsed.session.sources, true)
-                    .map_err(|error| with_prior_diagnostics(&parsed.stderr, error))?;
-            let mut stdout = generated.clif;
-            stdout.push_str(&dependency_stdout);
-            return Ok(DriverOutput {
-                stdout,
-                stderr: parsed.stderr,
-            });
+            let (parsed, ir) = lower_frontend_preprocessed(prepared)?;
+            let generated = codegen_frontend(
+                &ir,
+                &parsed.session.config,
+                &parsed.session.sources,
+                true,
+                false,
+            )
+            .map_err(|error| with_prior_diagnostics(&parsed.stderr, error))?;
+            (generated.clif, parsed.stderr)
         }
     };
-    let mut stdout = stdout;
+    let dependency_stdout = publish_deferred_dependencies(deferred_dependencies)
+        .map_err(|error| with_prior_diagnostics(&stderr, error))?;
     stdout.push_str(&dependency_stdout);
-    Ok(DriverOutput {
-        stdout,
-        stderr: prepared.stderr,
-    })
+    Ok(DriverOutput { stdout, stderr })
 }
 
 fn compile_output(
@@ -668,28 +1833,37 @@ fn compile_output(
     prepared: PreparedSource,
     link: bool,
 ) -> Result<DriverOutput, DriverError> {
+    let (output, _packaging) = compile_output_retaining_packaging(options, prepared, link)?;
+    Ok(output)
+}
+
+fn compile_output_retaining_packaging(
+    options: &DriverOptions,
+    prepared: PreparedSource,
+    link: bool,
+) -> Result<(DriverOutput, ccc_link::PackagingReport), DriverError> {
     let output = options.output.clone().unwrap_or_else(|| {
         if link {
             PathBuf::from("a.out")
         } else {
-            options.input.with_extension("o")
+            compile_output_path(&options.input)
         }
     });
-    let dependency_stdout = if matches!(
-        options.dependencies.mode,
-        DriverDependencyMode::SideEffect { .. }
-    ) {
-        write_side_effect_dependencies(options, &prepared.output, options.output.as_deref())
-            .map_err(|error| with_prior_diagnostics(&prepared.stderr, error))?
-    } else {
-        String::new()
-    };
+    let deferred_dependencies =
+        defer_side_effect_dependencies(options, &prepared.output, options.output.as_deref());
 
-    let prior_stderr = prepared.stderr.clone();
-    let (parsed, ir) = lower_frontend_preprocessed(prepared, &prior_stderr)?;
-    let generated = codegen_frontend(&ir, &parsed.session.config, &parsed.session.sources, false)
-        .map_err(|error| with_prior_diagnostics(&parsed.stderr, error))?;
+    let (parsed, ir) = lower_frontend_preprocessed(prepared)?;
+    let generated = codegen_frontend(
+        &ir,
+        &parsed.session.config,
+        &parsed.session.sources,
+        false,
+        options.debug_info,
+    )
+    .map_err(|error| with_prior_diagnostics(&parsed.stderr, error))?;
     let artifact = generated.into_artifact_bundle();
+    let dependency_stdout;
+    let packaging;
     if link {
         let mut temporary = TemporaryObject::create()
             .map_err(|error| with_prior_diagnostics(&parsed.stderr, error))?;
@@ -697,10 +1871,11 @@ fn compile_output(
             .prepare_external_write()
             .map_err(|error| with_prior_diagnostics(&parsed.stderr, error))?
             .to_path_buf();
-        ccc_link::package_artifact_bundle(artifact, &artifact_path, &parsed.session.config)
-            .map_err(|error| {
-                with_prior_diagnostics(&parsed.stderr, owner_error(error.code, error.message))
-            })?;
+        packaging =
+            ccc_link::package_artifact_bundle(artifact, &artifact_path, &parsed.session.config)
+                .map_err(|error| {
+                    with_prior_diagnostics(&parsed.stderr, owner_error(error.code, error.message))
+                })?;
         let mut pending = atomic_output::PendingOutput::create(&output).map_err(|error| {
             with_prior_diagnostics(
                 &parsed.stderr,
@@ -731,6 +1906,8 @@ fn compile_output(
         .map_err(|error| {
             with_prior_diagnostics(&parsed.stderr, owner_error(error.code, error.message))
         })?;
+        dependency_stdout = publish_deferred_dependencies(deferred_dependencies)
+            .map_err(|error| with_prior_diagnostics(&parsed.stderr, error))?;
         pending.commit(&output).map_err(|error| {
             with_prior_diagnostics(
                 &parsed.stderr,
@@ -741,14 +1918,51 @@ fn compile_output(
             )
         })?;
     } else {
-        ccc_link::package_artifact_bundle(artifact, &output, &parsed.session.config).map_err(
-            |error| with_prior_diagnostics(&parsed.stderr, owner_error(error.code, error.message)),
-        )?;
+        let mut pending = atomic_output::PendingOutput::create(&output).map_err(|error| {
+            with_prior_diagnostics(
+                &parsed.stderr,
+                DriverError::new(format!(
+                    "ccc: cannot create output {}: {error}",
+                    output.display()
+                )),
+            )
+        })?;
+        let package_output = pending
+            .prepare_external_write()
+            .map_err(|error| {
+                with_prior_diagnostics(
+                    &parsed.stderr,
+                    DriverError::new(format!(
+                        "ccc: cannot prepare output {}: {error}",
+                        output.display()
+                    )),
+                )
+            })?
+            .to_path_buf();
+        packaging =
+            ccc_link::package_artifact_bundle(artifact, &package_output, &parsed.session.config)
+                .map_err(|error| {
+                    with_prior_diagnostics(&parsed.stderr, owner_error(error.code, error.message))
+                })?;
+        dependency_stdout = publish_deferred_dependencies(deferred_dependencies)
+            .map_err(|error| with_prior_diagnostics(&parsed.stderr, error))?;
+        pending.commit(&output).map_err(|error| {
+            with_prior_diagnostics(
+                &parsed.stderr,
+                DriverError::new(format!(
+                    "ccc: cannot replace output {}: {error}",
+                    output.display()
+                )),
+            )
+        })?;
     }
-    Ok(DriverOutput {
-        stdout: dependency_stdout,
-        stderr: parsed.stderr,
-    })
+    Ok((
+        DriverOutput {
+            stdout: dependency_stdout,
+            stderr: parsed.stderr,
+        },
+        packaging,
+    ))
 }
 
 fn rendered_dependencies(
@@ -788,11 +2002,22 @@ fn rendered_dependencies(
     )
 }
 
-fn write_side_effect_dependencies(
+struct DeferredDependencyPublication {
+    rendered: dependency::RenderedDependencies,
+    destination: PathBuf,
+}
+
+fn defer_side_effect_dependencies(
     options: &DriverOptions,
     output: &PreprocessOutput,
     output_target: Option<&Path>,
-) -> Result<String, DriverError> {
+) -> Option<DeferredDependencyPublication> {
+    if !matches!(
+        options.dependencies.mode,
+        DriverDependencyMode::SideEffect { .. }
+    ) {
+        return None;
+    }
     let rendered = rendered_dependencies(options, output, output_target);
     let destination = options
         .dependencies
@@ -806,82 +2031,220 @@ fn write_side_effect_dependencies(
             }
         })
         .unwrap_or_else(|| default_dependency_path(&options.input, output_target));
-    if destination == Path::new("-") {
-        return Ok(rendered.contents);
+    Some(DeferredDependencyPublication {
+        rendered,
+        destination,
+    })
+}
+
+fn publish_deferred_dependencies(
+    publication: Option<DeferredDependencyPublication>,
+) -> Result<String, DriverError> {
+    let Some(publication) = publication else {
+        return Ok(String::new());
+    };
+    if publication.destination == Path::new("-") {
+        return Ok(publication.rendered.contents);
     }
-    atomic_output::write_atomic(&destination, rendered.as_bytes())
+    atomic_output::write_atomic(&publication.destination, publication.rendered.as_bytes())
         .map_err(|error| {
             DriverError::new(format!(
                 "ccc: cannot write dependency file {}: {error}",
-                destination.display()
+                publication.destination.display()
             ))
         })
         .map(|()| String::new())
 }
 
+fn write_side_effect_dependencies(
+    options: &DriverOptions,
+    output: &PreprocessOutput,
+    output_target: Option<&Path>,
+) -> Result<String, DriverError> {
+    publish_deferred_dependencies(defer_side_effect_dependencies(
+        options,
+        output,
+        output_target,
+    ))
+}
+
 struct FrontendParsedSource {
     session: Session,
     ast: FrontendTranslationUnit,
+    diagnostics: DiagnosticEngine,
+    diagnostic_format: DiagnosticFormat,
     stderr: String,
+    poisoned_bindings: Vec<PoisonedBinding>,
+}
+
+impl FrontendParsedSource {
+    fn reject_if_errors(&mut self) -> Result<(), DriverError> {
+        if self.diagnostics.has_errors() {
+            return Err(diagnostic_engine_error(
+                &self.session.sources,
+                &self.diagnostics,
+                self.diagnostic_format,
+            ));
+        }
+        self.stderr = successful_diagnostics(
+            &self.session.sources,
+            &self.diagnostics,
+            self.diagnostic_format,
+        );
+        Ok(())
+    }
 }
 
 fn parse_frontend_preprocessed(
-    session: Session,
-    output: PreprocessOutput,
-    prior_stderr: &str,
+    prepared: PreparedSource,
 ) -> Result<FrontendParsedSource, DriverError> {
-    let items = convert_pp_items(output.items).map_err(|error| {
-        with_prior_diagnostics(
-            prior_stderr,
-            diagnostic_error(
+    let PreparedSource {
+        session,
+        output,
+        mut diagnostics,
+        diagnostic_format,
+        stderr,
+    } = prepared;
+    if diagnostics.is_halted() {
+        return Err(diagnostic_engine_error(
+            &session.sources,
+            &diagnostics,
+            diagnostic_format,
+        ));
+    }
+    let items = match convert_pp_items(output.items) {
+        Ok(items) => items,
+        Err(error) => {
+            let _ = diagnostics.emit(
                 &session.sources,
                 Diagnostic::error(error.code, error.message)
+                    .with_category("lexical")
                     .with_primary(error.span, "while converting preprocessing tokens"),
-            ),
-        )
-    })?;
-    let ast = parse_frontend_with_mode(&items, session.config.language.mode).map_err(|error| {
-        with_prior_diagnostics(
-            prior_stderr,
-            diagnostic_error(
+            );
+            return Err(diagnostic_engine_error(
                 &session.sources,
-                Diagnostic::error(error.code, error.message)
-                    .with_primary(error.span, "while parsing"),
-            ),
-        )
-    })?;
+                &diagnostics,
+                diagnostic_format,
+            ));
+        }
+    };
+    let remaining = remaining_error_budget(&diagnostics);
+    let recovered = parse_frontend_recovering_with_mode_and_limit(
+        &items,
+        session.config.language.mode,
+        remaining,
+    );
+    for error in recovered.diagnostics {
+        let outcome = diagnostics.emit(
+            &session.sources,
+            Diagnostic::error(error.code, error.message)
+                .with_category("syntax")
+                .with_primary(error.span, "while parsing"),
+        );
+        if outcome == EmitOutcome::Halted || diagnostics.is_halted() {
+            break;
+        }
+    }
     Ok(FrontendParsedSource {
         session,
-        ast,
-        stderr: prior_stderr.to_owned(),
+        ast: recovered.ast,
+        diagnostics,
+        diagnostic_format,
+        stderr,
+        poisoned_bindings: recovered.poisoned_bindings,
     })
 }
 
 fn analyze_frontend_preprocessed(
     prepared: PreparedSource,
-    prior_stderr: &str,
 ) -> Result<(FrontendParsedSource, FullTypedTranslationUnit), DriverError> {
-    let parsed = parse_frontend_preprocessed(prepared.session, prepared.output, prior_stderr)?;
-    let typed = analyze_frontend(&parsed.ast, &parsed.session.config).map_err(|diagnostics| {
-        with_prior_diagnostics(
-            prior_stderr,
-            diagnostics_error(&parsed.session.sources, diagnostics),
-        )
-    })?;
+    let mut parsed = parse_frontend_preprocessed(prepared)?;
+    let typed = if parsed.diagnostics.is_halted() {
+        None
+    } else {
+        let remaining = remaining_error_budget(&parsed.diagnostics);
+        match analyze_frontend_with_recovery_limit(
+            &parsed.ast,
+            &parsed.session.config,
+            remaining,
+            &parsed.poisoned_bindings,
+        ) {
+            Ok(typed) => Some(typed),
+            Err(diagnostics) => {
+                for mut diagnostic in diagnostics {
+                    if diagnostic_depends_on_recovery(
+                        &diagnostic,
+                        &parsed.poisoned_bindings,
+                        &parsed.session.sources,
+                    ) {
+                        continue;
+                    }
+                    if diagnostic.category.is_none() {
+                        diagnostic = diagnostic.with_category("semantic");
+                    }
+                    let outcome = parsed.diagnostics.emit(&parsed.session.sources, diagnostic);
+                    if outcome == EmitOutcome::Halted || parsed.diagnostics.is_halted() {
+                        break;
+                    }
+                }
+                None
+            }
+        }
+    };
+    parsed.reject_if_errors()?;
+    let typed = typed.expect("error-free semantic analysis returns a typed translation unit");
     Ok((parsed, typed))
+}
+
+fn remaining_error_budget(diagnostics: &DiagnosticEngine) -> Option<usize> {
+    let limit = diagnostics.options().error_limit;
+    (limit != 0).then(|| limit.saturating_sub(diagnostics.error_count()))
+}
+
+fn diagnostic_depends_on_recovery(
+    diagnostic: &Diagnostic,
+    bindings: &[PoisonedBinding],
+    sources: &SourceMap,
+) -> bool {
+    if diagnostic.code != "CCC2274" {
+        return false;
+    }
+    let Some(primary) = diagnostic.primary.as_ref() else {
+        return false;
+    };
+    let use_span = primary.span;
+    let Some(spelling) = sources
+        .source(use_span.file)
+        .and_then(|source| source.get(use_span.start..use_span.end))
+    else {
+        return false;
+    };
+    bindings.iter().any(|binding| {
+        binding.name == spelling
+            && binding.binding.file == use_span.file
+            && use_span.start >= binding.binding.end
+            && use_span.start < binding.scope_end
+    })
 }
 
 fn lower_frontend_preprocessed(
     prepared: PreparedSource,
-    prior_stderr: &str,
 ) -> Result<(FrontendParsedSource, FullModule), DriverError> {
-    let (parsed, typed) = analyze_frontend_preprocessed(prepared, prior_stderr)?;
-    let ir = ccc_ir::generic::lower_frontend(&typed).map_err(|error| {
+    let (parsed, typed) = analyze_frontend_preprocessed(prepared)?;
+    let mut ir = ccc_ir::generic::lower_frontend(&typed).map_err(|error| {
         with_prior_diagnostics(
-            prior_stderr,
+            &parsed.stderr,
             frontend_ir_error(&parsed.session.sources, error),
         )
     })?;
+    ccc_ir::generic::optimize_frontend_for_config(&mut ir, &parsed.session.config).map_err(
+        |error| {
+            with_prior_diagnostics(
+                &parsed.stderr,
+                frontend_ir_error(&parsed.session.sources, error),
+            )
+        },
+    )?;
     Ok((parsed, ir))
 }
 
@@ -906,8 +2269,17 @@ fn codegen_frontend(
     config: &EffectiveCompilationConfig,
     sources: &SourceMap,
     emit_clif: bool,
+    debug_info: bool,
 ) -> Result<CodegenOutput, DriverError> {
-    ccc_codegen::generic::emit(ir, config, CodegenOptions { emit_clif }).map_err(|error| {
+    ccc_codegen::generic::emit(
+        ir,
+        config,
+        CodegenOptions {
+            emit_clif,
+            debug_info: debug_info.then_some(sources),
+        },
+    )
+    .map_err(|error| {
         let mut diagnostic = Diagnostic::error(error.code, error.message);
         if let Some(span) = error.span {
             diagnostic = diagnostic.with_primary(span, "while generating native code");
@@ -989,21 +2361,50 @@ fn dump_frontend_tokens(sources: &SourceMap, items: &[FrontendItem]) -> String {
     stdout
 }
 
-fn warning_toggle(options: &[String], enable: &str, disable: &str, default: bool) -> bool {
-    options.iter().fold(default, |state, option| {
-        if option == enable {
-            true
-        } else if option == disable {
-            false
-        } else {
-            state
-        }
-    })
+struct TemporaryObject {
+    temporary: RegisteredTemporaryFile,
+    file: Option<File>,
 }
 
-struct TemporaryObject {
-    path: PathBuf,
-    file: Option<File>,
+struct TemporaryAssembly {
+    temporary: RegisteredTemporaryFile,
+}
+
+impl TemporaryAssembly {
+    fn create(contents: &[u8]) -> Result<Self, DriverError> {
+        for _ in 0..100 {
+            let id = TEMPORARY_ID.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!("ccc-{}-{id}.s", std::process::id()));
+            match RegisteredTemporaryFile::create(path) {
+                Ok((mut file, temporary)) => {
+                    file.write_all(contents).map_err(|error| {
+                        DriverError::new(format!(
+                            "ccc: cannot write a temporary assembly input: {error}"
+                        ))
+                    })?;
+                    file.sync_all().map_err(|error| {
+                        DriverError::new(format!(
+                            "ccc: cannot prepare a temporary assembly input: {error}"
+                        ))
+                    })?;
+                    return Ok(Self { temporary });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(DriverError::new(format!(
+                        "ccc: cannot create a temporary assembly input: {error}"
+                    )));
+                }
+            }
+        }
+        Err(DriverError::new(
+            "ccc: cannot allocate a collision-free temporary assembly path",
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        self.temporary.path()
+    }
 }
 
 impl TemporaryObject {
@@ -1011,10 +2412,10 @@ impl TemporaryObject {
         for _ in 0..100 {
             let id = TEMPORARY_ID.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!("ccc-{}-{id}.o", std::process::id()));
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(file) => {
+            match RegisteredTemporaryFile::create(path) {
+                Ok((file, temporary)) => {
                     return Ok(Self {
-                        path,
+                        temporary,
                         file: Some(file),
                     });
                 }
@@ -1037,17 +2438,11 @@ impl TemporaryObject {
                 DriverError::new(format!("ccc: cannot prepare temporary object: {error}"))
             })?;
         }
-        Ok(&self.path)
+        Ok(self.path())
     }
 
     fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TemporaryObject {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        self.temporary.path()
     }
 }
 
@@ -1059,26 +2454,64 @@ fn rendered_driver_error(rendered: String) -> DriverError {
     }
 }
 
+fn successful_diagnostics(
+    sources: &SourceMap,
+    diagnostics: &DiagnosticEngine,
+    format: DiagnosticFormat,
+) -> String {
+    if diagnostics.diagnostics().is_empty() {
+        String::new()
+    } else {
+        diagnostics.render_format(sources, format)
+    }
+}
+
+fn render_diagnostics_for_error(
+    sources: &SourceMap,
+    diagnostics: &DiagnosticEngine,
+    format: DiagnosticFormat,
+) -> String {
+    diagnostics.render_format(sources, format)
+}
+
+fn diagnostic_engine_error(
+    sources: &SourceMap,
+    diagnostics: &DiagnosticEngine,
+    format: DiagnosticFormat,
+) -> DriverError {
+    let rendered = render_diagnostics_for_error(sources, diagnostics, format);
+    match format {
+        DiagnosticFormat::Text => rendered_driver_error(rendered),
+        DiagnosticFormat::Json => {
+            DriverError::with_json_document(rendered.trim_end(), rendered.clone())
+        }
+    }
+}
+
 fn diagnostic_error(sources: &SourceMap, diagnostic: Diagnostic) -> DriverError {
-    DriverError::new(format!("ccc: {}", diagnostic.render(sources).trim_end()))
+    let message = format!("ccc: {}", diagnostic.render(sources).trim_end());
+    let json = render_json_document(&[diagnostic], sources, RenderOptions::default());
+    DriverError::with_json_document(message, json)
 }
 
 fn owner_error(code: &'static str, message: impl Into<String>) -> DriverError {
     diagnostic_error(&SourceMap::new(), Diagnostic::error(code, message))
 }
 
-fn diagnostics_error(sources: &SourceMap, diagnostics: Vec<Diagnostic>) -> DriverError {
-    let rendered = diagnostics
-        .iter()
-        .map(|diagnostic| diagnostic.render(sources))
-        .collect::<Vec<_>>()
-        .join("");
-    DriverError::new(format!("ccc: {}", rendered.trim_end()))
-}
-
 fn with_prior_diagnostics(prior: &str, error: DriverError) -> DriverError {
     if prior.trim().is_empty() {
         error
+    } else if is_json_diagnostic_document(prior) {
+        let error = error_for_format(error, DiagnosticFormat::Json);
+        let merged = merge_json_documents(
+            prior,
+            error
+                .json_document
+                .as_deref()
+                .expect("JSON-formatted driver errors carry a document"),
+        )
+        .unwrap_or_else(|| format!("{prior}{}", error.message));
+        DriverError::with_json_document(merged.trim_end(), merged.clone())
     } else {
         let mut combined = prior.to_owned();
         if !combined.ends_with('\n') {
@@ -1089,9 +2522,102 @@ fn with_prior_diagnostics(prior: &str, error: DriverError) -> DriverError {
     }
 }
 
+fn error_for_format(error: DriverError, format: DiagnosticFormat) -> DriverError {
+    if format == DiagnosticFormat::Text {
+        return error;
+    }
+    if let Some(json) = &error.json_document {
+        return DriverError::with_json_document(json.trim_end(), json.clone());
+    }
+    let message = error
+        .message
+        .strip_prefix("ccc: ")
+        .unwrap_or(&error.message)
+        .to_owned();
+    let diagnostic = Diagnostic::error("CCC6000", message).with_category("driver");
+    let json = render_json_document(&[diagnostic], &SourceMap::new(), RenderOptions::default());
+    DriverError::with_json_document(json.trim_end(), json.clone())
+}
+
+fn prepend_json_to_error(document: &str, error: DriverError) -> DriverError {
+    let error = error_for_format(error, DiagnosticFormat::Json);
+    let merged = merge_json_documents(
+        document,
+        error
+            .json_document
+            .as_deref()
+            .expect("JSON-formatted driver errors carry a document"),
+    )
+    .unwrap_or_else(|| format!("{document}{}", error.message));
+    DriverError::with_json_document(merged.trim_end(), merged.clone())
+}
+
+fn is_json_diagnostic_document(document: &str) -> bool {
+    document
+        .trim()
+        .starts_with("{\"schema_version\":1,\"diagnostics\":[")
+}
+
+fn append_diagnostic_output(accumulated: &mut String, next: &str, format: DiagnosticFormat) {
+    if next.trim().is_empty() {
+        return;
+    }
+    if format == DiagnosticFormat::Text {
+        accumulated.push_str(next);
+        return;
+    }
+
+    let as_document = |output: &str| {
+        if is_json_diagnostic_document(output) {
+            output.to_owned()
+        } else {
+            render_json_document(
+                &[Diagnostic::warning("CCC6006", "driver", output.trim())],
+                &SourceMap::new(),
+                RenderOptions::default(),
+            )
+        }
+    };
+    let next = as_document(next);
+    if accumulated.trim().is_empty() {
+        *accumulated = next;
+        return;
+    }
+    let current = as_document(accumulated);
+    *accumulated = merge_json_documents(&current, &next)
+        .expect("normalized diagnostic outputs are valid JSON documents");
+}
+
+fn merge_json_documents(first: &str, second: &str) -> Option<String> {
+    const PREFIX: &str = "{\"schema_version\":1,\"diagnostics\":[";
+    const SUFFIX: &str = "]}";
+    let first = first.trim();
+    let second = second.trim();
+    let first_items = first.strip_prefix(PREFIX)?.strip_suffix(SUFFIX)?;
+    let second_items = second.strip_prefix(PREFIX)?.strip_suffix(SUFFIX)?;
+    let separator = (!first_items.is_empty() && !second_items.is_empty()).then_some(',');
+    let mut merged = String::from(PREFIX);
+    merged.push_str(first_items);
+    if let Some(separator) = separator {
+        merged.push(separator);
+    }
+    merged.push_str(second_items);
+    merged.push_str("]}\n");
+    Some(merged)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn make_executable(path: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
+    }
 
     #[test]
     fn version_reports_the_driver_identity_without_an_input() {
@@ -1101,6 +2627,195 @@ mod tests {
             format!("ccc {}\n", env!("CARGO_PKG_VERSION"))
         );
         assert!(output.stderr.is_empty());
+    }
+
+    fn parsed_driver_options(arguments: &[&str]) -> DriverOptions {
+        let ParsedCommand::Run(options) =
+            args::parse(arguments.iter().map(|argument| (*argument).to_owned())).unwrap()
+        else {
+            panic!("expected runnable driver options");
+        };
+        *options
+    }
+
+    #[test]
+    fn degraded_hardening_uses_the_effective_warning_policy() {
+        let cases: &[(&[&str], Option<&str>)] = &[
+            (&["-fstack-protector-strong", "input.c"], Some("warning")),
+            (
+                &["-fstack-protector-strong", "-Werror", "input.c"],
+                Some("error"),
+            ),
+            (
+                &[
+                    "-fstack-protector-strong",
+                    "-Wno-degraded-hardening",
+                    "input.c",
+                ],
+                None,
+            ),
+            (
+                &[
+                    "-fstack-protector-strong",
+                    "-Wno-degraded-hardening",
+                    "-Wdegraded-hardening",
+                    "input.c",
+                ],
+                Some("warning"),
+            ),
+            (
+                &[
+                    "-fstack-protector-strong",
+                    "-Werror=degraded-hardening",
+                    "input.c",
+                ],
+                Some("error"),
+            ),
+            (
+                &[
+                    "-fstack-protector-strong",
+                    "-Werror",
+                    "-Wno-error=degraded-hardening",
+                    "input.c",
+                ],
+                Some("warning"),
+            ),
+            (
+                &[
+                    "-fstack-protector-strong",
+                    "-Werror=degraded-hardening",
+                    "-Wno-error=degraded-hardening",
+                    "input.c",
+                ],
+                Some("warning"),
+            ),
+            (
+                &[
+                    "-fstack-protector-strong",
+                    "-Wno-error=degraded-hardening",
+                    "-Werror=degraded-hardening",
+                    "input.c",
+                ],
+                Some("error"),
+            ),
+            (&["-fstack-protector-strong", "-w", "input.c"], None),
+        ];
+
+        for (arguments, expected_severity) in cases {
+            let options = parsed_driver_options(arguments);
+            let diagnostic = degraded_hardening_diagnostics(&options);
+            match expected_severity {
+                None => assert_eq!(diagnostic.unwrap(), "", "{arguments:?}"),
+                Some("warning") => {
+                    let diagnostic = diagnostic.unwrap();
+                    assert!(
+                        diagnostic.contains("ccc: warning:"),
+                        "{arguments:?}: {diagnostic}"
+                    );
+                }
+                Some("error") => {
+                    let diagnostic = diagnostic.unwrap_err().to_string();
+                    assert!(
+                        diagnostic.contains("ccc: error:"),
+                        "{arguments:?}: {diagnostic}"
+                    );
+                }
+                Some(severity) => panic!("unexpected severity {severity}"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn debug_artifact_tool_runs_before_registered_objects_are_dropped() {
+        let unique = TEMPORARY_ID.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "ccc-debug-artifact-contract-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let output = directory.join("program");
+        let driver = directory.join("fixture-cc");
+        let dsymutil = directory.join("fixture-dsymutil");
+
+        let mut object = TemporaryObject::create().unwrap();
+        let object_path = object.prepare_external_write().unwrap().to_path_buf();
+        fs::write(&object_path, b"temporary debug object").unwrap();
+        fs::write(&output, b"linked executable").unwrap();
+        fs::write(
+            directory.join("expected-object"),
+            object_path.as_os_str().as_encoded_bytes(),
+        )
+        .unwrap();
+        fs::write(
+            &dsymutil,
+            "#!/bin/sh\n\
+                 expected=$(cat \"$(dirname \"$0\")/expected-object\")\n\
+                 test -f \"$expected\" || exit 65\n\
+                 test -f \"$1\" || exit 66\n\
+                 test \"$2\" = -o || exit 67\n\
+                 mkdir -p \"$3/Contents/Resources/DWARF\"\n\
+                 printf 'materialized while object existed\\n' > \"$3/Contents/Resources/DWARF/program\"\n",
+        )
+        .unwrap();
+        fs::write(
+            &driver,
+            "#!/bin/sh\n\
+                 test \"$1\" = -print-prog-name=dsymutil || exit 64\n\
+                 printf '%s\\n' \"$(dirname \"$0\")/fixture-dsymutil\"\n",
+        )
+        .unwrap();
+        make_executable(&driver);
+        make_executable(&dsymutil);
+
+        let triple = "aarch64-apple-darwin".parse().unwrap();
+        let mut config = EffectiveCompilationConfig::for_target(triple).unwrap();
+        config.toolchain.compiler_driver = Some(ccc_target::ToolCommandSpec::new(&driver));
+        assert_eq!(
+            materialize_darwin_debug_artifact(&output, &config).unwrap(),
+            ""
+        );
+        assert!(object_path.is_file());
+        assert_eq!(
+            fs::read_to_string(
+                darwin_debug_artifact_path(&output).join("Contents/Resources/DWARF/program")
+            )
+            .unwrap(),
+            "materialized while object existed\n"
+        );
+
+        drop(object);
+        assert!(!object_path.exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn debug_artifact_tool_must_be_an_absolute_selected_toolchain_path() {
+        let unique = TEMPORARY_ID.fetch_add(1, Ordering::Relaxed);
+        let directory = std::env::temp_dir().join(format!(
+            "ccc-debug-artifact-path-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let driver = directory.join("fixture-cc");
+        fs::write(
+            &driver,
+            "#!/bin/sh\n\
+             test \"$1\" = -print-prog-name=dsymutil || exit 64\n\
+             printf 'dsymutil\\n'\n",
+        )
+        .unwrap();
+        make_executable(&driver);
+
+        let triple = "aarch64-apple-darwin".parse().unwrap();
+        let mut config = EffectiveCompilationConfig::for_target(triple).unwrap();
+        config.toolchain.compiler_driver = Some(ccc_target::ToolCommandSpec::new(&driver));
+        let error = resolve_dsymutil(&config).unwrap_err().to_string();
+        assert!(error.contains("CCC6006"), "{error}");
+        assert!(error.contains("absolute dsymutil path"), "{error}");
+
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -1257,8 +2972,12 @@ mod tests {
         ])
         .unwrap()
         .stdout;
-        assert!(abi.contains("abi-plan schema=ccc-abi-config-v2"));
-        assert!(abi.contains(&format!("target={}", ccc_target::Triple::host())));
+        assert!(abi.contains("abi-plan schema=ccc-abi-config-v3"));
+        let host_target = ccc_target::EffectiveCompilationConfig::host()
+            .unwrap()
+            .target
+            .triple;
+        assert!(abi.contains(&format!("target={host_target}")));
         assert!(abi.contains("definition function=0"));
         assert!(!abi.contains(std::env::temp_dir().to_string_lossy().as_ref()));
         let clif = run(["--emit=clif".to_owned(), "-nostdinc".to_owned(), input])
@@ -1316,9 +3035,9 @@ mod tests {
     fn unsupported_programs_do_not_emit_objects() {
         let cases = [
             (
-                "atomic.c",
-                "_Atomic int value; int main(void) { return value; }",
-                "CCC4011",
+                "atomic-i128.c",
+                "_Atomic(__int128) value; int main(void) { return 0; }",
+                "CCC2443",
             ),
             (
                 "wide-literal.c",
@@ -1472,6 +3191,7 @@ mod tests {
         assert!(output.stdout.is_empty());
         let dependencies = fs::read_to_string(&dependency_path).unwrap();
         let target = Path::new(&name).with_extension("o");
+        let object_path = std::env::current_dir().unwrap().join(&target);
         assert!(
             dependencies.starts_with(&format!("{}:", target.display())),
             "{dependencies}"
@@ -1479,6 +3199,7 @@ mod tests {
         assert!(!dependencies.starts_with("a.out:"), "{dependencies}");
 
         fs::remove_file(dependency_path).unwrap();
+        fs::remove_file(object_path).unwrap();
         fs::remove_dir_all(directory).unwrap();
     }
 

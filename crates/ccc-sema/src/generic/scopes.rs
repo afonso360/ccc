@@ -16,6 +16,7 @@ pub(super) enum OrdinarySymbol {
     PredefinedFunctionName,
     Typedef(TypedefId, QualifiedType),
     Enumerator(i128, QualifiedType),
+    Poisoned,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

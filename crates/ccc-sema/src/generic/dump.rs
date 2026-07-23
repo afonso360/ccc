@@ -98,7 +98,7 @@ fn dump_function(output: &mut String, unit: &FullTypedTranslationUnit, id: FullF
         output,
         0,
         format_args!(
-            "function @{} {} : {} storage={:?} linkage={:?}{} visibility={:?} inline={} noreturn={} {}",
+            "function @{} {} : {} storage={:?} linkage={:?}{} visibility={:?} inline={} noreturn={}{} {}",
             id.0,
             function.name,
             unit.types.display(function.signature),
@@ -112,6 +112,11 @@ fn dump_function(output: &mut String, unit: &FullTypedTranslationUnit, id: FullF
             function.visibility,
             function.properties.inline,
             function.properties.no_return,
+            if function.properties.returns_twice {
+                " returns-twice=true"
+            } else {
+                ""
+            },
             if function.body.is_some() {
                 "definition"
             } else {
@@ -246,6 +251,86 @@ fn dump_statement(
             line(output, indent, format_args!("computed-goto"));
             dump_expression(output, unit, expression, indent + 1);
         }
+        FullTypedStatementKind::InlineAsm(asm) => {
+            line(
+                output,
+                indent,
+                format_args!(
+                    "inline-asm {} template={:?} volatile={}",
+                    inline_asm_kind_name(&asm.kind),
+                    asm.template,
+                    asm.volatile
+                ),
+            );
+            match &asm.kind {
+                FullTypedInlineAsmKind::CompilerBarrier { .. }
+                | FullTypedInlineAsmKind::CodeLayoutHint(_) => {}
+                FullTypedInlineAsmKind::OpaqueScalar { target } => {
+                    dump_named_expression(output, unit, "target", target, indent + 1);
+                }
+                FullTypedInlineAsmKind::X86Cpuid {
+                    leaf,
+                    subleaf,
+                    outputs,
+                } => {
+                    dump_named_expression(output, unit, "leaf", leaf, indent + 1);
+                    if let Some(subleaf) = subleaf {
+                        dump_named_expression(output, unit, "subleaf", subleaf, indent + 1);
+                    }
+                    for register in outputs {
+                        dump_named_expression(
+                            output,
+                            unit,
+                            match register.register {
+                                X86CpuidRegister::Eax => "eax",
+                                X86CpuidRegister::Ebx => "ebx",
+                                X86CpuidRegister::Ecx => "ecx",
+                                X86CpuidRegister::Edx => "edx",
+                            },
+                            &register.target,
+                            indent + 1,
+                        );
+                    }
+                }
+                FullTypedInlineAsmKind::X86Rdtsc { low, high } => {
+                    dump_named_expression(output, unit, "low", low, indent + 1);
+                    dump_named_expression(output, unit, "high", high, indent + 1);
+                }
+                FullTypedInlineAsmKind::X86AtomicExchange {
+                    object,
+                    value,
+                    result,
+                } => {
+                    dump_named_expression(output, unit, "object", object, indent + 1);
+                    dump_named_expression(output, unit, "value", value, indent + 1);
+                    if let Some(result) = result {
+                        dump_named_expression(output, unit, "result", result, indent + 1);
+                    }
+                }
+                FullTypedInlineAsmKind::X86AtomicCompareExchange {
+                    object,
+                    expected,
+                    desired,
+                    original,
+                } => {
+                    dump_named_expression(output, unit, "object", object, indent + 1);
+                    dump_named_expression(output, unit, "expected", expected, indent + 1);
+                    dump_named_expression(output, unit, "desired", desired, indent + 1);
+                    dump_named_expression(output, unit, "original", original, indent + 1);
+                }
+                FullTypedInlineAsmKind::X86ConditionalMoveAbove {
+                    target,
+                    index,
+                    low_limit,
+                    backup,
+                } => {
+                    dump_named_expression(output, unit, "target", target, indent + 1);
+                    dump_named_expression(output, unit, "index", index, indent + 1);
+                    dump_named_expression(output, unit, "low-limit", low_limit, indent + 1);
+                    dump_named_expression(output, unit, "backup", backup, indent + 1);
+                }
+            }
+        }
         FullTypedStatementKind::Continue => line(output, indent, format_args!("continue")),
         FullTypedStatementKind::Break => line(output, indent, format_args!("break")),
         FullTypedStatementKind::Return(expression) => {
@@ -254,6 +339,22 @@ fn dump_statement(
                 dump_expression(output, unit, expression, indent + 1);
             }
         }
+    }
+}
+
+fn inline_asm_kind_name(kind: &FullTypedInlineAsmKind) -> &'static str {
+    match kind {
+        FullTypedInlineAsmKind::CompilerBarrier { .. } => "compiler-barrier",
+        FullTypedInlineAsmKind::OpaqueScalar { .. } => "opaque-scalar",
+        FullTypedInlineAsmKind::CodeLayoutHint(CodeLayoutHint::AlignToPowerOfTwo(_)) => {
+            "code-align"
+        }
+        FullTypedInlineAsmKind::CodeLayoutHint(CodeLayoutHint::Nop) => "layout-nop",
+        FullTypedInlineAsmKind::X86Cpuid { .. } => "x86-cpuid",
+        FullTypedInlineAsmKind::X86Rdtsc { .. } => "x86-rdtsc",
+        FullTypedInlineAsmKind::X86AtomicExchange { .. } => "x86-atomic-exchange",
+        FullTypedInlineAsmKind::X86AtomicCompareExchange { .. } => "x86-atomic-compare-exchange",
+        FullTypedInlineAsmKind::X86ConditionalMoveAbove { .. } => "x86-conditional-move-above",
     }
 }
 
@@ -301,16 +402,19 @@ fn dump_block_item(
                 dump_initializer(output, unit, initializer, indent + 1);
             }
         }
-        FullTypedBlockItem::Typedef(typedef) => line(
-            output,
-            indent,
-            format_args!(
-                "typedef !{} {} : {}",
-                typedef.id.0,
-                typedef.name,
-                unit.types.display_qualified(typedef.ty)
-            ),
-        ),
+        FullTypedBlockItem::Typedef(typedef) => {
+            line(
+                output,
+                indent,
+                format_args!(
+                    "typedef !{} {} : {}",
+                    typedef.id.0,
+                    typedef.name,
+                    unit.types.display_qualified(typedef.ty)
+                ),
+            );
+            dump_variable_length_bounds(output, unit, &typedef.variable_length_bounds, indent + 1);
+        }
         FullTypedBlockItem::ExternalObject(id) => {
             line(output, indent, format_args!("extern-object @{}", id.0));
         }
@@ -421,6 +525,25 @@ fn dump_expression(
                 format_args!("decl-ref {reference:?}{suffix}"),
             );
         }
+        FullTypedExpressionKind::GenericSelection {
+            controlling_ty,
+            selected,
+        } => {
+            line(
+                output,
+                indent,
+                format_args!(
+                    "generic-selection controlling={}{suffix}",
+                    unit.types.display_qualified(*controlling_ty)
+                ),
+            );
+            dump_expression(output, unit, selected, indent + 1);
+        }
+        FullTypedExpressionKind::VariableLengthBoundEvaluation { bounds, expression } => {
+            line(output, indent, format_args!("vla-bound-evaluation{suffix}"));
+            dump_variable_length_bounds(output, unit, bounds, indent + 1);
+            dump_expression(output, unit, expression, indent + 1);
+        }
         FullTypedExpressionKind::Conversion { kind, expression } => {
             line(output, indent, format_args!("convert {kind:?}{suffix}"));
             dump_expression(output, unit, expression, indent + 1);
@@ -475,11 +598,14 @@ fn dump_expression(
             );
             dump_expression(output, unit, base, indent + 1);
         }
-        FullTypedExpressionKind::CompoundLiteral { local, initializer } => {
+        FullTypedExpressionKind::CompoundLiteral {
+            storage,
+            initializer,
+        } => {
             line(
                 output,
                 indent,
-                format_args!("compound-literal l{}{suffix}", local.0),
+                format_args!("compound-literal {storage:?}{suffix}"),
             );
             dump_initializer(output, unit, initializer, indent + 1);
         }
@@ -619,6 +745,38 @@ fn dump_expression(
             );
             dump_expression(output, unit, address, indent + 1);
         }
+        FullTypedExpressionKind::AtomicLoad {
+            pointer,
+            object,
+            order,
+        } => {
+            line(
+                output,
+                indent,
+                format_args!(
+                    "atomic-load object={} order={order:?}{suffix}",
+                    unit.types.display_qualified(*object)
+                ),
+            );
+            dump_expression(output, unit, pointer, indent + 1);
+        }
+        FullTypedExpressionKind::AtomicStore {
+            pointer,
+            value,
+            object,
+            order,
+        } => {
+            line(
+                output,
+                indent,
+                format_args!(
+                    "atomic-store object={} order={order:?}{suffix}",
+                    unit.types.display_qualified(*object)
+                ),
+            );
+            dump_expression(output, unit, pointer, indent + 1);
+            dump_expression(output, unit, value, indent + 1);
+        }
         FullTypedExpressionKind::AtomicReadModifyWrite {
             operation,
             pointer,
@@ -644,13 +802,14 @@ fn dump_expression(
             replacement,
             object,
             return_boolean,
+            expected_is_pointer,
             order,
         } => {
             line(
                 output,
                 indent,
                 format_args!(
-                    "atomic-cmpxchg object={} return-boolean={return_boolean} order={order:?}{suffix}",
+                    "atomic-cmpxchg object={} return-boolean={return_boolean} expected-pointer={expected_is_pointer} order={order:?}{suffix}",
                     unit.types.display_qualified(*object)
                 ),
             );
@@ -658,14 +817,24 @@ fn dump_expression(
             dump_expression(output, unit, expected, indent + 1);
             dump_expression(output, unit, replacement, indent + 1);
         }
-        FullTypedExpressionKind::Sizeof { operand_ty, size } => line(
-            output,
-            indent,
-            format_args!(
-                "sizeof {} = {size}{suffix}",
-                unit.types.display_qualified(*operand_ty)
-            ),
-        ),
+        FullTypedExpressionKind::Sizeof {
+            operand,
+            operand_ty,
+            size,
+        } => {
+            line(
+                output,
+                indent,
+                format_args!(
+                    "sizeof {} = {}{suffix}",
+                    unit.types.display_qualified(*operand_ty),
+                    size.map_or_else(|| "runtime".to_owned(), |size| size.to_string())
+                ),
+            );
+            if let Some(operand) = operand {
+                dump_expression(output, unit, operand, indent + 1);
+            }
+        }
         FullTypedExpressionKind::Alignof { operand_ty, align } => line(
             output,
             indent,

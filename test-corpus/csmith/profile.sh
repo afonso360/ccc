@@ -32,6 +32,7 @@ generator_options=(
 )
 
 reference_optimizations=(-O0 -O2)
+subject_optimizations=(-O0 -O2 -Oz)
 
 default_cases=100
 default_start_seed=1
@@ -69,6 +70,7 @@ EOF
 reference_compilers = ["gcc", "clang"]
 reference_optimizations = ["-O0", "-O2"]
 target_compiler = "ccc"
+target_optimizations = ["-O0", "-O2", "-Oz"]
 output_oracle = "reference-consensus"
 eligibility = "gcc-and-clang-strict-c11"
 inconclusive_policy = "replace-joint-reference-timeout"

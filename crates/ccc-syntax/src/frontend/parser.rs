@@ -16,6 +16,41 @@ pub struct ParseError {
     pub code: &'static str,
     pub span: Span,
     pub message: String,
+    pub recovery: Option<ParseRecovery>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ParseRecovery {
+    InsertedToken {
+        spelling: &'static str,
+        before: Span,
+    },
+    SkippedTokens {
+        span: Span,
+    },
+    StoppedAtBoundary {
+        at: Span,
+    },
+}
+
+/// The observable result of a recovering parse.
+///
+/// Malformed external declarations and block items are omitted from `ast`.
+/// Independent items after a synchronization boundary remain available to
+/// semantic analysis, and every boundary contributes at most one diagnostic.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RecoveringParse {
+    pub ast: TranslationUnit,
+    pub diagnostics: Vec<ParseError>,
+    pub poisoned_bindings: Vec<PoisonedBinding>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PoisonedBinding {
+    pub name: String,
+    pub class: NameClass,
+    pub binding: Span,
+    pub scope_end: usize,
 }
 
 impl fmt::Display for ParseError {
@@ -40,6 +75,35 @@ pub fn parse_with_mode(
     items: &[FrontendItem],
     language_mode: LanguageMode,
 ) -> Result<TranslationUnit, ParseError> {
+    let recovered = parse_recovering_with_mode(items, language_mode);
+    match recovered.diagnostics.into_iter().next() {
+        Some(error) => Err(error),
+        None => Ok(recovered.ast),
+    }
+}
+
+/// Parses a translation unit while recovering at C declaration and statement
+/// boundaries. The returned AST is intentionally partial when diagnostics are
+/// present.
+pub fn parse_recovering(items: &[FrontendItem]) -> RecoveringParse {
+    parse_recovering_with_mode(items, LanguageMode::Gnu11)
+}
+
+pub fn parse_recovering_with_mode(
+    items: &[FrontendItem],
+    language_mode: LanguageMode,
+) -> RecoveringParse {
+    parse_recovering_with_mode_and_limit(items, language_mode, None)
+}
+
+/// Parses with an optional cap on newly produced parser errors. This is used by
+/// the driver to honor the remaining compilation-wide error budget without
+/// parsing the rest of a translation unit after the budget is exhausted.
+pub fn parse_recovering_with_mode_and_limit(
+    items: &[FrontendItem],
+    language_mode: LanguageMode,
+    error_limit: Option<usize>,
+) -> RecoveringParse {
     let items = items
         .iter()
         .filter_map(|item| match item {
@@ -54,8 +118,13 @@ pub fn parse_with_mode(
         names: NameClassEnv::new(),
         recursion_depth: 0,
         language_mode,
+        diagnostics: Vec::new(),
+        poisoned_bindings: Vec::new(),
+        recovered_error_bindings: Vec::new(),
+        recovering_function_definition: false,
+        error_limit,
     }
-    .translation_unit()
+    .translation_unit_recovering()
 }
 
 struct Parser<'a> {
@@ -64,12 +133,17 @@ struct Parser<'a> {
     names: NameClassEnv,
     recursion_depth: usize,
     language_mode: LanguageMode,
+    diagnostics: Vec<ParseError>,
+    poisoned_bindings: Vec<RecoveredNameBinding>,
+    recovered_error_bindings: Vec<RecoveredNameBinding>,
+    recovering_function_definition: bool,
+    error_limit: Option<usize>,
 }
 
 impl Parser<'_> {
-    fn translation_unit(mut self) -> Result<TranslationUnit, ParseError> {
+    fn translation_unit_recovering(mut self) -> RecoveringParse {
         let mut items = Vec::new();
-        while self.current_item().is_some() {
+        while self.current_item().is_some() && !self.error_limit_reached() {
             if let Some(pragma) = self.consume_pragma() {
                 items.push(ExternalItem::Pragma(pragma));
                 continue;
@@ -80,19 +154,70 @@ impl Parser<'_> {
                 continue;
             }
             if self.check_keyword(Keyword::StaticAssert) {
-                let assertion = self.static_assert()?;
-                items.push(ExternalItem::StaticAssert(Box::new(assertion)));
+                let checkpoint = self.names.checkpoint();
+                let start = self.position;
+                match self.static_assert() {
+                    Ok(assertion) => {
+                        self.names.commit(checkpoint);
+                        items.push(ExternalItem::StaticAssert(Box::new(assertion)));
+                    }
+                    Err(mut error) => {
+                        self.names.rollback(checkpoint);
+                        let insert_semicolon = error.message.contains("expected `;`");
+                        error.recovery = Some(self.synchronize(
+                            RecoveryBoundary::ExternalDeclaration,
+                            start,
+                            insert_semicolon,
+                        ));
+                        self.record_recovered_error(error);
+                        if self.error_limit_reached() {
+                            break;
+                        }
+                    }
+                }
                 continue;
             }
-            items.push(self.external_declaration()?);
+            self.recovering_function_definition = false;
+            let start = self.position;
+            match self.external_declaration() {
+                Ok(item) => items.push(item),
+                Err(mut error) => {
+                    let insert_semicolon = error.message.contains("expected `;`");
+                    let boundary = if self.recovering_function_definition {
+                        RecoveryBoundary::ExternalFunctionDefinition
+                    } else {
+                        RecoveryBoundary::ExternalDeclaration
+                    };
+                    error.recovery = Some(self.synchronize(boundary, start, insert_semicolon));
+                    self.record_recovered_error(error);
+                    if self.error_limit_reached() {
+                        break;
+                    }
+                }
+            }
         }
-        Ok(TranslationUnit {
-            items,
-            scope_events: self.names.events,
-        })
+        let poisoned_bindings = self
+            .poisoned_bindings
+            .iter()
+            .map(|binding| PoisonedBinding {
+                name: binding.name.clone(),
+                class: binding.class,
+                binding: binding.span,
+                scope_end: scope_end_for_binding(&self.names.events, binding),
+            })
+            .collect();
+        RecoveringParse {
+            ast: TranslationUnit {
+                items,
+                scope_events: self.names.events,
+            },
+            diagnostics: self.diagnostics,
+            poisoned_bindings,
+        }
     }
 
     fn external_declaration(&mut self) -> Result<ExternalItem, ParseError> {
+        self.recovered_error_bindings.clear();
         let checkpoint = self.names.checkpoint();
         let result = self.external_declaration_inner();
         match result {
@@ -101,6 +226,7 @@ impl Parser<'_> {
                 Ok(item)
             }
             Err(error) => {
+                self.recovered_error_bindings = self.names.bindings_since(&checkpoint);
                 self.names.rollback(checkpoint);
                 Err(error)
             }
@@ -129,6 +255,7 @@ impl Parser<'_> {
         if self.check_punctuator(Punctuator::LeftBrace)
             || (declarator.has_old_style_names() && self.starts_old_style_parameter_declaration())
         {
+            self.recovering_function_definition = true;
             let scope_span = declarator.span;
             self.names.enter_scope(ScopeKind::Function, scope_span);
             for name in declarator.old_style_names() {
@@ -181,6 +308,7 @@ impl Parser<'_> {
     }
 
     fn declaration(&mut self) -> Result<Declaration, ParseError> {
+        self.recovered_error_bindings.clear();
         let checkpoint = self.names.checkpoint();
         let result = self.declaration_inner();
         match result {
@@ -189,6 +317,7 @@ impl Parser<'_> {
                 Ok(declaration)
             }
             Err(error) => {
+                self.recovered_error_bindings = self.names.bindings_since(&checkpoint);
                 self.names.rollback(checkpoint);
                 Err(error)
             }
@@ -1034,12 +1163,53 @@ impl Parser<'_> {
             }
             if let Some(pragma) = self.consume_pragma() {
                 items.push(BlockItem::Pragma(pragma));
-            } else if self.check_keyword(Keyword::StaticAssert) {
-                items.push(BlockItem::StaticAssert(Box::new(self.static_assert()?)));
-            } else if self.starts_declaration() {
-                items.push(BlockItem::Declaration(self.declaration()?));
             } else {
-                items.push(BlockItem::Statement(Box::new(self.statement()?)));
+                let declaration = self.starts_declaration();
+                let checkpoint = self.names.checkpoint();
+                let start = self.position;
+                let parsed = if self.check_keyword(Keyword::StaticAssert) {
+                    self.static_assert()
+                        .map(|assertion| BlockItem::StaticAssert(Box::new(assertion)))
+                } else if declaration {
+                    self.declaration().map(BlockItem::Declaration)
+                } else {
+                    self.statement()
+                        .map(|statement| BlockItem::Statement(Box::new(statement)))
+                };
+                match parsed {
+                    Ok(item) => {
+                        self.names.commit(checkpoint);
+                        items.push(item);
+                    }
+                    Err(mut error) => {
+                        self.names.rollback(checkpoint);
+                        if !declaration {
+                            self.recovered_error_bindings.clear();
+                        }
+                        let insert_semicolon = error.message.contains("expected `;`");
+                        error.recovery = Some(self.synchronize(
+                            if declaration {
+                                RecoveryBoundary::BlockDeclaration
+                            } else {
+                                RecoveryBoundary::Statement
+                            },
+                            start,
+                            insert_semicolon,
+                        ));
+                        self.record_recovered_error(error);
+                        if self.error_limit_reached() {
+                            let end = self.current_item().map_or(left.span, ParseItem::span);
+                            self.position = self.items.len();
+                            if create_scope {
+                                self.names.leave_scope(end);
+                            }
+                            return Ok(Statement {
+                                kind: StatementKind::Compound(items),
+                                span: span_through(left.span, end),
+                            });
+                        }
+                    }
+                }
             }
         }
         let right = self.expect_punctuator(Punctuator::RightBrace, "expected `}` after block")?;
@@ -1151,6 +1321,9 @@ impl Parser<'_> {
         if let Some(keyword) = self.consume_keyword(Keyword::For) {
             return self.for_statement(keyword.span);
         }
+        if self.check_asm_keyword() {
+            return self.asm_statement();
+        }
         if let Some(keyword) = self.consume_keyword(Keyword::Goto) {
             if self.language_mode == LanguageMode::Gnu11
                 && self.consume_punctuator(Punctuator::Star).is_some()
@@ -1213,6 +1386,162 @@ impl Parser<'_> {
         Ok(Statement {
             span: span_through(expression.span, semicolon.span),
             kind: StatementKind::Expression(Some(Box::new(expression))),
+        })
+    }
+
+    fn asm_statement(&mut self) -> Result<Statement, ParseError> {
+        let keyword = self
+            .consume_asm_keyword()
+            .expect("caller checked the asm keyword");
+        let mut qualifiers = Vec::new();
+        loop {
+            let (kind, token) = if let Some(token) = self.consume_keyword(Keyword::Volatile) {
+                (AsmQualifierKind::Volatile, token)
+            } else if let Some(token) = self.consume_keyword(Keyword::Inline) {
+                (AsmQualifierKind::Inline, token)
+            } else if let Some(token) = self.consume_keyword(Keyword::Goto) {
+                (AsmQualifierKind::Goto, token)
+            } else {
+                break;
+            };
+            qualifiers.push(AsmQualifier {
+                kind,
+                spelling: token.spelling,
+                span: token.span,
+            });
+        }
+        self.expect_punctuator(Punctuator::LeftParen, "expected `(` after `asm`")?;
+        let template = self.asm_string("expected a string literal assembly template")?;
+        let mut outputs = Vec::new();
+        let mut inputs = Vec::new();
+        let mut clobbers = Vec::new();
+        let mut goto_labels = Vec::new();
+        let mut colon_group_count = 0_u8;
+        if self.consume_punctuator(Punctuator::Colon).is_some() {
+            colon_group_count = 1;
+            outputs = self.asm_operands()?;
+            if self.consume_punctuator(Punctuator::Colon).is_some() {
+                colon_group_count = 2;
+                inputs = self.asm_operands()?;
+                if self.consume_punctuator(Punctuator::Colon).is_some() {
+                    colon_group_count = 3;
+                    clobbers = self.asm_strings()?;
+                    if self.consume_punctuator(Punctuator::Colon).is_some() {
+                        colon_group_count = 4;
+                        goto_labels = self.asm_goto_labels()?;
+                    }
+                }
+            }
+        }
+        let right = self.expect_punctuator(
+            Punctuator::RightParen,
+            "expected `)` after assembly operands",
+        )?;
+        let semicolon = self.expect_punctuator(
+            Punctuator::Semicolon,
+            "expected `;` after assembly statement",
+        )?;
+        let asm = AsmStatement {
+            keyword_spelling: keyword.spelling,
+            qualifiers,
+            template_spelling: template.spelling.clone(),
+            template: template.literal,
+            outputs,
+            inputs,
+            clobbers,
+            goto_labels,
+            colon_group_count,
+            span: span_through(keyword.span, right.span),
+        };
+        Ok(Statement {
+            kind: StatementKind::Asm(Box::new(asm)),
+            span: span_through(keyword.span, semicolon.span),
+        })
+    }
+
+    fn asm_operands(&mut self) -> Result<Vec<AsmOperand>, ParseError> {
+        let mut operands = Vec::new();
+        if self.check_punctuator(Punctuator::Colon) || self.check_punctuator(Punctuator::RightParen)
+        {
+            return Ok(operands);
+        }
+        loop {
+            let start = self.current_span()?;
+            let symbolic_name = if self.consume_punctuator(Punctuator::LeftBracket).is_some() {
+                let name = self.identifier()?;
+                self.expect_punctuator(
+                    Punctuator::RightBracket,
+                    "expected `]` after symbolic assembly operand name",
+                )?;
+                Some(name)
+            } else {
+                None
+            };
+            let constraint = self.asm_string("expected an assembly operand constraint")?;
+            self.expect_punctuator(
+                Punctuator::LeftParen,
+                "expected `(` before assembly operand expression",
+            )?;
+            let expression = self.expression()?;
+            let right = self.expect_punctuator(
+                Punctuator::RightParen,
+                "expected `)` after assembly operand expression",
+            )?;
+            operands.push(AsmOperand {
+                symbolic_name,
+                constraint,
+                expression: Box::new(expression),
+                span: span_through(start, right.span),
+            });
+            if self.consume_punctuator(Punctuator::Comma).is_none() {
+                break;
+            }
+        }
+        Ok(operands)
+    }
+
+    fn asm_strings(&mut self) -> Result<Vec<AsmString>, ParseError> {
+        let mut strings = Vec::new();
+        if self.check_punctuator(Punctuator::Colon) || self.check_punctuator(Punctuator::RightParen)
+        {
+            return Ok(strings);
+        }
+        loop {
+            strings.push(self.asm_string("expected an assembly clobber string")?);
+            if self.consume_punctuator(Punctuator::Comma).is_none() {
+                break;
+            }
+        }
+        Ok(strings)
+    }
+
+    fn asm_goto_labels(&mut self) -> Result<Vec<Identifier>, ParseError> {
+        let mut labels = Vec::new();
+        if self.check_punctuator(Punctuator::RightParen) {
+            return Ok(labels);
+        }
+        loop {
+            labels.push(self.identifier()?);
+            if self.consume_punctuator(Punctuator::Comma).is_none() {
+                break;
+            }
+        }
+        Ok(labels)
+    }
+
+    fn asm_string(&mut self, message: &str) -> Result<AsmString, ParseError> {
+        let token = self
+            .current_token()
+            .ok_or_else(|| self.error_eof(message))?
+            .clone();
+        let TokenKind::String(literal) = token.kind else {
+            return Err(self.error_at(token.span, message));
+        };
+        self.position += 1;
+        Ok(AsmString {
+            spelling: token.spelling,
+            literal,
+            span: token.span,
         })
     }
 
@@ -1591,6 +1920,29 @@ impl Parser<'_> {
         }
         if token.spelling == "__sync_synchronize" {
             return self.builtin_sync_synchronize();
+        }
+        let atomic_operation = match token.spelling.as_str() {
+            "__atomic_load_n" => Some(AtomicBuiltinOperation::Load),
+            "__atomic_store_n" => Some(AtomicBuiltinOperation::Store),
+            "__atomic_exchange_n" => Some(AtomicBuiltinOperation::Exchange),
+            "__atomic_fetch_add" => Some(AtomicBuiltinOperation::FetchAdd),
+            "__atomic_fetch_sub" => Some(AtomicBuiltinOperation::FetchSubtract),
+            "__atomic_fetch_and" => Some(AtomicBuiltinOperation::FetchAnd),
+            "__atomic_fetch_or" => Some(AtomicBuiltinOperation::FetchOr),
+            "__atomic_fetch_xor" => Some(AtomicBuiltinOperation::FetchXor),
+            "__atomic_add_fetch" => Some(AtomicBuiltinOperation::AddFetch),
+            "__atomic_sub_fetch" => Some(AtomicBuiltinOperation::SubtractFetch),
+            "__atomic_and_fetch" => Some(AtomicBuiltinOperation::AndFetch),
+            "__atomic_or_fetch" => Some(AtomicBuiltinOperation::OrFetch),
+            "__atomic_xor_fetch" => Some(AtomicBuiltinOperation::XorFetch),
+            "__atomic_compare_exchange_n" => Some(AtomicBuiltinOperation::CompareExchange),
+            "__ccc_atomic_is_lock_free" => Some(AtomicBuiltinOperation::IsLockFree),
+            "__atomic_thread_fence" => Some(AtomicBuiltinOperation::ThreadFence),
+            "__atomic_signal_fence" => Some(AtomicBuiltinOperation::SignalFence),
+            _ => None,
+        };
+        if let Some(operation) = atomic_operation {
+            return self.builtin_atomic_operation(operation);
         }
         match token.kind {
             TokenKind::Identifier => {
@@ -2104,6 +2456,52 @@ impl Parser<'_> {
         })
     }
 
+    fn builtin_atomic_operation(
+        &mut self,
+        operation: AtomicBuiltinOperation,
+    ) -> Result<Expression, ParseError> {
+        let builtin = self
+            .current_token()
+            .expect("caller checked builtin")
+            .clone();
+        self.position += 1;
+        self.expect_punctuator(
+            Punctuator::LeftParen,
+            &format!("expected `(` after `{}`", operation.spelling()),
+        )?;
+        let mut arguments = Vec::new();
+        while !self.check_punctuator(Punctuator::RightParen) {
+            arguments.push(self.assignment_expression()?);
+            if self.consume_punctuator(Punctuator::Comma).is_none() {
+                break;
+            }
+            if self.check_punctuator(Punctuator::RightParen) {
+                return Err(self.error_current(&format!(
+                    "trailing `,` is not allowed in `{}` arguments",
+                    operation.spelling()
+                )));
+            }
+        }
+        if arguments.len() != operation.arity() {
+            return Err(self.error_current(&format!(
+                "`{}` requires exactly {} arguments",
+                operation.spelling(),
+                operation.arity()
+            )));
+        }
+        let right = self.expect_punctuator(
+            Punctuator::RightParen,
+            &format!("expected `)` after `{}` arguments", operation.spelling()),
+        )?;
+        Ok(Expression {
+            kind: ExpressionKind::BuiltinAtomicOperation {
+                operation,
+                arguments,
+            },
+            span: span_through(builtin.span, right.span),
+        })
+    }
+
     fn sync_builtin_argument(&mut self, protected: bool) -> Result<Expression, ParseError> {
         if protected
             && self
@@ -2515,6 +2913,7 @@ impl Parser<'_> {
             code: "CCC1020",
             span: Span::with_origin(last.file, last.end, last.end, last.origin),
             message: message.to_owned(),
+            recovery: None,
         }
     }
 
@@ -2523,8 +2922,269 @@ impl Parser<'_> {
             code: "CCC1020",
             span,
             message: message.to_owned(),
+            recovery: None,
         }
     }
+
+    fn record_recovered_error(&mut self, error: ParseError) {
+        if self.error_limit_reached() {
+            return;
+        }
+        self.poisoned_bindings
+            .append(&mut self.recovered_error_bindings);
+        let duplicate = self.diagnostics.last().is_some_and(|previous| {
+            previous.code == error.code
+                && previous.span == error.span
+                && previous.message == error.message
+        });
+        if !duplicate {
+            self.diagnostics.push(error);
+        }
+    }
+
+    fn error_limit_reached(&self) -> bool {
+        self.error_limit
+            .is_some_and(|limit| self.diagnostics.len() >= limit)
+    }
+
+    fn synchronize(
+        &mut self,
+        boundary: RecoveryBoundary,
+        start: usize,
+        insert_semicolon: bool,
+    ) -> ParseRecovery {
+        let (mut braces, mut parentheses, mut brackets) =
+            self.delimiter_depths(start, self.position);
+        if insert_semicolon
+            && braces == 0
+            && parentheses == 0
+            && brackets == 0
+            && self.position > start
+            && self.is_recovery_start(boundary)
+        {
+            return ParseRecovery::InsertedToken {
+                spelling: ";",
+                before: self
+                    .current_item()
+                    .map_or_else(|| self.previous_span(), ParseItem::span),
+            };
+        }
+        let skipped_start = self.current_item().map(ParseItem::span);
+
+        while let Some(item) = self.current_item() {
+            let ParseItem::Token(token) = item else {
+                if braces == 0 && parentheses == 0 && brackets == 0 {
+                    break;
+                }
+                self.position += 1;
+                continue;
+            };
+            let TokenKind::Punctuator(punctuator) = token.kind else {
+                self.position += 1;
+                continue;
+            };
+            match punctuator {
+                Punctuator::LeftBrace => {
+                    braces += 1;
+                    self.position += 1;
+                }
+                Punctuator::RightBrace if braces != 0 => {
+                    braces -= 1;
+                    self.position += 1;
+                    if boundary == RecoveryBoundary::ExternalFunctionDefinition
+                        && braces == 0
+                        && parentheses == 0
+                        && brackets == 0
+                    {
+                        break;
+                    }
+                }
+                Punctuator::RightBrace => {
+                    if matches!(
+                        boundary,
+                        RecoveryBoundary::ExternalDeclaration
+                            | RecoveryBoundary::ExternalFunctionDefinition
+                    ) {
+                        self.position += 1;
+                    }
+                    break;
+                }
+                Punctuator::LeftParen => {
+                    parentheses += 1;
+                    self.position += 1;
+                }
+                Punctuator::RightParen if parentheses != 0 => {
+                    parentheses -= 1;
+                    self.position += 1;
+                }
+                Punctuator::LeftBracket => {
+                    brackets += 1;
+                    self.position += 1;
+                }
+                Punctuator::RightBracket if brackets != 0 => {
+                    brackets -= 1;
+                    self.position += 1;
+                }
+                Punctuator::Semicolon if braces == 0 && parentheses == 0 && brackets == 0 => {
+                    self.position += 1;
+                    break;
+                }
+                _ => self.position += 1,
+            }
+        }
+
+        // A malformed item must never strand the recovering loop on the token
+        // at which it started. A closing brace is deliberately retained for
+        // the enclosing compound statement.
+        if self.position == start
+            && (matches!(
+                boundary,
+                RecoveryBoundary::ExternalDeclaration
+                    | RecoveryBoundary::ExternalFunctionDefinition
+            ) || !self.check_punctuator(Punctuator::RightBrace))
+            && self.current_item().is_some()
+        {
+            self.position += 1;
+        }
+        if let Some(skipped_start) = skipped_start
+            && self.position > start
+        {
+            return ParseRecovery::SkippedTokens {
+                span: span_through(skipped_start, self.previous_span()),
+            };
+        }
+        ParseRecovery::StoppedAtBoundary {
+            at: self
+                .current_item()
+                .map_or_else(|| self.previous_span(), ParseItem::span),
+        }
+    }
+
+    fn is_recovery_start(&self, boundary: RecoveryBoundary) -> bool {
+        if self.check_punctuator(Punctuator::RightBrace) || self.current_item().is_none() {
+            return true;
+        }
+        if matches!(self.current_item(), Some(ParseItem::Pragma(_))) {
+            return true;
+        }
+        match boundary {
+            RecoveryBoundary::ExternalDeclaration
+            | RecoveryBoundary::ExternalFunctionDefinition => {
+                self.starts_declaration() || self.check_keyword(Keyword::StaticAssert)
+            }
+            RecoveryBoundary::BlockDeclaration => self.starts_block_item(),
+            RecoveryBoundary::Statement => self.starts_block_item(),
+        }
+    }
+
+    fn starts_block_item(&self) -> bool {
+        self.check_keyword(Keyword::StaticAssert)
+            || self.starts_declaration()
+            || self.starts_statement()
+    }
+
+    fn starts_statement(&self) -> bool {
+        self.check_punctuator(Punctuator::LeftBrace)
+            || self.check_punctuator(Punctuator::Semicolon)
+            || self.starts_expression()
+            || matches!(
+                self.current_token().map(|token| &token.kind),
+                Some(TokenKind::Keyword(
+                    Keyword::Case
+                        | Keyword::Default
+                        | Keyword::If
+                        | Keyword::Switch
+                        | Keyword::While
+                        | Keyword::Do
+                        | Keyword::For
+                        | Keyword::Goto
+                        | Keyword::Continue
+                        | Keyword::Break
+                        | Keyword::Return
+                        | Keyword::Asm
+                ))
+            )
+    }
+
+    fn starts_expression(&self) -> bool {
+        matches!(
+            self.current_token().map(|token| &token.kind),
+            Some(
+                TokenKind::Identifier
+                    | TokenKind::Integer(_)
+                    | TokenKind::Floating(_)
+                    | TokenKind::Character(_)
+                    | TokenKind::String(_)
+                    | TokenKind::Keyword(
+                        Keyword::Sizeof | Keyword::Alignof | Keyword::Generic | Keyword::Extension
+                    )
+                    | TokenKind::Punctuator(
+                        Punctuator::LeftParen
+                            | Punctuator::PlusPlus
+                            | Punctuator::MinusMinus
+                            | Punctuator::Amp
+                            | Punctuator::AmpAmp
+                            | Punctuator::Star
+                            | Punctuator::Plus
+                            | Punctuator::Minus
+                            | Punctuator::Tilde
+                            | Punctuator::Bang
+                    )
+            )
+        )
+    }
+
+    fn delimiter_depths(&self, start: usize, end: usize) -> (usize, usize, usize) {
+        let mut braces = 0_usize;
+        let mut parentheses = 0_usize;
+        let mut brackets = 0_usize;
+        for item in &self.items[start..end.min(self.items.len())] {
+            let ParseItem::Token(token) = item else {
+                continue;
+            };
+            match token.kind {
+                TokenKind::Punctuator(Punctuator::LeftBrace) => braces += 1,
+                TokenKind::Punctuator(Punctuator::RightBrace) => {
+                    braces = braces.saturating_sub(1);
+                }
+                TokenKind::Punctuator(Punctuator::LeftParen) => parentheses += 1,
+                TokenKind::Punctuator(Punctuator::RightParen) => {
+                    parentheses = parentheses.saturating_sub(1);
+                }
+                TokenKind::Punctuator(Punctuator::LeftBracket) => brackets += 1,
+                TokenKind::Punctuator(Punctuator::RightBracket) => {
+                    brackets = brackets.saturating_sub(1);
+                }
+                _ => {}
+            }
+        }
+        (braces, parentheses, brackets)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryBoundary {
+    ExternalDeclaration,
+    ExternalFunctionDefinition,
+    BlockDeclaration,
+    Statement,
+}
+
+fn scope_end_for_binding(events: &[ScopeEvent], binding: &RecoveredNameBinding) -> usize {
+    if binding.depth == 0 {
+        return usize::MAX;
+    }
+    events
+        .iter()
+        .filter(|event| {
+            matches!(event.kind, ScopeEventKind::Leave(_))
+                && event.depth == binding.depth
+                && event.span.file == binding.span.file
+                && event.span.end >= binding.span.end
+        })
+        .map(|event| event.span.end)
+        .min()
+        .unwrap_or(usize::MAX)
 }
 
 impl ParseItem<'_> {

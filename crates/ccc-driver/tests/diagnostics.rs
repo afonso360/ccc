@@ -61,18 +61,6 @@ fn rejected_translations_match_diagnostic_goldens_and_emit_no_object() {
             ),
         },
         Case {
-            name: "long-double-operation",
-            expected: include_str!(
-                "../../../tests/diagnostics/goldens/long-double-operation.stderr"
-            ),
-        },
-        Case {
-            name: "long-double-boundary",
-            expected: include_str!(
-                "../../../tests/diagnostics/goldens/long-double-boundary.stderr"
-            ),
-        },
-        Case {
             name: "invalid-va-start",
             expected: include_str!("../../../tests/diagnostics/goldens/invalid-va-start.stderr"),
         },
@@ -105,10 +93,6 @@ fn rejected_translations_match_diagnostic_goldens_and_emit_no_object() {
             expected: include_str!(
                 "../../../tests/diagnostics/goldens/variably-modified-va-arg.stderr"
             ),
-        },
-        Case {
-            name: "atomic-access",
-            expected: include_str!("../../../tests/diagnostics/goldens/atomic-access.stderr"),
         },
         Case {
             name: "wrong-call-arity",
@@ -170,6 +154,451 @@ fn rejected_translations_match_diagnostic_goldens_and_emit_no_object() {
     }
 }
 
+#[test]
+fn binary128_long_double_rejections_match_diagnostic_goldens() {
+    let cases = [
+        Case {
+            name: "long-double-operation",
+            expected: include_str!(
+                "../../../tests/diagnostics/goldens/long-double-operation.stderr"
+            ),
+        },
+        Case {
+            name: "long-double-boundary",
+            expected: include_str!(
+                "../../../tests/diagnostics/goldens/long-double-boundary.stderr"
+            ),
+        },
+    ];
+    let repository = repository();
+
+    for case in cases {
+        let directory = temporary_directory(case.name);
+        let output = directory.join(format!("{}.o", case.name));
+        let input = format!("tests/diagnostics/cases/{}.c", case.name);
+        let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+            .current_dir(&repository)
+            .env("LC_ALL", "C")
+            .env("LANG", "C")
+            .args([
+                "--target=aarch64-unknown-linux-gnu",
+                "-nostdinc",
+                "-c",
+                &input,
+                "-o",
+            ])
+            .arg(&output)
+            .output()
+            .unwrap();
+
+        assert!(
+            !result.status.success(),
+            "{} unexpectedly compiled successfully",
+            case.name
+        );
+        assert!(
+            result.stdout.is_empty(),
+            "{} wrote stdout:\n{}",
+            case.name,
+            String::from_utf8_lossy(&result.stdout)
+        );
+        assert_eq!(
+            String::from_utf8(result.stderr).unwrap(),
+            case.expected,
+            "{}",
+            case.name
+        );
+        assert!(
+            !output.exists(),
+            "{} emitted an object despite its diagnostic",
+            case.name
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
+fn inline_assembly_near_misses_fail_closed_before_object_emission() {
+    let cases = [
+        ("unknown-template", "void f(void) { asm(\"pause\"); }"),
+        (
+            "unsupported-alignment",
+            "void f(void) { asm(\".p2align 7\"); }",
+        ),
+        (
+            "incomplete-cpuid-clobbers",
+            "void f(unsigned value) { asm(\"cpuid\" : \"=a\"(value) : \"a\"(0) : \"ebx\", \"ecx\"); }",
+        ),
+        (
+            "incomplete-rdtsc-outputs",
+            "void f(unsigned value) { asm volatile(\"rdtsc\" : \"=a\"(value)); }",
+        ),
+        (
+            "wrong-atomic-width",
+            "void f(long *field, int value) { asm volatile(\"lock; xchgq %0, %1\" : \"+q\"(value), \"+m\"(*field)); }",
+        ),
+        (
+            "asm-goto",
+            "void f(void) { asm goto(\"\" : : : : target); target: ; }",
+        ),
+        (
+            "symbolic-operand",
+            "void f(unsigned value) { asm(\"\" : [value] \"+r\"(value)); }",
+        ),
+    ];
+
+    for (name, text) in cases {
+        let directory = temporary_directory(name);
+        let source = directory.join(format!("{name}.c"));
+        let object = directory.join(format!("{name}.o"));
+        fs::write(&source, text).unwrap();
+        let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+            .arg("-c")
+            .arg(&source)
+            .arg("-o")
+            .arg(&object)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(!result.status.success(), "{name} unexpectedly compiled");
+        assert!(stderr.contains("CCC2454"), "{name}: {stderr}");
+        assert!(!object.exists(), "{name} emitted an object after rejection");
+        fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+#[test]
+fn parser_recovery_reports_independent_errors_and_preserves_publications() {
+    let repository = repository();
+    let directory = temporary_directory("parser-recovery");
+    let object = directory.join("recovered.o");
+    let dependencies = directory.join("recovered.d");
+    fs::write(&object, b"existing object").unwrap();
+    fs::write(&dependencies, b"existing dependencies").unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+        .current_dir(&repository)
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .args(["-nostdinc", "-ferror-limit=0", "-MD", "-MF"])
+        .arg(&dependencies)
+        .args(["-c", "tests/diagnostics/cases/parser-recovery.c", "-o"])
+        .arg(&object)
+        .output()
+        .unwrap();
+
+    assert!(!result.status.success());
+    assert!(result.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(result.stderr).unwrap(),
+        include_str!("../../../tests/diagnostics/goldens/parser-recovery.stderr")
+    );
+    assert_eq!(fs::read(&object).unwrap(), b"existing object");
+    assert_eq!(fs::read(&dependencies).unwrap(), b"existing dependencies");
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn error_limit_is_shared_across_preprocessing_parsing_and_semantics() {
+    let repository = repository();
+    let run = |limit: usize| {
+        Command::new(env!("CARGO_BIN_EXE_ccc"))
+            .current_dir(&repository)
+            .env("LC_ALL", "C")
+            .env("LANG", "C")
+            .args([
+                "-nostdinc",
+                "-fsyntax-only",
+                &format!("-ferror-limit={limit}"),
+                "tests/diagnostics/cases/cross-stage-limit.c",
+            ])
+            .output()
+            .unwrap()
+    };
+
+    let limited = run(3);
+    let limited_stderr = String::from_utf8(limited.stderr).unwrap();
+    assert!(!limited.status.success());
+    assert_eq!(limited_stderr.matches("error[CCC1314]").count(), 1);
+    assert_eq!(limited_stderr.matches("error[CCC1020]").count(), 2);
+    assert_eq!(limited_stderr.matches("error[CCC0000]").count(), 1);
+    assert!(!limited_stderr.contains("CCC2274"), "{limited_stderr}");
+
+    let unlimited = run(0);
+    let unlimited_stderr = String::from_utf8(unlimited.stderr).unwrap();
+    assert!(!unlimited.status.success());
+    assert_eq!(unlimited_stderr.matches("error[CCC1314]").count(), 1);
+    assert_eq!(unlimited_stderr.matches("error[CCC1020]").count(), 2);
+    assert_eq!(unlimited_stderr.matches("error[CCC2274]").count(), 1);
+    assert!(!unlimited_stderr.contains("CCC0000"), "{unlimited_stderr}");
+}
+
+#[test]
+fn json_diagnostics_match_the_versioned_deterministic_golden() {
+    let repository = repository();
+    let run = || {
+        Command::new(env!("CARGO_BIN_EXE_ccc"))
+            .current_dir(&repository)
+            .env("LC_ALL", "C")
+            .env("LANG", "C")
+            .args([
+                "-nostdinc",
+                "-fsyntax-only",
+                "-ferror-limit=0",
+                "-fdiagnostics-format=json",
+                "tests/diagnostics/cases/parser-recovery.c",
+            ])
+            .output()
+            .unwrap()
+    };
+
+    let first = run();
+    let second = run();
+    assert!(!first.status.success());
+    assert!(first.stdout.is_empty());
+    assert_eq!(first.stderr, second.stderr);
+    assert_eq!(
+        String::from_utf8(first.stderr).unwrap(),
+        include_str!("../../../tests/diagnostics/goldens/parser-recovery.json")
+    );
+}
+
+#[test]
+fn json_diagnostics_carry_include_and_macro_provenance() {
+    let repository = repository();
+    let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+        .current_dir(&repository)
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .args([
+            "-nostdinc",
+            "-fsyntax-only",
+            "-ferror-limit=0",
+            "-fdiagnostics-format=json",
+            "-Itests/diagnostics/cases",
+            "tests/diagnostics/cases/json-trace.c",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(!result.status.success());
+    let stderr = String::from_utf8(result.stderr).unwrap();
+    assert!(stderr.starts_with("{\"schema_version\":1,\"diagnostics\":["));
+    assert!(stderr.contains("\"code\":\"CCC1314\""), "{stderr}");
+    assert!(stderr.contains("\"code\":\"CCC1020\""), "{stderr}");
+    assert!(stderr.contains("\"include_trace\":{\"truncated\":false,\"frames\":[{"));
+    assert!(stderr.contains("\"kind\":\"macro_expansion\""), "{stderr}");
+    assert!(stderr.contains("\"name\":\"BROKEN_TOKEN\""), "{stderr}");
+    assert!(
+        stderr.contains("tests/diagnostics/cases/json-trace.h"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn json_mode_formats_command_line_parse_errors() {
+    let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+        .args(["-fdiagnostics-format=json", "--unsupported-for-json-test"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(result.stderr).unwrap();
+
+    assert!(!result.status.success());
+    assert!(stderr.starts_with("{\"schema_version\":1,\"diagnostics\":["));
+    assert_eq!(stderr.matches("\"schema_version\":1").count(), 1);
+    assert!(stderr.contains("\"code\":\"CCC6000\""), "{stderr}");
+    assert!(stderr.contains("\"category\":\"driver\""), "{stderr}");
+    assert!(stderr.contains("unsupported option"), "{stderr}");
+    assert!(stderr.ends_with("]}\n"), "{stderr}");
+    assert!(!stderr.contains("\nccc:"), "{stderr}");
+}
+
+#[test]
+fn recovery_poison_suppresses_only_dependent_semantic_errors() {
+    let directory = temporary_directory("recovery-poison");
+    let source = directory.join("recovery-poison.c");
+    fs::write(
+        &source,
+        "int first(void) { int poisoned = ; return poisoned + independent; }\n\
+         int second(void) { { int scoped = ; } return scoped; }\n",
+    )
+    .unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+        .args(["-nostdinc", "-fsyntax-only", "-ferror-limit=0"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(result.stderr).unwrap();
+
+    assert!(!result.status.success());
+    assert_eq!(stderr.matches("error[CCC1020]").count(), 2, "{stderr}");
+    assert!(
+        stderr.contains("undeclared identifier `independent`"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("undeclared identifier `scoped`"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("undeclared identifier `poisoned`"),
+        "{stderr}"
+    );
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn json_mode_composes_driver_and_frontend_diagnostics_once() {
+    let repository = repository();
+    let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+        .current_dir(&repository)
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .args([
+            "-nostdinc",
+            "-E",
+            "-fdiagnostics-format=json",
+            "-fstack-protector-strong",
+            "tests/preprocessing/diagnostics/warning.c",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(result.stderr).unwrap();
+
+    assert!(result.status.success(), "{stderr}");
+    assert_eq!(
+        stderr.matches("\"schema_version\":1").count(),
+        1,
+        "{stderr}"
+    );
+    assert!(stderr.starts_with("{\"schema_version\":1,\"diagnostics\":["));
+    assert!(stderr.ends_with("]}\n"), "{stderr}");
+    assert!(stderr.contains("\"code\":\"CCC6009\""), "{stderr}");
+    assert!(stderr.contains("\"code\":\"CCC1315\""), "{stderr}");
+    assert!(!stderr.contains("\nccc:"), "{stderr}");
+}
+
+#[test]
+fn json_mode_composes_publication_failures_with_prior_warnings() {
+    let repository = repository();
+    let directory = temporary_directory("json-publication");
+    let missing = directory.join("missing").join("output.d");
+    let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+        .current_dir(&repository)
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .args(["-nostdinc", "-E", "-fdiagnostics-format=json", "-MD", "-MF"])
+        .arg(&missing)
+        .arg("tests/preprocessing/diagnostics/warning.c")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(result.stderr).unwrap();
+
+    assert!(!result.status.success());
+    assert_eq!(
+        stderr.matches("\"schema_version\":1").count(),
+        1,
+        "{stderr}"
+    );
+    assert!(stderr.ends_with("]}\n"), "{stderr}");
+    assert!(stderr.contains("\"code\":\"CCC1315\""), "{stderr}");
+    assert!(stderr.contains("\"code\":\"CCC6000\""), "{stderr}");
+    assert!(!stderr.contains("\nccc:"), "{stderr}");
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn json_mode_composes_diagnostics_across_multiple_inputs() {
+    let directory = temporary_directory("json-multiple-inputs");
+    fs::write(
+        directory.join("first.c"),
+        "#warning first input\nint first;\n",
+    )
+    .unwrap();
+    fs::write(
+        directory.join("second.c"),
+        "#warning second input\nint second = ;\n",
+    )
+    .unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+        .current_dir(&directory)
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .args([
+            "-nostdinc",
+            "-c",
+            "-fdiagnostics-format=json",
+            "first.c",
+            "second.c",
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(result.stderr).unwrap();
+
+    assert!(!result.status.success());
+    assert_eq!(
+        stderr.matches("\"schema_version\":1").count(),
+        1,
+        "{stderr}"
+    );
+    assert_eq!(
+        stderr.matches("\"code\":\"CCC1315\"").count(),
+        2,
+        "{stderr}"
+    );
+    assert!(stderr.contains("\"code\":\"CCC1020\""), "{stderr}");
+    assert!(stderr.ends_with("]}\n"), "{stderr}");
+    assert!(!stderr.contains("\nccc:"), "{stderr}");
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn preprocessing_stops_when_the_shared_error_budget_is_exhausted() {
+    let directory = temporary_directory("preprocessor-error-budget");
+    let source = directory.join("budget.c");
+    fs::write(
+        &source,
+        "#error stop here\n#include \"must-not-be-opened.h\"\nint malformed = ;\n",
+    )
+    .unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+        .args(["-nostdinc", "-fsyntax-only", "-ferror-limit=1"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(result.stderr).unwrap();
+
+    assert!(!result.status.success());
+    assert_eq!(stderr.matches("error[CCC1314]").count(), 1, "{stderr}");
+    assert_eq!(stderr.matches("error[CCC0000]").count(), 1, "{stderr}");
+    assert!(!stderr.contains("must-not-be-opened"), "{stderr}");
+    assert!(!stderr.contains("CCC1020"), "{stderr}");
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn failed_assembly_preserves_an_existing_object() {
+    let directory = temporary_directory("assembly-publication");
+    let source = directory.join("invalid.s");
+    let object = directory.join("invalid.o");
+    fs::write(&source, ".definitely_not_a_real_directive\n").unwrap();
+    fs::write(&object, b"existing object").unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+        .args(["-c", "-x", "assembler"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&object)
+        .output()
+        .unwrap();
+
+    assert!(!result.status.success());
+    assert_eq!(fs::read(&object).unwrap(), b"existing object");
+    fs::remove_dir_all(directory).unwrap();
+}
+
 #[cfg(any(
     all(target_arch = "x86_64", target_os = "linux"),
     all(target_arch = "aarch64", target_os = "linux"),
@@ -177,7 +606,7 @@ fn rejected_translations_match_diagnostic_goldens_and_emit_no_object() {
     all(target_arch = "aarch64", target_os = "macos")
 ))]
 #[test]
-fn float16_value_paths_fail_before_object_publication() {
+fn float16_value_paths_publish_objects() {
     for (name, source) in [
         ("initialization", "_Float16 value = 1.0;\n"),
         (
@@ -211,16 +640,14 @@ fn float16_value_paths_fail_before_object_publication() {
             .output()
             .unwrap();
 
-        assert!(!result.status.success(), "{name} unexpectedly compiled");
-        assert!(result.stdout.is_empty(), "{name} wrote stdout");
-        let stderr = String::from_utf8(result.stderr).unwrap();
-        assert_eq!(
-            stderr.matches("error[CCC3518]").count(),
-            1,
-            "{name}: {stderr}"
+        assert!(
+            result.status.success(),
+            "{name} did not compile: {}",
+            String::from_utf8_lossy(&result.stderr)
         );
-        assert!(stderr.contains("_Float16"), "{name}: {stderr}");
-        assert!(!output.exists(), "{name} emitted an object");
+        assert!(result.stdout.is_empty(), "{name} wrote stdout");
+        assert!(result.stderr.is_empty(), "{name} wrote stderr");
+        assert!(output.exists(), "{name} did not emit an object");
         fs::remove_dir_all(directory).unwrap();
     }
 }

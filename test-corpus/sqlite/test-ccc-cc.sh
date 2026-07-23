@@ -74,7 +74,6 @@ export CCC_SQLITE_SOURCE_ROOT="$source_directory"
 export CCC_SQLITE_GENERATED_SOURCE_ROOT="$generated_directory"
 export CCC_SQLITE_SOURCE_LOG="$temporary_directory/sources"
 export CCC_SQLITE_LANGUAGE_MODE_LOG="$temporary_directory/language-modes"
-export CCC_SQLITE_FUZZCHECK_HWTIME_FALLBACK=1
 
 : >"$TRACE"
 : >"$CCC_SQLITE_COMMAND_LOG"
@@ -99,18 +98,17 @@ grep -Eq '^gnu11 ordinary strict-ansi=absent ' "$CCC_SQLITE_LANGUAGE_MODE_LOG"
   -DSQLITE_OSS_FUZZ \
   -c "$generated_source" -o "$temporary_directory/fuzzcheck-sqlite3.o"
 [[ -f "$temporary_directory/fuzzcheck-sqlite3.o" ]]
-grep -Eq '^gnu11 fuzzcheck-amalgamation strict-ansi=defined ' \
+grep -Eq '^gnu11 fuzzcheck-amalgamation strict-ansi=absent ' \
   "$CCC_SQLITE_LANGUAGE_MODE_LOG"
 awk '
   $1 == "ccc" {
     for( i=1; i<=NF; i++ ) {
       if( $i ~ /^-std=/ ) standard=$i
-      if( $i ~ /^-D__STRICT_ANSI__(=|$)/ ) predicate="defined"
       if( $i == "-U__STRICT_ANSI__" ) predicate="absent"
     }
   }
   END {
-    exit standard == "-std=gnu11" && predicate == "defined" ? 0 : 1
+    exit standard == "-std=gnu11" && predicate == "absent" ? 0 : 1
   }
 ' "$CCC_SQLITE_COMMAND_LOG"
 
@@ -154,7 +152,7 @@ fi
 : >"$CCC_SQLITE_LANGUAGE_MODE_LOG"
 if "$script_directory/ccc-cc" -D__STRICT_ANSI__=1 \
   -c "$source_directory/src/a.c" -o "$temporary_directory/wrong-predicate.o"; then
-  echo "ccc-cc test: hwtime predicate override leaked to an ordinary input" >&2
+  echo "ccc-cc test: strict-ANSI override unexpectedly reached CCC" >&2
   exit 1
 fi
 [[ ! -s "$TRACE" ]]

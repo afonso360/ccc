@@ -46,6 +46,14 @@ pub struct NameClassCheckpoint {
     event_len: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct RecoveredNameBinding {
+    pub name: String,
+    pub class: NameClass,
+    pub depth: usize,
+    pub span: Span,
+}
+
 /// Syntax-owned ordinary-identifier classification environment.
 #[derive(Clone, Debug)]
 pub struct NameClassEnv {
@@ -124,6 +132,27 @@ impl NameClassEnv {
     }
 
     pub fn commit(&mut self, _checkpoint: NameClassCheckpoint) {}
+
+    pub(super) fn bindings_since(
+        &self,
+        checkpoint: &NameClassCheckpoint,
+    ) -> Vec<RecoveredNameBinding> {
+        let depth = checkpoint.scopes.len() - 1;
+        self.events[checkpoint.event_len..]
+            .iter()
+            .filter_map(|event| match &event.kind {
+                ScopeEventKind::Bind { name, class } if event.depth == depth => {
+                    Some(RecoveredNameBinding {
+                        name: name.clone(),
+                        class: *class,
+                        depth,
+                        span: event.span,
+                    })
+                }
+                _ => None,
+            })
+            .collect()
+    }
 
     pub fn rollback(&mut self, checkpoint: NameClassCheckpoint) {
         self.scopes = checkpoint.scopes;

@@ -10,8 +10,6 @@ archive_sha256 = "e6a471f1238225f34c2c48c5601b54024cc538044368230f59ff0672be1fc6
 archive_sha3_256 = "1f908b251b88ce5644261581d1955b5d0e86485a84793fd8b490b3e6fdb834b9"
 source_id = "2024-12-07 20:39:59 2aabe05e2e8cae4847a802ee2daddc1d7413d8fc560254d93ee3e72c14685b6c"
 generated_sqlite3_sha3_256 = "586b5789453ee5c51e8d858cd836f20ce60df882323f2070547cbaf23a5898af"
-generated_strict_ansi_predicate_uses = 4
-generated_strict_ansi_negated_uses = 3
 test_adjustment_patch = "recoverfault-clean-output.patch"
 test_adjustment_sha256 = "dcd0621e2d8a1129d87813ca13adb61b297e6c194acf27672b351628fdd4b243"
 test_adjustment_target = "ext/recover/recoverfault.test"
@@ -94,7 +92,7 @@ unselected_builtin_families = [
     "__builtin_overflow",
     "__builtin_clz",
 ]
-inline_assembly_forms = []
+inline_assembly_forms = ["x86-rdtsc-in-full-suite-fuzzcheck"]
 wide_integer_uses = []
 variable_length_array_objects = []
 statement_expressions = []
@@ -106,17 +104,16 @@ macros = [
     "SQLITE_PERFORMANCE_TRACE",
     "SQLITE_ENABLE_STMT_SCANSTATUS",
 ]
-rationale = "These macros are inactive for testfixture and the Tcl suites, excluding src/hwtime.h and its rdtsc inline assembly from that surface. The full suite's fuzzcheck profile enables SQLITE_ENABLE_STMT_SCANSTATUS under the scoped hwtime predicate override below."
+rationale = "These macros are inactive for testfixture and the Tcl suites, excluding src/hwtime.h and its rdtsc inline assembly from that surface. The full suite's fuzzcheck profile enables SQLITE_ENABLE_STMT_SCANSTATUS and compiles the selected timing instruction directly."
 
-[fuzzcheck_capability_adjustment]
+[fuzzcheck_inline_assembly]
 component = "fuzzcheck generated sqlite3.c translation"
 language_mode = "gnu11"
-preprocessor_override = "__STRICT_ANSI__=1"
 upstream_feature_macro = "SQLITE_ENABLE_STMT_SCANSTATUS"
-timing_backend = "upstream-no-assembly-zero-fallback"
-additional_effect = "SQLITE_INLINE is disabled in the amalgamation"
+timing_backend = "certified-x86-rdtsc"
+outputs = ["eax-low-32", "edx-high-32"]
 unmodified_components = ["alltest", "fuzzcheck support translation units", "sessionfuzz"]
-rationale = "SQLite's checked fuzzcheck profile enables statement scan status, which selects rdtsc inline assembly in the generated amalgamation under the advertised GNU x86-64 identity. Defining SQLite's __STRICT_ANSI__ predicate for that one sqlite3.c translation selects src/hwtime.h's upstream no-assembly timing fallback without changing source, removing fuzz inputs, disabling feature macros, or exposing strict-mode parsing to GNU system headers. In this release the predicate's only other SQLite effect is suppressing the SQLITE_INLINE optimization hint."
+rationale = "SQLite's checked fuzzcheck profile enables statement scan status, which selects the volatile rdtsc form with unsigned-int =a and =d outputs in the generated amalgamation under the advertised GNU x86-64 identity. CCC retains the operation explicitly and supplies one deterministic hidden support helper without changing source predicates or feature macros."
 
 [test_suites.veryquick]
 driver = "make-target"

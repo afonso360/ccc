@@ -50,6 +50,14 @@ mod tests {
         parse_with_mode(&converted(source), mode)
     }
 
+    fn parse_source_recovering(source: &str) -> RecoveringParse {
+        parse_recovering(&converted(source))
+    }
+
+    fn parse_source_recovering_with_mode(source: &str, mode: LanguageMode) -> RecoveringParse {
+        parse_recovering_with_mode(&converted(source), mode)
+    }
+
     #[test]
     fn conversion_decodes_numbers_and_concatenates_strings() {
         let items = converted("int *s = \"left\" u\" right\"; double x = 0x1.8p+2;");
@@ -70,7 +78,7 @@ mod tests {
             FrontendItem::Token(Token {
                 kind: TokenKind::Floating(value),
                 ..
-            }) if value.value == 6.0
+            }) if value.number == "0x1.8p+2"
         )));
     }
 
@@ -102,6 +110,241 @@ mod tests {
             ExternalItem::Pragma(PragmaEvent::Pack { .. })
         ));
         assert!(matches!(unit.items[2], ExternalItem::Declaration(_)));
+    }
+
+    #[test]
+    fn recovering_parse_retains_independent_external_and_block_items() {
+        let recovered = parse_source_recovering(
+            "typedef int T;\n\
+             int broken = ;\n\
+             int good;\n\
+             int function(void) {\n\
+                 int local = ;\n\
+                 int retained;\n\
+                 return retained + ;\n\
+                 retained = 1;\n\
+                 return retained;\n\
+             }\n\
+             int tail = ;",
+        );
+
+        assert_eq!(
+            recovered.diagnostics.len(),
+            4,
+            "{:#?}",
+            recovered.diagnostics
+        );
+        assert!(
+            recovered
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code == "CCC1020")
+        );
+        assert!(recovered.diagnostics.iter().all(|diagnostic| matches!(
+            diagnostic.recovery,
+            Some(ParseRecovery::SkippedTokens { .. })
+        )));
+        assert_eq!(recovered.ast.items.len(), 3);
+        assert!(matches!(
+            recovered.ast.items[0],
+            ExternalItem::Declaration(_)
+        ));
+        assert!(matches!(
+            recovered.ast.items[1],
+            ExternalItem::Declaration(_)
+        ));
+        let ExternalItem::FunctionDefinition(function) = &recovered.ast.items[2] else {
+            panic!("the valid portion of the function should be retained");
+        };
+        let StatementKind::Compound(items) = &function.body.kind else {
+            panic!("expected a compound function body");
+        };
+        assert_eq!(items.len(), 3);
+        assert!(matches!(items[0], BlockItem::Declaration(_)));
+        assert!(matches!(items[1], BlockItem::Statement(_)));
+        assert!(matches!(items[2], BlockItem::Statement(_)));
+    }
+
+    #[test]
+    fn recovery_rolls_back_typedef_names_before_the_next_statement() {
+        let recovered = parse_source_recovering(
+            "int function(void) {\n\
+                 typedef int Leaked = ;\n\
+                 Leaked * value;\n\
+                 return 0;\n\
+             }",
+        );
+
+        assert_eq!(
+            recovered.diagnostics.len(),
+            1,
+            "{:#?}",
+            recovered.diagnostics
+        );
+        let ExternalItem::FunctionDefinition(function) = &recovered.ast.items[0] else {
+            panic!("expected the recovered function");
+        };
+        let StatementKind::Compound(items) = &function.body.kind else {
+            panic!("expected a compound function body");
+        };
+        assert!(matches!(items[0], BlockItem::Statement(_)));
+        assert!(matches!(items[1], BlockItem::Statement(_)));
+        assert!(!recovered.ast.scope_events.iter().any(|event| matches!(
+            &event.kind,
+            ScopeEventKind::Bind { name, class: NameClass::TypedefName } if name == "Leaked"
+        )));
+    }
+
+    #[test]
+    fn recovery_treats_missing_semicolons_as_insertions_at_boundaries() {
+        let recovered = parse_source_recovering(
+            "int missing_external_semicolon\n\
+             int retained_external;\n\
+             int function(void) {\n\
+                 int missing_local_semicolon\n\
+                 int retained_local;\n\
+                 return 1\n\
+                 return retained_local;\n\
+             }",
+        );
+
+        assert_eq!(
+            recovered.diagnostics.len(),
+            3,
+            "{:#?}",
+            recovered.diagnostics
+        );
+        assert!(recovered.diagnostics.iter().all(|diagnostic| matches!(
+            diagnostic.recovery,
+            Some(ParseRecovery::InsertedToken { spelling: ";", .. })
+        )));
+        assert_eq!(recovered.ast.items.len(), 2);
+        assert!(matches!(
+            recovered.ast.items[0],
+            ExternalItem::Declaration(_)
+        ));
+        let ExternalItem::FunctionDefinition(function) = &recovered.ast.items[1] else {
+            panic!("expected the function after external recovery");
+        };
+        let StatementKind::Compound(items) = &function.body.kind else {
+            panic!("expected a compound function body");
+        };
+        assert_eq!(items.len(), 2);
+        assert!(matches!(items[0], BlockItem::Declaration(_)));
+        assert!(matches!(items[1], BlockItem::Statement(_)));
+    }
+
+    #[test]
+    fn recovery_skips_an_unbalanced_statement_without_cascading() {
+        let recovered = parse_source_recovering(
+            "int function(void) {\n\
+                 if (1 + ; ) return 1;\n\
+                 int retained;\n\
+                 return retained;\n\
+             }",
+        );
+
+        assert_eq!(
+            recovered.diagnostics.len(),
+            1,
+            "{:#?}",
+            recovered.diagnostics
+        );
+        let ExternalItem::FunctionDefinition(function) = &recovered.ast.items[0] else {
+            panic!("expected a recovered function");
+        };
+        let StatementKind::Compound(items) = &function.body.kind else {
+            panic!("expected a compound body");
+        };
+        assert_eq!(items.len(), 2);
+        assert!(matches!(items[0], BlockItem::Declaration(_)));
+        assert!(matches!(items[1], BlockItem::Statement(_)));
+    }
+
+    #[test]
+    fn recovery_preserves_every_following_block_item_family() {
+        let recovered = parse_source_recovering(
+            "int function(int value) {\n\
+                 int declaration\n\
+                 return retained_return;\n\
+                 while (1) {\n\
+                     break\n\
+                     (void)retained_parenthesized;\n\
+                     break\n\
+                     ++value;\n\
+                 }\n\
+             }",
+        );
+
+        assert_eq!(
+            recovered.diagnostics.len(),
+            3,
+            "{:#?}",
+            recovered.diagnostics
+        );
+        assert!(recovered.diagnostics.iter().all(|diagnostic| matches!(
+            diagnostic.recovery,
+            Some(ParseRecovery::InsertedToken { spelling: ";", .. })
+        )));
+        let debug = format!("{:#?}", recovered.ast);
+        for retained in [
+            "retained_return",
+            "retained_parenthesized",
+            "PrefixIncrement",
+        ] {
+            assert!(debug.contains(retained), "missing {retained}: {debug}");
+        }
+    }
+
+    #[test]
+    fn c11_external_initializer_recovery_consumes_its_semicolon() {
+        let recovered = parse_source_recovering_with_mode(
+            "struct S { int member; };\n\
+             struct S broken = { .member = ; };\n\
+             int retained;",
+            LanguageMode::C11,
+        );
+
+        assert_eq!(
+            recovered.diagnostics.len(),
+            1,
+            "{:#?}",
+            recovered.diagnostics
+        );
+        assert_eq!(recovered.ast.items.len(), 2);
+        let ExternalItem::Declaration(retained) = &recovered.ast.items[1] else {
+            panic!("the declaration after the invalid initializer was not retained");
+        };
+        assert_eq!(
+            retained.declarators[0]
+                .declarator
+                .identifier()
+                .unwrap()
+                .name,
+            "retained"
+        );
+    }
+
+    #[test]
+    fn recovering_parser_stops_at_its_stage_budget() {
+        let items = converted("int first = ; int second = ; int retained;");
+        let recovered = parse_recovering_with_mode_and_limit(&items, LanguageMode::Gnu11, Some(1));
+        assert_eq!(recovered.diagnostics.len(), 1);
+        assert!(recovered.ast.items.is_empty());
+    }
+
+    #[test]
+    fn recovered_bindings_expire_at_their_lexical_scope() {
+        let source = "int function(void) { { int scoped = ; } return scoped; }";
+        let recovered = parse_source_recovering(source);
+
+        assert_eq!(recovered.diagnostics.len(), 1);
+        let [binding] = recovered.poisoned_bindings.as_slice() else {
+            panic!("expected exactly one recovered binding");
+        };
+        assert_eq!(binding.name, "scoped");
+        assert_eq!(binding.scope_end, source.find('}').unwrap() + 1);
+        assert!(binding.scope_end < source.rfind("scoped").unwrap());
     }
 
     #[test]
@@ -394,6 +637,74 @@ mod tests {
     }
 
     #[test]
+    fn parses_and_preserves_complete_gnu_asm_statements() {
+        let unit = parse_source(
+            "int f(int index, int limit, int backup) {\n\
+                 int candidate = 1;\n\
+                 __asm__ __volatile__ __inline__ goto (\"cmp %[limit], %[index]\\n\\t\" \"cmova %[backup], %[candidate]\"\n\
+                     : [candidate] \"+r\" (candidate)\n\
+                     : [index] \"r\" (index), [limit] \"r\" (limit), [backup] \"r\" (backup)\n\
+                     : \"cc\", \"memory\" : done);\n\
+             done: return candidate;\n\
+             }",
+        )
+        .unwrap();
+        let ExternalItem::FunctionDefinition(function) = &unit.items[0] else {
+            panic!("expected function definition");
+        };
+        let StatementKind::Compound(items) = &function.body.kind else {
+            panic!("expected compound statement");
+        };
+        let BlockItem::Statement(statement) = &items[1] else {
+            panic!("expected asm statement");
+        };
+        let StatementKind::Asm(asm) = &statement.kind else {
+            panic!("expected asm statement");
+        };
+        assert_eq!(asm.keyword_spelling, "__asm__");
+        assert_eq!(asm.qualifiers.len(), 3);
+        assert_eq!(asm.outputs.len(), 1);
+        assert_eq!(asm.inputs.len(), 3);
+        assert_eq!(asm.clobbers.len(), 2);
+        assert_eq!(asm.goto_labels[0].name, "done");
+        assert_eq!(asm.colon_group_count, 4);
+        assert_eq!(asm.outputs[0].constraint.spelling, "\"+r\"");
+        assert_eq!(
+            asm.outputs[0].symbolic_name.as_ref().unwrap().name,
+            "candidate"
+        );
+        assert!(dump_ast(&unit).contains("asm-statement"));
+    }
+
+    #[test]
+    fn parses_basic_and_empty_group_asm_statements() {
+        let unit = parse_source(
+            "void f(long *field, long value) {\n\
+                 asm(\"nop\");\n\
+                 asm volatile (\"\" ::: \"memory\");\n\
+                 __asm__(\"lock; xchgq %0, %1\" : \"+q\"(value), \"+m\"(*field));\n\
+             }",
+        )
+        .unwrap();
+        let dump = dump_ast(&unit);
+        assert_eq!(dump.matches("asm-statement").count(), 3, "{dump}");
+        assert!(dump.contains("colon-groups=3"), "{dump}");
+    }
+
+    #[test]
+    fn rejects_malformed_gnu_asm_operands() {
+        for source in [
+            "void f(void) { asm(); }",
+            "void f(int x) { asm(\"\" : +r(x)); }",
+            "void f(int x) { asm(\"\" : \"+r\" x); }",
+            "void f(void) { asm(\"\" ::: memory); }",
+            "void f(void) { asm goto (\"\" :::: 1); }",
+        ] {
+            assert!(parse_source(source).is_err(), "accepted {source}");
+        }
+    }
+
+    #[test]
     fn parses_enumerator_attributes_before_and_after_the_enumerator() {
         let unit = parse_source(
             "enum State {
@@ -603,6 +914,68 @@ mod tests {
             let error = parse_source(source).unwrap_err();
             assert!(
                 error.message.contains("requires at least"),
+                "{source}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn parses_the_exact_scalar_atomic_builtin_surface() {
+        let unit = parse_source(
+            "int value; int expected;\n\
+             int update(int operand) {\n\
+                 int result = __atomic_load_n(&value, 0);\n\
+                 __atomic_store_n(&value, operand, 3);\n\
+                 result ^= __atomic_exchange_n(&value, operand, 5);\n\
+                 result ^= __atomic_fetch_add(&value, operand, 0);\n\
+                 result ^= __atomic_fetch_sub(&value, operand, 1);\n\
+                 result ^= __atomic_fetch_and(&value, operand, 2);\n\
+                 result ^= __atomic_fetch_or(&value, operand, 3);\n\
+                 result ^= __atomic_fetch_xor(&value, operand, 4);\n\
+                 result ^= __atomic_add_fetch(&value, operand, 5);\n\
+                 result ^= __atomic_sub_fetch(&value, operand, 0);\n\
+                 result ^= __atomic_and_fetch(&value, operand, 1);\n\
+                 result ^= __atomic_or_fetch(&value, operand, 2);\n\
+                 result ^= __atomic_xor_fetch(&value, operand, 3);\n\
+                 result ^= __atomic_compare_exchange_n(\n\
+                     &value, &expected, operand, 1, 4, 2);\n\
+                 __atomic_thread_fence(5);\n\
+                 __atomic_signal_fence(5);\n\
+                 return result;\n\
+             }",
+        )
+        .unwrap();
+        let dump = dump_ast(&unit);
+        for spelling in [
+            "__atomic_load_n",
+            "__atomic_store_n",
+            "__atomic_exchange_n",
+            "__atomic_fetch_add",
+            "__atomic_fetch_sub",
+            "__atomic_fetch_and",
+            "__atomic_fetch_or",
+            "__atomic_fetch_xor",
+            "__atomic_add_fetch",
+            "__atomic_sub_fetch",
+            "__atomic_and_fetch",
+            "__atomic_or_fetch",
+            "__atomic_xor_fetch",
+            "__atomic_compare_exchange_n",
+            "__atomic_thread_fence",
+            "__atomic_signal_fence",
+        ] {
+            assert!(dump.contains(spelling), "{dump}");
+        }
+
+        for source in [
+            "int x; int f(void) { return __atomic_load_n(&x); }",
+            "int x; void f(void) { __atomic_store_n(&x, 1); }",
+            "int x, expected; int f(void) { return __atomic_compare_exchange_n(&x, &expected, 1, 0, 5); }",
+            "void f(void) { __atomic_thread_fence(); }",
+        ] {
+            let error = parse_source(source).unwrap_err();
+            assert!(
+                error.message.contains("requires exactly"),
                 "{source}: {error}"
             );
         }

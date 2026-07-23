@@ -1,4 +1,4 @@
-ccc: error[CCC3509]: native `long double` parameter type `long double` is outside the enabled boundary profile
+ccc: error[CCC3509]: binary128 `long double` parameter type `long double` has no enabled transport
  --> tests/diagnostics/cases/long-double-boundary.c:1:1
    |
  1 | int consume(long double value) {

@@ -242,6 +242,8 @@ impl CapabilityRegistry {
             "__transparent_union__",
             "tls_model",
             "__tls_model__",
+            "returns_twice",
+            "__returns_twice__",
         ] {
             registry.insert_with_rationale(
                 CapabilityKind::Attribute,
@@ -357,6 +359,44 @@ impl CapabilityRegistry {
                 "the operator is typed and lowered as a native sequentially consistent atomic read-modify-write",
             );
         }
+        for name in [
+            "__atomic_load_n",
+            "__atomic_store_n",
+            "__atomic_exchange_n",
+            "__atomic_fetch_add",
+            "__atomic_fetch_sub",
+            "__atomic_fetch_and",
+            "__atomic_fetch_or",
+            "__atomic_fetch_xor",
+            "__atomic_add_fetch",
+            "__atomic_sub_fetch",
+            "__atomic_and_fetch",
+            "__atomic_or_fetch",
+            "__atomic_xor_fetch",
+            "__atomic_compare_exchange_n",
+            "__ccc_atomic_is_lock_free",
+            "__atomic_thread_fence",
+            "__atomic_signal_fence",
+        ] {
+            registry.insert_with_rationale(
+                CapabilityKind::Builtin,
+                name,
+                CapabilityState::Implemented,
+                "the operator supports naturally aligned 1, 2, 4, and 8-byte integer and pointer objects and strengthens every accepted memory order to sequential consistency",
+            );
+        }
+        registry.insert_with_rationale(
+            CapabilityKind::Feature,
+            "c11-native-scalar-atomics",
+            CapabilityState::Implemented,
+            "the compiler-owned header and native lowering support naturally aligned 1, 2, 4, and 8-byte integer and pointer atomics; the complete C atomic-type capability remains unadvertised",
+        );
+        registry.insert_with_rationale(
+            CapabilityKind::Feature,
+            "c11-vla",
+            CapabilityState::Implemented,
+            "variably modified declarations and type names retain exactly-once bounds; checked runtime layout, pointer strides, sizeof, and hosted automatic storage are implemented on every enabled target",
+        );
 
         registry
     }

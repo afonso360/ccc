@@ -254,8 +254,7 @@ run_case() {
   local index baseline_stdout baseline_stderr timeout_count nonzero_count
   local gcc_syntax_status="$directory/gcc.syntax.status"
   local clang_syntax_status="$directory/clang.syntax.status"
-  local ccc_object="$directory/ccc.o"
-  local ccc_executable="$directory/ccc.exe"
+  local ccc_object ccc_executable
 
   : >"$command_log"
   run_timed \
@@ -414,55 +413,65 @@ run_case() {
     fi
   done
 
-  run_timed \
-    "$compile_timeout" \
-    "$directory/ccc.compile.stdout" \
-    "$directory/ccc.compile.stderr" \
-    "$command_log" \
-    "$directory/ccc.compile.status" \
-    "$ccc" -resource-dir "$ccc_resource_dir" \
-    ${ccc_target_arguments[@]+"${ccc_target_arguments[@]}"} -std=c11 -c \
-    -I "$csmith_runtime" "$source_file" -o "$ccc_object"
-  if ! status_is_zero "$directory/ccc.compile.status"; then
-    write_result "$directory" ccc-compile-failure \
-      "CCC failed or timed out while compiling seed $seed" 1 1 1
-    return
-  fi
+  for ((index = 0; index < ${#subject_labels[@]}; index++)); do
+    label=${subject_labels[$index]}
+    optimization=${subject_options[$index]}
+    ccc_object="$directory/ccc-${label}.o"
+    ccc_executable="$directory/ccc-${label}.exe"
 
-  run_timed \
-    "$compile_timeout" \
-    "$directory/ccc.link.stdout" \
-    "$directory/ccc.link.stderr" \
-    "$command_log" \
-    "$directory/ccc.link.status" \
-    "$native_link_driver" \
-    ${reference_target_arguments[@]+"${reference_target_arguments[@]}"} \
-    "$ccc_object" -o "$ccc_executable" -lm
-  if ! status_is_zero "$directory/ccc.link.status"; then
-    write_result "$directory" ccc-link-failure \
-      "the native driver failed or timed out while linking CCC's object for seed $seed" 1 1 1
-    return
-  fi
+    run_timed \
+      "$compile_timeout" \
+      "$directory/ccc-${label}.compile.stdout" \
+      "$directory/ccc-${label}.compile.stderr" \
+      "$command_log" \
+      "$directory/ccc-${label}.compile.status" \
+      "$ccc" -resource-dir "$ccc_resource_dir" \
+      ${ccc_target_arguments[@]+"${ccc_target_arguments[@]}"} \
+      -std=c11 "$optimization" -c \
+      -I "$csmith_runtime" "$source_file" -o "$ccc_object"
+    if ! status_is_zero "$directory/ccc-${label}.compile.status"; then
+      write_result "$directory" ccc-compile-failure \
+        "CCC $optimization failed or timed out while compiling seed $seed" 1 1 1
+      return
+    fi
 
-  run_timed \
-    "$execution_timeout" \
-    "$directory/ccc.run.stdout" \
-    "$directory/ccc.run.stderr" \
-    "$command_log" \
-    "$directory/ccc.run.status" \
-    "$ccc_executable"
-  if ! status_is_zero "$directory/ccc.run.status"; then
-    write_result "$directory" ccc-execution-failure \
-      "CCC output failed or timed out while executing seed $seed" 1 1 1
-    return
-  fi
+    run_timed \
+      "$compile_timeout" \
+      "$directory/ccc-${label}.link.stdout" \
+      "$directory/ccc-${label}.link.stderr" \
+      "$command_log" \
+      "$directory/ccc-${label}.link.status" \
+      "$native_link_driver" \
+      ${reference_target_arguments[@]+"${reference_target_arguments[@]}"} \
+      "$ccc_object" -o "$ccc_executable" -lm
+    if ! status_is_zero "$directory/ccc-${label}.link.status"; then
+      write_result "$directory" ccc-link-failure \
+        "the native driver failed or timed out while linking CCC $optimization for seed $seed" \
+        1 1 1
+      return
+    fi
 
-  if ! cmp -s "$baseline_stdout" "$directory/ccc.run.stdout" ||
-    ! cmp -s "$baseline_stderr" "$directory/ccc.run.stderr"; then
-    write_result "$directory" output-mismatch \
-      "CCC output differs from the reference consensus for seed $seed" 1 1 1
-    return
-  fi
+    run_timed \
+      "$execution_timeout" \
+      "$directory/ccc-${label}.run.stdout" \
+      "$directory/ccc-${label}.run.stderr" \
+      "$command_log" \
+      "$directory/ccc-${label}.run.status" \
+      "$ccc_executable"
+    if ! status_is_zero "$directory/ccc-${label}.run.status"; then
+      write_result "$directory" ccc-execution-failure \
+        "CCC $optimization failed or timed out while executing seed $seed" 1 1 1
+      return
+    fi
+
+    if ! cmp -s "$baseline_stdout" "$directory/ccc-${label}.run.stdout" ||
+      ! cmp -s "$baseline_stderr" "$directory/ccc-${label}.run.stderr"; then
+      write_result "$directory" output-mismatch \
+        "CCC $optimization output differs from the reference consensus for seed $seed" \
+        1 1 1
+      return
+    fi
+  done
 
   write_result "$directory" pass "seed $seed" 1 1 0
 }
@@ -973,6 +982,15 @@ for optimization in "${reference_optimizations[@]}"; do
   reference_options+=("$optimization")
 done
 
+subject_labels=()
+subject_options=()
+for optimization in "${subject_optimizations[@]}"; do
+  normalized=${optimization#-}
+  normalized=$(printf '%s' "$normalized" | tr '[:upper:]' '[:lower:]')
+  subject_labels+=("$normalized")
+  subject_options+=("$optimization")
+done
+
 generator_source=pinned-archive
 generator_revision=$csmith_revision
 if ((allow_unverified_csmith == 1)); then
@@ -1009,6 +1027,8 @@ fi
   printf ' %q' "${generator_options[@]}"
   printf '\nreference_matrix='
   printf ' %s' "${reference_labels[@]}"
+  printf '\nccc_matrix='
+  printf ' %s' "${subject_labels[@]}"
   printf '\n'
 } >"$work_directory/run-config.txt"
 

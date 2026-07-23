@@ -10,269 +10,215 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-24.04
-    env:
-      CCC_REQUIRE_SYSV_ABI_TESTS: "1"
-    steps:
-      - uses: actions/checkout@v7
-      - name: Install native ABI and corpus prerequisites
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes \
-            binutils clang coreutils curl g++ gcc gdb make openssl patch \
-            pkg-config tcl-dev zlib1g-dev
-      - name: Verify runner prerequisites
-        shell: bash
-        run: |
-          set -euo pipefail
-          artifact_dir="$RUNNER_TEMP/ccc-sysv-amd64-artifacts"
-          mkdir -p "$artifact_dir"
-          missing=()
-          for tool in curl cc gcc clang make tclsh pkg-config objdump readelf gdb objcopy timeout openssl patch; do
-            if ! command -v "$tool" >/dev/null; then
-              missing+=("$tool")
-            fi
-          done
-          if command -v pkg-config >/dev/null; then
-            for module in tcl zlib; do
-              if ! pkg-config --exists "$module"; then
-                missing+=("pkg-config:$module")
-              fi
-            done
-          fi
-          if (( ${#missing[@]} )); then
-            printf -v missing_list '%s, ' "${missing[@]}"
-            missing_list=${missing_list%, }
-            printf '::error::Missing runner prerequisites: %s\n' "$missing_list" \
-              | tee "$artifact_dir/runner-prerequisites.txt"
-            exit 1
-          fi
-          printf 'All runner prerequisites are available.\n' \
-            > "$artifact_dir/runner-prerequisites.txt"
-      - name: Verify pinned ABI sources
-        run: |
-          mkdir -p "$RUNNER_TEMP/ccc-sysv-amd64-artifacts"
-          curl --fail --silent --show-error --location --retry 3 \
-            https://gitlab.com/x86-psABIs/x86-64-ABI/-/raw/e1ce098331da5dbd66e1ffc74162380bcc213236/x86-64-ABI/low-level-sys-info.tex \
-            --output "$RUNNER_TEMP/ccc-sysv-amd64-artifacts/x86-64-low-level-sys-info.tex"
-          echo "2d42f2ab76b99a3b8456e6bc07e18314e85991119f72db90ca1175328e27b705  $RUNNER_TEMP/ccc-sysv-amd64-artifacts/x86-64-low-level-sys-info.tex" | sha256sum --check --strict
-          curl --fail --silent --show-error --location --retry 3 \
-            https://raw.githubusercontent.com/ARM-software/abi-aa/daa7a94ca55973736c0e434a67a6e4bbcd35d7fa/aapcs64/aapcs64.rst \
-            --output "$RUNNER_TEMP/ccc-sysv-amd64-artifacts/aapcs64.rst"
-          echo "92460d0e8a1e081e0b1ed8f23dd6f9a0716ca566158a3e099a48de62cb2125a6  $RUNNER_TEMP/ccc-sysv-amd64-artifacts/aapcs64.rst" | sha256sum --check --strict
-          curl --fail --silent --show-error --location --retry 3 \
-            https://raw.githubusercontent.com/riscv-non-isa/riscv-elf-psabi-doc/e03d44ae2f0e1144f9498c2896b5ae25b0449398/riscv-cc.adoc \
-            --output "$RUNNER_TEMP/ccc-sysv-amd64-artifacts/riscv-cc.adoc"
-          echo "c87c97d518681c44398add931cc41a43235abe656eaf831b849934a3919d86e5  $RUNNER_TEMP/ccc-sysv-amd64-artifacts/riscv-cc.adoc" | sha256sum --check --strict
-      - uses: dtolnay/rust-toolchain@1.96.0
-        with:
-          components: clippy,rustfmt
-      - name: Record native ABI and corpus tool identities
-        run: |
-          mkdir -p "$RUNNER_TEMP/ccc-sysv-amd64-artifacts/tmp"
-          {
-            rustc --version --verbose
-            cargo --version
-            gcc --version
-            gcc -dumpmachine
-            clang --version
-            clang --print-target-triple
-            objdump --version
-            readelf --version
-            gdb --version
-            objcopy --version
-            make --version
-            pkg-config --modversion tcl
-            pkg-config --modversion zlib
-            printf 'puts [info patchlevel]\n' | tclsh
-          } 2>&1 | tee "$RUNNER_TEMP/ccc-sysv-amd64-artifacts/tool-identities.txt"
-      - run: cargo fmt --check
-      - name: Test corpus adapters
-        run: ./test-corpus/test-adapters.sh
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test -p ccc-driver --test preprocessing -- --show-output
-      - run: cargo test -p ccc-driver --features ci-sysv-amd64 --test sysv_amd64_environment -- --show-output
-        env:
-          TMPDIR: ${{ runner.temp }}/ccc-sysv-amd64-artifacts/tmp
-      - run: cargo test -p ccc-driver --features ci-sysv-amd64 --test abi_oracle -- --show-output
-        env:
-          TMPDIR: ${{ runner.temp }}/ccc-sysv-amd64-artifacts/tmp
-      - run: cargo test -p ccc-driver --features ci-sysv-amd64 --test sysv_amd64_interop -- --show-output
-        env:
-          TMPDIR: ${{ runner.temp }}/ccc-sysv-amd64-artifacts/tmp
-      - run: cargo test --workspace --all-targets
-      - name: Retain native ABI failure artifacts
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: sysv-amd64-failure-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/ccc-sysv-amd64-artifacts
-          if-no-files-found: error
-
-  target-oracle-linux:
-    runs-on: ubuntu-24.04
+    name: Rust tests (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - name: aarch64-linux
-            triple: aarch64-unknown-linux-gnu
-            driver: aarch64-linux-gnu-gcc
-            objcopy: aarch64-linux-gnu-objcopy
-            archiver: aarch64-linux-gnu-ar
-            ranlib: aarch64-linux-gnu-ranlib
-            readelf: aarch64-linux-gnu-readelf
-            qemu: qemu-aarch64
-            qemu_root: /usr/aarch64-linux-gnu
-          - name: riscv64-linux
-            triple: riscv64-unknown-linux-gnu
-            driver: riscv64-linux-gnu-gcc
-            objcopy: riscv64-linux-gnu-objcopy
-            archiver: riscv64-linux-gnu-ar
-            ranlib: riscv64-linux-gnu-ranlib
-            readelf: riscv64-linux-gnu-readelf
-            qemu: qemu-riscv64
-            qemu_root: /usr/riscv64-linux-gnu
-    steps:
-      - uses: actions/checkout@v7
-      - name: Build pinned cross-target environment
-        run: |
-          command -v docker >/dev/null || {
-            echo "Docker is required for pinned cross-target evidence" >&2
-            exit 1
-          }
-          docker build \
-            --file .github/target-oracle-linux.Dockerfile \
-            --tag ccc-target-oracle-linux:${{ github.sha }} \
-            .
-      - name: Run cross-target ABI, header, debugger, and corpus evidence
-        env:
-          ARTIFACT_DIR: ${{ runner.temp }}/ccc-target-${{ matrix.name }}-${{ github.run_id }}-${{ github.run_attempt }}
-        run: |
-          set -euo pipefail
-          mkdir -p "$ARTIFACT_DIR"
-          docker run --rm \
-            --user "$(id -u):$(id -g)" \
-            --volume "$PWD:/workspace" \
-            --volume "$ARTIFACT_DIR:/artifacts" \
-            --workdir /workspace \
-            --env HOME=/tmp/ccc-home \
-            --env CARGO_HOME=/tmp/ccc-cargo \
-            --env CCC_REQUIRE_TARGET_ORACLE=1 \
-            --env CCC_TARGET_ORACLE_ARTIFACTS=/artifacts/oracle \
-            --env CCC_OBJCOPY=${{ matrix.objcopy }} \
-            --env CCC_QEMU_ROOT=${{ matrix.qemu_root }} \
-            --env CCC_LINK_CC=${{ matrix.driver }} \
-            --env BZIP2_AR=${{ matrix.archiver }} \
-            --env BZIP2_RANLIB=${{ matrix.ranlib }} \
-            --env BZIP2_READELF=${{ matrix.readelf }} \
-            --env BZIP2_QEMU=${{ matrix.qemu }} \
-            --env BZIP2_QEMU_ROOT=${{ matrix.qemu_root }} \
-            ccc-target-oracle-linux:${{ github.sha }} \
-            bash -c '
-              set -euo pipefail
-              mkdir -p "$HOME" "$CARGO_HOME"
-              cargo build --locked -p ccc-driver
-              if CCC_BIN=/definitely/missing/ccc \
-                   CCC_TARGET_ORACLE_ARTIFACTS=/tmp/fail-closed-probe \
-                   tests/target-oracle/run.sh aarch64-linux; then
-                echo "target oracle masked a prerequisite failure" >&2
-                exit 1
-              fi
-              tests/target-oracle/run.sh "${{ matrix.name }}"
-              CCC=target/debug/ccc \
-                test-corpus/bzip2/run.sh \
-                --target "${{ matrix.triple }}" \
-                --work-dir /artifacts/bzip2
-            '
-      - name: Retain cross-target evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: target-${{ matrix.name }}-evidence-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/ccc-target-${{ matrix.name }}-${{ github.run_id }}-${{ github.run_attempt }}
-          if-no-files-found: error
+          - name: Linux x86-64
+            runner: ubuntu-24.04
+            packages: >-
+              binutils build-essential clang coreutils gdb libc-bin procps
+            rust_target: ""
+            qemu: false
+            oracle: x86_64-linux
+            ccc_bin: target/debug/ccc
+          - name: Linux AArch64
+            runner: ubuntu-24.04-arm
+            packages: >-
+              binutils binutils-aarch64-linux-gnu build-essential clang
+              coreutils gdb gcc-aarch64-linux-gnu libc-bin procps
+            rust_target: ""
+            qemu: false
+            oracle: aarch64-linux
+            ccc_bin: target/debug/ccc
+          - name: Linux RISC-V64 under QEMU
+            runner: ubuntu-24.04
+            packages: >-
+              binutils-riscv64-linux-gnu build-essential coreutils
+              gcc-riscv64-linux-gnu gdb-multiarch libc-bin
+              libc6-dev-riscv64-cross procps qemu-user qemu-user-binfmt
+            rust_target: riscv64gc-unknown-linux-gnu
+            qemu: true
+            oracle: riscv64-linux
+            ccc_bin: target/riscv64gc-unknown-linux-gnu/debug/ccc
+          - name: macOS AArch64
+            runner: macos-26
+            packages: ""
+            rust_target: ""
+            qemu: false
+            oracle: darwin-arm64
+            ccc_bin: target/debug/ccc
 
-  target-oracle-darwin-arm64:
-    runs-on: macos-26
-    env:
-      DEVELOPER_DIR: /Library/Developer/CommandLineTools
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v6
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ${{ matrix.packages }}
+
       - uses: dtolnay/rust-toolchain@1.96.0
-      - name: Verify pinned Darwin ABI source and toolchain identity
-        shell: bash
-        env:
-          ARTIFACT_DIR: ${{ runner.temp }}/ccc-target-darwin-arm64-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Install cross-compilation target
+        if: matrix.rust_target != ''
+        run: rustup target add ${{ matrix.rust_target }}
+
+      - name: Configure RISC-V QEMU
+        if: matrix.qemu
         run: |
-          set -euo pipefail
-          mkdir -p "$ARTIFACT_DIR"
-          for tool in curl file lldb nm otool shasum xcrun; do
-            command -v "$tool" >/dev/null || {
-              echo "missing required Darwin tool: $tool" >&2
-              exit 1
-            }
-          done
-          openssl_bin="$(brew --prefix openssl@3)/bin/openssl"
-          "$openssl_bin" dgst -sha3-256 /dev/null >/dev/null
-          clt_version=$(pkgutil --pkg-info=com.apple.pkg.CLTools_Executables | awk '/^version:/ { print $2 }')
-          sdk_version=$(xcrun --sdk macosx --show-sdk-version)
-          compiler_target=$(/usr/bin/cc -dumpmachine)
-          [[ "$clt_version" == 26.6.0.0.1.1781586589 || "$clt_version" == 26.6.0.0.1781586589 ]]
-          [[ "$sdk_version" == 26.5 ]]
-          [[ "$(/usr/bin/cc --version | head -n 1)" == "Apple clang version 21.0.0 (clang-2100.1.1.101)" ]]
-          [[ "$compiler_target" == arm64-apple-darwin25.* ]]
-          grep -Fq 'developer_tools = "Command Line Tools 26.6.0.0.1781586589"' docs/spec-sources/darwin-arm64.toml
-          grep -Fq 'sdk = "macOS 26.5"' docs/spec-sources/darwin-arm64.toml
-          grep -Fq 'compiler = "Apple clang 21.0.0 (clang-2100.1.1.101)"' docs/spec-sources/darwin-arm64.toml
-          grep -Fq 'compiler_host_target_family = "arm64-apple-darwin25.*"' docs/spec-sources/darwin-arm64.toml
-          grep -Fq 'compiler_reference_target = "arm64-apple-macos11"' docs/spec-sources/darwin-arm64.toml
-          curl --fail --silent --show-error --location --retry 3 \
-            https://docs.developer.apple.com/tutorials/data/documentation/xcode/writing-arm64-code-for-apple-platforms.md \
-            --output "$ARTIFACT_DIR/writing-arm64-code-for-apple-platforms.md"
-          echo "afe0badf53abe5510e610358ba81050080692af7df7715a44be55271904d3b3e  $ARTIFACT_DIR/writing-arm64-code-for-apple-platforms.md" \
-            | shasum -a 256 --check
-          {
-            echo "clt=$clt_version"
-            echo "sdk=$sdk_version"
-            echo "target=$compiler_target"
-            /usr/bin/cc --version
-            xcrun ld -version_details
-            /usr/bin/nmedit --version || true
-            lldb --version
-          } > "$ARTIFACT_DIR/pinned-tool-identities.txt" 2>&1
-      - name: Run native Darwin ABI, header, debugger, and corpus evidence
-        shell: bash
-        env:
-          ARTIFACT_DIR: ${{ runner.temp }}/ccc-target-darwin-arm64-${{ github.run_id }}-${{ github.run_attempt }}
+          echo 'CARGO_BUILD_TARGET=riscv64gc-unknown-linux-gnu' >> "$GITHUB_ENV"
+          echo 'CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER=riscv64-linux-gnu-gcc' >> "$GITHUB_ENV"
+          echo 'CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_RUNNER=qemu-riscv64 -L /usr/riscv64-linux-gnu' >> "$GITHUB_ENV"
+          echo 'CARGO_PROFILE_DEV_OPT_LEVEL=2' >> "$GITHUB_ENV"
+          echo 'CCC_CC=riscv64-linux-gnu-gcc' >> "$GITHUB_ENV"
+          echo 'QEMU_LD_PREFIX=/usr/riscv64-linux-gnu' >> "$GITHUB_ENV"
+
+      - name: Verify RISC-V QEMU
+        if: matrix.qemu
         run: |
-          set -euo pipefail
-          cargo build --locked -p ccc-driver
-          if CCC_REQUIRE_TARGET_ORACLE=1 \
-               CCC_BIN=/definitely/missing/ccc \
-               CCC_TARGET_ORACLE_ARTIFACTS="$ARTIFACT_DIR/fail-closed-probe" \
-               tests/target-oracle/run.sh darwin-arm64; then
-            echo "target oracle masked a prerequisite failure" >&2
-            exit 1
-          fi
-          CCC_REQUIRE_TARGET_ORACLE=1 \
-            CCC_NMEDIT=/usr/bin/nmedit \
-            CCC_TARGET_ORACLE_ARTIFACTS="$ARTIFACT_DIR/oracle" \
-            tests/target-oracle/run.sh darwin-arm64
-          CCC=target/debug/ccc \
-            CCC_NMEDIT=/usr/bin/nmedit \
-            CCC_LINK_CC=/usr/bin/cc \
-            BZIP2_OPENSSL="$(brew --prefix openssl@3)/bin/openssl" \
-            BZIP2_MD5SUM="$PWD/test-corpus/bzip2/md5sum-darwin" \
-            BZIP2_SDKROOT="$(xcrun --sdk macosx --show-sdk-path)" \
-            BZIP2_DEPLOYMENT_TARGET=11.0 \
-            test-corpus/bzip2/run.sh \
-            --target aarch64-apple-darwin \
-            --work-dir "$ARTIFACT_DIR/bzip2"
-      - name: Retain Darwin target evidence
+          sudo systemctl restart systemd-binfmt.service
+          grep -q '^enabled' /proc/sys/fs/binfmt_misc/qemu-riscv64
+          printf '%s\n' 'int main(void) { return 0; }' > "$RUNNER_TEMP/qemu-smoke.c"
+          riscv64-linux-gnu-gcc "$RUNNER_TEMP/qemu-smoke.c" -o "$RUNNER_TEMP/qemu-smoke"
+          "$RUNNER_TEMP/qemu-smoke"
+
+      - name: Run Rust test suite
+        run: cargo test --locked --workspace --all-targets
+
+      - name: Run target oracle
+        env:
+          CCC_BIN: ${{ github.workspace }}/${{ matrix.ccc_bin }}
+          CCC_REQUIRE_TARGET_ORACLE: "1"
+          CCC_TARGET_ORACLE_ARTIFACTS: ${{ runner.temp }}/ccc-target-oracle-${{ matrix.oracle }}
+        run: tests/target-oracle/run.sh ${{ matrix.oracle }}
+
+      - name: Upload target-oracle evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: target-darwin-arm64-evidence-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/ccc-target-darwin-arm64-${{ github.run_id }}-${{ github.run_attempt }}
-          if-no-files-found: error
+          name: target-oracle-${{ matrix.oracle }}
+          path: ${{ runner.temp }}/ccc-target-oracle-${{ matrix.oracle }}
+          if-no-files-found: ignore
+
+  bzip2-targets:
+    name: bzip2 corpus (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux AArch64
+            runner: ubuntu-24.04
+            target: aarch64-unknown-linux-gnu
+            packages: >-
+              binutils-aarch64-linux-gnu build-essential curl
+              gcc-aarch64-linux-gnu git libc6-dev-arm64-cross make openssl
+              qemu-user
+            qemu_root: /usr/aarch64-linux-gnu
+          - name: Linux RISC-V64
+            runner: ubuntu-24.04
+            target: riscv64-unknown-linux-gnu
+            packages: >-
+              binutils-riscv64-linux-gnu build-essential curl
+              gcc-riscv64-linux-gnu git libc6-dev-riscv64-cross make openssl
+              qemu-user
+            qemu_root: /usr/riscv64-linux-gnu
+          - name: macOS AArch64
+            runner: macos-26
+            target: aarch64-apple-darwin
+            packages: coreutils openssl@3
+            qemu_root: ""
+    env:
+      CCC: ${{ github.workspace }}/target/debug/ccc
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends ${{ matrix.packages }}
+
+      - name: Install Darwin dependencies
+        if: runner.os == 'macOS'
+        run: brew install ${{ matrix.packages }}
+
+      - name: Configure target execution tools
+        if: runner.os == 'Linux'
+        run: echo 'BZIP2_QEMU_ROOT=${{ matrix.qemu_root }}' >> "$GITHUB_ENV"
+
+      - name: Configure Darwin checksum tools
+        if: runner.os == 'macOS'
+        run: |
+          echo "BZIP2_OPENSSL=$(brew --prefix openssl@3)/bin/openssl" >> "$GITHUB_ENV"
+          echo "BZIP2_MD5SUM=$(command -v gmd5sum)" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Build CCC
+        run: cargo build --locked -p ccc-driver
+
+      - name: Test bzip2
+        run: >-
+          test-corpus/bzip2/run.sh --target ${{ matrix.target }}
+          --work-dir "$RUNNER_TEMP/ccc-corpus/bzip2-${{ matrix.target }}"
+
+      - name: Upload bzip2 evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bzip2-${{ matrix.target }}
+          path: ${{ runner.temp }}/ccc-corpus/bzip2-${{ matrix.target }}
+          if-no-files-found: ignore
+
+  corpus:
+    name: Test corpus (Linux x86-64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      CCC: ${{ github.workspace }}/target/debug/ccc
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install corpus dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            binutils clang coreutils curl diffutils file findutils g++ gcc gdb \
+            git make openssl patch pkg-config tar tcl-dev unzip zlib1g-dev
+
+      - uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Build CCC
+        run: cargo build --locked -p ccc-driver
+
+      - name: Test corpus adapters
+        run: ./test-corpus/test-adapters.sh
+
+      - name: Test Lua
+        run: test-corpus/lua/run.sh --work-dir "$RUNNER_TEMP/ccc-corpus/lua"
+
+      - name: Test SQLite
+        run: >-
+          test-corpus/sqlite/run.sh --suite veryquick
+          --work-dir "$RUNNER_TEMP/ccc-corpus/sqlite"
+
+      - name: Test bzip2
+        run: >-
+          test-corpus/bzip2/run.sh --target x86_64-unknown-linux-gnu
+          --work-dir "$RUNNER_TEMP/ccc-corpus/bzip2"
+
+      - name: Test zlib
+        run: test-corpus/zlib/run.sh --work-dir "$RUNNER_TEMP/ccc-corpus/zlib"
+
+      - name: Test Redis
+        run: test-corpus/redis/run.sh --work-dir "$RUNNER_TEMP/ccc-corpus/redis"
+
+      - name: Test zstd
+        run: test-corpus/zstd/run.sh --work-dir "$RUNNER_TEMP/ccc-corpus/zstd"

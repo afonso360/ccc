@@ -29,7 +29,7 @@ facts:
 | CCC identity            | `__CCC__` and the `__CCC_{MAJOR,MINOR,PATCHLEVEL}__` tuple identify the actual compiler.                                                                                                                                                                                  |
 | Target facts            | Width, limit, byte-order, data-model, object-format, architecture, and operating-system macros come from the effective target configuration. They are not copied from the host compiler.                                                                                  |
 | Target symbol spelling  | `__USER_LABEL_PREFIX__` is empty for the x86-64 ELF SysV target, matching its external-symbol ABI and allowing libc redirect declarations to form their linker names.                                                                                                     |
-| Capability denials      | `__STDC_NO_ATOMICS__`, `__STDC_NO_COMPLEX__`, `__STDC_NO_THREADS__`, and `__STDC_NO_VLA__` are derived from the registry and disappear only when the corresponding complete capability is active.                                                                         |
+| Capability denials      | `__STDC_NO_ATOMICS__`, `__STDC_NO_COMPLEX__`, `__STDC_NO_THREADS__`, and `__STDC_NO_VLA__` are derived from the registry. The complete VLA capability is active on every enabled target, so `__STDC_NO_VLA__` is absent there; the other unavailable optional capabilities remain denied.                                                                         |
 | Dynamic predicates      | `__has_include`, `__has_include_next`, `__has_attribute`, `__has_builtin`, `__has_feature`, and `__has_extension` are CCC-provided operators. Their existence is an intentional deviation from GCC 4.2.1, and each answer comes from the resolver or capability registry. |
 | Dynamic counter         | `__COUNTER__` is provided even though it postdates GCC 4.2.1. Its monotonic translation-unit-local behavior is part of CCC's identity.                                                                                                                                    |
 | Wide-integer fact       | `__SIZEOF_INT128__` is absent until the complete `__int128` syntax, arithmetic, conversion, layout, ABI, varargs, and helper-link contract is active. Defining it is another intentional deviation from GCC 4.2.1.                                                        |
@@ -75,7 +75,7 @@ surface under CCC's identity:
 | `GCC_VERSION >= 4003000` or `>= 4008000`                                       | Byte-swap builtins are not selected.                                                                                                           |
 | `GCC_VERSION >= 4007000` or `__has_extension(c_atomic)`                        | `__atomic_load_n` and `__atomic_store_n` are not selected because the version test and predicate are both false.                               |
 | `GCC_VERSION >= 5004000`                                                       | Overflow and count-leading-zero builtins are not selected.                                                                                     |
-| `VDBE_PROFILE`, `SQLITE_PERFORMANCE_TRACE`, or `SQLITE_ENABLE_STMT_SCANSTATUS` | None is enabled by the pinned test adapter, so `src/hwtime.h` contributes no inline assembly.                                                  |
+| `VDBE_PROFILE`, `SQLITE_PERFORMANCE_TRACE`, or `SQLITE_ENABLE_STMT_SCANSTATUS` | None is enabled by `testfixture`; the full-suite fuzzcheck profile enables statement scan status and selects the certified x86-64 RDTSC form. |
 | glibc `<math.h>` constants in the SQLite command-line shell                    | `NAN` and `INFINITY` select `__builtin_nanf("")` and `__builtin_inff()`; CCC folds them to canonical binary32 constants.                       |
 
 The Redis source inventory is likewise preprocessed under CCC's effective
@@ -91,21 +91,26 @@ expand. No `bswap32`, `ctz`, `ctzl`, `popcountl`, unreachable, overflow, or
 CPU-support builtin is selected. These results do not admit neighboring
 family spellings.
 
-The same inventory found that xxHash selects its empty GNU inline-assembly
-compiler guard from the compatibility tuple; an exact-hash adjustment selects
-a standard-C no-op under `__CCC__`, and the adapter requires exactly one marked
-no-op expansion and zero expanded inline-assembly forms.
+The same inventory found seven Redis inline-assembly statements: two empty
+volatile memory barriers, two locked stores, one locked exchange with an
+additional result output, one locked compare-exchange, and xxHash's empty
+read/write register guard. They reach CCC unchanged. The adapter requires the
+exact templates, constraints, clobbers, operand widths, and expansion counts;
+neighboring forms are not admitted.
 
-The builtin registry admits `__sync_synchronize` and the exact implemented
-legacy operation set (`__sync_add_and_fetch`, `__sync_fetch_and_add`,
+The builtin registry admits `__sync_synchronize`, the exact implemented legacy
+operation set (`__sync_add_and_fetch`, `__sync_fetch_and_add`,
 `__sync_sub_and_fetch`, both compare-and-swap result forms, and
-`__sync_lock_test_and_set`) independently. That atomic surface does not infer
-support for any other `__sync_*` or `__atomic_*` spelling. The Redis inventory
-requires each listed operation to occur in the captured source. If a later
-adapter selects the hardware-timing header, the
-first candidate to certify is the x86-64 volatile `rdtsc` form with `=a` and
-`=d` outputs. No general inline-assembly certifier is built merely in
-anticipation of that change.
+`__sync_lock_test_and_set`), and the separately enumerated native-width
+`__atomic_*_n` family. Neighboring spellings are not inferred. GNU
+`__ATOMIC_*` order macros remain absent from the global predefined identity,
+so the GCC 4.2.1 Redis and SQLite inventories retain their audited source
+branches. The Redis inventory requires each selected legacy operation to occur
+in the captured source. SQLite's
+full-suite fuzzcheck profile selects the x86-64 volatile `rdtsc` form with
+unsigned-int `=a` and `=d` outputs. CCC retains that operation explicitly and
+calls a deterministic hidden support routine that executes the instruction
+once and stores both halves.
 
 ## ISO C11 semantics
 
@@ -158,9 +163,12 @@ storage duration associated with the enclosing block. The expression is an
 lvalue designating that object, and repeated evaluation of the same occurrence
 reinitializes and designates the same object. Initializer checking, zero-fill,
 qualifiers, volatile access, aggregate copy, array-bound completion, and nested
-designators reuse the ordinary object-initialization and place rules.
-File-scope compound literals require static-object lowering and are rejected
-with `CCC2430` until that path is implemented.
+designators reuse the ordinary object-initialization and place rules. Each
+file-scope occurrence creates a distinct deterministic internal object with
+static storage duration. Its data, padding, nested initializers, and symbol
+relocations use the same initializer graph as an ordinary static definition.
+The expression remains an lvalue with the occurrence's completed type and
+qualifiers.
 
 ### Flexible array members
 
@@ -179,12 +187,14 @@ allocation, and multidimensional strides follow the provider-independent type
 contract in [the conformance policy](conformance.md#variable-length-arrays).
 Automatic VLA objects use the hosted arena in
 [ADR-0011](../adr/0011-arena-backed-runtime-sized-automatic-storage.md).
-Runtime `sizeof` and several variably modified typedef/type-name contexts remain
-explicit boundaries, so the complete VLA capability is not yet advertised.
+Variably modified typedefs and evaluated type names retain their bound effects
+at the declaration or expression site. Runtime `sizeof`, allocation sizes, and
+dynamic pointer strides reuse those saved values through checked CCC-IR size
+operations. The complete VLA capability is advertised on every enabled target.
 Arena storage neither implies native-stack mutation nor enables GNU `alloca`.
 Named and switch jumps cannot enter a variably modified declaration path;
-computed goto is conservatively rejected when such an automatic object exists
-in the same function.
+computed goto is conservatively rejected when such a declaration exists in the
+same function.
 
 ## GNU C semantics
 
@@ -287,11 +297,18 @@ pre-budgets these symbol families:
 
 - `__divti3`, `__udivti3`, `__modti3`, and `__umodti3`;
 - `__floattisf`, `__floattidf`, `__floatuntisf`, and `__floatuntidf`; and
-- `__fixsfti`, `__fixdfti`, `__fixunssfti`, and `__fixunsdfti`.
+- `__fixsfti`, `__fixdfti`, `__fixunssfti`, and `__fixunsdfti`;
+- `__floattixf` and `__floatuntixf` for signed and unsigned 128-bit integer
+  conversion to x87 f80; and
+- `__fixxfti` and `__fixunsxfti` for truncating x87 f80 conversion to signed
+  and unsigned 128-bit integers.
 
 Every selected helper has an exact signature, target provider, object-symbol
 test, link-plan entry, and cross-linked execution test. The backend's default
 libcall-name table is not treated as support for helpers it does not model.
+The `xf` helpers use the System V x87 boundary convention only inside localized
+assembly: CCC's CLIF functions continue to exchange f80 values exclusively by
+address.
 
 The SQLite build under the effective 4.2.1 gate does not select wide-integer
 code and therefore supplies no evidence for this extension. Acceptance comes
@@ -350,12 +367,38 @@ cannot be conflated. CCC currently uses sequentially consistent ordering for
 every form; that is an intentional strengthening of GNU's acquire-only minimum
 guarantee for `__sync_lock_test_and_set`.
 
+The compiler-owned `<stdatomic.h>` exposes fundamental integer and pointer
+typedefs, lock-free macros for their native representations, ordinary atomic
+loads/stores, native integer RMW operations, pointer exchange/CAS, and both
+fences. Its implementation maps to the exact `__atomic_*_n` builtin registry
+entries, but its order constants are header-private rather than global GNU
+identity claims. Legal relaxed, consume, acquire, release, and acq-rel requests
+are strengthened to sequential consistency. Constant-invalid load/store orders
+and compare-exchange failure orders are rejected; compare-exchange updates the
+expected value only on failure, and a weak request may use the stronger
+non-spurious operation. Atomic integer compound updates and pointer
+increment/decrement use native RMW operations, with pointer deltas scaled by
+the pointee size.
+
+This is deliberately a partial atomic-type surface. Aggregate, floating, f80,
+128-bit, misaligned packed, and unsupported compound operations fail closed;
+standard pointer `atomic_fetch_add`/`atomic_fetch_sub` also fail closed rather
+than inheriting GNU's raw-byte pointer arithmetic. Consequently
+`__STDC_NO_ATOMICS__` remains defined and `__has_extension(c_atomic)` remains
+false. The lock-free query validates the pointed-to type against the same
+native-width semantic gate before returning true.
+
 Inline assembly is retained losslessly through parsing: template, operands,
-constraints and alternatives, ties, early-clobber markers, clobbers,
-volatility, and goto labels. Emission is enabled only for an inventory-derived
-form whose marshalling and register effects have been certified. An empty
-corpus inventory causes no emission machinery to be built and leaves inline
-assembly unavailable; it does not turn a parse-only construct into a no-op.
+constraint spellings, clobbers, volatility, symbolic names, and goto labels.
+Emission is enabled only for an inventory-derived form whose operand and
+register effects have been certified. The selected x86-64 set consists of
+compiler memory barriers, empty read/write scalar guards, CPUID, RDTSC, the
+Redis locked exchange and compare-exchange forms, zstd's conditional move, and
+behavior-free `nop`/`.p2align` layout hints. Atomics and conditional selection
+lower to explicit CCC-IR operations; CPUID and RDTSC use deterministic hidden
+assembly support routines through the generated-artifact pipeline. Unsupported
+templates, constraints, clobbers, types, qualifiers, symbolic operands, and
+`asm goto` fail before object emission rather than becoming no-ops.
 
 ## Evidence partitions
 

@@ -12,6 +12,7 @@ ccc-session = { path = "../ccc-session" }
 ccc-syntax = { path = "../ccc-syntax" }
 ccc-target = { path = "../ccc-target" }
 ccc-types = { path = "../ccc-types" }
+rustc_apfloat.workspace = true
 
 [lints]
 workspace = true

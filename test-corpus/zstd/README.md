@@ -52,7 +52,7 @@ platform defaults without an adapter-supplied relocation option. The adapter
 requires the resulting `zstd` and `datagen` files to be PIE executables with
 ELF type `DYN` and the PIE dynamic flag, and rejects dynamic text relocations.
 
-## Portable no-assembly configuration
+## Stand-alone and inline assembly
 
 Upstream's `ZSTD_NO_ASM=1` setting removes the stand-alone amd64 assembly
 translation unit and defines `ZSTD_DISABLE_ASM`, but zstd 1.5.7 still selects a
@@ -62,22 +62,28 @@ paths. The complete selected count-bit group is implemented directly through
 `__builtin_clz`, `__builtin_clzll`, `__builtin_ctz`, and `__builtin_ctzll`, so
 the upstream builtin path remains unchanged.
 
-The checked source adjustment extends `ZSTD_DISABLE_ASM` guards only to those
-performance-only inline-assembly paths. The existing CPU-feature fallback,
-conditional expression, and unaligned loops remain the implementation. The
-upstream prefetch path uses CCC's validated nonfaulting builtin. The adjustment
-does not undefine `__GNUC__`, remove a source file, alter the public API, or
-change the compressed format. Its patch, complete
-target preimage and postimage hashes, exact application log, and rationale are
-retained with each run. Any release drift or non-exact hunk match fails before
-compilation.
+Those upstream inline forms now reach CCC unchanged. The selected surface is
+three CPUID constraint families, one empty compiler barrier, one conditional
+`cmova`, two compression-loop alignment hints, and eleven decompression layout
+hints made from `nop` and
+`.p2align 3` through `.p2align 6`. Templates, constraints, clobbers, operand
+types, and the x86-64 target are matched exactly; neighboring forms fail before
+object emission. CPUID uses a compiler-generated hidden support routine that
+preserves RBX and executes the instruction once. The conditional move and
+behavior-free layout hints lower directly.
+
+The upstream prefetch path uses CCC's validated nonfaulting builtin. No source
+file is adjusted, `__GNUC__` remains defined, and the stand-alone assembly unit
+remains excluded by the upstream switch. The adapter records the effective
+inline-assembly inventory and verifies the source anchors before compilation.
 
 The capability probe requires CCC's own GNU 4.2.1 and LP64 x86-64 identity,
 the exact relevant builtin-registry profile, the native count-bit and upstream
-`aligned(1)` scalar unaligned-access paths, and disabled assembly. CCC advertises
+`aligned(1)` scalar unaligned-access paths, and disabled stand-alone assembly.
+CCC advertises
 `__builtin_bswap64` and a behavior-compatible no-op `__builtin_prefetch`;
 zstd's version predicates exclude the former and use the latter. Build-command
-auditing requires the no-assembly decision on every C translation.
+auditing requires the stand-alone-assembly decision on every C translation.
 
 Zstd's dependency header selects `__builtin_memcpy`, `__builtin_memmove`, and
 `__builtin_memset` from the legacy GNU version tuple. CCC implements all three

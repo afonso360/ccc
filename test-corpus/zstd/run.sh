@@ -6,7 +6,6 @@ script_directory=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 repository=$(cd "$script_directory/../.." && pwd)
 manifest="$script_directory/manifest.toml"
 source "$repository/test-corpus/adapter-environment.sh"
-source "$script_directory/source-adjustment.sh"
 
 manifest_string() {
   sed -n "s/^$1 = \"\(.*\)\"$/\1/p" "$manifest"
@@ -134,7 +133,7 @@ export LC_ALL=C
 export TZ=UTC
 umask 022
 
-for tool in awk basename cat cmp cp dd diff dirname file find gcc grep id make md5sum mkdir mkfifo mktemp mv openssl patch readelf rm sed sort stat tar tee touch tr uname wc; do
+for tool in awk basename cat cmp cp dd diff dirname file find gcc grep id make md5sum mkdir mkfifo mktemp mv openssl readelf rm sed sort stat tar tee touch tr uname wc; do
   require_tool "$tool"
 done
 
@@ -148,12 +147,7 @@ archive_name=$(manifest_string archive)
 expected_bytes=$(manifest_integer archive_bytes)
 expected_sha256=$(manifest_string archive_sha256)
 expected_sha3=$(manifest_string archive_sha3_256)
-adjustment_patch=$(manifest_string source_adjustment_patch)
-expected_adjustment_sha256=$(manifest_string source_adjustment_sha256)
-adjustment_hashes=$(manifest_string source_adjustment_hashes)
-expected_adjustment_hashes_sha256=$(manifest_string source_adjustment_hashes_sha256)
-adjustment_target_files=$(manifest_integer source_adjustment_target_files)
-adjustment_rationale=$(manifest_string source_adjustment_rationale)
+expected_inline_assembly_statements=$(manifest_integer selected_inline_assembly_statements)
 expected_translation_occurrences=$(manifest_integer source_translation_occurrences)
 expected_probe_translation_occurrences=$(manifest_integer generated_pthread_probe_translation_occurrences)
 expected_probe_sha256=$(manifest_string generated_pthread_probe_sha256)
@@ -204,18 +198,27 @@ grep -Fq 'Redistribution and use in source and binary forms' "$source_directory/
 grep -Fq 'GNU GENERAL PUBLIC LICENSE' "$source_directory/COPYING" ||
   die "zstd GPL license text is missing"
 
-hash_target_count=$(grep -Evc '^[[:space:]]*(#|$)' \
-  "$script_directory/adjustments/$adjustment_hashes")
-[[ "$hash_target_count" == "$adjustment_target_files" ]] ||
-  die "zstd source-adjustment target count does not match the corpus pin"
-apply_zstd_source_adjustment \
-  "$source_directory" \
-  "$work_directory" \
-  "$script_directory/adjustments/$adjustment_patch" \
-  "$expected_adjustment_sha256" \
-  "$script_directory/adjustments/$adjustment_hashes" \
-  "$expected_adjustment_hashes_sha256" \
-  "$adjustment_rationale"
+inline_assembly_source_audit="$work_directory/inline-assembly-source-audit.txt"
+{
+  printf '%s\n' \
+    'effective_gnu_version=4.2.1' \
+    'standalone_assembly=disabled' \
+    'x86_cpuid_statements=3' \
+    'basic_empty_compiler_barriers=1' \
+    'x86_conditional_move_above=1' \
+    'p2align_5_compression_hints=2' \
+    'decompression_layout_hints=11'
+  printf 'selected_inline_assembly_statements=%s\n' \
+    "$expected_inline_assembly_statements"
+} >"$inline_assembly_source_audit"
+[[ "$(grep -Fc '__asm__("cpuid"' "$source_directory/lib/common/cpu.h")" == 3 ]] ||
+  die "zstd's certified CPUID source surface changed"
+[[ "$(grep -Fc 'cmova %3, %0' "$source_directory/lib/compress/zstd_compress_internal.h")" == 1 ]] ||
+  die "zstd's certified conditional-move source surface changed"
+[[ "$(grep -Fc '__asm__("")' "$source_directory/lib/compress/zstd_fast.c")" == 1 ]] ||
+  die "zstd's certified empty compiler barrier changed"
+[[ "$(grep -Fc '__asm__(".p2align 5")' "$source_directory/lib/compress/zstd_lazy.c")" == 2 ]] ||
+  die "zstd's certified compression layout hints changed"
 
 : "${CCC:=$repository/target/debug/ccc}"
 : "${CCC_RESOURCE_DIR:=$repository/resource-dir}"
@@ -307,6 +310,9 @@ done
     'variable_length_array_object=none' \
     'statement_expression=none' \
     'computed_goto=none'
+  printf 'inline_assembly=certified-upstream-forms\n'
+  printf 'selected_inline_assembly_statements=%s\n' \
+    "$expected_inline_assembly_statements"
 } >"$work_directory/capability-inventory.txt"
 
 expected_source_inputs="$work_directory/expected-source-inputs.txt"

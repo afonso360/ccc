@@ -1,0 +1,62 @@
+format_version = 1
+name = "berkeley-extf80-oracle"
+role = "independent-test-harness-oracle"
+production_linkage = "forbidden"
+fetched_not_vendored = true
+
+softfloat_version = "3e"
+softfloat_release_date = "2018-01-20"
+softfloat_origin = "https://www.jhauser.us/arithmetic/SoftFloat-3e.zip"
+softfloat_documentation = "https://www.jhauser.us/arithmetic/SoftFloat-3/doc/SoftFloat.html"
+softfloat_archive = "SoftFloat-3e.zip"
+softfloat_archive_bytes = 729637
+softfloat_archive_sha256 = "21130ce885d35c1fe73fc1e1bf2244178167e05c6747cad5f450cc991714c746"
+softfloat_archive_sha3_256 = "dfd6f82934c3837302bf072f2778190ed0d9414f423b6dfa2263451f4432c3ce"
+softfloat_license = "BSD-3-Clause"
+softfloat_license_file = "COPYING.txt"
+softfloat_license_sha256 = "1a9bde4daac8f2fd9593128ef605238471209e79c9fc2cabc22557d3da29fa65"
+
+testfloat_version = "3e"
+testfloat_release_date = "2018-01-20"
+testfloat_origin = "https://www.jhauser.us/arithmetic/TestFloat-3e.zip"
+testfloat_documentation = "https://www.jhauser.us/arithmetic/TestFloat-3/doc/TestFloat-general.html"
+testfloat_archive = "TestFloat-3e.zip"
+testfloat_archive_bytes = 429806
+testfloat_archive_sha256 = "6d4bdf0096b48a653aa59fc203a9e5fe18b5a58d7a1b715107c7146776a0aad6"
+testfloat_archive_sha3_256 = "aa209f807bf2a3bae3152aa5f9783149d88c27ea3a481e562006dadd614d8611"
+testfloat_license = "BSD-3-Clause"
+testfloat_license_file = "COPYING.txt"
+testfloat_license_sha256 = "de822828fa475ba5f10115954a7471fe84ec04884ac7a38de1c3adfc7ceed858"
+
+target = "x86_64-unknown-linux-gnu"
+execution = "native-only"
+reference_implementation = "Berkeley SoftFloat linked only into TestFloat"
+subject_implementation = "CCC-compiled extF80 operation adapter"
+generator_seed = 1128481606
+generator_level = 1
+rounding_precision = 80
+rounding_modes = ["near-even", "toward-zero", "downward", "upward"]
+tininess_detection = "after-rounding"
+subject_optimizations = ["-O0", "-O2"]
+check_nan_payloads = false
+representation_transfer = "__builtin_memcpy with compile-time size equality"
+integer_invalid_policy = "defined adapter guard; 8086-SSE indefinite value plus FE_INVALID before any C cast"
+expected_cases_per_optimization = 894816
+expected_cases_total = 1789632
+operations = [
+    "ui64_to_extF80",
+    "i64_to_extF80",
+    "f32_to_extF80",
+    "f64_to_extF80",
+    "extF80_to_ui64_rx_minMag",
+    "extF80_to_i64_rx_minMag",
+    "extF80_to_f32",
+    "extF80_to_f64",
+    "extF80_add",
+    "extF80_sub",
+    "extF80_mul",
+    "extF80_div",
+    "extF80_eq",
+    "extF80_le",
+    "extF80_lt",
+]

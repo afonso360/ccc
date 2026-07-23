@@ -1,5 +1,7 @@
 use ccc_ir::generic as gir;
-use ccc_target::{AbiIdentity, ByteOrder, CallingConvention, EffectiveCompilationConfig};
+use ccc_target::{
+    AbiIdentity, ByteOrder, CallingConvention, EffectiveCompilationConfig, LongDoubleFormat,
+};
 use ccc_types::{ArrayLength, TypeKind, TypeQualifiers, TypeStore};
 use sha2::{Digest as _, Sha256};
 
@@ -30,7 +32,7 @@ pub fn abi_config_key(config: &EffectiveCompilationConfig) -> Result<AbiConfigKe
     })?;
     let layout = config.target.data_layout;
     let data_layout = format!(
-        "endian={};char_signed={};bool={}/{};char={}/{};short={}/{};int={}/{};long={}/{};long_long={}/{};pointer={}/{};float={}/{};double={}/{};long_double={}/{};wchar=width:{},signed:{};wint=width:{},signed:{};bitfields={}:{}:{}:{}:{};default_pack={}:{}",
+        "endian={};char_signed={};bool={}/{};char={}/{};short={}/{};int={}/{};long={}/{};long_long={}/{};pointer={}/{};float={}/{};double={}/{};long_double={}/{}/{};wchar=width:{},signed:{};wint=width:{},signed:{};bitfields={}:{}:{}:{}:{};default_pack={}:{}",
         match layout.byte_order {
             ByteOrder::Little => "little",
             ByteOrder::Big => "big",
@@ -56,6 +58,11 @@ pub fn abi_config_key(config: &EffectiveCompilationConfig) -> Result<AbiConfigKe
         layout.double_align,
         layout.long_double_width,
         layout.long_double_align,
+        match layout.long_double_format {
+            LongDoubleFormat::Binary64 => "binary64",
+            LongDoubleFormat::X87Extended => "x87-extended",
+            LongDoubleFormat::IeeeBinary128 => "ieee-binary128",
+        },
         layout.wchar_width,
         layout.wchar_is_signed as u8,
         layout.wint_width,
@@ -71,7 +78,7 @@ pub fn abi_config_key(config: &EffectiveCompilationConfig) -> Result<AbiConfigKe
     let (boundary_profile, classifier_revision, specification_revision, specification_digest) =
         match config.target.abi {
             AbiIdentity::SysvAmd64Lp64 => {
-                ("sysv-amd64-lp64-v2", 2, PSABI_COMMIT, PSABI_SOURCE_SHA256)
+                ("sysv-amd64-lp64-v3", 3, PSABI_COMMIT, PSABI_SOURCE_SHA256)
             }
             AbiIdentity::Aapcs64Lp64 => {
                 ("aapcs64-lp64-v1", 1, AAPCS64_COMMIT, AAPCS64_SOURCE_SHA256)
@@ -90,7 +97,7 @@ pub fn abi_config_key(config: &EffectiveCompilationConfig) -> Result<AbiConfigKe
             ),
         };
     Ok(AbiConfigKey {
-        schema: "ccc-abi-config-v2",
+        schema: "ccc-abi-config-v3",
         target_triple: config.target.triple.to_string(),
         abi_identity: config.target.abi,
         data_layout,
@@ -129,6 +136,18 @@ pub fn sysv_amd64_v1_config_fingerprint(
         ));
     }
     let mut key = abi_config_key(config)?;
+    key.data_layout = key.data_layout.replace(
+        &format!(
+            "long_double={}/{}/x87-extended;",
+            config.target.data_layout.long_double_width,
+            config.target.data_layout.long_double_align
+        ),
+        &format!(
+            "long_double={}/{};",
+            config.target.data_layout.long_double_width,
+            config.target.data_layout.long_double_align
+        ),
+    );
     key.schema = "ccc-abi-config-v1";
     key.boundary_profile = "sysv-amd64-lp64-v1";
     key.classifier_revision = 1;
@@ -843,54 +862,59 @@ fn encode_instruction(encoder: &mut Encoder, instruction: &gir::FullInstructionK
             encoder.bool(*write);
             encoder.tag(*locality);
         }
-        I::RuntimeSizedAllocate {
-            storage,
+        I::RuntimeSize {
             extents,
             element,
             constant_factor,
-            requested_alignment,
         } => {
-            encoder.tag(32);
-            encoder.u32(storage.0);
+            encoder.tag(42);
             encoder.len(extents.len());
             for extent in extents {
                 encoder.u32(extent.0);
             }
             encoder.qualified(*element);
             encoder.u64(*constant_factor);
+        }
+        I::RuntimeSizedAllocate {
+            storage,
+            size,
+            element,
+            requested_alignment,
+        } => {
+            // Tags 32 through 34 retain the retired extent-bearing runtime
+            // operation encodings. New operand shapes receive append-only
+            // tags so a historical digest cannot be reinterpreted.
+            encoder.tag(43);
+            encoder.u32(storage.0);
+            encoder.u32(size.0);
+            encoder.qualified(*element);
             encoder.option_u64(*requested_alignment);
         }
         I::RuntimePointerOffset {
             base,
             index,
             element,
-            extents,
+            stride,
             subtract,
         } => {
-            encoder.tag(33);
+            encoder.tag(44);
             encoder.u32(base.0);
             encoder.u32(index.0);
             encoder.qualified(*element);
-            encoder.len(extents.len());
-            for extent in extents {
-                encoder.u32(extent.0);
-            }
+            encoder.u32(stride.0);
             encoder.bool(*subtract);
         }
         I::RuntimePointerDifference {
             left,
             right,
             element,
-            extents,
+            stride,
         } => {
-            encoder.tag(34);
+            encoder.tag(45);
             encoder.u32(left.0);
             encoder.u32(right.0);
             encoder.qualified(*element);
-            encoder.len(extents.len());
-            for extent in extents {
-                encoder.u32(extent.0);
-            }
+            encoder.u32(stride.0);
         }
         I::MemoryCopy {
             destination,
@@ -913,6 +937,46 @@ fn encode_instruction(encoder: &mut Encoder, instruction: &gir::FullInstructionK
             encoder.u32(destination.0);
             encoder.u32(value.0);
             encoder.u32(length.0);
+        }
+        I::CompilerBarrier { memory } => {
+            encoder.tag(37);
+            encoder.bool(*memory);
+        }
+        I::OpaqueScalar { operand } => {
+            encoder.tag(38);
+            encoder.u32(operand.0);
+        }
+        I::CodeLayoutHint(hint) => {
+            encoder.tag(39);
+            match hint {
+                gir::CodeLayoutHint::AlignToPowerOfTwo(power) => {
+                    encoder.tag(0);
+                    encoder.u8(*power);
+                }
+                gir::CodeLayoutHint::Nop => encoder.tag(1),
+            }
+        }
+        I::X86Cpuid {
+            leaf,
+            subleaf,
+            eax,
+            ebx,
+            ecx,
+            edx,
+        } => {
+            encoder.tag(40);
+            encoder.u32(leaf.0);
+            for value in [subleaf, eax, ebx, ecx, edx] {
+                encoder.bool(value.is_some());
+                if let Some(value) = value {
+                    encoder.u32(value.0);
+                }
+            }
+        }
+        I::X86Rdtsc { low, high } => {
+            encoder.tag(41);
+            encoder.u32(low.0);
+            encoder.u32(high.0);
         }
     }
 }
@@ -990,6 +1054,15 @@ fn encode_constant(encoder: &mut Encoder, constant: gir::ScalarConstant) {
             encoder.u64(value.to_bits());
         }
         gir::ScalarConstant::NullPointer => encoder.tag(3),
+        gir::ScalarConstant::LongDouble(value) => {
+            encoder.tag(4);
+            encoder.tag(match value.format {
+                ccc_target::LongDoubleFormat::Binary64 => 0,
+                ccc_target::LongDoubleFormat::X87Extended => 1,
+                ccc_target::LongDoubleFormat::IeeeBinary128 => 2,
+            });
+            encoder.bytes(&value.bytes);
+        }
     }
 }
 
@@ -1136,7 +1209,7 @@ mod tests {
             (
                 EffectiveCompilationConfig::x86_64_unknown_linux_gnu(),
                 AbiIdentity::SysvAmd64Lp64,
-                "sysv-amd64-lp64-v2",
+                "sysv-amd64-lp64-v3",
                 "x86-64",
                 "lp64",
             ),
@@ -1163,7 +1236,7 @@ mod tests {
             ),
         ] {
             let key = abi_config_key(&config).unwrap();
-            assert_eq!(key.schema, "ccc-abi-config-v2");
+            assert_eq!(key.schema, "ccc-abi-config-v3");
             assert_eq!(key.abi_identity, identity);
             assert_eq!(key.boundary_profile, profile);
             assert_eq!(key.normalized_target_arch, architecture);
@@ -1180,7 +1253,7 @@ mod tests {
             assert_eq!(
                 key.classifier_revision,
                 if identity == AbiIdentity::SysvAmd64Lp64 {
-                    2
+                    3
                 } else {
                     1
                 }
@@ -1230,11 +1303,11 @@ mod tests {
         let translation_unit = translation_unit_digest(&module, &key, ir);
         assert_eq!(
             crate::hex(&ir.0),
-            "f89ea5d276f2c628e75874271d7cf43fc3dce97a1c52114148486e491af892cc"
+            "d5edbc83204023579e6874355650a9b39158909baa4ee253b2b290e41b953dec"
         );
         assert_eq!(
             crate::hex(&translation_unit.0),
-            "403fcbbf0155eff8563cc1ae9cdc4adc7791a1ced4a6301e40555e7f6ed9b77d"
+            "3206def366107367d10225d3da354593553c76c043b060d0b31a79370dc923d4"
         );
     }
 

@@ -4,13 +4,15 @@ CCC targets pragmatic C11 plus a documented GNU compatibility profile. Every acc
 
 ## Language modes
 
-The default language mode is `gnu11`. The initially supported explicit modes are
-`-std=gnu11` and `-std=c11`; other `-std=` values are rejected before reading an
-input. Both modes define `__STDC_VERSION__` as `201112L`. Strict `c11` also
-defines `__STRICT_ANSI__`. Trigraph replacement is enabled in strict `c11` and
-by an explicit `-trigraphs` option, and disabled in `gnu11`; a disabled
-trigraph that could change the program is covered by the `trigraphs` warning
-category.
+The default language mode is `gnu11`. The explicit modes are `-std=gnu11` and
+`-std=c11`; `-std=gnu99` and `-std=c99` are accepted build-profile aliases for
+those respective modes rather than distinct C99 frontends. Consequently all
+four spellings define `__STDC_VERSION__` as `201112L`, and the strict `c99`
+alias defines `__STRICT_ANSI__` just like strict `c11`. Other `-std=` values are
+rejected before reading an input. Trigraph replacement is enabled in the
+strict mode and by an explicit `-trigraphs` option, and disabled in the GNU
+mode; a disabled trigraph that could change the program is covered by the
+`trigraphs` warning category.
 
 Input is UTF-8, with one optional leading UTF-8 byte-order mark. Universal
 character names permitted in C11 identifiers are accepted and canonicalized
@@ -29,7 +31,10 @@ The default mode always preserves the selected target's C ABI, including represe
 
 Declarations, `sizeof`, and `_Alignof` remain usable even when the selected backend lacks arithmetic or boundary support. Any literal conversion, arithmetic operation, call, return, or initializer that needs an unavailable capability is a hard, target-specific error. CCC must not substitute `double` implicitly.
 
-`-mlong-double-64` is an explicit compatibility mode, never the default on a target whose ABI uses f80 or binary128. In that mode the [`EffectiveCompilationConfig`](targets.md#effective-compilation-configuration) changes the representation coherently: size, alignment, `__SIZEOF_LONG_DOUBLE__`, every `__LDBL_*__` macro, `<float.h>`, and ABI lowering all describe binary64. The driver emits one prominent ABI-incompatibility warning unless explicitly silenced. Objects produced in this mode carry a mode identifier in CCC metadata so the linker can diagnose incompatible CCC objects.
+CCC does not accept an ABI-changing `long double` override. In particular,
+`-mlong-double-64` is rejected instead of changing only part of the language,
+header, object, or calling-convention contract. Each enabled profile uses the
+selected target's native representation throughout.
 
 The runtime/helper and assembly-bridge availability is a target capability checked before code generation. Soft-float arithmetic alone is not considered ABI support.
 
@@ -40,16 +45,25 @@ are part of the accepted-program restriction and are tested separately from
 layout and macro evidence. Darwin's binary64 representation has native fixed
 and variadic transport.
 
-The enabled `x86_64-unknown-linux-gnu` SysV boundary profile does not yet
-provide native x87 transport or an address-backed scalar `long double` value.
-A call, definition, return, or variadic fetch using `long double` is therefore
-rejected. The same profile rejects an aggregate containing `long double`, even
-when the psABI would ultimately pass that aggregate in memory: accepting it
-would also require 16-byte overflow and fixed-argument placement that the
-native Cranelift `StructArgument` interface cannot describe. Declarations and
-layout queries remain valid. The profile is explicitly versioned so an
-address-only generated bridge capability can remove this accepted-program
-restriction coherently.
+The `x86_64-unknown-linux-gnu` profile keeps every f80 value in an
+address-backed, 16-byte object. The low ten bytes contain the x87 value;
+compiler-created constants and ABI staging objects zero the remaining six
+bytes, which are never treated as a C value. Exact literal conversion and
+constant folding use the target f80 format rather than host `double`; runtime
+arithmetic, comparison, sign change, volatile access, and conversions to or
+from integer types, `float`, and `double` run through a
+translation-unit-local assembly dispatcher. The dispatcher is called through
+a nonvariadic `void (frame *)` interface, so Cranelift never needs an f80 value
+or x87 register class.
+
+Generated SysV assembly bridges implement fixed, prototyped-variadic, and
+unprototyped direct and indirect calls, definitions, scalar returns in
+`%st(0)`, memory-class aggregates containing f80, and the 16-byte overflow path
+used by `va_arg`. This transport is cross-linked with GCC in both directions.
+The 128-bit integer conversions select the corresponding compiler-runtime
+helper explicitly and remain address-backed on the f80 side. Runtime x87
+arithmetic observes the current x87 rounding mode. Operations that temporarily
+change control bits restore the incoming control word before returning.
 
 ## Variadic fetch restrictions
 
@@ -80,19 +94,27 @@ C11 makes runtime-sized automatic VLA objects optional and does not require
 their physical storage to reside on the machine stack. Variably modified types
 remain representable independently of that storage capability. Semantic
 analysis distinguishes an expression-bound array from prototype-scope `[*]`,
-retains supported parameter and local-declaration extents, permits fixed-size
-objects such as pointers to VLA where C permits them, and diagnoses illegal
-storage classes. Variably modified typedef and type-name bounds remain explicit
-frontend boundaries until their effects can be represented without loss.
+retains parameter, local-declaration, typedef, and evaluated type-name extents
+exactly once, permits fixed-size objects such as pointers to VLA where C permits
+them, and diagnoses the storage classes that C forbids for variably modified
+types. Named and switch jumps cannot bypass a declaration whose saved bound is
+in scope; computed goto remains conservatively incompatible with such a
+declaration in the same function. Conditional expressions over compatible
+pointers to runtime-sized arrays evaluate only the selected operand's bounds
+and merge that selected layout for later `sizeof` and pointer arithmetic.
+GNU fixed zero-length arrays remain available, while mixing a zero-length
+dimension with a runtime dimension is a deliberate `CCC2456` semantic boundary
+because such a layout cannot produce a valid checked runtime size.
 
 The hosted profile implements automatic VLA object allocation through the
 [runtime-sized automatic storage contract](cranelift-risks.md#runtime-sized-automatic-storage-contract),
 including checked extents, multidimensional strides, alignment, bounded reuse,
-and normal-return cleanup. It still defines `__STDC_NO_VLA__` to `1` until the
-remaining runtime-layout and variably modified type contexts have complete
-semantic, CCC-IR, provider, failure, and execution evidence. The macro describes
-the complete optional C11 capability; it does not prevent a documented subset
-from being accepted as an extension and does not promise native-stack storage.
+runtime `sizeof`, and normal-return cleanup. `RuntimeSize` makes checked extent
+multiplication explicit in CCC-IR and is shared by allocation, layout, and
+dynamic pointer strides. Semantic, verifier, provider-success/failure, native
+execution, and O0/O2 target-oracle tests cover every enabled target. The
+`c11-vla` registry capability is therefore implemented and
+`__STDC_NO_VLA__` is absent. This does not promise native-stack storage.
 
 The selected hosted provider is the scoped arena in
 [ADR-0011](../adr/0011-arena-backed-runtime-sized-automatic-storage.md). It
@@ -165,4 +187,4 @@ pinned libc-header corpus.
 
 A GNU profile is not optional on hosted Linux targets. When `__GNUC__` is absent or ancient, glibc and musl headers take a fallback path that erases attributes and related keywords by macro (`sys/cdefs.h` defines `__attribute__(xyz)` to nothing), silently changing declarations, layout, and ABI — outside CCC's own no-silent-change machinery, because it happens by macro expansion inside libc. The apparently conservative option is the unsafe one. A hosted target's capability manifest therefore includes a minimum claimed GCC version, its header gates run with that profile active, and compiling against a hosted libc without an active GNU profile is refused rather than allowed to degrade silently.
 
-Supported GNU syntax includes only registry entries with the state above. Inline assembly is represented with templates, operands, constraints, clobbers, volatility, and `asm goto` labels; code generation follows the bridge/whole-function rules in the [Cranelift risk register](cranelift-risks.md#risk-register). Assembly labels on declarations (`int f(void) __asm__("f_impl");`) are a separate registry capability from inline-assembly bodies: they change the linked symbol name, can never be no-ops, and glibc's `__REDIRECT` machinery makes them a requirement for hosted compiles.
+Supported GNU syntax includes only registry entries with the state above. Inline assembly is represented with templates, operands, constraints, clobbers, volatility, and `asm goto` labels; only exact target-specific inventory forms pass semantic analysis, as described in the [Cranelift risk register](cranelift-risks.md#risk-register). Assembly labels on declarations (`int f(void) __asm__("f_impl");`) are a separate registry capability from inline-assembly bodies: they change the linked symbol name, can never be no-ops, and glibc's `__REDIRECT` machinery makes them a requirement for hosted compiles.

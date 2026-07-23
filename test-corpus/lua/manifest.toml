@@ -1,7 +1,7 @@
 format_version = 2
 name = "lua"
 version = "5.5.0"
-release_date = "2025-12-22"
+release_date = "2025-12-15"
 distribution = "official-source"
 origin = "https://www.lua.org/ftp/lua-5.5.0.tar.gz"
 archive = "lua-5.5.0.tar.gz"
@@ -11,6 +11,8 @@ archive_sha3_256 = "5153631a215cc387b652e3bbbf6e3f82b93020a18b2f78520181bd2273c7
 license = "MIT"
 upstream_license_file = "src/lua.h"
 fetched_not_vendored = true
+source_adjustments = "none"
+compiler_wrapper = "none"
 
 test_distribution = "official-tests"
 test_origin = "https://www.lua.org/tests/lua-5.5.0-tests.tar.gz"
@@ -26,10 +28,12 @@ language_mode_selection = "driver-default"
 gnu_compatibility_tuple = "4.2.1"
 build_interface = "upstream-make-linux"
 build_target = "linux"
-build_command = "make linux CC=<ccc-adapter>"
+build_command = "make linux CC=ccc"
 source_translation_units = 34
+archive_members = 32
+link_commands = 2
 target_compiler = "ccc"
-link_driver = "gcc"
+link_driver = "ccc via resolved GCC target toolchain"
 link_mode = "platform-default-pie-executable"
 
 test_profile = "basic"
@@ -79,15 +83,23 @@ statement_expressions = []
 
 [adapter_artifacts]
 retain = [
+    "archive-members.txt",
     "build.log",
+    "ccc-commands.txt",
     "compile-commands.txt",
     "effective-macros.txt",
     "elf-dynamic-tags.txt",
     "elf-headers.txt",
+    "expected-archive-members.txt",
+    "expected-link-arguments.txt",
+    "expected-object-outputs.txt",
     "expected-source-inputs.txt",
     "hosted-probe.txt",
     "link-driver-identity.txt",
     "link-driver-macros.txt",
+    "link-commands.txt",
+    "normalized-link-arguments.txt",
+    "object-outputs.txt",
     "predicate-probe.txt",
     "capability-inventory.txt",
     "source-inputs.txt",

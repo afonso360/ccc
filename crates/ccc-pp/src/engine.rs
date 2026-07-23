@@ -311,8 +311,10 @@ struct Engine<'a> {
 impl Engine<'_> {
     fn run(&mut self, main_file: FileId) -> PreprocessOutput {
         let reference = Span::new(main_file, 0, 0);
-        self.install_predefined_macros(reference);
-        self.apply_command_line_macros(reference);
+        if !self.options.preprocessed_input {
+            self.install_predefined_macros(reference);
+            self.apply_command_line_macros(reference);
+        }
 
         let main_name = self
             .session
@@ -334,25 +336,35 @@ impl Engine<'_> {
             .unwrap_or_else(|| FileIdentity(format!("main:{}", main_path.display())));
         let main_dependency = self.dependencies.record_file(main_path.clone(), false);
 
-        for path in self.options.imacros.clone() {
-            self.process_forced_path(&path, main_file, false);
+        if !self.options.preprocessed_input {
+            for path in self.options.imacros.clone() {
+                if self.diagnostics.is_halted() {
+                    break;
+                }
+                self.process_forced_path(&path, main_file, false);
+            }
+            for path in self.options.forced_includes.clone() {
+                if self.diagnostics.is_halted() {
+                    break;
+                }
+                self.process_forced_path(&path, main_file, true);
+            }
         }
-        for path in self.options.forced_includes.clone() {
-            self.process_forced_path(&path, main_file, true);
+        if !self.diagnostics.is_halted() {
+            self.process_file(
+                FileFrame {
+                    file: main_file,
+                    path: main_path,
+                    identity: main_identity,
+                    found_entry: None,
+                    system: false,
+                    dependency_index: main_dependency,
+                    dependency_edge: None,
+                    is_main: true,
+                },
+                true,
+            );
         }
-        self.process_file(
-            FileFrame {
-                file: main_file,
-                path: main_path,
-                identity: main_identity,
-                found_entry: None,
-                system: false,
-                dependency_index: main_dependency,
-                dependency_edge: None,
-                is_main: true,
-            },
-            true,
-        );
 
         let macros = MacroSnapshot {
             definitions: self
@@ -637,6 +649,9 @@ impl Engine<'_> {
         for (line_index, (mut line, line_errors)) in
             lexed.lines.into_iter().zip(lexed.line_errors).enumerate()
         {
+            if self.diagnostics.is_halted() {
+                break;
+            }
             let physical_line = line
                 .iter()
                 .filter_map(|token| {
@@ -845,6 +860,9 @@ impl Engine<'_> {
         logical_file: &str,
         system: bool,
     ) -> (Vec<PpToken>, bool) {
+        if self.options.preprocessed_input {
+            return (tokens, false);
+        }
         let expansion = expand(
             &mut self.session.sources,
             &mut self.macros,
@@ -1796,6 +1814,9 @@ impl Engine<'_> {
     }
 
     fn emit(&mut self, mut diagnostic: PpDiagnostic) {
+        if self.diagnostics.is_halted() {
+            return;
+        }
         if let Some(span) = diagnostic.span {
             diagnostic.is_system_header |= self.session.sources.is_system_header(span);
         }
@@ -2970,6 +2991,36 @@ mod tests {
         assert_eq!(tokens[0].spelling, "12");
         assert_eq!(tokens[1].spelling, "\"logical.c\"");
         assert!(tokens.iter().all(|token| token.is_system_header));
+    }
+
+    #[test]
+    fn preprocessed_input_forwards_tokens_without_reapplying_macros_or_forced_inputs() {
+        let mut files = MemoryFiles::default();
+        files.0.insert(
+            PathBuf::from("/project/forced.h"),
+            "int forced_input_was_processed;\n".to_owned(),
+        );
+        let (output, diagnostics) = run(
+            "# 9 \"generated.c\"\nint SELECTED;\n",
+            &files,
+            &PreprocessOptions {
+                preprocessed_input: true,
+                command_line_macros: vec![CommandLineMacro::Define(
+                    "SELECTED=reexpanded".to_owned(),
+                )],
+                forced_includes: vec![PathBuf::from("/project/forced.h")],
+                suppress_line_markers: true,
+                ..PreprocessOptions::default()
+            },
+        );
+        assert!(!output.had_errors, "{:#?}", diagnostics.diagnostics);
+        let rendered = render_preprocessed(&output, true);
+        assert!(rendered.contains("int SELECTED;"), "{rendered}");
+        assert!(!rendered.contains("reexpanded"), "{rendered}");
+        assert!(
+            !rendered.contains("forced_input_was_processed"),
+            "{rendered}"
+        );
     }
 
     #[test]

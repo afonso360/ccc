@@ -1,0 +1,105 @@
+format_version = 2
+name = "zlib"
+version = "1.3.2"
+release_date = "2026-02-17"
+distribution = "official-source"
+origin = "https://zlib.net/fossils/zlib-1.3.2.tar.gz"
+archive = "zlib-1.3.2.tar.gz"
+archive_bytes = 1502830
+archive_sha256 = "bb329a0a2cd0274d05519d61c667c062e06990d72e125ee2dfa8de64f0119d16"
+archive_sha3_256 = "451bedbdcd78dec3704df673c976fab25beaef6adb9433fe84665e7bf946e325"
+license = "zlib"
+upstream_license_file = "LICENSE"
+fetched_not_vendored = true
+source_adjustments = "none"
+compiler_wrapper = "none"
+
+target = "x86_64-unknown-linux-gnu"
+language_mode = "gnu11"
+language_mode_selection = "driver-default"
+gnu_compatibility_tuple = "4.2.1"
+build_interface = "upstream-configure-and-make"
+configure_command = "CC=ccc ./configure"
+build_command = "make test test64"
+core_translation_units = 15
+expected_translation_occurrences = 34
+target_compiler = "ccc"
+link_driver = "ccc"
+outputs = ["libz.a", "libz.so.1.3.2", "example", "minigzip", "example64", "minigzip64", "examplesh", "minigzipsh"]
+test_profile = "upstream-static-shared-and-large-file"
+success_markers = ["*** zlib test OK ***", "*** zlib shared test OK ***", "*** zlib 64-bit test OK ***"]
+
+required_tools = [
+    "ar",
+    "awk",
+    "bash",
+    "cmp",
+    "cp",
+    "dirname",
+    "find",
+    "gcc",
+    "grep",
+    "make",
+    "mkdir",
+    "mktemp",
+    "mv",
+    "openssl",
+    "readelf",
+    "rm",
+    "sed",
+    "sort",
+    "tar",
+    "tee",
+    "tr",
+    "uname",
+    "wc",
+]
+conditional_download_tools = ["curl"]
+
+[expected_inventory]
+gnu_attributes = ["visibility-hidden"]
+shared_output = true
+position_independent_objects = true
+static_archive_input = true
+inline_assembly_forms = []
+wide_integer_uses = []
+returns_twice_interfaces = []
+variable_length_array_objects = []
+statement_expressions = []
+
+[adapter_artifacts]
+retain = [
+    "archive-members.txt",
+    "build.log",
+    "capability-inventory.txt",
+    "ccc-version.txt",
+    "compile-commands.txt",
+    "configure.log",
+    "dynamic-tags.txt",
+    "elf-headers.txt",
+    "expected-source-multiset.txt",
+    "link-driver-identity.txt",
+    "link-driver-macros.txt",
+    "round-trip-input.bin",
+    "round-trip-output.bin",
+    "source-multiset.txt",
+    "test.log",
+]
+
+[target_applicability."x86_64-unknown-linux-gnu"]
+status = "applicable"
+evidence_kind = "execution"
+runner = "run.sh"
+reason = "The adapter audits the unmodified upstream configure and Make build, CCC-linked static and shared products, ELF PIE/shared artifacts, and upstream execution tests."
+
+[target_applicability."aarch64-unknown-linux-gnu"]
+status = "inapplicable"
+reason = "The adapter has no AArch64 cross-toolchain, QEMU execution, or target-adjusted artifact inventory."
+
+[target_applicability."riscv64-unknown-linux-gnu"]
+status = "inapplicable"
+reason = "The adapter has no RISC-V cross-toolchain, QEMU execution, or target-adjusted artifact inventory."
+
+[target_applicability."aarch64-apple-darwin"]
+status = "inapplicable"
+reason = "The reproducible gate currently requires GNU ELF inspection; Darwin shared builds are covered by native driver integration tests rather than this corpus runner."

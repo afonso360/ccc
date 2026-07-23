@@ -675,7 +675,36 @@ mod tests {
         let resources = ResourceDirectory::discover(None).unwrap();
         assert!(resources.root().ends_with("resource-dir"));
         assert!(resources.include().join("stdbool.h").is_file());
+        assert!(resources.include().join("stdatomic.h").is_file());
         assert!(resources.include().join("stddef.h").is_file());
+    }
+
+    #[test]
+    fn ships_the_scalar_atomic_header_contract() {
+        let resources = ResourceDirectory::discover(None).unwrap();
+        let manifest_source = fs::read_to_string(resources.root().join("manifest.toml")).unwrap();
+        let manifest = ResourceManifest::parse(&manifest_source).unwrap();
+        assert!(
+            manifest
+                .headers
+                .compiler_owned
+                .iter()
+                .any(|header| header == "stdatomic.h")
+        );
+
+        let header = fs::read_to_string(resources.include().join("stdatomic.h")).unwrap();
+        for contract in [
+            "typedef _Atomic(int) atomic_int;",
+            "#define ATOMIC_INT_LOCK_FREE 2",
+            "#define atomic_load_explicit(object, order)",
+            "#define atomic_compare_exchange_strong_explicit(",
+            "#define atomic_thread_fence(order)",
+        ] {
+            assert!(
+                header.contains(contract),
+                "stdatomic.h is missing contract {contract:?}"
+            );
+        }
     }
 
     #[test]
@@ -715,14 +744,27 @@ mod tests {
     }
 
     #[test]
-    fn ships_the_hosted_math_and_apple_inline_policy_wrappers() {
+    fn ships_the_hosted_float_math_and_apple_inline_policy_wrappers() {
         let resources = ResourceDirectory::discover(None).unwrap();
         let manifest_source = fs::read_to_string(resources.root().join("manifest.toml")).unwrap();
         let manifest = ResourceManifest::parse(&manifest_source).unwrap();
         assert_eq!(
             manifest.headers.hosted_wrappers,
-            vec!["math.h".to_owned(), "sys/cdefs.h".to_owned()]
+            vec![
+                "float.h".to_owned(),
+                "math.h".to_owned(),
+                "sys/cdefs.h".to_owned()
+            ]
         );
+
+        let float = fs::read_to_string(resources.include().join("float.h")).unwrap();
+        for contract in [
+            "#include_next <float.h>",
+            "#define FLT16_MAX ((_Float16)__FLT16_MAX__)",
+            "#define FLT16_TRUE_MIN ((_Float16)__FLT16_DENORM_MIN__)",
+        ] {
+            assert!(float.contains(contract), "float.h is missing {contract:?}");
+        }
 
         let math = fs::read_to_string(resources.include().join("math.h")).unwrap();
         for contract in [

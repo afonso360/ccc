@@ -25,5 +25,11 @@ ccc-syntax = { path = "../ccc-syntax" }
 ccc-target = { path = "../ccc-target" }
 object.workspace = true
 
+[dev-dependencies]
+gimli.workspace = true
+
+[target.'cfg(unix)'.dev-dependencies]
+signal-hook.workspace = true
+
 [lints]
 workspace = true

@@ -146,8 +146,6 @@ expected_sha256=$(manifest_string archive_sha256)
 expected_sha3=$(manifest_string archive_sha3_256)
 expected_source_id=$(manifest_string source_id)
 expected_generated_sha3=$(manifest_string generated_sqlite3_sha3_256)
-expected_strict_ansi_predicate_uses=$(manifest_integer generated_strict_ansi_predicate_uses)
-expected_strict_ansi_negated_uses=$(manifest_integer generated_strict_ansi_negated_uses)
 adjustment_patch=$(manifest_string test_adjustment_patch)
 expected_adjustment_sha256=$(manifest_string test_adjustment_sha256)
 adjustment_target=$(manifest_string test_adjustment_target)
@@ -294,12 +292,6 @@ grep -Fq "$expected_source_id" sqlite3.c || {
   echo "generated sqlite3.c source ID mismatch" >&2
   exit 1
 }
-actual_strict_ansi_predicate_uses=$(grep -Fc 'defined(__STRICT_ANSI__)' sqlite3.c)
-actual_strict_ansi_negated_uses=$(grep -Fc '!defined(__STRICT_ANSI__)' sqlite3.c)
-[[ "$actual_strict_ansi_predicate_uses" == "$expected_strict_ansi_predicate_uses" ]] ||
-  die "generated sqlite3.c changed its __STRICT_ANSI__ predicate surface"
-[[ "$actual_strict_ansi_negated_uses" == "$expected_strict_ansi_negated_uses" ]] ||
-  die "generated sqlite3.c changed its negated __STRICT_ANSI__ predicate surface"
 
 apply_sqlite_test_adjustment \
   "$source_directory" \
@@ -330,7 +322,7 @@ expected_source_count=$(wc -l <"$expected_source_inputs" | tr -d '[:space:]')
 {
   grep -E '^(selected_builtin|available_hosted_builtin)=' predicate-probe.txt
   printf '%s\n' \
-    'inline_assembly=none' \
+    'testfixture_inline_assembly=none' \
     'wide_integer_use=none' \
     'variable_length_array_object=none' \
     'statement_expression=none' \
@@ -340,9 +332,8 @@ expected_source_count=$(wc -l <"$expected_source_inputs" | tr -d '[:space:]')
       'fuzzcheck_feature=SQLITE_ENABLE_STMT_SCANSTATUS' \
       'fuzzcheck_amalgamation_language_mode=gnu11' \
       'fuzzcheck_support_language_mode=gnu11' \
-      'fuzzcheck_hwtime_predicate_override=__STRICT_ANSI__=1' \
-      'fuzzcheck_additional_predicate_effect=SQLITE_INLINE-disabled' \
-      'fuzzcheck_timing_backend=upstream-no-assembly-zero-fallback'
+      'fuzzcheck_inline_assembly=x86-rdtsc' \
+      'fuzzcheck_timing_backend=certified-x86-rdtsc'
   fi
 } >capability-inventory.txt
 
@@ -357,8 +348,8 @@ expected_source_count=$(wc -l <"$expected_source_inputs" | tr -d '[:space:]')
     printf '%s\n' \
       'fuzzcheck_amalgamation_language_mode=gnu11' \
       'fuzzcheck_support_language_mode=gnu11' \
-      'fuzzcheck_hwtime_predicate_override=__STRICT_ANSI__=1' \
-      'fuzzcheck_timing_backend=upstream-no-assembly-fallback' \
+      'fuzzcheck_inline_assembly=x86-rdtsc' \
+      'fuzzcheck_timing_backend=certified-x86-rdtsc' \
       'other_translation_language_mode=gnu11'
     printf 'fuzzcheck_translation_units=%s\n' \
       "$expected_fuzzcheck_translation_units"
@@ -372,7 +363,6 @@ export CCC_SQLITE_SOURCE_ROOT="$source_directory"
 export CCC_SQLITE_GENERATED_SOURCE_ROOT="$build_directory"
 export CCC_SQLITE_SOURCE_LOG="$build_directory/source-inputs.txt"
 export CCC_SQLITE_LANGUAGE_MODE_LOG="$build_directory/language-modes.txt"
-export CCC_SQLITE_FUZZCHECK_HWTIME_FALLBACK=1
 : >"$CCC_SQLITE_COMMAND_LOG"
 : >"$CCC_SQLITE_SOURCE_LOG"
 : >"$CCC_SQLITE_LANGUAGE_MODE_LOG"
@@ -438,26 +428,26 @@ if [[ "$suite" == full ]]; then
     sessionfuzz sessionfuzz-elf-headers.txt sessionfuzz-elf-dynamic-tags.txt
 fi
 
-hwtime_override_translation_count=$(grep -c \
-  '^gnu11 fuzzcheck-amalgamation strict-ansi=defined ' \
+fuzzcheck_amalgamation_translation_count=$(grep -c \
+  '^gnu11 fuzzcheck-amalgamation strict-ansi=absent ' \
   "$CCC_SQLITE_LANGUAGE_MODE_LOG" || true)
 fuzzcheck_support_translation_count=$(grep -c \
   '^gnu11 fuzzcheck-support strict-ansi=absent ' \
   "$CCC_SQLITE_LANGUAGE_MODE_LOG" || true)
 unexpected_language_mode_count=$(grep -Evc \
-  '^(gnu11 ordinary strict-ansi=absent|gnu11 fuzzcheck-support strict-ansi=absent|gnu11 fuzzcheck-amalgamation strict-ansi=defined) ' \
+  '^(gnu11 ordinary strict-ansi=absent|gnu11 fuzzcheck-support strict-ansi=absent|gnu11 fuzzcheck-amalgamation strict-ansi=absent) ' \
   "$CCC_SQLITE_LANGUAGE_MODE_LOG" || true)
 [[ "$unexpected_language_mode_count" == 0 ]] ||
   die "SQLite language-mode audit contains $unexpected_language_mode_count unexpected records"
 if [[ "$suite" == full ]]; then
-  [[ "$hwtime_override_translation_count" == 1 ]] ||
-    die "SQLite full suite applied the hwtime predicate override to $hwtime_override_translation_count inputs; expected the generated amalgamation only"
+  [[ "$fuzzcheck_amalgamation_translation_count" == 1 ]] ||
+    die "SQLite full suite translated $fuzzcheck_amalgamation_translation_count fuzzcheck amalgamations; expected one"
   [[ "$fuzzcheck_support_translation_count" == "$expected_fuzzcheck_support_translation_units" ]] ||
     die "SQLite full suite translated $fuzzcheck_support_translation_count fuzzcheck support inputs; expected $expected_fuzzcheck_support_translation_units in GNU C11"
-  [[ "$((hwtime_override_translation_count + fuzzcheck_support_translation_count))" == "$expected_fuzzcheck_translation_units" ]] ||
+  [[ "$((fuzzcheck_amalgamation_translation_count + fuzzcheck_support_translation_count))" == "$expected_fuzzcheck_translation_units" ]] ||
     die "SQLite full suite fuzzcheck source audit did not cover $expected_fuzzcheck_translation_units inputs"
 else
-  [[ "$hwtime_override_translation_count" == 0 ]] ||
+  [[ "$fuzzcheck_amalgamation_translation_count" == 0 ]] ||
     die "SQLite $suite suite unexpectedly translated a fuzzcheck input"
 fi
 

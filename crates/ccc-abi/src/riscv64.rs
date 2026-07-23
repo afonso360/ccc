@@ -249,6 +249,7 @@ fn plan_native_signature(
                 if class == AbiClass::Sse && fp_used >= ARGUMENT_REGISTERS {
                     class = AbiClass::Integer;
                     carrier = match scalar {
+                        AbiScalar::Float16 => AbiCarrier::I16,
                         AbiScalar::Float32 => AbiCarrier::I32,
                         AbiScalar::Float64 => AbiCarrier::I64,
                         _ => unreachable!(),
@@ -856,6 +857,11 @@ fn flatten_aggregate(
     base: u64,
 ) -> Result<Option<Vec<FlattenedLeaf>>, AbiError> {
     match types.try_kind(ty) {
+        Some(TypeKind::Builtin(BuiltinType::Float16)) => Ok(Some(vec![FlattenedLeaf {
+            offset: base,
+            size: 2,
+            class: AbiClass::Sse,
+        }])),
         Some(TypeKind::Builtin(BuiltinType::Float)) => Ok(Some(vec![FlattenedLeaf {
             offset: base,
             size: 4,
@@ -1014,6 +1020,7 @@ fn boundary_scalar(
     boundary: &str,
 ) -> Result<AbiScalar, AbiError> {
     match types.try_kind(ty) {
+        Some(TypeKind::Builtin(BuiltinType::Float16)) => Ok(AbiScalar::Float16),
         Some(TypeKind::Builtin(BuiltinType::Float)) => Ok(AbiScalar::Float32),
         Some(TypeKind::Builtin(BuiltinType::Double)) => Ok(AbiScalar::Float64),
         Some(TypeKind::Builtin(BuiltinType::LongDouble)) => Err(AbiError::new(
@@ -1103,7 +1110,7 @@ fn boundary_scalar(
 
 fn scalar_class(scalar: AbiScalar) -> AbiClass {
     match scalar {
-        AbiScalar::Float32 | AbiScalar::Float64 => AbiClass::Sse,
+        AbiScalar::Float16 | AbiScalar::Float32 | AbiScalar::Float64 => AbiClass::Sse,
         _ => AbiClass::Integer,
     }
 }
@@ -1119,6 +1126,7 @@ fn scalar_carrier(scalar: AbiScalar) -> AbiCarrier {
             64 => AbiCarrier::I64,
             _ => unreachable!("unsupported scalar width"),
         },
+        AbiScalar::Float16 => AbiCarrier::F16,
         AbiScalar::Float32 => AbiCarrier::F32,
         AbiScalar::Float64 => AbiCarrier::F64,
     }
@@ -1129,6 +1137,7 @@ fn scalar_size(scalar: AbiScalar) -> u8 {
         AbiScalar::SignedInteger { bits }
         | AbiScalar::UnsignedInteger { bits }
         | AbiScalar::Pointer { bits } => bits / 8,
+        AbiScalar::Float16 => 2,
         AbiScalar::Float32 => 4,
         AbiScalar::Float64 => 8,
     }
@@ -1145,6 +1154,7 @@ fn scalar_extension(scalar: AbiScalar) -> IntegerExtension {
 fn piece_carrier(piece: &AbiPiece) -> Result<AbiCarrier, AbiError> {
     match (piece.class, piece.valid_bytes) {
         (AbiClass::Integer, _) => Ok(AbiCarrier::I64),
+        (AbiClass::Sse, 2) => Ok(AbiCarrier::F16),
         (AbiClass::Sse, 4) => Ok(AbiCarrier::F32),
         (AbiClass::Sse, 8) => Ok(AbiCarrier::F64),
         _ => Err(AbiError::new(
@@ -1160,6 +1170,7 @@ fn flattened_piece_carrier(piece: &AbiPiece) -> Result<AbiCarrier, AbiError> {
         (AbiClass::Integer, 2) => Ok(AbiCarrier::I16),
         (AbiClass::Integer, 4) => Ok(AbiCarrier::I32),
         (AbiClass::Integer, 8) => Ok(AbiCarrier::I64),
+        (AbiClass::Sse, 2) => Ok(AbiCarrier::F16),
         (AbiClass::Sse, 4) => Ok(AbiCarrier::F32),
         (AbiClass::Sse, 8) => Ok(AbiCarrier::F64),
         _ => Err(AbiError::new(

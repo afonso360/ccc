@@ -144,7 +144,11 @@ fn types_block_scope_compound_literals_as_initialized_addressable_lvalues() {
     else {
         panic!("compound literal is converted for aggregate initialization")
     };
-    let FullTypedExpressionKind::CompoundLiteral { local, initializer } = &expression.kind else {
+    let FullTypedExpressionKind::CompoundLiteral {
+        storage: CompoundLiteralStorage::Automatic(local),
+        initializer,
+    } = &expression.kind
+    else {
         panic!("pair is initialized from a compound literal")
     };
     assert_eq!(expression.category, ValueCategory::Lvalue);
@@ -157,13 +161,210 @@ fn types_block_scope_compound_literals_as_initialized_addressable_lvalues() {
         initializer.kind,
         FullTypedInitializerKind::Aggregate(ref entries) if entries.len() == 2
     ));
+}
 
+#[test]
+fn file_scope_compound_literals_create_distinct_internal_static_objects() {
+    let unit = analyze_source(
+        "struct Pair { int left; int right; };
+         struct Pair *first = &(struct Pair){ .left = 1, .right = 2 };
+         struct Pair *second = &(struct Pair){ .left = 1, .right = 2 };
+         const struct Pair *qualified = &(const struct Pair){ .left = 3, .right = 4 };
+         int *array = (int[]){ 5, 6, 7 };",
+    )
+    .unwrap();
+
+    let compound_objects = unit
+        .globals
+        .iter()
+        .filter(|global| global.name.starts_with("<compound-literal-"))
+        .collect::<Vec<_>>();
+    assert_eq!(compound_objects.len(), 4);
+    assert!(compound_objects.iter().all(|global| {
+        global.storage == SemanticStorageClass::Static
+            && global.linkage == Linkage::Internal
+            && global.duration == StorageDuration::Static
+            && global.emission.definition == ObjectDefinitionPolicy::Definition
+            && global.initializer.is_some()
+    }));
+    assert_ne!(compound_objects[0].id, compound_objects[1].id);
+    assert!(
+        compound_objects[2]
+            .ty
+            .qualifiers
+            .contains(TypeQualifiers::CONST)
+    );
+    let TypeKind::Array(array_ty) = unit.types.kind(compound_objects[3].ty.ty) else {
+        panic!("the array compound literal has array type")
+    };
+    assert_eq!(array_ty.length, ArrayLength::Constant(3));
+
+    let first = unit
+        .globals
+        .iter()
+        .find(|global| global.name == "first")
+        .unwrap();
+    let FullTypedInitializerKind::Scalar(initializer) = &first.initializer.as_ref().unwrap().kind
+    else {
+        panic!("first has a scalar pointer initializer")
+    };
+    let FullTypedExpressionKind::Conversion {
+        kind: ConversionKind::PointerConversion,
+        expression: address,
+    } = &initializer.kind
+    else {
+        panic!("first retains its pointer conversion")
+    };
+    let FullTypedExpressionKind::AddressOf(compound) = &address.kind else {
+        panic!("first takes a compound literal address")
+    };
+    let FullTypedExpressionKind::CompoundLiteral {
+        storage: CompoundLiteralStorage::Static(object),
+        ..
+    } = compound.kind
+    else {
+        panic!("the file-scope occurrence retains static compound-literal storage")
+    };
+    assert_eq!(object, compound_objects[0].id);
+    assert_eq!(
+        compound.place.as_ref().unwrap().base,
+        PlaceBase::Global(object)
+    );
+    assert_eq!(
+        compound.constant,
+        Some(ConstantValue::Address(RelocatableAddress {
+            base: RelocatableBase::Global(object),
+            addend: 0,
+            one_past: false,
+        }))
+    );
+}
+
+#[test]
+fn compound_literals_reject_dynamic_static_initializers_and_variable_types() {
+    assert_eq!(
+        diagnostic_codes("extern int value; int *pointer = &(int){ value };"),
+        vec!["CCC2344"]
+    );
+    assert_eq!(
+        diagnostic_codes("int f(int n) { return ((int[n]){ 1 })[0]; }"),
+        vec!["CCC2430"]
+    );
+}
+
+#[test]
+fn static_initializers_can_reuse_file_compound_literal_initializers() {
+    let unit = analyze_source(
+        "struct Pair { int left; int right; };
+         struct Pair copied = (struct Pair){ .left = 7, .right = 8 };
+         int scalar = (int){ 9 };
+         int selected = _Generic(0, int: (int){ 10 }, default: 0);",
+    )
+    .unwrap();
+    for (object_index, destination_name) in [(0_usize, "copied"), (2, "scalar"), (4, "selected")] {
+        let object_initializer = unit.globals[object_index].initializer.as_ref().unwrap();
+        let destination_initializer = unit
+            .globals
+            .iter()
+            .find(|global| global.name == destination_name)
+            .unwrap()
+            .initializer
+            .as_ref()
+            .unwrap();
+        assert_eq!(destination_initializer, object_initializer);
+    }
+}
+
+#[test]
+fn generic_selection_records_only_the_selected_typed_expression() {
+    let unit = analyze_source(
+        "struct Bits { unsigned flag : 1; };
+         int side_effect(void);
+         int select(struct Bits *bits) {
+             _Generic(0, int: bits->flag, default: bits->flag) = 1;
+             return _Generic(side_effect(), int: 42, default: 0);
+         }
+         _Static_assert(_Generic(*(int const *)0, int: 7, default: 0) == 7, \"\");
+         _Static_assert(_Generic(\"abc\", char *: 1, default: 0) == 1, \"\");
+         _Static_assert(_Generic(side_effect, int (*)(void): 1, default: 0) == 1, \"\");",
+    )
+    .unwrap();
+    let function = unit
+        .functions
+        .iter()
+        .find(|function| function.name == "select")
+        .unwrap();
+    let FullTypedStatementKind::Compound(items) = &function.body.as_ref().unwrap().kind else {
+        panic!("select has a compound body")
+    };
+    let FullTypedBlockItem::Statement(assignment) = &items[0] else {
+        panic!("select starts with an assignment")
+    };
+    let FullTypedStatementKind::Expression(Some(assignment)) = &assignment.kind else {
+        panic!("select starts with an expression statement")
+    };
+    let FullTypedExpressionKind::Assignment { target, .. } = &assignment.kind else {
+        panic!("the first expression assigns through the generic selection")
+    };
+    let FullTypedExpressionKind::GenericSelection {
+        controlling_ty,
+        selected,
+    } = &target.kind
+    else {
+        panic!("the assignment target remains an explicit generic selection")
+    };
+    assert_eq!(controlling_ty.ty, TypeId::INT);
+    assert_eq!(target.category, ValueCategory::Lvalue);
+    assert!(target.place.as_ref().unwrap().bitfield.is_some());
+    assert!(matches!(
+        selected.kind,
+        FullTypedExpressionKind::Member { .. }
+    ));
+
+    let FullTypedBlockItem::Statement(return_statement) = &items[1] else {
+        panic!("select ends with a return")
+    };
+    let FullTypedStatementKind::Return(Some(result)) = &return_statement.kind else {
+        panic!("select ends with a value return")
+    };
+    let FullTypedExpressionKind::GenericSelection { selected, .. } = &result.kind else {
+        panic!("the return value remains an explicit generic selection")
+    };
+    assert_eq!(result.constant, Some(ConstantValue::Signed(42)));
+    assert_eq!(
+        result.constant_expression_kind,
+        ConstantExpressionKind::Integer
+    );
+    assert!(matches!(
+        selected.kind,
+        FullTypedExpressionKind::Constant(ConstantValue::Signed(42))
+    ));
+}
+
+#[test]
+fn generic_selection_validates_association_constraints() {
+    for source in [
+        "int f(int x) { return _Generic(x, int: 1, int: 2); }",
+        "int f(int x) { return _Generic(x, default: 1, default: 2); }",
+        "int f(int x) { return _Generic(x, double: 1); }",
+        "int f(int n) { return _Generic(n, int (*)[n]: 1, default: 2); }",
+    ] {
+        assert_eq!(diagnostic_codes(source), vec!["CCC2270"], "{source}");
+    }
+    assert_eq!(
+        diagnostic_codes("int f(int x) { return _Generic(x, void: 1, default: 2); }"),
+        vec!["CCC2341"]
+    );
     assert_eq!(
         diagnostic_codes(
-            "struct Pair { int left; int right; };
-             struct Pair pair = (struct Pair){ .left = 1, .right = 2 };"
+            "struct Missing; int f(int x) { return _Generic(x, struct Missing: 1, default: 2); }"
         ),
-        vec!["CCC2430"]
+        vec!["CCC2342"]
+    );
+
+    assert_eq!(
+        diagnostic_codes("int f(int x) { return _Generic(x, int: 1, default: missing); }"),
+        vec!["CCC2274"]
     );
 }
 
@@ -395,13 +596,13 @@ fn assembly_labels_reject_conflicts_and_unsupported_storage() {
     ] {
         assert!(diagnostic_codes(source).contains(&"CCC2419".to_owned()));
     }
-    assert!(
-        diagnostic_codes("int f(void) { int local asm(\"linked\"); return local; }")
-            .contains(&"CCC2257".to_owned())
+    assert_eq!(
+        diagnostic_codes("int f(void) { int local asm(\"linked\"); return local; }"),
+        ["CCC2257"]
     );
-    assert!(
-        diagnostic_codes("int f(void) { static int local asm(\"linked\"); return local; }")
-            .contains(&"CCC2257".to_owned())
+    assert_eq!(
+        diagnostic_codes("int f(void) { static int local asm(\"linked\"); return local; }"),
+        ["CCC2257"]
     );
     assert!(diagnostic_codes("extern int object asm(\"\");").contains(&"CCC2349".to_owned()));
 }
@@ -497,6 +698,50 @@ fn gnu_noreturn_attribute_updates_function_control_flow_properties() {
             .unwrap()
             .capability,
         CapabilityState::Implemented
+    );
+}
+
+#[test]
+fn returns_twice_functions_are_classified_from_attributes_and_hosted_names() {
+    let unit = analyze_source(
+        "extern int checkpoint(void *) __attribute__((__returns_twice__));\n\
+         extern int setjmp(void *);\n\
+         static int local_setjmp(void *);",
+    )
+    .unwrap();
+
+    let checkpoint = unit
+        .functions
+        .iter()
+        .find(|function| function.name == "checkpoint")
+        .unwrap();
+    assert!(checkpoint.properties.returns_twice);
+    assert_eq!(
+        checkpoint
+            .attributes
+            .iter()
+            .find(|attribute| attribute.name == "__returns_twice__")
+            .unwrap()
+            .capability,
+        CapabilityState::Implemented
+    );
+
+    assert!(
+        unit.functions
+            .iter()
+            .find(|function| function.name == "setjmp")
+            .unwrap()
+            .properties
+            .returns_twice
+    );
+    assert!(
+        !unit
+            .functions
+            .iter()
+            .find(|function| function.name == "local_setjmp")
+            .unwrap()
+            .properties
+            .returns_twice
     );
 }
 
@@ -951,7 +1196,7 @@ fn types_legacy_sync_operations_with_native_scalar_and_pointer_contracts() {
         "{dump}"
     );
     assert!(
-        dump.contains("atomic-cmpxchg object=int return-boolean=true order=SequentiallyConsistent : _Bool Value"),
+        dump.contains("atomic-cmpxchg object=int return-boolean=true expected-pointer=false order=SequentiallyConsistent : _Bool Value"),
         "{dump}"
     );
     assert!(
@@ -1016,6 +1261,202 @@ fn types_legacy_sync_operations_with_native_scalar_and_pointer_contracts() {
         8,
         "{dump}"
     );
+}
+
+#[test]
+fn types_scalar_atomic_header_and_gnu_operations_with_fail_closed_boundaries() {
+    let unit = analyze_resource_source(
+        "#include <stdatomic.h>\n\
+         #if !__has_builtin(__atomic_load_n) || \
+             !__has_builtin(__atomic_compare_exchange_n)\n\
+         #error missing atomic builtin\n\
+         #endif\n\
+         atomic_int value = ATOMIC_VAR_INIT(1);\n\
+         int update(int operand, int *expected) {\n\
+             int old = atomic_load_explicit(&value, memory_order_relaxed);\n\
+             atomic_store_explicit(&value, operand, memory_order_release);\n\
+             old ^= atomic_fetch_or(&value, 4);\n\
+             old ^= __atomic_xor_fetch(&value, 3, __ATOMIC_ACQUIRE);\n\
+             old ^= atomic_compare_exchange_weak_explicit(\n\
+                 &value, expected, old, memory_order_relaxed,\n\
+                 memory_order_relaxed);\n\
+             atomic_thread_fence(memory_order_acquire);\n\
+             atomic_signal_fence(memory_order_release);\n\
+             return old;\n\
+         }",
+    )
+    .unwrap();
+    let dump = dump_frontend_typed_ast(&unit);
+    assert!(
+        dump.contains("typedef !1 atomic_bool : _Atomic _Bool"),
+        "{dump}"
+    );
+    assert!(
+        dump.contains("atomic-load object=_Atomic int order=SequentiallyConsistent"),
+        "{dump}"
+    );
+    assert!(
+        dump.contains("atomic-store object=_Atomic int order=SequentiallyConsistent"),
+        "{dump}"
+    );
+    assert!(dump.contains("atomic-rmw BitwiseOr"), "{dump}");
+    assert!(dump.contains("atomic-rmw BitwiseXor"), "{dump}");
+    assert!(
+        dump.contains("return-boolean=true expected-pointer=true order=SequentiallyConsistent"),
+        "{dump}"
+    );
+    assert_eq!(
+        dump.matches("memory-fence SequentiallyConsistent").count(),
+        2
+    );
+
+    for source in [
+        "float value; int f(void) { return __atomic_load_n(&value, 0); }",
+        "struct Pair { int x; } value; int f(void) { return __atomic_load_n(&value, 0).x; }",
+        "const int value = 0; void f(void) { __atomic_store_n(&value, 1, 0); }",
+        "int value; _Atomic int expected; int f(void) { return __atomic_compare_exchange_n(&value, &expected, 1, 0, 0, 0); }",
+        "int *value; int *f(void) { return __atomic_fetch_add(&value, 1, 0); }",
+        "int value; int f(void) { return __atomic_load_n(&value, 3); }",
+        "int value; void f(void) { __atomic_store_n(&value, 1, 2); }",
+        "int value; int expected; int f(void) { return __atomic_compare_exchange_n(&value, &expected, 1, 0, 5, 3); }",
+        "int value; int expected; int f(void) { return __atomic_compare_exchange_n(&value, &expected, 1, 0, 0, 2); }",
+        "_Atomic int value; int f(void) { return value *= 2; }",
+        "_Atomic _Bool value; int f(void) { return ++value; }",
+        "_Atomic double value; int f(void) { return ++value != 0; }",
+    ] {
+        assert_eq!(diagnostic_codes(source), vec!["CCC2455"], "{source}");
+    }
+    assert_eq!(
+        diagnostic_codes("_Atomic(__int128) value;"),
+        vec!["CCC2443"]
+    );
+    for source in [
+        "struct __attribute__((packed)) Packed { _Atomic int value; };",
+        "struct Bits { _Atomic unsigned value : 1; };",
+    ] {
+        assert_eq!(diagnostic_codes(source), vec!["CCC2453"], "{source}");
+    }
+    analyze_source("struct __attribute__((packed)) Restored { _Alignas(4) _Atomic int value; };")
+        .unwrap();
+    let diagnostics = analyze_resource_source(
+        "#include <stdatomic.h>\n\
+         int values[2]; _Atomic(int *) pointer;\n\
+         int *advance(void) { return atomic_fetch_add(&pointer, 1); }",
+    )
+    .unwrap_err();
+    assert_eq!(diagnostics[0].code, "CCC2455");
+}
+
+#[test]
+fn scalar_atomic_builtins_reject_known_packed_addresses_but_allow_unknown_pointers() {
+    for source in [
+        "struct __attribute__((packed)) Packed { char tag; int value; };\n\
+         int load(struct Packed *object) { return __atomic_load_n(&object->value, 0); }",
+        "struct __attribute__((packed)) PackedArray { char tag; int values[2]; };\n\
+         int load(struct PackedArray *object, int index) {\n\
+             return __atomic_load_n(&object->values[index], 0);\n\
+         }",
+        "struct __attribute__((packed)) Packed { char tag; int value; };\n\
+         int update(struct Packed *object) {\n\
+             return __sync_fetch_and_add(&object->value, 1);\n\
+         }",
+    ] {
+        let diagnostics = analyze_source(source).unwrap_err();
+        assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:#?}");
+        assert!(
+            matches!(diagnostics[0].code.as_str(), "CCC2434" | "CCC2455"),
+            "{source}: {diagnostics:#?}"
+        );
+        assert!(
+            diagnostics[0].message.contains("packed-member alignment"),
+            "{source}: {diagnostics:#?}"
+        );
+    }
+
+    let diagnostics = analyze_resource_source(
+        "#include <stdatomic.h>\n\
+         struct __attribute__((packed)) Packed { char tag; int value; };\n\
+         int load(struct Packed *object) {\n\
+             return atomic_load_explicit(\n\
+                 (_Atomic int *)&object->value, memory_order_relaxed);\n\
+         }",
+    )
+    .unwrap_err();
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(diagnostics[0].code, "CCC2455");
+    assert!(diagnostics[0].message.contains("packed-member alignment"));
+
+    analyze_source(
+        "int load_unknown(int *object) { return __atomic_load_n(object, 0); }\n\
+         int update_unknown(int *object) { return __sync_fetch_and_add(object, 1); }\n\
+         struct __attribute__((packed)) Holder { char tag; int *pointer; };\n\
+         int load_indirect(struct Holder *holder) {\n\
+             return __atomic_load_n(holder->pointer, 0);\n\
+         }\n\
+         struct __attribute__((packed)) Restored {\n\
+             char tag; _Alignas(4) int value;\n\
+         };\n\
+         int load_restored(struct Restored *object) {\n\
+             return __atomic_load_n(&object->value, 0);\n\
+         }",
+    )
+    .unwrap();
+}
+
+#[test]
+fn atomic_alignment_provenance_keeps_weakened_conditional_alternatives() {
+    for (source, code) in [
+        (
+            "struct __attribute__((packed)) Packed { char tag; int value; };\n\
+             int load(struct Packed *packed, int *unknown, int select) {\n\
+                 return __atomic_load_n(select ? &packed->value : unknown, 0);\n\
+             }",
+            "CCC2455",
+        ),
+        (
+            "struct __attribute__((packed)) Packed { char tag; int value; };\n\
+             void store(struct Packed *packed, int *unknown, int select) {\n\
+                 __atomic_store_n(select ? unknown : &packed->value, 1, 0);\n\
+             }",
+            "CCC2455",
+        ),
+        (
+            "struct __attribute__((packed)) Packed { char tag; int value; };\n\
+             int update(struct Packed *packed, int *unknown, int select) {\n\
+                 return __sync_fetch_and_add(\n\
+                     select ? &packed->value : unknown, 1);\n\
+             }",
+            "CCC2434",
+        ),
+        (
+            "struct __attribute__((packed)) Packed { char tag; int value; };\n\
+             int compare(struct Packed *packed, int *unknown, int select) {\n\
+                 return __sync_bool_compare_and_swap(\n\
+                     select ? unknown : &packed->value, 1, 2);\n\
+             }",
+            "CCC2434",
+        ),
+    ] {
+        let diagnostics = analyze_source(source).unwrap_err();
+        assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:#?}");
+        assert_eq!(diagnostics[0].code, code, "{source}: {diagnostics:#?}");
+        assert!(
+            diagnostics[0].message.contains("packed-member alignment"),
+            "{source}: {diagnostics:#?}"
+        );
+    }
+
+    analyze_source(
+        "struct Aligned { int value; };\n\
+         int load(struct Aligned *aligned, int *unknown, int select) {\n\
+             return __atomic_load_n(select ? &aligned->value : unknown, 0);\n\
+         }\n\
+         int update(struct Aligned *aligned, int *unknown, int select) {\n\
+             return __sync_fetch_and_add(\n\
+                 select ? unknown : &aligned->value, 1);\n\
+         }",
+    )
+    .unwrap();
 }
 
 #[test]
@@ -1895,13 +2336,128 @@ fn retains_parameter_and_local_variable_length_bounds_without_requiring_vla_stor
         diagnostic_codes("int rejected(int n) { extern int (*(*value)(void))[n++]; return 0; }"),
         vec!["CCC2415"]
     );
-    assert_eq!(
-        diagnostic_codes("int rejected(int n) { typedef int Row[n]; return 0; }"),
-        vec!["CCC2416"]
+    let typedef =
+        analyze_source("int accepted(int n) { typedef int Row[n++]; return 0; }").unwrap();
+    assert_eq!(typedef.typedefs[0].variable_length_bounds.len(), 1);
+    assert!(matches!(
+        typedef.typedefs[0].variable_length_bounds[0]
+            .expression
+            .kind,
+        FullTypedExpressionKind::Increment { .. }
+    ));
+
+    let cast = analyze_source("void *accepted(int n, void *value) { return (int (*)[n++])value; }")
+        .unwrap();
+    assert!(
+        dump_frontend_typed_ast(&cast).contains("vla-bound-evaluation"),
+        "{}",
+        dump_frontend_typed_ast(&cast)
     );
+
+    let atomic =
+        analyze_source("int accepted(int n) { _Atomic(int (*)[n++]) first, second; return n; }")
+            .unwrap();
+    let function = &atomic.functions[0];
+    let FullTypedStatementKind::Compound(items) = &function.body.as_ref().unwrap().kind else {
+        panic!("accepted has a compound body")
+    };
+    let FullTypedBlockItem::Declaration(first) = &items[0] else {
+        panic!("accepted begins with an atomic pointer declaration")
+    };
+    let FullTypedBlockItem::Declaration(second) = &items[1] else {
+        panic!("accepted has a second atomic pointer declaration")
+    };
+    assert_eq!(first.variable_length_bounds.len(), 1);
+    assert!(second.variable_length_bounds.is_empty());
+}
+
+#[test]
+fn runtime_sizeof_retains_only_bounds_that_determine_the_result() {
+    let unit = analyze_source(
+        "unsigned long inspect(int n, void *value) {
+             typedef int Row[n++];
+             unsigned long first = sizeof(Row);
+             unsigned long second = sizeof *(int (*)[n++])value;
+             unsigned long pointer_size = sizeof(int (*)[n++]);
+             unsigned long alignment = _Alignof(int[n++]);
+             return first + second + pointer_size + alignment + n;
+         }",
+    )
+    .unwrap();
+    let dump = dump_frontend_typed_ast(&unit);
+    assert_eq!(dump.matches("vla-bound-evaluation").count(), 1, "{dump}");
+    assert_eq!(dump.matches("= runtime").count(), 2, "{dump}");
+}
+
+#[test]
+fn conditional_pointer_to_vla_retains_each_operand_bound() {
+    let unit = analyze_source(
+        "unsigned long inspect(int choose, int left, int right, int *address) {
+             return sizeof *(choose
+                 ? (int (*)[left++])address
+                 : (int (*)[right++])address);
+         }",
+    )
+    .unwrap();
+    let dump = dump_frontend_typed_ast(&unit);
+    assert_eq!(dump.matches("vla-bound-evaluation").count(), 2, "{dump}");
+    assert!(dump.contains("conditional"), "{dump}");
+}
+
+#[test]
+fn runtime_sizeof_expression_retains_its_evaluated_operand() {
+    let unit = analyze_source(
+        "int observe(void);
+         unsigned long inspect(int n, int (*rows)[n]) {
+             return sizeof *((observe(), rows));
+         }",
+    )
+    .unwrap();
+    let inspect = unit
+        .functions
+        .iter()
+        .find(|function| function.name == "inspect")
+        .unwrap();
+    let FullTypedStatementKind::Compound(items) = &inspect.body.as_ref().unwrap().kind else {
+        panic!("inspect has a compound body")
+    };
+    let FullTypedBlockItem::Statement(statement) = &items[0] else {
+        panic!("inspect has a return statement")
+    };
+    let FullTypedStatementKind::Return(Some(expression)) = &statement.kind else {
+        panic!("inspect returns a value")
+    };
+    let FullTypedExpressionKind::Sizeof {
+        operand: Some(operand),
+        size: None,
+        ..
+    } = &expression.kind
+    else {
+        panic!("runtime sizeof does not retain its expression operand")
+    };
+    let FullTypedExpressionKind::Dereference(pointer) = &operand.kind else {
+        panic!("sizeof operand remains an array dereference")
+    };
+    let FullTypedExpressionKind::Comma(operands) = &pointer.kind else {
+        panic!("sizeof operand retains its comma expression")
+    };
+    assert!(matches!(
+        operands[0].kind,
+        FullTypedExpressionKind::Call { .. }
+    ));
+}
+
+#[test]
+fn semantic_analysis_recovers_independent_errors_inside_one_function() {
     assert_eq!(
-        diagnostic_codes("void *rejected(int n, void *value) { return (int (*)[n++])value; }"),
-        vec!["CCC2417"]
+        diagnostic_codes(
+            "int inspect(void) {
+                 missing_one;
+                 missing_two;
+                 return 0;
+             }"
+        ),
+        vec!["CCC2274", "CCC2274"]
     );
 }
 
@@ -2026,6 +2582,49 @@ fn rejects_variably_modified_members_and_block_function_types() {
     assert!(
         analyze_source("void f(struct S { int (*callback)(int values[*]); } argument);").is_ok()
     );
+
+    assert_eq!(
+        diagnostic_codes("int f(int n) { typedef int Row[n]; Row *returns_vm(void); return 0; }"),
+        vec!["CCC2418"]
+    );
+    assert_eq!(
+        diagnostic_codes(
+            "int f(int n) {
+                 typedef int Row[n];
+                 struct S { Row *(*returns_vm)(void); };
+                 return 0;
+             }"
+        ),
+        vec!["CCC2235"]
+    );
+    assert!(
+        analyze_source(
+            "int f(int n) {
+                 typedef int Row[n];
+                 void takes_vm(Row *value);
+                 struct S { void (*takes_vm)(Row *value); };
+                 return 0;
+             }"
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn rejects_runtime_arrays_with_zero_length_dimensions() {
+    assert!(
+        analyze_source("int accepted(void) { int fixed[2][0]; return (int)sizeof(fixed); }")
+            .is_ok()
+    );
+
+    for source in [
+        "int rejected(int n) { int values[n][0]; return 0; }",
+        "int rejected(int n) { int values[0][n]; return 0; }",
+        "unsigned long rejected(int n, void *p) { return sizeof *(int (*)[n][0])p; }",
+        "void *rejected(int n, void *p) { return (int (*)[n][0])p + 1; }",
+    ] {
+        assert_eq!(diagnostic_codes(source), vec!["CCC2456"], "{source}");
+    }
 }
 
 #[test]
@@ -3128,8 +3727,23 @@ fn accepts_automatic_variable_length_and_thread_local_objects() {
     );
     assert_eq!(
         diagnostic_codes(
+            "int f(int n) { goto inside; typedef int Row[n++]; inside: return sizeof(Row); }"
+        ),
+        vec!["CCC2442"]
+    );
+    assert_eq!(
+        diagnostic_codes(
             "int f(int n, int choice) {
                  switch (choice) { int values[n]; case 0: return values[0]; }
+                 return 0;
+             }"
+        ),
+        vec!["CCC2442"]
+    );
+    assert_eq!(
+        diagnostic_codes(
+            "int f(int n, int choice) {
+                 switch (choice) { typedef int Row[n++]; case 0: return sizeof(Row); }
                  return 0;
              }"
         ),
@@ -3147,15 +3761,23 @@ fn accepts_automatic_variable_length_and_thread_local_objects() {
         vec!["CCC2442"]
     );
     assert_eq!(
+        diagnostic_codes(
+            "int f(int n) {
+                 void *target = &&done;
+                 typedef int Row[n++];
+                 goto *target;
+                 done: return sizeof(Row);
+             }"
+        ),
+        vec!["CCC2442"]
+    );
+    assert_eq!(
         diagnostic_codes("int f(int n) { static int values[n]; return 0; }"),
         vec!["CCC2258"]
     );
     assert!(analyze_source("unsigned long size = sizeof(long double);").is_ok());
     assert!(analyze_source("unsigned long alignment = __alignof__(long double);").is_ok());
-    assert!(
-        diagnostic_codes("long double f(long double x) { return x + 1.0L; }")
-            .contains(&"CCC2343".to_owned())
-    );
+    assert!(analyze_source("long double f(long double x) { return x + 1.0L; }").is_ok());
 
     let parsed = parse_source("int value __attribute__((aligned(8))); ");
     let mut config = EffectiveCompilationConfig::default();
@@ -3219,7 +3841,7 @@ fn accepts_automatic_variable_length_and_thread_local_objects() {
 }
 
 #[test]
-fn target_specific_tls_and_variadic_alignment_gates_are_exact() {
+fn enabled_target_tls_and_variadic_alignment_contracts_are_exact() {
     let tls_sources = [
         "_Thread_local int file_value;",
         "static _Thread_local int file_static;",
@@ -3230,25 +3852,19 @@ fn target_specific_tls_and_variadic_alignment_gates_are_exact() {
         "int read(void) { extern _Thread_local int block_value; return block_value; }",
     ];
     for config in [
+        EffectiveCompilationConfig::default(),
         EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
         EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
         EffectiveCompilationConfig::aarch64_apple_darwin(),
     ] {
         for source in tls_sources {
-            let diagnostics = analyze_source_with_config(source, &config).unwrap_err();
-            assert_eq!(
-                diagnostics
-                    .iter()
-                    .map(|diagnostic| diagnostic.code.as_str())
-                    .collect::<Vec<_>>(),
-                ["CCC2441"],
-                "{} should reject `{source}` before IR lowering",
-                config.target.triple
-            );
+            analyze_source_with_config(source, &config).unwrap_or_else(|diagnostics| {
+                panic!(
+                    "{} rejected supported TLS source `{source}`: {diagnostics:#?}",
+                    config.target.triple
+                )
+            });
         }
-    }
-    for source in tls_sources {
-        analyze_source_with_config(source, &EffectiveCompilationConfig::default()).unwrap();
     }
 
     let aligned_va_arg = "typedef __builtin_va_list va_list;\n\
@@ -3317,6 +3933,105 @@ fn linux_binary128_operations_and_variadic_fetches_fail_explicitly() {
                 .any(|diagnostic| diagnostic.code == "CCC2404")
         );
     }
+}
+
+#[test]
+fn x87_literals_conversions_and_folds_preserve_extended_precision() {
+    let unit = analyze_source(
+        "static long double literal = 0x1.0000000000000002p0L;
+         static long double folded = 0x1p0L + 0x1p-63L;
+         static long double unsigned_max = 18446744073709551615UL;",
+    )
+    .unwrap();
+    let constants = unit
+        .globals
+        .iter()
+        .map(|global| {
+            let FullTypedInitializerKind::Scalar(expression) =
+                &global.initializer.as_ref().unwrap().kind
+            else {
+                panic!("{} has a scalar initializer", global.name)
+            };
+            let ConstantValue::LongDouble(value) = expression.constant.unwrap() else {
+                panic!("{} has an exact long-double constant", global.name)
+            };
+            assert_eq!(value.format, ccc_target::LongDoubleFormat::X87Extended);
+            assert_eq!(&value.bytes[10..], &[0; 6]);
+            (global.name.as_str(), value.bytes)
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let one_plus_ulp = [1, 0, 0, 0, 0, 0, 0, 128, 255, 63, 0, 0, 0, 0, 0, 0];
+    assert_eq!(constants["literal"], one_plus_ulp);
+    assert_eq!(constants["folded"], one_plus_ulp);
+    assert_eq!(
+        constants["unsigned_max"],
+        [
+            255, 255, 255, 255, 255, 255, 255, 255, 62, 64, 0, 0, 0, 0, 0, 0
+        ]
+    );
+}
+
+#[test]
+fn x87_and_128_bit_integer_conversions_are_typed_and_folded_exactly() {
+    let unit = analyze_source(
+        "long double from_signed(__int128 value) { return (long double)value; }
+         long double from_unsigned(unsigned __int128 value) { return (long double)value; }
+         __int128 to_signed(long double value) { return (__int128)value; }
+         unsigned __int128 to_unsigned(long double value) { return (unsigned __int128)value; }
+         static long double high = (unsigned __int128)1 << 100;
+         static __int128 truncated = (__int128)0x1.0000000000000002p100L;",
+    )
+    .unwrap();
+    assert_eq!(unit.functions.len(), 4);
+    assert!(unit.globals.iter().all(|global| {
+        global.initializer.as_ref().is_some_and(|initializer| {
+            matches!(
+                &initializer.kind,
+                FullTypedInitializerKind::Scalar(expression) if expression.constant.is_some()
+            )
+        })
+    }));
+}
+
+#[test]
+fn floating_literal_range_is_checked_after_suffix_selects_the_format() {
+    assert_eq!(diagnostic_codes("double value = 1e4000;"), vec!["CCC2444"]);
+    assert_eq!(diagnostic_codes("float value = 1e100f;"), vec!["CCC2444"]);
+    assert!(analyze_source("long double value = 1e4000L;").is_ok());
+}
+
+#[test]
+fn x87_constant_casts_comparisons_and_sign_changes_fold_exactly() {
+    let unit = analyze_source(
+        "static int truncated = (int)3.75L;
+         static int greater = 0x1.0000000000000002p0L > 1.0L;
+         static double demoted = (double)0x1.0000000000000002p0L;
+         static long double negative = -1.0L;",
+    )
+    .unwrap();
+    let constant = |name: &str| {
+        let global = unit
+            .globals
+            .iter()
+            .find(|global| global.name == name)
+            .unwrap();
+        let FullTypedInitializerKind::Scalar(expression) =
+            &global.initializer.as_ref().unwrap().kind
+        else {
+            panic!("{name} has a scalar initializer")
+        };
+        expression.constant.unwrap()
+    };
+    assert_eq!(constant("truncated"), ConstantValue::Signed(3));
+    assert_eq!(constant("greater"), ConstantValue::Signed(1));
+    assert_eq!(constant("demoted"), ConstantValue::Floating(1.0));
+    let ConstantValue::LongDouble(negative) = constant("negative") else {
+        panic!("negative has an exact long-double constant")
+    };
+    assert_eq!(
+        negative.bytes,
+        [0, 0, 0, 0, 0, 0, 0, 128, 255, 191, 0, 0, 0, 0, 0, 0]
+    );
 }
 
 #[test]
@@ -3439,7 +4154,7 @@ fn compiler_128_bit_integers_have_target_gated_value_transport() {
 }
 
 #[test]
-fn float16_supports_declarations_and_layout_without_value_transport() {
+fn float16_supports_declarations_layout_and_value_expressions() {
     analyze_source(
         "static _Float16 file_object;\n\
          struct HalfPair { _Float16 first; _Float16 second; };\n\
@@ -3453,7 +4168,15 @@ fn float16_supports_declarations_and_layout_without_value_transport() {
              _Static_assert(sizeof values == 4, \"array size\");\n\
              (void)pointer;\n\
          }\n\
-         extern _Float16 declaration_only(_Float16);",
+         _Float16 identity(_Float16 value) { return value; }
+         _Float16 arithmetic(_Float16 left, _Float16 right) { return left * right + left / right; }
+         extern _Float16 declaration_only(_Float16);
+         typedef __builtin_va_list va_list;
+         int read_half(int count, ...) {
+             va_list list;
+             __builtin_va_start(list, count);
+             return __builtin_va_arg(list, _Float16) != 0;
+         }",
     )
     .unwrap();
 
@@ -3464,6 +4187,41 @@ fn float16_supports_declarations_and_layout_without_value_transport() {
     ] {
         assert_eq!(diagnostic_codes(source), ["CCC2218"], "{source}");
     }
+}
+
+#[test]
+fn float16_constants_round_to_binary16_with_ties_to_even() {
+    let unit = analyze_source(
+        "_Float16 exact = 1.5;
+         _Float16 tie_down = 1.00048828125;
+         _Float16 tie_up = 1.00146484375;
+         _Float16 underflow_tie = 0x1p-25;
+         _Float16 subnormal_tie = 0x1.8p-24;
+         _Float16 expression_tie = (_Float16)1.0 + (_Float16)0x1p-11;",
+    )
+    .unwrap();
+    let constant = |name: &str| {
+        let global = unit
+            .globals
+            .iter()
+            .find(|global| global.name == name)
+            .unwrap();
+        let FullTypedInitializerKind::Scalar(expression) =
+            &global.initializer.as_ref().unwrap().kind
+        else {
+            panic!("{name} has a scalar initializer")
+        };
+        expression.constant.unwrap()
+    };
+    assert_eq!(constant("exact"), ConstantValue::Floating(1.5));
+    assert_eq!(constant("tie_down"), ConstantValue::Floating(1.0));
+    assert_eq!(constant("tie_up"), ConstantValue::Floating(1.001953125));
+    assert_eq!(constant("underflow_tie"), ConstantValue::Floating(0.0));
+    assert_eq!(
+        constant("subnormal_tie"),
+        ConstantValue::Floating(2.0f64.powi(-23))
+    );
+    assert_eq!(constant("expression_tie"), ConstantValue::Floating(1.0));
 }
 
 #[test]
@@ -3610,5 +4368,86 @@ fn ordinary_character_constants_follow_target_char_signedness() {
     assert_eq!(
         unsigned_expression.constant,
         Some(ConstantValue::Unsigned(255))
+    );
+}
+
+#[test]
+fn classifies_the_certified_x86_64_inline_assembly_forms() {
+    let unit = analyze_source(
+        "typedef unsigned int U32;\n\
+         void forms(U32 index, U32 low, const unsigned char *backup,\n\
+                    void **pointer, void *pointer_value,\n\
+                    long *field, long *expected, long desired) {\n\
+             U32 eax, ebx, ecx, edx;\n\
+             const unsigned char *candidate = backup;\n\
+             long value = desired;\n\
+             long result;\n\
+             long original;\n\
+             asm(\"\");\n\
+             asm(\".p2align 6\");\n\
+             asm(\"nop\");\n\
+             asm(\"\" : \"+r\"(index));\n\
+             asm(\"cpuid\" : \"=a\"(eax) : \"a\"(0) : \"ebx\", \"ecx\", \"edx\");\n\
+             asm(\"cpuid\" : \"=a\"(eax), \"=c\"(ecx), \"=d\"(edx) : \"a\"(1) : \"ebx\");\n\
+             asm(\"cpuid\" : \"=a\"(eax), \"=b\"(ebx), \"=c\"(ecx) : \"a\"(7), \"c\"(0) : \"edx\");\n\
+             asm volatile(\"rdtsc\" : \"=a\"(eax), \"=d\"(edx));\n\
+             asm(\"cmp %1, %2\\ncmova %3, %0\\n\" : \"+r\"(candidate) : \"r\"(index), \"r\"(low), \"r\"(backup));\n\
+             asm volatile(\"\" ::: \"memory\");\n\
+             asm volatile(\"lock; xchgq %0, %1\" : \"+q\"(pointer_value), \"+m\"(*pointer));\n\
+             asm volatile(\"lock; xchgq %0, %1\" : \"+q\"(value), \"+m\"(*field));\n\
+             asm volatile(\"lock; xchgq %1, %2\" : \"=r\"(result), \"+q\"(value), \"+m\"(*field));\n\
+             asm volatile(\"lock; cmpxchgq %2, %1\" : \"=a\"(original), \"+m\"(*field) : \"q\"(desired), \"0\"(*expected));\n\
+         }",
+    )
+    .unwrap();
+    let dump = dump_frontend_typed_ast(&unit);
+    for kind in [
+        "compiler-barrier",
+        "code-align",
+        "layout-nop",
+        "opaque-scalar",
+        "x86-cpuid",
+        "x86-rdtsc",
+        "x86-conditional-move-above",
+        "x86-atomic-exchange",
+        "x86-atomic-compare-exchange",
+    ] {
+        assert!(dump.contains(&format!("inline-asm {kind}")), "{dump}");
+    }
+    assert_eq!(dump.matches("inline-asm x86-cpuid").count(), 3, "{dump}");
+    assert_eq!(
+        dump.matches("inline-asm x86-atomic-exchange").count(),
+        3,
+        "{dump}"
+    );
+}
+
+#[test]
+fn inline_assembly_classifier_rejects_near_misses() {
+    for source in [
+        "void f(void) { asm(\"pause\"); }",
+        "void f(void) { asm(\".p2align 7\"); }",
+        "void f(void) { asm volatile(\"\" ::: \"cc\"); }",
+        "void f(unsigned value) { asm(\"\" : \"=r\"(value)); }",
+        "void f(unsigned value) { asm(\"\" : \"+r\"(value) : \"r\"(value)); }",
+        "void f(unsigned value) { asm(\"cpuid\" : \"=a\"(value) : \"a\"(0) : \"ebx\", \"ecx\"); }",
+        "void f(unsigned value) { asm volatile(\"rdtsc\" : \"=a\"(value)); }",
+        "void f(long *field, int value) { asm volatile(\"lock; xchgq %0, %1\" : \"+q\"(value), \"+m\"(*field)); }",
+        "void f(void) { asm goto(\"\" :::: done); done: return; }",
+    ] {
+        assert_eq!(diagnostic_codes(source), ["CCC2454"], "{source}");
+    }
+
+    let diagnostics = analyze_source_with_config(
+        "void f(void) { asm(\"nop\"); }",
+        &EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.code.as_str())
+            .collect::<Vec<_>>(),
+        ["CCC2454"]
     );
 }

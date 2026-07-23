@@ -10,10 +10,8 @@ ccc-pp = { path = "../ccc-pp" }
 ccc-sema = { path = "../ccc-sema" }
 ccc-session = { path = "../ccc-session" }
 ccc-syntax = { path = "../ccc-syntax" }
-ccc-types = { path = "../ccc-types" }
-
-[dev-dependencies]
 ccc-target = { path = "../ccc-target" }
+ccc-types = { path = "../ccc-types" }
 
 [lints]
 workspace = true

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ccc_target::{CapabilityKind, EffectiveCompilationConfig, RelocationModel};
+use ccc_target::{CapabilityKind, EffectiveCompilationConfig, OptimizationLevel, RelocationModel};
 
 pub(crate) fn additional_predefined_macros(
     config: &EffectiveCompilationConfig,
@@ -16,6 +16,17 @@ pub(crate) fn additional_predefined_macros(
         ("__CCC_PATCHLEVEL__", "0"),
     ] {
         macros.insert(name.to_owned(), replacement.to_owned());
+    }
+
+    match config.optimization {
+        OptimizationLevel::O0 => {}
+        OptimizationLevel::O1 | OptimizationLevel::O2 | OptimizationLevel::O3 => {
+            macros.insert("__OPTIMIZE__".to_owned(), "1".to_owned());
+        }
+        OptimizationLevel::Size | OptimizationLevel::SizeMin => {
+            macros.insert("__OPTIMIZE__".to_owned(), "1".to_owned());
+            macros.insert("__OPTIMIZE_SIZE__".to_owned(), "1".to_owned());
+        }
     }
 
     if matches!(
@@ -140,7 +151,6 @@ mod tests {
             "__STDC_NO_ATOMICS__",
             "__STDC_NO_COMPLEX__",
             "__STDC_NO_THREADS__",
-            "__STDC_NO_VLA__",
         ] {
             assert_eq!(
                 macros.get(unsupported).map(String::as_str),
@@ -148,6 +158,7 @@ mod tests {
                 "missing denial macro {unsupported}"
             );
         }
+        assert!(!macros.contains_key("__STDC_NO_VLA__"));
         for (name, expected) in [
             ("__CCC__", "1"),
             ("__CCC_MAJOR__", "0"),
@@ -193,6 +204,27 @@ mod tests {
     }
 
     #[test]
+    fn optimization_macros_follow_the_selected_profile() {
+        for (optimization, optimize, size) in [
+            (OptimizationLevel::O0, false, false),
+            (OptimizationLevel::O1, true, false),
+            (OptimizationLevel::O2, true, false),
+            (OptimizationLevel::O3, true, false),
+            (OptimizationLevel::Size, true, true),
+            (OptimizationLevel::SizeMin, true, true),
+        ] {
+            let config = EffectiveCompilationConfig {
+                optimization,
+                ..EffectiveCompilationConfig::default()
+            };
+            let macros = additional_predefined_macros(&config);
+            assert_eq!(macros.contains_key("__OPTIMIZE__"), optimize);
+            assert_eq!(macros.contains_key("__OPTIMIZE_SIZE__"), size);
+            assert!(!macros.contains_key("__NO_INLINE__"));
+        }
+    }
+
+    #[test]
     fn strict_language_mode_reports_strict_ansi_without_changing_identity() {
         let config = EffectiveCompilationConfig::default().with_language_mode(LanguageMode::C11);
         let mut macros = config.frontend_predefined_macros();
@@ -214,6 +246,11 @@ mod tests {
             "c11-vla",
             ccc_target::CapabilityState::Implemented,
         );
+        config.capabilities.insert(
+            CapabilityKind::Feature,
+            "c11-atomics",
+            ccc_target::CapabilityState::Unsupported,
+        );
 
         let macros = additional_predefined_macros(&config);
         assert!(!macros.contains_key("__STDC_NO_VLA__"));
@@ -221,6 +258,22 @@ mod tests {
             macros.get("__STDC_NO_ATOMICS__").map(String::as_str),
             Some("1")
         );
+    }
+
+    #[test]
+    fn enabled_targets_do_not_define_the_vla_denial_macro() {
+        for config in [
+            EffectiveCompilationConfig::default(),
+            EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+            EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
+            EffectiveCompilationConfig::aarch64_apple_darwin(),
+        ] {
+            assert!(
+                !additional_predefined_macros(&config).contains_key("__STDC_NO_VLA__"),
+                "{}",
+                config.target.triple
+            );
+        }
     }
 
     #[test]

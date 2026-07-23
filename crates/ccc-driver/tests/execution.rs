@@ -1,5 +1,10 @@
 #![cfg_attr(
-    not(all(target_arch = "x86_64", target_os = "linux")),
+    not(any(
+        all(target_arch = "x86_64", target_os = "linux"),
+        all(target_arch = "aarch64", target_os = "linux"),
+        all(target_arch = "riscv64", target_os = "linux"),
+        all(target_arch = "aarch64", target_os = "macos")
+    )),
     allow(dead_code)
 )]
 
@@ -108,6 +113,90 @@ fn host_default_emits_a_native_relocatable_object() {
     fs::remove_dir_all(directory).unwrap();
 }
 
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "riscv64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "macos")
+))]
+#[test]
+fn float16_values_execute_with_exact_payloads_and_native_varargs() {
+    let directory = test_directory("float16-values");
+    let executable = directory.join("float16-values");
+    let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+        .arg(fixture("float16_values.c"))
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .unwrap();
+    assert!(
+        compilation.status.success(),
+        "ccc failed: {}",
+        String::from_utf8_lossy(&compilation.stderr)
+    );
+    let execution = Command::new(&executable).output().unwrap();
+    assert_eq!(execution.status.code(), Some(0));
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "riscv64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "macos")
+))]
+#[test]
+fn selected_c11_results_match_the_host_compiler() {
+    let directory = test_directory("selected-c11-differential");
+    let reference_driver = std::env::var_os("CCC_REFERENCE_CC")
+        .or_else(|| std::env::var_os("CCC_CC"))
+        .unwrap_or_else(|| "cc".into());
+    for source_name in [
+        "generic_selection.c",
+        "compound_literals.c",
+        "runtime_sized_storage.c",
+    ] {
+        let source = fixture(source_name);
+        let ccc_executable = directory.join(format!("{source_name}-ccc"));
+        let reference_executable = directory.join(format!("{source_name}-reference"));
+
+        let ccc_compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+            .arg(&source)
+            .arg("-o")
+            .arg(&ccc_executable)
+            .output()
+            .unwrap();
+        assert!(
+            ccc_compilation.status.success(),
+            "CCC failed for {source_name}: {}",
+            String::from_utf8_lossy(&ccc_compilation.stderr)
+        );
+        let reference_compilation = Command::new(&reference_driver)
+            .args(["-std=c11", "-pedantic-errors"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&reference_executable)
+            .output()
+            .unwrap();
+        assert!(
+            reference_compilation.status.success(),
+            "reference compiler failed for {source_name}: {}",
+            String::from_utf8_lossy(&reference_compilation.stderr)
+        );
+
+        let ccc_result = Command::new(&ccc_executable).output().unwrap();
+        let reference_result = Command::new(&reference_executable).output().unwrap();
+        assert_eq!(
+            ccc_result.status.code(),
+            reference_result.status.code(),
+            "exit status differs for {source_name}"
+        );
+        assert_eq!(ccc_result.stdout, reference_result.stdout, "{source_name}");
+        assert_eq!(ccc_result.stderr, reference_result.stderr, "{source_name}");
+    }
+    fs::remove_dir_all(directory).unwrap();
+}
+
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 #[test]
 fn darwin_linker_accepts_unwind_when_functions_reference_constant_data() {
@@ -159,6 +248,59 @@ fn apple_sdk_redirects_and_header_inline_fallback_link_and_execute() {
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 #[test]
+fn darwin_setjmp_and_longjmp_resume_materialized_automatic_objects() {
+    let directory = test_directory("darwin-returns-twice");
+    for optimization in ["-O0", "-O2", "-Oz"] {
+        let executable = directory.join(format!("returns-twice-{}", &optimization[1..]));
+        let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+            .arg("--target=aarch64-apple-darwin")
+            .args(["--sdk-root", &macos_sdk_root()])
+            .arg("-mmacosx-version-min=11.0")
+            .arg(optimization)
+            .arg(fixture("returns_twice.c"))
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .unwrap();
+        assert!(
+            compilation.status.success(),
+            "ccc {optimization} failed: {}",
+            String::from_utf8_lossy(&compilation.stderr)
+        );
+        assert_eq!(Command::new(&executable).status().unwrap().code(), Some(0));
+    }
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "riscv64", target_os = "linux")
+))]
+#[test]
+fn linux_setjmp_and_longjmp_resume_materialized_automatic_objects() {
+    let directory = test_directory("linux-returns-twice");
+    for optimization in ["-O0", "-O2", "-Oz"] {
+        let executable = directory.join(format!("returns-twice-{}", &optimization[1..]));
+        let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+            .arg(optimization)
+            .arg(fixture("returns_twice.c"))
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .unwrap();
+        assert!(
+            compilation.status.success(),
+            "ccc {optimization} failed: {}",
+            String::from_utf8_lossy(&compilation.stderr)
+        );
+        assert_eq!(Command::new(&executable).status().unwrap().code(), Some(0));
+    }
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+#[test]
 fn apple_math_public_classifiers_evaluate_once_and_fabsl_stays_a_library_call() {
     compile_and_run_darwin_header_program(
         "darwin-math-wrapper",
@@ -201,91 +343,121 @@ fn apple_variadic_bridge_uses_the_exact_declaration_assembly_label() {
     );
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "riscv64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "macos")
+))]
 #[test]
-fn execution_programs_emit_x86_64_objects() {
-    use object::{Architecture, Object as _, ObjectSymbol as _};
+fn execution_programs_emit_native_objects() {
+    use object::{Object as _, ObjectSymbol as _};
 
     for case in execution_cases() {
-        if case.requires_bridge && !bridge_packaging_is_available() {
+        if !case.applies_to_native_host() {
             continue;
         }
         let name = case.source;
         let directory = test_directory(name);
-        let output = directory.join("program.o");
-        let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
-            .arg("--target=x86_64-unknown-linux-gnu")
-            .arg("-c")
-            .arg(fixture(name))
-            .arg("-o")
-            .arg(&output)
-            .output()
-            .unwrap();
-        assert!(
-            result.status.success(),
-            "ccc failed for {name}: {}",
-            String::from_utf8_lossy(&result.stderr)
-        );
-        let bytes = fs::read(&output).unwrap();
-        let object = object::File::parse(bytes.as_slice()).unwrap();
-        assert_eq!(object.architecture(), Architecture::X86_64, "{name}");
-        assert!(
-            object.symbols().any(|symbol| symbol.name() == Ok("main")),
-            "{name} has no main symbol"
-        );
+        for (optimization, artifact) in EXECUTION_OPTIMIZATION_PROFILES {
+            let output = directory.join(format!("program-{artifact}.o"));
+            let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+                .arg(format!("--target={}", native_target_triple()))
+                .arg(optimization)
+                .arg("-c")
+                .arg(fixture(name))
+                .arg("-o")
+                .arg(&output)
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "ccc failed for {name} under {optimization}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let bytes = fs::read(&output).unwrap();
+            let object = object::File::parse(bytes.as_slice()).unwrap();
+            assert_eq!(
+                object.architecture(),
+                native_object_architecture(),
+                "{name} under {optimization}"
+            );
+            assert!(
+                object
+                    .symbols()
+                    .any(|symbol| symbol.name() == Ok(native_main_symbol())),
+                "{name} under {optimization} has no main symbol"
+            );
+        }
         fs::remove_dir_all(directory).unwrap();
     }
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "riscv64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "macos")
+))]
 #[test]
 fn execution_programs_produce_the_expected_exit_status() {
     for case in execution_cases() {
+        if !case.applies_to_native_host() {
+            continue;
+        }
         let name = case.source;
         let directory = test_directory(name);
-        let executable = directory.join("program");
-        let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
-            .arg("--target=x86_64-unknown-linux-gnu")
-            .arg(fixture(name))
-            .arg("-o")
-            .arg(&executable)
-            .output()
-            .unwrap();
-        assert!(
-            compilation.status.success(),
-            "ccc failed for {name}: {}",
-            String::from_utf8_lossy(&compilation.stderr)
-        );
-        let execution = Command::new(&executable)
-            .env("LC_ALL", "C")
-            .output()
-            .unwrap();
-        assert_eq!(
-            execution.status.code(),
-            Some(case.status),
-            "wrong exit status for {name}; stderr: {}",
-            String::from_utf8_lossy(&execution.stderr)
-        );
-        assert_eq!(
-            execution.stdout,
-            case.stdout,
-            "wrong stdout for {name}: {}",
-            String::from_utf8_lossy(&execution.stdout)
-        );
-        assert_eq!(
-            execution.stderr,
-            case.stderr,
-            "wrong stderr for {name}: {}",
-            String::from_utf8_lossy(&execution.stderr)
-        );
+        for (optimization, artifact) in EXECUTION_OPTIMIZATION_PROFILES {
+            let executable = directory.join(format!("program-{artifact}"));
+            let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+                .arg(format!("--target={}", native_target_triple()))
+                .arg(optimization)
+                .arg(fixture(name))
+                .arg("-o")
+                .arg(&executable)
+                .output()
+                .unwrap();
+            assert!(
+                compilation.status.success(),
+                "ccc failed for {name} under {optimization}: {}",
+                String::from_utf8_lossy(&compilation.stderr)
+            );
+            let execution = Command::new(&executable)
+                .env("LC_ALL", "C")
+                .output()
+                .unwrap();
+            assert_eq!(
+                execution.status.code(),
+                Some(case.status),
+                "wrong exit status for {name} under {optimization}; stderr: {}",
+                String::from_utf8_lossy(&execution.stderr)
+            );
+            assert_eq!(
+                execution.stdout,
+                case.stdout,
+                "wrong stdout for {name} under {optimization}: {}",
+                String::from_utf8_lossy(&execution.stdout)
+            );
+            assert_eq!(
+                execution.stderr,
+                case.stderr,
+                "wrong stderr for {name} under {optimization}: {}",
+                String::from_utf8_lossy(&execution.stderr)
+            );
+        }
         fs::remove_dir_all(directory).unwrap();
     }
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "riscv64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "macos")
+))]
 #[test]
 fn default_link_produces_a_working_position_independent_executable() {
-    use object::{Object as _, ObjectKind, ObjectSection as _};
+    use object::{FileFlags, Object as _, ObjectKind, ObjectSection as _};
 
     let directory = test_directory("position-independent-executable");
     let source = directory.join("position-independent-executable.c");
@@ -323,16 +495,24 @@ int main(void) {
 
     let bytes = fs::read(&executable).unwrap();
     let file = object::File::parse(bytes.as_slice()).unwrap();
-    assert_eq!(file.kind(), ObjectKind::Dynamic);
-    let text = file.section_by_name(".text").unwrap();
-    let text_start = text.address();
-    let text_end = text_start + text.size();
-    assert!(
-        file.dynamic_relocations()
-            .unwrap()
-            .all(|(address, _)| address < text_start || address >= text_end),
-        "PIE has a dynamic relocation in executable text"
-    );
+    if cfg!(target_os = "linux") {
+        assert_eq!(file.kind(), ObjectKind::Dynamic);
+        let text = file.section_by_name(".text").unwrap();
+        let text_start = text.address();
+        let text_end = text_start + text.size();
+        assert!(
+            file.dynamic_relocations()
+                .unwrap()
+                .all(|(address, _)| address < text_start || address >= text_end),
+            "PIE has a dynamic relocation in executable text"
+        );
+    } else {
+        assert_eq!(file.kind(), ObjectKind::Executable);
+        let FileFlags::MachO { flags } = file.flags() else {
+            panic!("Darwin executable did not carry Mach-O flags");
+        };
+        assert_ne!(flags & object::macho::MH_PIE, 0, "Mach-O output is not PIE");
+    }
 
     let execution = Command::new(&executable).output().unwrap();
     assert_eq!(
@@ -397,7 +577,12 @@ int main(void) {
     fs::remove_dir_all(directory).unwrap();
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "riscv64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "macos")
+))]
 #[test]
 fn thread_local_objects_are_isolated_in_pthreads_and_pie() {
     use object::{Object as _, ObjectKind};
@@ -417,11 +602,19 @@ fn thread_local_objects_are_isolated_in_pthreads_and_pie() {
     );
     let bytes = fs::read(&executable).unwrap();
     let file = object::File::parse(bytes.as_slice()).unwrap();
-    assert_eq!(
-        file.kind(),
-        ObjectKind::Dynamic,
-        "default output must be PIE"
-    );
+    if cfg!(target_os = "linux") {
+        assert_eq!(
+            file.kind(),
+            ObjectKind::Dynamic,
+            "default ELF output must be PIE"
+        );
+    } else {
+        assert_eq!(
+            file.kind(),
+            ObjectKind::Executable,
+            "default Mach-O output must be an executable"
+        );
+    }
 
     let execution = Command::new(&executable).output().unwrap();
     assert_eq!(
@@ -433,9 +626,14 @@ fn thread_local_objects_are_isolated_in_pthreads_and_pie() {
     fs::remove_dir_all(directory).unwrap();
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "riscv64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "macos")
+))]
 #[test]
-fn all_elf_tls_models_link_and_execute_as_pie() {
+fn all_tls_models_link_and_execute_as_pie() {
     use object::{Object as _, ObjectKind};
 
     let directory = test_directory("thread-local-models-pie");
@@ -473,11 +671,19 @@ int main(void) {
     );
     let bytes = fs::read(&executable).unwrap();
     let file = object::File::parse(bytes.as_slice()).unwrap();
-    assert_eq!(
-        file.kind(),
-        ObjectKind::Dynamic,
-        "default output must be PIE"
-    );
+    if cfg!(target_os = "linux") {
+        assert_eq!(
+            file.kind(),
+            ObjectKind::Dynamic,
+            "default ELF output must be PIE"
+        );
+    } else {
+        assert_eq!(
+            file.kind(),
+            ObjectKind::Executable,
+            "default Mach-O output must be an executable"
+        );
+    }
     let execution = Command::new(&executable).output().unwrap();
     assert!(
         execution.status.success(),
@@ -487,7 +693,12 @@ int main(void) {
     fs::remove_dir_all(directory).unwrap();
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "riscv64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "macos")
+))]
 #[test]
 fn an_invalid_computed_goto_target_traps() {
     use std::os::unix::process::ExitStatusExt as _;
@@ -507,11 +718,20 @@ fn an_invalid_computed_goto_target_traps() {
     );
     let execution = Command::new(&executable).output().unwrap();
     assert_eq!(execution.status.code(), None);
-    assert_eq!(execution.status.signal(), Some(4));
+    assert!(
+        matches!(execution.status.signal(), Some(4 | 5)),
+        "expected SIGILL or SIGTRAP, got {:?}",
+        execution.status.signal()
+    );
     fs::remove_dir_all(directory).unwrap();
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "riscv64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "macos")
+))]
 #[test]
 fn runtime_sized_aggregate_return_is_materialized_before_cleanup() {
     let directory = test_directory("runtime-sized-aggregate-return");
@@ -537,15 +757,25 @@ fn runtime_sized_aggregate_return_is_materialized_before_cleanup() {
     fs::remove_dir_all(directory).unwrap();
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "riscv64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "macos")
+))]
 #[test]
 fn invalid_runtime_sized_storage_extents_trap() {
     use std::os::unix::process::ExitStatusExt as _;
 
-    for name in [
+    let mut names = vec![
         "runtime_sized_storage_nonpositive.c",
         "runtime_sized_storage_overflow.c",
-    ] {
+        "runtime_sized_storage_provider_failure.c",
+    ];
+    if cfg!(all(target_arch = "x86_64", target_os = "linux")) {
+        names.push("runtime_sized_storage_wide_overflow.c");
+    }
+    for name in names {
         let directory = test_directory(name);
         let executable = directory.join("program");
         let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
@@ -561,7 +791,11 @@ fn invalid_runtime_sized_storage_extents_trap() {
         );
         let execution = Command::new(&executable).output().unwrap();
         assert_eq!(execution.status.code(), None, "{name}");
-        assert_eq!(execution.status.signal(), Some(4), "{name}");
+        assert!(
+            matches!(execution.status.signal(), Some(4 | 5)),
+            "{name}: expected SIGILL or SIGTRAP, got {:?}",
+            execution.status.signal()
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 }
@@ -629,16 +863,18 @@ int main(void) {
     fs::remove_dir_all(directory).unwrap();
 }
 
-#[cfg_attr(
-    not(all(target_arch = "x86_64", target_os = "linux")),
-    allow(dead_code)
-)]
 struct ExecutionExpectation {
     source: &'static str,
     status: i32,
     stdout: &'static [u8],
     stderr: &'static [u8],
-    requires_bridge: bool,
+    x86_64_only: bool,
+}
+
+impl ExecutionExpectation {
+    fn applies_to_native_host(&self) -> bool {
+        !self.x86_64_only || cfg!(target_arch = "x86_64")
+    }
 }
 
 const fn exit_status(source: &'static str, status: i32) -> ExecutionExpectation {
@@ -647,29 +883,73 @@ const fn exit_status(source: &'static str, status: i32) -> ExecutionExpectation 
         status,
         stdout: b"",
         stderr: b"",
-        requires_bridge: false,
+        x86_64_only: false,
     }
 }
 
-const fn bridged_exit_status(source: &'static str, status: i32) -> ExecutionExpectation {
+const fn x86_64_exit_status(source: &'static str, status: i32) -> ExecutionExpectation {
     ExecutionExpectation {
         source,
         status,
         stdout: b"",
         stderr: b"",
-        requires_bridge: true,
+        x86_64_only: true,
     }
-}
-
-fn bridge_packaging_is_available() -> bool {
-    cfg!(all(target_arch = "x86_64", target_os = "linux")) || std::env::var_os("CCC_CC").is_some()
 }
 
 fn execution_cases() -> &'static [ExecutionExpectation] {
     &EXECUTION_CASES
 }
 
-static EXECUTION_CASES: [ExecutionExpectation; 55] = [
+#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+const fn native_target_triple() -> &'static str {
+    "x86_64-unknown-linux-gnu"
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+const fn native_target_triple() -> &'static str {
+    "aarch64-unknown-linux-gnu"
+}
+
+#[cfg(all(target_arch = "riscv64", target_os = "linux"))]
+const fn native_target_triple() -> &'static str {
+    "riscv64-unknown-linux-gnu"
+}
+
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+const fn native_target_triple() -> &'static str {
+    "aarch64-apple-darwin"
+}
+
+#[cfg(target_arch = "x86_64")]
+const fn native_object_architecture() -> object::Architecture {
+    object::Architecture::X86_64
+}
+
+#[cfg(target_arch = "aarch64")]
+const fn native_object_architecture() -> object::Architecture {
+    object::Architecture::Aarch64
+}
+
+#[cfg(target_arch = "riscv64")]
+const fn native_object_architecture() -> object::Architecture {
+    object::Architecture::Riscv64
+}
+
+#[cfg(target_os = "macos")]
+const fn native_main_symbol() -> &'static str {
+    "_main"
+}
+
+#[cfg(target_os = "linux")]
+const fn native_main_symbol() -> &'static str {
+    "main"
+}
+
+const EXECUTION_OPTIMIZATION_PROFILES: [(&str, &str); 3] =
+    [("-O0", "o0"), ("-O2", "o2"), ("-Oz", "oz")];
+
+static EXECUTION_CASES: [ExecutionExpectation; 59] = [
     exit_status("return_constant.c", 42),
     exit_status("arithmetic_precedence.c", 14),
     exit_status("unary_arithmetic.c", 3),
@@ -707,28 +987,32 @@ static EXECUTION_CASES: [ExecutionExpectation; 55] = [
     exit_status("scalar_builtins.c", 56),
     exit_status("computed_goto.c", 57),
     exit_status("compound_literals.c", 58),
+    exit_status("generic_selection.c", 44),
     exit_status("flexible_array_members.c", 59),
     exit_status("sync_atomic_builtins.c", 60),
     exit_status("sync_atomic_pthreads.c", 64),
-    bridged_exit_status("thread_local_pthreads.c", 66),
+    exit_status("c11_atomic_builtins.c", 68),
+    exit_status("thread_local_pthreads.c", 66),
     exit_status("integer_intrinsics.c", 61),
     exit_status("predefined_function_name.c", 62),
     exit_status("alignment_and_transparent_union.c", 65),
     exit_status("aligned_integer_typedefs.c", 67),
     exit_status("runtime_sized_storage.c", 0),
     exit_status("runtime_sized_storage_reuse.c", 66),
+    exit_status("negative_switch_constant.c", 0),
     exit_status("gnu_statement_and_memory_builtins.c", 66),
+    x86_64_exit_status("inline_assembly.c", 0),
     exit_status("combined_language_features.c", 53),
     exit_status("semantic_regressions.c", 54),
     exit_status("aggregate_calls.c", 63),
     exit_status("aggregate_rvalue_arrays.c", 42),
     exit_status("aggregate_rvalue_bitfield.c", 37),
-    bridged_exit_status("variadic_functions.c", 93),
+    exit_status("variadic_functions.c", 93),
     ExecutionExpectation {
         source: "variadic_printf.c",
         status: 0,
         stdout: b"ccc 7 2.5 ok\n",
         stderr: b"",
-        requires_bridge: true,
+        x86_64_only: false,
     },
 ];

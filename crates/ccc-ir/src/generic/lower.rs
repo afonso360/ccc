@@ -3,13 +3,15 @@ use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use ccc_pp::StringLiteralPrefix;
 use ccc_sema::generic::{
     AccessSemantics, AtomicReadModifyWriteOperation as TypedAtomicReadModifyWriteOperation,
-    BitfieldPlace, CompoundAssignmentPlan, ConstantValue, ConversionKind, FullFunctionId,
-    FullLocalId, FullTypedBlockItem, FullTypedExpression, FullTypedExpressionKind,
-    FullTypedForInitializer, FullTypedFunction, FullTypedInitializer, FullTypedInitializerKind,
-    FullTypedLocalDeclaration, FullTypedStatement, FullTypedStatementKind,
-    FullTypedTranslationUnit, GlobalId, InitializerPathElement,
-    IntegerIntrinsicOperation as TypedIntegerIntrinsicOperation, LabelId, Linkage,
-    MemoryOrder as TypedMemoryOrder, Place, PlaceBase, StorageDuration, StringId, SymbolReference,
+    BitfieldPlace, CodeLayoutHint as TypedCodeLayoutHint, CompoundAssignmentPlan,
+    CompoundLiteralStorage, ConstantValue, ConversionKind, FullFunctionId, FullLocalId,
+    FullTypedBlockItem, FullTypedExpression, FullTypedExpressionKind, FullTypedForInitializer,
+    FullTypedFunction, FullTypedInitializer, FullTypedInitializerKind, FullTypedInlineAsm,
+    FullTypedInlineAsmKind, FullTypedLocalDeclaration, FullTypedStatement, FullTypedStatementKind,
+    FullTypedTranslationUnit, FullTypedTypedef, FullTypedVariableLengthBound, GlobalId,
+    InitializerPathElement, IntegerIntrinsicOperation as TypedIntegerIntrinsicOperation, LabelId,
+    Linkage, MemoryOrder as TypedMemoryOrder, Place, PlaceBase, StorageDuration, StringId,
+    SymbolReference, X86CpuidRegister,
 };
 use ccc_session::Span;
 use ccc_syntax::frontend::{
@@ -22,10 +24,10 @@ use ccc_types::{
 
 use super::{
     AggregateOverlap, AggregateProjection, AtomicReadModifyWriteOperation, BinaryOperation,
-    BitfieldDescriptor, BlockId, CallEffects, DataId, DataOrigin, FullBlock, FullEdge,
-    FullFunction, FullGlobal, FullInstruction, FullInstructionKind, FullModule, FullParameter,
-    FullStorage, FullString, FullTerminator, InitializerEdge, InitializerGraph, InitializerNode,
-    InitializerNodeId, InitializerNodeKind, InitializerPath, InstructionId,
+    BitfieldDescriptor, BlockId, CallEffects, CodeLayoutHint, DataId, DataOrigin, FullBlock,
+    FullEdge, FullFunction, FullGlobal, FullInstruction, FullInstructionKind, FullModule,
+    FullParameter, FullStorage, FullString, FullTerminator, InitializerEdge, InitializerGraph,
+    InitializerNode, InitializerNodeId, InitializerNodeKind, InitializerPath, InstructionId,
     IntegerIntrinsicOperation, IrError, MemoryAccess, MemoryOrder, MemoryResidencyReason,
     RelocationKind, RelocationTarget, ScalarConstant, ScalarConversion, StorageId, StorageLocation,
     StringEncoding, SwitchEdge, UnaryOperation, ValueId,
@@ -230,6 +232,7 @@ fn collect_static_declarations_in_statement<'a>(
         S::Expression(_)
         | S::Goto { .. }
         | S::ComputedGoto(_)
+        | S::InlineAsm(_)
         | S::Continue
         | S::Break
         | S::Return(_) => {}
@@ -401,6 +404,9 @@ fn constant_initializer(
         ConstantValue::Floating(value) => {
             InitializerNodeKind::Scalar(ScalarConstant::Floating(value))
         }
+        ConstantValue::LongDouble(value) => {
+            InitializerNodeKind::Scalar(ScalarConstant::LongDouble(value))
+        }
         ConstantValue::NullPointer => InitializerNodeKind::Scalar(ScalarConstant::NullPointer),
         ConstantValue::Address(address) => {
             let (target, kind) = match address.base {
@@ -565,7 +571,12 @@ fn contains_computed_goto(statement: &FullTypedStatement) -> bool {
                     .as_deref()
                     .is_some_and(contains_computed_goto)
         }
-        S::Expression(_) | S::Goto { .. } | S::Continue | S::Break | S::Return(_) => false,
+        S::Expression(_)
+        | S::InlineAsm(_)
+        | S::Goto { .. }
+        | S::Continue
+        | S::Break
+        | S::Return(_) => false,
     }
 }
 
@@ -587,6 +598,9 @@ fn make_local_fact(
     }
     if is_aggregate(types, ty.ty) {
         reasons.insert(MemoryResidencyReason::Aggregate);
+    }
+    if types.builtin_type(ty.ty) == Some(BuiltinType::LongDouble) {
+        reasons.insert(MemoryResidencyReason::AddressBackedScalar);
     }
     if variably_modified(types, ty.ty, &mut HashSet::new()) {
         reasons.insert(MemoryResidencyReason::VariablyModified);
@@ -616,24 +630,36 @@ fn collect_automatic_local_facts(
         S::Compound(items) => {
             for item in items {
                 match item {
-                    FullTypedBlockItem::Declaration(declaration)
-                        if declaration.duration == StorageDuration::Automatic =>
-                    {
-                        facts.insert(
-                            declaration.local,
-                            make_local_fact(
+                    FullTypedBlockItem::Declaration(declaration) => {
+                        if declaration.duration == StorageDuration::Automatic {
+                            facts.insert(
                                 declaration.local,
-                                declaration.name.clone(),
-                                declaration.ty,
-                                declaration.duration,
-                                declaration.requested_alignment,
-                                declaration.span,
-                                types,
-                            ),
+                                make_local_fact(
+                                    declaration.local,
+                                    declaration.name.clone(),
+                                    declaration.ty,
+                                    declaration.duration,
+                                    declaration.requested_alignment,
+                                    declaration.span,
+                                    types,
+                                ),
+                            );
+                        }
+                        collect_automatic_local_facts_in_bounds(
+                            &declaration.variable_length_bounds,
+                            types,
+                            facts,
                         );
                         if let Some(initializer) = &declaration.initializer {
                             collect_automatic_local_facts_in_initializer(initializer, types, facts);
                         }
+                    }
+                    FullTypedBlockItem::Typedef(declaration) => {
+                        collect_automatic_local_facts_in_bounds(
+                            &declaration.variable_length_bounds,
+                            types,
+                            facts,
+                        );
                     }
                     FullTypedBlockItem::Statement(statement) => {
                         collect_automatic_local_facts(statement, types, facts);
@@ -693,6 +719,17 @@ fn collect_automatic_local_facts(
                                     facts,
                                 );
                             }
+                            collect_automatic_local_facts_in_bounds(
+                                &declaration.variable_length_bounds,
+                                types,
+                                facts,
+                            );
+                        } else if let FullTypedBlockItem::Typedef(declaration) = item {
+                            collect_automatic_local_facts_in_bounds(
+                                &declaration.variable_length_bounds,
+                                types,
+                                facts,
+                            );
                         }
                     }
                 }
@@ -725,6 +762,11 @@ fn collect_automatic_local_facts(
         }
         S::ComputedGoto(expression) => {
             collect_automatic_local_facts_in_expression(expression, types, facts);
+        }
+        S::InlineAsm(asm) => {
+            for expression in inline_asm_expressions(asm) {
+                collect_automatic_local_facts_in_expression(expression, types, facts);
+            }
         }
         S::Return(expression) => {
             if let Some(expression) = expression {
@@ -760,6 +802,15 @@ fn collect_automatic_local_facts_in_expression(
 ) {
     use FullTypedExpressionKind as E;
     match &expression.kind {
+        E::GenericSelection { selected, .. } => {
+            collect_automatic_local_facts_in_expression(selected, types, facts);
+        }
+        E::VariableLengthBoundEvaluation { bounds, expression } => {
+            for bound in bounds {
+                collect_automatic_local_facts_in_expression(&bound.expression, types, facts);
+            }
+            collect_automatic_local_facts_in_expression(expression, types, facts);
+        }
         E::Conversion {
             expression: operand,
             ..
@@ -833,6 +884,18 @@ fn collect_automatic_local_facts_in_expression(
                         if let Some(initializer) = &declaration.initializer {
                             collect_automatic_local_facts_in_initializer(initializer, types, facts);
                         }
+                        collect_automatic_local_facts_in_bounds(
+                            &declaration.variable_length_bounds,
+                            types,
+                            facts,
+                        );
+                    }
+                    FullTypedBlockItem::Typedef(declaration) => {
+                        collect_automatic_local_facts_in_bounds(
+                            &declaration.variable_length_bounds,
+                            types,
+                            facts,
+                        );
                     }
                     FullTypedBlockItem::Statement(statement) => {
                         collect_automatic_local_facts(statement, types, facts);
@@ -870,6 +933,13 @@ fn collect_automatic_local_facts_in_expression(
         E::Prefetch { address, .. } => {
             collect_automatic_local_facts_in_expression(address, types, facts);
         }
+        E::AtomicLoad { pointer, .. } => {
+            collect_automatic_local_facts_in_expression(pointer, types, facts);
+        }
+        E::AtomicStore { pointer, value, .. } => {
+            collect_automatic_local_facts_in_expression(pointer, types, facts);
+            collect_automatic_local_facts_in_expression(value, types, facts);
+        }
         E::AtomicReadModifyWrite {
             pointer, operand, ..
         } => {
@@ -896,13 +966,27 @@ fn collect_automatic_local_facts_in_expression(
             collect_automatic_local_facts_in_expression(destination, types, facts);
             collect_automatic_local_facts_in_expression(source, types, facts);
         }
+        E::Sizeof {
+            operand: Some(operand),
+            ..
+        } => collect_automatic_local_facts_in_expression(operand, types, facts),
         E::Constant(_)
         | E::StringLiteral(_)
         | E::DeclRef(_)
-        | E::Sizeof { .. }
+        | E::Sizeof { operand: None, .. }
         | E::Alignof { .. }
         | E::Offsetof { .. }
         | E::MemoryFence { .. } => {}
+    }
+}
+
+fn collect_automatic_local_facts_in_bounds(
+    bounds: &[FullTypedVariableLengthBound],
+    types: &TypeStore,
+    facts: &mut BTreeMap<FullLocalId, LocalFact>,
+) {
+    for bound in bounds {
+        collect_automatic_local_facts_in_expression(&bound.expression, types, facts);
     }
 }
 
@@ -943,7 +1027,7 @@ fn runtime_sized_object(types: &TypeStore, ty: TypeId) -> bool {
     }
 }
 
-fn runtime_storage_layout(
+fn runtime_layout_parts(
     types: &TypeStore,
     ty: QualifiedType,
     bounds: &[(VariableLengthId, ValueId)],
@@ -970,6 +1054,7 @@ fn runtime_storage_layout(
                 extents.push(
                     bounds
                         .iter()
+                        .rev()
                         .find_map(|(candidate, value)| (*candidate == id).then_some(*value))
                         .ok_or_else(|| {
                             IrError::lower(
@@ -992,6 +1077,61 @@ fn runtime_storage_layout(
     }
 }
 
+fn array_dimensions_in_type(types: &TypeStore, ty: TypeId) -> Vec<ArrayLength> {
+    let mut current = types.without_alignment_adjustment(ty);
+    if let Some(TypeKind::Pointer(pointer)) = types.try_kind(current) {
+        current = pointer.pointee.ty;
+    }
+    let mut active = HashSet::new();
+    let mut dimensions = Vec::new();
+    while active.insert(current) {
+        match types.try_kind(types.without_alignment_adjustment(current)) {
+            Some(TypeKind::Array(array)) => {
+                dimensions.push(array.length);
+                current = array.element.ty;
+            }
+            _ => break,
+        }
+    }
+    dimensions
+}
+
+/// Finds the runtime layout carried by a conditional operand before sema's
+/// common-pointer conversion changes its visible type to the left operand's
+/// type. Type-name bound wrappers identify an explicit cast's newly evaluated
+/// layout and therefore take precedence over the wrapped conversion source.
+fn conditional_operand_array_dimensions(
+    expression: &FullTypedExpression,
+    types: &TypeStore,
+) -> Vec<ArrayLength> {
+    match &expression.kind {
+        FullTypedExpressionKind::GenericSelection { selected, .. } => {
+            conditional_operand_array_dimensions(selected, types)
+        }
+        FullTypedExpressionKind::VariableLengthBoundEvaluation {
+            expression: nested, ..
+        } => {
+            let dimensions = array_dimensions_in_type(types, expression.ty.ty);
+            if dimensions.is_empty() {
+                conditional_operand_array_dimensions(nested, types)
+            } else {
+                dimensions
+            }
+        }
+        FullTypedExpressionKind::Conversion {
+            expression: nested, ..
+        } => {
+            let dimensions = conditional_operand_array_dimensions(nested, types);
+            if dimensions.is_empty() {
+                array_dimensions_in_type(types, expression.ty.ty)
+            } else {
+                dimensions
+            }
+        }
+        _ => array_dimensions_in_type(types, expression.ty.ty),
+    }
+}
+
 fn scan_statement_for_address_taken(
     statement: &FullTypedStatement,
     types: &TypeStore,
@@ -1007,9 +1147,21 @@ fn scan_statement_for_address_taken(
             for item in items {
                 match item {
                     FullTypedBlockItem::Declaration(declaration) => {
+                        scan_variable_length_bounds_for_address_taken(
+                            &declaration.variable_length_bounds,
+                            types,
+                            facts,
+                        );
                         if let Some(initializer) = &declaration.initializer {
                             scan_initializer_for_address_taken(initializer, types, facts);
                         }
+                    }
+                    FullTypedBlockItem::Typedef(declaration) => {
+                        scan_variable_length_bounds_for_address_taken(
+                            &declaration.variable_length_bounds,
+                            types,
+                            facts,
+                        );
                     }
                     FullTypedBlockItem::Statement(statement) => {
                         scan_statement_for_address_taken(statement, types, facts);
@@ -1068,10 +1220,21 @@ fn scan_statement_for_address_taken(
                 }
                 FullTypedForInitializer::Declarations(items) => {
                     for item in items {
-                        if let FullTypedBlockItem::Declaration(declaration) = item
-                            && let Some(initializer) = &declaration.initializer
-                        {
-                            scan_initializer_for_address_taken(initializer, types, facts);
+                        if let FullTypedBlockItem::Declaration(declaration) = item {
+                            scan_variable_length_bounds_for_address_taken(
+                                &declaration.variable_length_bounds,
+                                types,
+                                facts,
+                            );
+                            if let Some(initializer) = &declaration.initializer {
+                                scan_initializer_for_address_taken(initializer, types, facts);
+                            }
+                        } else if let FullTypedBlockItem::Typedef(declaration) = item {
+                            scan_variable_length_bounds_for_address_taken(
+                                &declaration.variable_length_bounds,
+                                types,
+                                facts,
+                            );
                         }
                     }
                 }
@@ -1090,6 +1253,16 @@ fn scan_statement_for_address_taken(
             }
         }
         S::ComputedGoto(expression) => scan_expression_for_address_taken(expression, types, facts),
+        S::InlineAsm(asm) => {
+            for expression in inline_asm_expressions(asm) {
+                scan_expression_for_address_taken(expression, types, facts);
+            }
+            for output in inline_asm_outputs(asm) {
+                if let Some(place) = &output.place {
+                    mark_place_address_taken(place, facts);
+                }
+            }
+        }
         S::Goto { .. } | S::Continue | S::Break => {}
     }
 }
@@ -1119,6 +1292,15 @@ fn scan_expression_for_address_taken(
 ) {
     use FullTypedExpressionKind as E;
     match &expression.kind {
+        E::GenericSelection { selected, .. } => {
+            scan_expression_for_address_taken(selected, types, facts);
+        }
+        E::VariableLengthBoundEvaluation { bounds, expression } => {
+            for bound in bounds {
+                scan_expression_for_address_taken(&bound.expression, types, facts);
+            }
+            scan_expression_for_address_taken(expression, types, facts);
+        }
         E::AddressOf(operand) => {
             if let Some(place) = &operand.place {
                 mark_place_address_taken(place, facts);
@@ -1142,18 +1324,23 @@ fn scan_expression_for_address_taken(
             scan_expression_for_address_taken(right, types, facts);
         }
         E::Member { base, .. } => scan_expression_for_address_taken(base, types, facts),
-        E::CompoundLiteral { local, initializer } => {
-            let mut fact = make_local_fact(
-                *local,
-                format!("<compound-literal-{}>", local.0),
-                expression.ty,
-                StorageDuration::Automatic,
-                None,
-                expression.span,
-                types,
-            );
-            fact.reasons.insert(MemoryResidencyReason::AddressTaken);
-            facts.insert(*local, fact);
+        E::CompoundLiteral {
+            storage,
+            initializer,
+        } => {
+            if let CompoundLiteralStorage::Automatic(local) = storage {
+                let mut fact = make_local_fact(
+                    *local,
+                    format!("<compound-literal-{}>", local.0),
+                    expression.ty,
+                    StorageDuration::Automatic,
+                    None,
+                    expression.span,
+                    types,
+                );
+                fact.reasons.insert(MemoryResidencyReason::AddressTaken);
+                facts.insert(*local, fact);
+            }
             scan_initializer_for_address_taken(initializer, types, facts);
         }
         E::Assignment { target, value, .. } => {
@@ -1187,9 +1374,21 @@ fn scan_expression_for_address_taken(
             for item in items {
                 match item {
                     FullTypedBlockItem::Declaration(declaration) => {
+                        scan_variable_length_bounds_for_address_taken(
+                            &declaration.variable_length_bounds,
+                            types,
+                            facts,
+                        );
                         if let Some(initializer) = &declaration.initializer {
                             scan_initializer_for_address_taken(initializer, types, facts);
                         }
+                    }
+                    FullTypedBlockItem::Typedef(declaration) => {
+                        scan_variable_length_bounds_for_address_taken(
+                            &declaration.variable_length_bounds,
+                            types,
+                            facts,
+                        );
                     }
                     FullTypedBlockItem::Statement(statement) => {
                         scan_statement_for_address_taken(statement, types, facts);
@@ -1229,6 +1428,13 @@ fn scan_expression_for_address_taken(
         E::Prefetch { address, .. } => {
             scan_expression_for_address_taken(address, types, facts);
         }
+        E::AtomicLoad { pointer, .. } => {
+            scan_expression_for_address_taken(pointer, types, facts);
+        }
+        E::AtomicStore { pointer, value, .. } => {
+            scan_expression_for_address_taken(pointer, types, facts);
+            scan_expression_for_address_taken(value, types, facts);
+        }
         E::AtomicReadModifyWrite {
             pointer, operand, ..
         } => {
@@ -1264,13 +1470,27 @@ fn scan_expression_for_address_taken(
                 mark_place_address_taken(place, facts);
             }
         }
+        E::Sizeof {
+            operand: Some(operand),
+            ..
+        } => scan_expression_for_address_taken(operand, types, facts),
         E::Constant(_)
         | E::StringLiteral(_)
         | E::DeclRef(_)
-        | E::Sizeof { .. }
+        | E::Sizeof { operand: None, .. }
         | E::Alignof { .. }
         | E::Offsetof { .. }
         | E::MemoryFence { .. } => {}
+    }
+}
+
+fn scan_variable_length_bounds_for_address_taken(
+    bounds: &[FullTypedVariableLengthBound],
+    types: &TypeStore,
+    facts: &mut BTreeMap<FullLocalId, LocalFact>,
+) {
+    for bound in bounds {
+        scan_expression_for_address_taken(&bound.expression, types, facts);
     }
 }
 
@@ -1340,6 +1560,12 @@ fn collect_aggregate_projection<'a>(
 struct SwitchContext {
     cases: VecDeque<(u128, BlockId)>,
     default: Option<BlockId>,
+}
+
+#[derive(Clone, Copy)]
+enum ConditionalBoundValue {
+    Runtime(ValueId),
+    Constant(u64),
 }
 
 struct FunctionBuilder<'a> {
@@ -1528,7 +1754,38 @@ impl<'a> FunctionBuilder<'a> {
                 block.terminator = Some(FullTerminator::Unreachable);
             }
         }
-        promote_scalar_locals(&mut builder.function, builder.types)?;
+        if let Some(span) = returns_twice_call_span(&builder.function) {
+            if builder
+                .function
+                .storage
+                .iter()
+                .any(|storage| storage.location == StorageLocation::RuntimeSized)
+            {
+                return Err(IrError::lower(
+                    LOWERING_ERROR,
+                    span,
+                    "a returns-twice call cannot be combined with runtime-sized automatic storage",
+                ));
+            }
+
+            // A second return resumes the machine state captured by the first
+            // call. Keep every automatic object in stable stack storage so the
+            // resumed execution observes memory, rather than an SSA value from
+            // the first path through the call.
+            for storage in &mut builder.function.storage {
+                if storage.location == StorageLocation::Automatic
+                    && !storage
+                        .required_by
+                        .contains(&MemoryResidencyReason::ReturnsTwice)
+                {
+                    storage
+                        .required_by
+                        .push(MemoryResidencyReason::ReturnsTwice);
+                }
+            }
+        } else {
+            promote_scalar_locals(&mut builder.function, builder.types)?;
+        }
         Ok(builder.function)
     }
 
@@ -1656,31 +1913,27 @@ impl<'a> FunctionBuilder<'a> {
         )
     }
 
-    fn runtime_extents(
-        &self,
-        mut element: QualifiedType,
+    fn runtime_size(
+        &mut self,
+        object: QualifiedType,
+        result_ty: QualifiedType,
         span: Span,
-    ) -> Result<Vec<ValueId>, IrError> {
-        let mut extents = Vec::new();
-        while let Some(TypeKind::Array(array)) = self.types.try_kind(element.ty) {
-            if let ArrayLength::Variable(id) = array.length {
-                extents.push(
-                    self.runtime_bounds
-                        .iter()
-                        .rev()
-                        .find_map(|(candidate, value)| (*candidate == id).then_some(*value))
-                        .ok_or_else(|| {
-                            IrError::lower(
-                                LOWERING_ERROR,
-                                span,
-                                format!("pointer stride is missing runtime bound {}", id.0),
-                            )
-                        })?,
-                );
-            }
-            element = array.element;
+    ) -> Result<Option<ValueId>, IrError> {
+        let (extents, element, constant_factor) =
+            runtime_layout_parts(self.types, object, &self.runtime_bounds, span)?;
+        if extents.is_empty() {
+            return Ok(None);
         }
-        Ok(extents)
+        self.emit_result(
+            FullInstructionKind::RuntimeSize {
+                extents,
+                element,
+                constant_factor,
+            },
+            result_ty,
+            span,
+        )
+        .map(Some)
     }
 
     fn pointer_offset(
@@ -1692,20 +1945,24 @@ impl<'a> FunctionBuilder<'a> {
         result_ty: QualifiedType,
         span: Span,
     ) -> Result<ValueId, IrError> {
-        let extents = self.runtime_extents(element, span)?;
-        let kind = if extents.is_empty() {
-            FullInstructionKind::PointerOffset {
-                base,
-                index,
-                element,
-                subtract,
-            }
-        } else {
+        let stride = self.runtime_size(
+            element,
+            QualifiedType::unqualified(TypeId::UNSIGNED_LONG),
+            span,
+        )?;
+        let kind = if let Some(stride) = stride {
             FullInstructionKind::RuntimePointerOffset {
                 base,
                 index,
                 element,
-                extents,
+                stride,
+                subtract,
+            }
+        } else {
+            FullInstructionKind::PointerOffset {
+                base,
+                index,
+                element,
                 subtract,
             }
         };
@@ -1720,23 +1977,40 @@ impl<'a> FunctionBuilder<'a> {
         result_ty: QualifiedType,
         span: Span,
     ) -> Result<ValueId, IrError> {
-        let extents = self.runtime_extents(element, span)?;
-        let kind = if extents.is_empty() {
+        let stride = self.runtime_size(
+            element,
+            QualifiedType::unqualified(TypeId::UNSIGNED_LONG),
+            span,
+        )?;
+        let kind = if let Some(stride) = stride {
+            FullInstructionKind::RuntimePointerDifference {
+                left,
+                right,
+                element,
+                stride,
+            }
+        } else {
             FullInstructionKind::PointerDifference {
                 left,
                 right,
                 element,
             }
-        } else {
-            FullInstructionKind::RuntimePointerDifference {
-                left,
-                right,
-                element,
-                extents,
-            }
         };
         self.emit_result(kind, result_ty, span)
     }
+}
+
+fn returns_twice_call_span(function: &FullFunction) -> Option<Span> {
+    function.blocks.iter().find_map(|block| {
+        block.instructions.iter().find_map(|instruction| {
+            let returns_twice = match &instruction.kind {
+                FullInstructionKind::DirectCall { effects, .. }
+                | FullInstructionKind::IndirectCall { effects, .. } => effects.returns_twice,
+                _ => false,
+            };
+            returns_twice.then_some(instruction.span)
+        })
+    })
 }
 
 /// Promotes automatic scalar objects that do not require an address to SSA.
@@ -1983,7 +2257,7 @@ fn resolve_alias(
     Ok(value)
 }
 
-fn compact_values(
+pub(super) fn compact_values(
     function: &mut FullFunction,
     aliases: &BTreeMap<ValueId, ValueId>,
 ) -> Result<(), IrError> {
@@ -2078,12 +2352,15 @@ fn remap_instruction_values(
         | FullInstructionKind::AddressOfFunction { .. }
         | FullInstructionKind::AddressOfString { .. }
         | FullInstructionKind::AddressOfStorage { .. }
-        | FullInstructionKind::MemoryFence { .. } => {}
-        FullInstructionKind::RuntimeSizedAllocate { extents, .. } => {
+        | FullInstructionKind::MemoryFence { .. }
+        | FullInstructionKind::CompilerBarrier { .. }
+        | FullInstructionKind::CodeLayoutHint(_) => {}
+        FullInstructionKind::RuntimeSize { extents, .. } => {
             for extent in extents {
                 map(extent)?;
             }
         }
+        FullInstructionKind::RuntimeSizedAllocate { size, .. } => map(size)?,
         FullInstructionKind::ProjectField { base, .. } => map(base)?,
         FullInstructionKind::PointerOffset { base, index, .. } => {
             map(base)?;
@@ -2092,14 +2369,12 @@ fn remap_instruction_values(
         FullInstructionKind::RuntimePointerOffset {
             base,
             index,
-            extents,
+            stride,
             ..
         } => {
             map(base)?;
             map(index)?;
-            for extent in extents {
-                map(extent)?;
-            }
+            map(stride)?;
         }
         FullInstructionKind::PointerDifference { left, right, .. }
         | FullInstructionKind::Binary { left, right, .. } => {
@@ -2109,14 +2384,12 @@ fn remap_instruction_values(
         FullInstructionKind::RuntimePointerDifference {
             left,
             right,
-            extents,
+            stride,
             ..
         } => {
             map(left)?;
             map(right)?;
-            for extent in extents {
-                map(extent)?;
-            }
+            map(stride)?;
         }
         FullInstructionKind::Load { address, .. }
         | FullInstructionKind::BitfieldLoad { address, .. }
@@ -2186,7 +2459,25 @@ fn remap_instruction_values(
         }
         FullInstructionKind::Convert { operand, .. }
         | FullInstructionKind::Unary { operand, .. }
-        | FullInstructionKind::IntegerIntrinsic { operand, .. } => map(operand)?,
+        | FullInstructionKind::IntegerIntrinsic { operand, .. }
+        | FullInstructionKind::OpaqueScalar { operand } => map(operand)?,
+        FullInstructionKind::X86Cpuid {
+            leaf,
+            subleaf,
+            eax,
+            ebx,
+            ecx,
+            edx,
+        } => {
+            map(leaf)?;
+            for value in [subleaf, eax, ebx, ecx, edx].into_iter().flatten() {
+                map(value)?;
+            }
+        }
+        FullInstructionKind::X86Rdtsc { low, high } => {
+            map(low)?;
+            map(high)?;
+        }
         FullInstructionKind::DirectCall { arguments, .. } => {
             for argument in arguments {
                 map(argument)?;
@@ -2341,8 +2632,10 @@ impl FunctionBuilder<'_> {
                             self.local_declaration(declaration)?;
                         }
                         FullTypedBlockItem::Statement(statement) => self.statement(statement)?,
-                        FullTypedBlockItem::Typedef(_)
-                        | FullTypedBlockItem::ExternalObject(_)
+                        FullTypedBlockItem::Typedef(declaration) => {
+                            self.typedef_declaration(declaration)?;
+                        }
+                        FullTypedBlockItem::ExternalObject(_)
                         | FullTypedBlockItem::FunctionDeclaration(_)
                         | FullTypedBlockItem::StaticAssert { .. }
                         | FullTypedBlockItem::Pragma(_) => {}
@@ -2413,6 +2706,11 @@ impl FunctionBuilder<'_> {
                     self.terminate(FullTerminator::IndirectBranch { selector, targets })?;
                 }
             }
+            S::InlineAsm(asm) => {
+                if self.current.is_some() {
+                    self.inline_asm(asm, statement.span)?;
+                }
+            }
             S::Continue => {
                 if self.current.is_some() {
                     let target = self.continue_targets.last().copied().ok_or_else(|| {
@@ -2446,6 +2744,164 @@ impl FunctionBuilder<'_> {
         Ok(())
     }
 
+    fn inline_asm(&mut self, asm: &FullTypedInlineAsm, span: Span) -> Result<(), IrError> {
+        match &asm.kind {
+            FullTypedInlineAsmKind::CompilerBarrier { memory } => self.emit_effect(
+                FullInstructionKind::CompilerBarrier { memory: *memory },
+                span,
+            ),
+            FullTypedInlineAsmKind::OpaqueScalar { target } => {
+                let place = self.place(target)?;
+                let value = self.load_place(&place, span)?;
+                let value = self.emit_result(
+                    FullInstructionKind::OpaqueScalar { operand: value },
+                    QualifiedType::unqualified(target.ty.ty),
+                    span,
+                )?;
+                self.store_place(&place, value, span)
+            }
+            FullTypedInlineAsmKind::CodeLayoutHint(hint) => self.emit_effect(
+                FullInstructionKind::CodeLayoutHint(match hint {
+                    TypedCodeLayoutHint::AlignToPowerOfTwo(power) => {
+                        CodeLayoutHint::AlignToPowerOfTwo(*power)
+                    }
+                    TypedCodeLayoutHint::Nop => CodeLayoutHint::Nop,
+                }),
+                span,
+            ),
+            FullTypedInlineAsmKind::X86Cpuid {
+                leaf,
+                subleaf,
+                outputs,
+            } => {
+                let leaf = self.expect_value(leaf)?;
+                let subleaf = subleaf
+                    .as_ref()
+                    .map(|subleaf| self.expect_value(subleaf))
+                    .transpose()?;
+                let mut addresses = [None; 4];
+                for output in outputs {
+                    let address = self.place(&output.target)?.address;
+                    addresses[match output.register {
+                        X86CpuidRegister::Eax => 0,
+                        X86CpuidRegister::Ebx => 1,
+                        X86CpuidRegister::Ecx => 2,
+                        X86CpuidRegister::Edx => 3,
+                    }] = Some(address);
+                }
+                self.emit_effect(
+                    FullInstructionKind::X86Cpuid {
+                        leaf,
+                        subleaf,
+                        eax: addresses[0],
+                        ebx: addresses[1],
+                        ecx: addresses[2],
+                        edx: addresses[3],
+                    },
+                    span,
+                )
+            }
+            FullTypedInlineAsmKind::X86Rdtsc { low, high } => {
+                let low = self.place(low)?.address;
+                let high = self.place(high)?.address;
+                self.emit_effect(FullInstructionKind::X86Rdtsc { low, high }, span)
+            }
+            FullTypedInlineAsmKind::X86AtomicExchange {
+                object,
+                value,
+                result,
+            } => {
+                let object = self.place(object)?;
+                let value_place = self.place(value)?;
+                let replacement = self.load_place(&value_place, span)?;
+                let old = self.emit_result(
+                    FullInstructionKind::AtomicReadModifyWrite {
+                        operation: AtomicReadModifyWriteOperation::Exchange,
+                        address: object.address,
+                        operand: replacement,
+                        object: object.object,
+                        return_new: false,
+                        order: MemoryOrder::SequentiallyConsistent,
+                    },
+                    QualifiedType::unqualified(object.object.ty),
+                    span,
+                )?;
+                self.store_place(&value_place, old, span)?;
+                if let Some(result) = result {
+                    let result = self.place(result)?;
+                    self.store_place(&result, old, span)?;
+                }
+                Ok(())
+            }
+            FullTypedInlineAsmKind::X86AtomicCompareExchange {
+                object,
+                expected,
+                desired,
+                original,
+            } => {
+                let object = self.place(object)?;
+                let expected = self.expect_value(expected)?;
+                let desired = self.expect_value(desired)?;
+                let old = self.emit_result(
+                    FullInstructionKind::AtomicCompareExchange {
+                        address: object.address,
+                        expected,
+                        replacement: desired,
+                        object: object.object,
+                        order: MemoryOrder::SequentiallyConsistent,
+                    },
+                    QualifiedType::unqualified(object.object.ty),
+                    span,
+                )?;
+                let original = self.place(original)?;
+                self.store_place(&original, old, span)
+            }
+            FullTypedInlineAsmKind::X86ConditionalMoveAbove {
+                target,
+                index,
+                low_limit,
+                backup,
+            } => {
+                let target = self.place(target)?;
+                let candidate = self.load_place(&target, span)?;
+                let index = self.expect_value(index)?;
+                let low_limit = self.expect_value(low_limit)?;
+                let backup = self.expect_value(backup)?;
+                let below = self.emit_result(
+                    FullInstructionKind::Binary {
+                        operator: BinaryOperation::Less,
+                        left: index,
+                        right: low_limit,
+                    },
+                    QualifiedType::unqualified(TypeId::BOOL),
+                    span,
+                )?;
+                let backup_block = self.new_block();
+                let candidate_block = self.new_block();
+                let merge = self.new_block();
+                let selected =
+                    self.add_block_parameter(merge, QualifiedType::unqualified(target.object.ty));
+                self.terminate(FullTerminator::Conditional {
+                    condition: below,
+                    then_edge: empty_edge(backup_block),
+                    else_edge: empty_edge(candidate_block),
+                })?;
+                self.current = Some(backup_block);
+                self.terminate(FullTerminator::Branch(FullEdge {
+                    target: merge,
+                    arguments: vec![backup],
+                }))?;
+                self.current = Some(candidate_block);
+                self.terminate(FullTerminator::Branch(FullEdge {
+                    target: merge,
+                    arguments: vec![candidate],
+                }))?;
+                self.current = Some(merge);
+                self.store_place(&target, selected, span)
+            }
+        }
+    }
+
     fn local_declaration(
         &mut self,
         declaration: &FullTypedLocalDeclaration,
@@ -2453,12 +2909,7 @@ impl FunctionBuilder<'_> {
         if self.current.is_none() {
             return Ok(());
         }
-        let mut bounds = Vec::new();
-        for bound in &declaration.variable_length_bounds {
-            let value = self.expect_value(&bound.expression)?;
-            bounds.push((bound.id, value));
-            self.runtime_bounds.push((bound.id, value));
-        }
+        self.variable_length_bounds(&declaration.variable_length_bounds)?;
 
         if declaration.duration != StorageDuration::Automatic {
             return Ok(());
@@ -2481,15 +2932,31 @@ impl FunctionBuilder<'_> {
                     "a variable-length array cannot have an initializer",
                 ));
             }
-            let (extents, element, constant_factor) =
-                runtime_storage_layout(self.types, declaration.ty, &bounds, declaration.span)?;
+            let size = self
+                .runtime_size(
+                    declaration.ty,
+                    QualifiedType::unqualified(TypeId::UNSIGNED_LONG),
+                    declaration.span,
+                )?
+                .ok_or_else(|| {
+                    IrError::lower(
+                        LOWERING_ERROR,
+                        declaration.span,
+                        "runtime-sized storage has no dynamic extent",
+                    )
+                })?;
+            let (_, element, _) = runtime_layout_parts(
+                self.types,
+                declaration.ty,
+                &self.runtime_bounds,
+                declaration.span,
+            )?;
             let pointer = self.types.pointer(declaration.ty);
             let address = self.emit_result(
                 FullInstructionKind::RuntimeSizedAllocate {
                     storage,
-                    extents,
+                    size,
                     element,
-                    constant_factor,
                     requested_alignment: declaration.requested_alignment,
                 },
                 QualifiedType::unqualified(pointer),
@@ -2509,6 +2976,24 @@ impl FunctionBuilder<'_> {
                 bitfield: None,
             };
             self.runtime_initializer(place, initializer)?;
+        }
+        Ok(())
+    }
+
+    fn variable_length_bounds(
+        &mut self,
+        bounds: &[FullTypedVariableLengthBound],
+    ) -> Result<(), IrError> {
+        for bound in bounds {
+            let value = self.expect_value(&bound.expression)?;
+            self.runtime_bounds.push((bound.id, value));
+        }
+        Ok(())
+    }
+
+    fn typedef_declaration(&mut self, declaration: &FullTypedTypedef) -> Result<(), IrError> {
+        if self.current.is_some() {
+            self.variable_length_bounds(&declaration.variable_length_bounds)?;
         }
         Ok(())
     }
@@ -2888,6 +3373,11 @@ impl FunctionBuilder<'_> {
     fn expression(&mut self, expression: &FullTypedExpression) -> Result<Option<ValueId>, IrError> {
         use FullTypedExpressionKind as E;
         match &expression.kind {
+            E::GenericSelection { selected, .. } => self.expression(selected),
+            E::VariableLengthBoundEvaluation { bounds, expression } => {
+                self.variable_length_bounds(bounds)?;
+                self.expression(expression)
+            }
             E::Constant(constant) => self
                 .constant(*constant, expression.ty, expression.span)
                 .map(Some),
@@ -3068,8 +3558,10 @@ impl FunctionBuilder<'_> {
                             self.local_declaration(declaration)?;
                         }
                         FullTypedBlockItem::Statement(statement) => self.statement(statement)?,
-                        FullTypedBlockItem::Typedef(_)
-                        | FullTypedBlockItem::ExternalObject(_)
+                        FullTypedBlockItem::Typedef(declaration) => {
+                            self.typedef_declaration(declaration)?;
+                        }
+                        FullTypedBlockItem::ExternalObject(_)
                         | FullTypedBlockItem::FunctionDeclaration(_)
                         | FullTypedBlockItem::StaticAssert { .. }
                         | FullTypedBlockItem::Pragma(_) => {}
@@ -3173,6 +3665,58 @@ impl FunctionBuilder<'_> {
                 )?;
                 Ok(None)
             }
+            E::AtomicLoad {
+                pointer,
+                object,
+                order,
+            } => {
+                let address = self.expect_value(pointer)?;
+                let order = match order {
+                    TypedMemoryOrder::SequentiallyConsistent => MemoryOrder::SequentiallyConsistent,
+                };
+                self.emit_result(
+                    FullInstructionKind::Load {
+                        address,
+                        object: *object,
+                        access: MemoryAccess {
+                            volatile: object.qualifiers.contains(TypeQualifiers::VOLATILE),
+                            atomic: Some(order),
+                            non_elidable: true,
+                            non_movable: true,
+                        },
+                    },
+                    QualifiedType::unqualified(object.ty),
+                    expression.span,
+                )
+                .map(Some)
+            }
+            E::AtomicStore {
+                pointer,
+                value,
+                object,
+                order,
+            } => {
+                let address = self.expect_value(pointer)?;
+                let value = self.expect_value(value)?;
+                let order = match order {
+                    TypedMemoryOrder::SequentiallyConsistent => MemoryOrder::SequentiallyConsistent,
+                };
+                self.emit_effect(
+                    FullInstructionKind::Store {
+                        address,
+                        value,
+                        object: *object,
+                        access: MemoryAccess {
+                            volatile: object.qualifiers.contains(TypeQualifiers::VOLATILE),
+                            atomic: Some(order),
+                            non_elidable: true,
+                            non_movable: true,
+                        },
+                    },
+                    expression.span,
+                )?;
+                Ok(None)
+            }
             E::AtomicReadModifyWrite {
                 operation,
                 pointer,
@@ -3187,6 +3731,15 @@ impl FunctionBuilder<'_> {
                     TypedAtomicReadModifyWriteOperation::Add => AtomicReadModifyWriteOperation::Add,
                     TypedAtomicReadModifyWriteOperation::Subtract => {
                         AtomicReadModifyWriteOperation::Subtract
+                    }
+                    TypedAtomicReadModifyWriteOperation::BitwiseAnd => {
+                        AtomicReadModifyWriteOperation::BitwiseAnd
+                    }
+                    TypedAtomicReadModifyWriteOperation::BitwiseOr => {
+                        AtomicReadModifyWriteOperation::BitwiseOr
+                    }
+                    TypedAtomicReadModifyWriteOperation::BitwiseXor => {
+                        AtomicReadModifyWriteOperation::BitwiseXor
                     }
                     TypedAtomicReadModifyWriteOperation::Exchange => {
                         AtomicReadModifyWriteOperation::Exchange
@@ -3223,10 +3776,28 @@ impl FunctionBuilder<'_> {
                 replacement,
                 object,
                 return_boolean,
+                expected_is_pointer,
                 order,
             } => {
                 let address = self.expect_value(pointer)?;
-                let expected = self.expect_value(expected)?;
+                let expected_address = if *expected_is_pointer {
+                    Some(self.expect_value(expected)?)
+                } else {
+                    None
+                };
+                let expected = if let Some(expected_address) = expected_address {
+                    self.emit_result(
+                        FullInstructionKind::Load {
+                            address: expected_address,
+                            object: QualifiedType::unqualified(object.ty),
+                            access: MemoryAccess::default(),
+                        },
+                        QualifiedType::unqualified(object.ty),
+                        expression.span,
+                    )?
+                } else {
+                    self.expect_value(expected)?
+                };
                 let replacement = self.expect_value(replacement)?;
                 let order = match order {
                     TypedMemoryOrder::SequentiallyConsistent => MemoryOrder::SequentiallyConsistent,
@@ -3244,7 +3815,7 @@ impl FunctionBuilder<'_> {
                     expression.span,
                 )?;
                 if *return_boolean {
-                    self.emit_result(
+                    let succeeded = self.emit_result(
                         FullInstructionKind::Binary {
                             operator: BinaryOperation::Equal,
                             left: old,
@@ -3252,19 +3823,61 @@ impl FunctionBuilder<'_> {
                         },
                         QualifiedType::unqualified(TypeId::BOOL),
                         expression.span,
-                    )
-                    .map(Some)
+                    )?;
+                    if let Some(expected_address) = expected_address {
+                        let failure = self.new_block();
+                        let merge = self.new_block();
+                        self.terminate(FullTerminator::Conditional {
+                            condition: succeeded,
+                            then_edge: empty_edge(merge),
+                            else_edge: empty_edge(failure),
+                        })?;
+                        self.current = Some(failure);
+                        self.emit_effect(
+                            FullInstructionKind::Store {
+                                address: expected_address,
+                                value: old,
+                                object: QualifiedType::unqualified(object.ty),
+                                access: MemoryAccess::default(),
+                            },
+                            expression.span,
+                        )?;
+                        self.branch(merge)?;
+                        self.current = Some(merge);
+                    }
+                    Ok(Some(succeeded))
                 } else {
+                    debug_assert!(expected_address.is_none());
                     Ok(Some(old))
                 }
             }
-            E::Sizeof { size, .. } => self
-                .emit_result(
-                    FullInstructionKind::Constant(ScalarConstant::Unsigned(*size as u128)),
-                    expression.ty,
-                    expression.span,
-                )
-                .map(Some),
+            E::Sizeof {
+                operand,
+                operand_ty,
+                size,
+            } => {
+                if let Some(operand) = operand {
+                    let _ = self.place(operand)?;
+                }
+                if let Some(size) = size {
+                    self.emit_result(
+                        FullInstructionKind::Constant(ScalarConstant::Unsigned(u128::from(*size))),
+                        expression.ty,
+                        expression.span,
+                    )
+                    .map(Some)
+                } else {
+                    self.runtime_size(*operand_ty, expression.ty, expression.span)?
+                        .ok_or_else(|| {
+                            IrError::lower(
+                                LOWERING_ERROR,
+                                expression.span,
+                                "runtime sizeof has no dynamic extent",
+                            )
+                        })
+                        .map(Some)
+                }
+            }
             E::Alignof { align, .. } => self
                 .emit_result(
                     FullInstructionKind::Constant(ScalarConstant::Unsigned(*align as u128)),
@@ -3382,6 +3995,11 @@ impl FunctionBuilder<'_> {
                 ty,
                 span,
             ),
+            ConstantValue::LongDouble(value) => self.emit_result(
+                FullInstructionKind::Constant(ScalarConstant::LongDouble(value)),
+                ty,
+                span,
+            ),
             ConstantValue::NullPointer => self.emit_result(
                 FullInstructionKind::Constant(ScalarConstant::NullPointer),
                 ty,
@@ -3456,6 +4074,23 @@ impl FunctionBuilder<'_> {
     }
 
     fn zero_value(&mut self, ty: QualifiedType, span: Span) -> Result<ValueId, IrError> {
+        if self.types.builtin_type(ty.ty) == Some(BuiltinType::LongDouble) {
+            let zero = self.emit_result(
+                FullInstructionKind::Constant(ScalarConstant::Signed(0)),
+                QualifiedType::unqualified(TypeId::INT),
+                span,
+            )?;
+            return self.emit_result(
+                FullInstructionKind::Convert {
+                    kind: ScalarConversion::IntegerToFloating,
+                    operand: zero,
+                    from: QualifiedType::unqualified(TypeId::INT),
+                    to: QualifiedType::unqualified(ty.ty),
+                },
+                QualifiedType::unqualified(ty.ty),
+                span,
+            );
+        }
         let constant = if pointer_pointee(self.types, ty.ty).is_some() {
             ScalarConstant::NullPointer
         } else if self
@@ -3552,6 +4187,15 @@ impl FunctionBuilder<'_> {
     }
 
     fn place(&mut self, expression: &FullTypedExpression) -> Result<LoweredPlace, IrError> {
+        if let FullTypedExpressionKind::GenericSelection { selected, .. } = &expression.kind {
+            return self.place(selected);
+        }
+        if let FullTypedExpressionKind::VariableLengthBoundEvaluation { bounds, expression } =
+            &expression.kind
+        {
+            self.variable_length_bounds(bounds)?;
+            return self.place(expression);
+        }
         if let FullTypedExpressionKind::StatementExpression {
             items,
             result: Some(result),
@@ -3563,8 +4207,10 @@ impl FunctionBuilder<'_> {
                         self.local_declaration(declaration)?;
                     }
                     FullTypedBlockItem::Statement(statement) => self.statement(statement)?,
-                    FullTypedBlockItem::Typedef(_)
-                    | FullTypedBlockItem::ExternalObject(_)
+                    FullTypedBlockItem::Typedef(declaration) => {
+                        self.typedef_declaration(declaration)?;
+                    }
+                    FullTypedBlockItem::ExternalObject(_)
                     | FullTypedBlockItem::FunctionDeclaration(_)
                     | FullTypedBlockItem::StaticAssert { .. }
                     | FullTypedBlockItem::Pragma(_) => {}
@@ -3678,24 +4324,39 @@ impl FunctionBuilder<'_> {
             FullTypedExpressionKind::DeclRef(SymbolReference::PredefinedFunctionName(string)) => {
                 self.address_of_string(*string, expression.ty, expression.span)?
             }
-            FullTypedExpressionKind::CompoundLiteral { local, initializer } => {
-                let storage = *self.storage_by_local.get(local).ok_or_else(|| {
-                    IrError::lower(
-                        LOWERING_ERROR,
-                        expression.span,
-                        format!("reference to unknown compound literal {}", local.0),
-                    )
-                })?;
-                let address = self.address_of_storage(storage, expression.span)?;
-                let destination = LoweredPlace {
-                    address,
-                    object: expression.ty,
-                    access: access_from_qualified(expression.ty),
-                    bitfield: None,
-                };
-                self.runtime_initializer(destination, initializer)?;
-                address
-            }
+            FullTypedExpressionKind::CompoundLiteral {
+                storage,
+                initializer,
+            } => match storage {
+                CompoundLiteralStorage::Automatic(local) => {
+                    let storage = *self.storage_by_local.get(local).ok_or_else(|| {
+                        IrError::lower(
+                            LOWERING_ERROR,
+                            expression.span,
+                            format!("reference to unknown compound literal {}", local.0),
+                        )
+                    })?;
+                    let address = self.address_of_storage(storage, expression.span)?;
+                    let destination = LoweredPlace {
+                        address,
+                        object: expression.ty,
+                        access: access_from_qualified(expression.ty),
+                        bitfield: None,
+                    };
+                    self.runtime_initializer(destination, initializer)?;
+                    address
+                }
+                CompoundLiteralStorage::Static(global) => {
+                    let data = *self.file_data.get(global).ok_or_else(|| {
+                        IrError::lower(
+                            LOWERING_ERROR,
+                            expression.span,
+                            format!("reference to unknown compound literal object {}", global.0),
+                        )
+                    })?;
+                    self.address_of_data(data, expression.ty, expression.span)?
+                }
+            },
             FullTypedExpressionKind::StringLiteral(string) => {
                 self.address_of_string(*string, expression.ty, expression.span)?
             }
@@ -3989,11 +4650,69 @@ impl FunctionBuilder<'_> {
         }
         let stored = if let Some(plan) = compound {
             if destination.access.atomic.is_some() {
-                return Err(IrError::lower(
-                    LOWERING_ERROR,
+                let operation = match plan.operator {
+                    AstBinary::Add => AtomicReadModifyWriteOperation::Add,
+                    AstBinary::Subtract => AtomicReadModifyWriteOperation::Subtract,
+                    AstBinary::BitwiseAnd => AtomicReadModifyWriteOperation::BitwiseAnd,
+                    AstBinary::BitwiseOr => AtomicReadModifyWriteOperation::BitwiseOr,
+                    AstBinary::BitwiseXor => AtomicReadModifyWriteOperation::BitwiseXor,
+                    _ => {
+                        return Err(IrError::lower(
+                            LOWERING_ERROR,
+                            span,
+                            "this atomic compound operator has no enabled native read-modify-write instruction",
+                        ));
+                    }
+                };
+                let right = self.expect_value(value)?;
+                let operand = if let Some(element) = pointer_pointee(self.types, target.ty.ty) {
+                    if !matches!(plan.operator, AstBinary::Add | AstBinary::Subtract) {
+                        return Err(IrError::lower(
+                            LOWERING_ERROR,
+                            span,
+                            "only addition and subtraction are defined for atomic pointer compound assignment",
+                        ));
+                    }
+                    let zero = self.emit_result(
+                        FullInstructionKind::Constant(ScalarConstant::NullPointer),
+                        result_ty,
+                        span,
+                    )?;
+                    self.pointer_offset(zero, right, element, false, result_ty, span)?
+                } else {
+                    let source =
+                        QualifiedType::unqualified(self.function.value_types[right.0 as usize]);
+                    if source.ty == destination.object.ty {
+                        right
+                    } else {
+                        self.emit_result(
+                            FullInstructionKind::Convert {
+                                kind: inferred_conversion(
+                                    self.types,
+                                    source,
+                                    QualifiedType::unqualified(destination.object.ty),
+                                ),
+                                operand: right,
+                                from: source,
+                                to: QualifiedType::unqualified(destination.object.ty),
+                            },
+                            QualifiedType::unqualified(destination.object.ty),
+                            span,
+                        )?
+                    }
+                };
+                return self.emit_result(
+                    FullInstructionKind::AtomicReadModifyWrite {
+                        operation,
+                        address: destination.address,
+                        operand,
+                        object: destination.object,
+                        return_new: true,
+                        order: MemoryOrder::SequentiallyConsistent,
+                    },
+                    result_ty,
                     span,
-                    "atomic compound read-modify-write is not supported",
-                ));
+                );
             }
             let loaded =
                 self.load_place_with_access(&destination, access_from_semantics(plan.load), span)?;
@@ -4053,15 +4772,61 @@ impl FunctionBuilder<'_> {
         let mut place = self.place(operand)?;
         place.access = access_from_semantics(store);
         if place.access.atomic.is_some() {
-            return Err(IrError::lower(
-                LOWERING_ERROR,
+            let pointer = pointer_pointee(self.types, operand.ty.ty);
+            if pointer.is_none() && !self.types.is_integer(operand.ty.ty) {
+                return Err(IrError::lower(
+                    LOWERING_ERROR,
+                    span,
+                    "atomic increment and decrement require an integer or pointer object",
+                ));
+            }
+            let one = self.emit_result(
+                FullInstructionKind::Constant(ScalarConstant::Signed(1)),
+                QualifiedType::unqualified(TypeId::INT),
                 span,
-                "atomic increment and decrement are not supported",
-            ));
+            )?;
+            let one = if let Some(element) = pointer {
+                let zero = self.emit_result(
+                    FullInstructionKind::Constant(ScalarConstant::NullPointer),
+                    result_ty,
+                    span,
+                )?;
+                self.pointer_offset(zero, one, element, false, result_ty, span)?
+            } else if operand.ty.ty != TypeId::INT {
+                self.emit_result(
+                    FullInstructionKind::Convert {
+                        kind: ScalarConversion::IntegerConversion,
+                        operand: one,
+                        from: QualifiedType::unqualified(TypeId::INT),
+                        to: result_ty,
+                    },
+                    result_ty,
+                    span,
+                )?
+            } else {
+                one
+            };
+            return self.emit_result(
+                FullInstructionKind::AtomicReadModifyWrite {
+                    operation: if decrement {
+                        AtomicReadModifyWriteOperation::Subtract
+                    } else {
+                        AtomicReadModifyWriteOperation::Add
+                    },
+                    address: place.address,
+                    operand: one,
+                    object: place.object,
+                    return_new: !postfix,
+                    order: MemoryOrder::SequentiallyConsistent,
+                },
+                result_ty,
+                span,
+            );
         }
         let old = self.load_place(&place, span)?;
         let pointer = pointer_pointee(self.types, operand.ty.ty);
-        let one_ty = if pointer.is_some() {
+        let long_double = self.types.builtin_type(operand.ty.ty) == Some(BuiltinType::LongDouble);
+        let one_ty = if pointer.is_some() || long_double {
             QualifiedType::unqualified(TypeId::INT)
         } else {
             operand.ty
@@ -4070,12 +4835,27 @@ impl FunctionBuilder<'_> {
             .types
             .builtin_type(operand.ty.ty)
             .is_some_and(|builtin| builtin.is_floating())
+            && !long_double
         {
             ScalarConstant::Floating(1.0)
         } else {
             ScalarConstant::Signed(1)
         };
         let one = self.emit_result(FullInstructionKind::Constant(one), one_ty, span)?;
+        let one = if long_double {
+            self.emit_result(
+                FullInstructionKind::Convert {
+                    kind: ScalarConversion::IntegerToFloating,
+                    operand: one,
+                    from: one_ty,
+                    to: QualifiedType::unqualified(operand.ty.ty),
+                },
+                QualifiedType::unqualified(operand.ty.ty),
+                span,
+            )?
+        } else {
+            one
+        };
         let updated = if let Some(element) = pointer {
             self.pointer_offset(old, one, element, decrement, result_ty, span)?
         } else {
@@ -4214,9 +4994,20 @@ impl FunctionBuilder<'_> {
         then_expression: &FullTypedExpression,
         else_expression: &FullTypedExpression,
         result_ty: QualifiedType,
-        _span: Span,
+        span: Span,
     ) -> Result<Option<ValueId>, IrError> {
         let condition = self.expect_value(condition)?;
+        let result_bounds = array_dimensions_in_type(self.types, result_ty.ty)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(dimension, length)| match length {
+                ArrayLength::Variable(id) => Some((dimension, id)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let then_dimensions = conditional_operand_array_dimensions(then_expression, self.types);
+        let else_dimensions = conditional_operand_array_dimensions(else_expression, self.types);
+        let bound_snapshot = self.runtime_bounds.len();
         let then_block = self.new_block();
         let else_block = self.new_block();
         let merge = self.new_block();
@@ -4230,22 +5021,143 @@ impl FunctionBuilder<'_> {
 
         self.current = Some(then_block);
         let then_value = self.expression(then_expression)?;
-        if self.current.is_some() {
-            self.terminate(FullTerminator::Branch(FullEdge {
-                target: merge,
-                arguments: then_value.into_iter().collect(),
-            }))?;
-        }
+        let then_exit = self.current.take();
+        let then_bounds =
+            then_exit.and_then(|_| self.conditional_bound_values(&result_bounds, &then_dimensions));
+        self.runtime_bounds.truncate(bound_snapshot);
+
         self.current = Some(else_block);
         let else_value = self.expression(else_expression)?;
-        if self.current.is_some() {
+        let else_exit = self.current.take();
+        let else_bounds =
+            else_exit.and_then(|_| self.conditional_bound_values(&result_bounds, &else_dimensions));
+        self.runtime_bounds.truncate(bound_snapshot);
+
+        let merge_bounds = if !result_bounds.is_empty()
+            && then_exit.is_none_or(|_| then_bounds.is_some())
+            && else_exit.is_none_or(|_| else_bounds.is_some())
+            && (then_exit.is_some() || else_exit.is_some())
+        {
+            let then_bounds = then_bounds.as_deref().unwrap_or(&[]);
+            let else_bounds = else_bounds.as_deref().unwrap_or(&[]);
+            result_bounds
+                .iter()
+                .enumerate()
+                .map(|(index, (_, id))| {
+                    let then_ty = then_bounds
+                        .get(index)
+                        .map(|value| self.conditional_bound_type(*value));
+                    let else_ty = else_bounds
+                        .get(index)
+                        .map(|value| self.conditional_bound_type(*value));
+                    let ty = match (then_ty, else_ty) {
+                        (Some(left), Some(right)) if left == right => left,
+                        (Some(ty), None) | (None, Some(ty)) => ty,
+                        (Some(_), Some(_)) => TypeId::UNSIGNED_LONG,
+                        (None, None) => unreachable!("a live conditional branch supplies bounds"),
+                    };
+                    let parameter = self.add_block_parameter(merge, QualifiedType::unqualified(ty));
+                    (*id, parameter, ty)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        if let Some(exit) = then_exit {
+            self.current = Some(exit);
+            let mut arguments = then_value.into_iter().collect::<Vec<_>>();
+            if let Some(bounds) = &then_bounds {
+                arguments.extend(self.convert_conditional_bounds(bounds, &merge_bounds, span)?);
+            }
             self.terminate(FullTerminator::Branch(FullEdge {
                 target: merge,
-                arguments: else_value.into_iter().collect(),
+                arguments,
+            }))?;
+        }
+        if let Some(exit) = else_exit {
+            self.current = Some(exit);
+            let mut arguments = else_value.into_iter().collect::<Vec<_>>();
+            if let Some(bounds) = &else_bounds {
+                arguments.extend(self.convert_conditional_bounds(bounds, &merge_bounds, span)?);
+            }
+            self.terminate(FullTerminator::Branch(FullEdge {
+                target: merge,
+                arguments,
             }))?;
         }
         self.current = Some(merge);
+        self.runtime_bounds.extend(
+            merge_bounds
+                .into_iter()
+                .map(|(id, parameter, _)| (id, parameter)),
+        );
         Ok(result)
+    }
+
+    fn conditional_bound_values(
+        &self,
+        result_bounds: &[(usize, VariableLengthId)],
+        operand_dimensions: &[ArrayLength],
+    ) -> Option<Vec<ConditionalBoundValue>> {
+        result_bounds
+            .iter()
+            .map(|(dimension, _)| match operand_dimensions.get(*dimension)? {
+                ArrayLength::Variable(id) => {
+                    self.runtime_bounds
+                        .iter()
+                        .rev()
+                        .find_map(|(candidate, value)| {
+                            (candidate == id).then_some(ConditionalBoundValue::Runtime(*value))
+                        })
+                }
+                ArrayLength::Constant(length) => Some(ConditionalBoundValue::Constant(*length)),
+                ArrayLength::Incomplete | ArrayLength::UnspecifiedVariable(_) => None,
+            })
+            .collect()
+    }
+
+    fn conditional_bound_type(&self, bound: ConditionalBoundValue) -> TypeId {
+        match bound {
+            ConditionalBoundValue::Runtime(value) => self.function.value_types[value.0 as usize],
+            ConditionalBoundValue::Constant(_) => TypeId::UNSIGNED_LONG,
+        }
+    }
+
+    fn convert_conditional_bounds(
+        &mut self,
+        bounds: &[ConditionalBoundValue],
+        merge_bounds: &[(VariableLengthId, ValueId, TypeId)],
+        span: Span,
+    ) -> Result<Vec<ValueId>, IrError> {
+        bounds
+            .iter()
+            .zip(merge_bounds)
+            .map(|(bound, (_, _, target))| match bound {
+                ConditionalBoundValue::Constant(length) => self.emit_result(
+                    FullInstructionKind::Constant(ScalarConstant::Unsigned(u128::from(*length))),
+                    QualifiedType::unqualified(*target),
+                    span,
+                ),
+                ConditionalBoundValue::Runtime(value) => {
+                    let from = self.function.value_types[value.0 as usize];
+                    if from == *target {
+                        Ok(*value)
+                    } else {
+                        self.emit_result(
+                            FullInstructionKind::Convert {
+                                kind: ScalarConversion::IntegerConversion,
+                                operand: *value,
+                                from: QualifiedType::unqualified(from),
+                                to: QualifiedType::unqualified(*target),
+                            },
+                            QualifiedType::unqualified(*target),
+                            span,
+                        )
+                    }
+                }
+            })
+            .collect()
     }
 
     fn call(
@@ -4274,6 +5186,7 @@ impl FunctionBuilder<'_> {
                 declaration.signature,
                 CallEffects {
                     no_return: declaration.properties.no_return,
+                    returns_twice: declaration.properties.returns_twice,
                     ..CallEffects::default()
                 },
             )
@@ -4292,7 +5205,19 @@ impl FunctionBuilder<'_> {
                         "indirect call callee does not point to a function type",
                     )
                 })?;
-            (signature, CallEffects::default())
+            // Function types do not yet retain GNU declaration attributes, so
+            // an indirect callee may designate a returns-twice function even
+            // when the call site's type is otherwise ordinary. Select the
+            // conservative storage/frame profile for every indirect call
+            // rather than risk promoting a local whose restored value must
+            // survive a later nonlocal return.
+            (
+                signature,
+                CallEffects {
+                    returns_twice: true,
+                    ..CallEffects::default()
+                },
+            )
         };
         let function_type = self.types.function_signature(signature).ok_or_else(|| {
             IrError::lower(
@@ -4470,6 +5395,7 @@ fn collect_switch_labels(
         | S::Expression(_)
         | S::Goto { .. }
         | S::ComputedGoto(_)
+        | S::InlineAsm(_)
         | S::Continue
         | S::Break
         | S::Return(_) => {}
@@ -4517,9 +5443,71 @@ fn collect_labels(statement: &FullTypedStatement, labels: &mut Vec<LabelId>) {
         S::Expression(_)
         | S::Goto { .. }
         | S::ComputedGoto(_)
+        | S::InlineAsm(_)
         | S::Continue
         | S::Break
         | S::Return(_) => {}
+    }
+}
+
+fn inline_asm_expressions(asm: &FullTypedInlineAsm) -> Vec<&FullTypedExpression> {
+    match &asm.kind {
+        FullTypedInlineAsmKind::CompilerBarrier { .. }
+        | FullTypedInlineAsmKind::CodeLayoutHint(_) => Vec::new(),
+        FullTypedInlineAsmKind::OpaqueScalar { target } => vec![target],
+        FullTypedInlineAsmKind::X86Cpuid {
+            leaf,
+            subleaf,
+            outputs,
+        } => std::iter::once(leaf)
+            .chain(subleaf.iter())
+            .chain(outputs.iter().map(|output| &output.target))
+            .collect(),
+        FullTypedInlineAsmKind::X86Rdtsc { low, high } => vec![low, high],
+        FullTypedInlineAsmKind::X86AtomicExchange {
+            object,
+            value,
+            result,
+        } => std::iter::once(object)
+            .chain(std::iter::once(value))
+            .chain(result.iter())
+            .collect(),
+        FullTypedInlineAsmKind::X86AtomicCompareExchange {
+            object,
+            expected,
+            desired,
+            original,
+        } => vec![object, expected, desired, original],
+        FullTypedInlineAsmKind::X86ConditionalMoveAbove {
+            target,
+            index,
+            low_limit,
+            backup,
+        } => vec![target, index, low_limit, backup],
+    }
+}
+
+fn inline_asm_outputs(asm: &FullTypedInlineAsm) -> Vec<&FullTypedExpression> {
+    match &asm.kind {
+        FullTypedInlineAsmKind::CompilerBarrier { .. }
+        | FullTypedInlineAsmKind::CodeLayoutHint(_) => Vec::new(),
+        FullTypedInlineAsmKind::OpaqueScalar { target } => vec![target],
+        FullTypedInlineAsmKind::X86Cpuid { outputs, .. } => {
+            outputs.iter().map(|output| &output.target).collect()
+        }
+        FullTypedInlineAsmKind::X86Rdtsc { low, high } => vec![low, high],
+        FullTypedInlineAsmKind::X86AtomicExchange {
+            object,
+            value,
+            result,
+        } => std::iter::once(object)
+            .chain(std::iter::once(value))
+            .chain(result.iter())
+            .collect(),
+        FullTypedInlineAsmKind::X86AtomicCompareExchange {
+            object, original, ..
+        } => vec![object, original],
+        FullTypedInlineAsmKind::X86ConditionalMoveAbove { target, .. } => vec![target],
     }
 }
 

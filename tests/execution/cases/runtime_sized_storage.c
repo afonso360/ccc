@@ -8,6 +8,40 @@ extern int pthread_create(
     void *argument);
 extern int pthread_join(pthread_t thread, void **result);
 
+static int sizeof_operand_calls;
+static int left_bound_calls;
+static int right_bound_calls;
+
+static int observe_sizeof_operand(void) {
+    ++sizeof_operand_calls;
+    return 0;
+}
+
+static int next_left_bound(void) {
+    ++left_bound_calls;
+    return 5;
+}
+
+static int next_right_bound(void) {
+    ++right_bound_calls;
+    return 5;
+}
+
+static int exercise_conditional_vla_stride(int choose) {
+    int left[5];
+    int right[5];
+    left_bound_calls = 0;
+    right_bound_calls = 0;
+    char *end = (char *)((choose
+        ? (int (*)[next_left_bound()])left
+        : (int (*)[next_right_bound()])right) + 1);
+    char *start = (char *)(choose ? left : right);
+    unsigned long stride = (unsigned long)(end - start);
+    return stride != 5 * sizeof(int)
+        || left_bound_calls != (choose != 0)
+        || right_bound_calls != (choose == 0);
+}
+
 static int exercise_vla(int rows, int columns) {
     _Alignas(64) int matrix[rows][columns];
     if (((unsigned long)matrix & 63UL) != 0) {
@@ -46,6 +80,39 @@ int main(void) {
     once[2] = 9;
     if (evaluated_once != 4 || once[2] != 9) {
         return 1;
+    }
+    int typedef_extent = 3;
+    typedef int Vector[typedef_extent++];
+    Vector vector;
+    vector[2] = 11;
+    if (typedef_extent != 4 || sizeof(Vector) != 3 * sizeof(int)
+        || sizeof(vector) != 3 * sizeof(int) || vector[2] != 11) {
+        return 6;
+    }
+    int type_name_extent = 4;
+    unsigned long dynamic_size = sizeof *(int (*)[type_name_extent++])(void *)0;
+    unsigned long pointer_size = sizeof(int (*)[type_name_extent++]);
+    unsigned long array_alignment = _Alignof(int[type_name_extent++]);
+    if (dynamic_size != 4 * sizeof(int) || pointer_size != sizeof(void *)
+        || array_alignment != _Alignof(int) || type_name_extent != 5) {
+        return 7;
+    }
+    int sizeof_operand_side_effects = 0;
+    int sizeof_operand_extent = 4;
+    int sizeof_operand_backing[4];
+    int (*sizeof_operand_pointer)[sizeof_operand_extent]
+        = (int (*)[sizeof_operand_extent])&sizeof_operand_backing;
+    unsigned long evaluated_size = sizeof *((
+        sizeof_operand_side_effects++,
+        observe_sizeof_operand(),
+        sizeof_operand_pointer));
+    if (evaluated_size != sizeof(sizeof_operand_backing)
+        || sizeof_operand_side_effects != 1 || sizeof_operand_calls != 1) {
+        return 8;
+    }
+    if (exercise_conditional_vla_stride(1) != 0
+        || exercise_conditional_vla_stride(0) != 0) {
+        return 9;
     }
     for (int count = 1; count <= 40; ++count) {
         int values[count];

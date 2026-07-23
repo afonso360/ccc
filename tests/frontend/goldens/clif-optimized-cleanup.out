@@ -1,0 +1,15 @@
+; function optimized
+function u0:0(i32) -> i32 system_v {
+    sig0 = (i32) -> i32 system_v
+    fn0 = colocated u0:0 sig0
+    fn1 = colocated u0:0 sig0
+
+block0(v0: i32):
+    v1 = iconst.i32 3
+    v2 = iadd v0, v1  ; v1 = 3
+    jump block1
+
+block1:
+    v3 = bxor.i32 v2, v2
+    return v3
+}

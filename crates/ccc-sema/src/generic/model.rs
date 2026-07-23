@@ -1,7 +1,7 @@
 use ccc_pp::{PragmaEvent, StringLiteralPrefix};
 use ccc_session::Span;
 use ccc_syntax::frontend::{AssignmentOperator, BinaryOperator, UnaryOperator};
-use ccc_target::{CapabilityState, PackingPolicy};
+use ccc_target::{CapabilityState, LongDoubleFormat, PackingPolicy};
 use ccc_types::{QualifiedType, TypeId, TypeStore, VariableLengthId};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -12,6 +12,12 @@ pub struct FullFunctionId(pub u32);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct FullLocalId(pub u32);
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum CompoundLiteralStorage {
+    Automatic(FullLocalId),
+    Static(GlobalId),
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct LabelId(pub u32);
@@ -78,6 +84,9 @@ pub enum StorageDuration {
 pub struct FunctionProperties {
     pub inline: bool,
     pub no_return: bool,
+    /// The call may resume at its return continuation after control has
+    /// executed elsewhere, as with the setjmp family.
+    pub returns_twice: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -185,11 +194,13 @@ pub struct FullTypedVariableLengthBound {
     pub expression: FullTypedExpression,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct FullTypedTypedef {
     pub id: TypedefId,
     pub name: String,
     pub ty: QualifiedType,
+    /// Runtime bounds evaluated once when this typedef declaration is reached.
+    pub variable_length_bounds: Vec<FullTypedVariableLengthBound>,
     pub attributes: Vec<FullTypedAttribute>,
     pub span: Span,
 }
@@ -282,15 +293,82 @@ pub enum FullTypedStatementKind {
         name: String,
     },
     ComputedGoto(FullTypedExpression),
+    InlineAsm(Box<FullTypedInlineAsm>),
     Continue,
     Break,
     Return(Option<FullTypedExpression>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct FullTypedInlineAsm {
+    pub kind: FullTypedInlineAsmKind,
+    pub template: String,
+    pub volatile: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum FullTypedInlineAsmKind {
+    /// A compiler scheduling and memory-ordering barrier with no hardware
+    /// instruction requirement.
+    CompilerBarrier { memory: bool },
+    /// An empty read/write register operand used to make a scalar value opaque
+    /// to optimization while preserving its value.
+    OpaqueScalar { target: FullTypedExpression },
+    /// An advisory machine-code layout directive. It has no C observable
+    /// behavior and may be omitted by a backend without a placement API.
+    CodeLayoutHint(CodeLayoutHint),
+    X86Cpuid {
+        leaf: FullTypedExpression,
+        subleaf: Option<FullTypedExpression>,
+        outputs: Vec<X86CpuidOutput>,
+    },
+    X86Rdtsc {
+        low: FullTypedExpression,
+        high: FullTypedExpression,
+    },
+    X86AtomicExchange {
+        object: FullTypedExpression,
+        value: FullTypedExpression,
+        result: Option<FullTypedExpression>,
+    },
+    X86AtomicCompareExchange {
+        object: FullTypedExpression,
+        expected: FullTypedExpression,
+        desired: FullTypedExpression,
+        original: FullTypedExpression,
+    },
+    X86ConditionalMoveAbove {
+        target: FullTypedExpression,
+        index: FullTypedExpression,
+        low_limit: FullTypedExpression,
+        backup: FullTypedExpression,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CodeLayoutHint {
+    AlignToPowerOfTwo(u8),
+    Nop,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct X86CpuidOutput {
+    pub register: X86CpuidRegister,
+    pub target: FullTypedExpression,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum X86CpuidRegister {
+    Eax,
+    Ebx,
+    Ecx,
+    Edx,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum FullTypedForInitializer {
     Empty,
-    Expression(FullTypedExpression),
+    Expression(Box<FullTypedExpression>),
     Declarations(Vec<FullTypedBlockItem>),
 }
 
@@ -335,6 +413,9 @@ pub enum AtomicReadModifyWriteOperation {
     Add,
     Subtract,
     Exchange,
+    BitwiseAnd,
+    BitwiseOr,
+    BitwiseXor,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -399,8 +480,39 @@ pub enum ConstantValue {
     Signed(i128),
     Unsigned(u128),
     Floating(f64),
+    LongDouble(LongDoubleConstant),
     NullPointer,
     Address(RelocatableAddress),
+}
+
+/// Exact target `long double` object bytes. X87 values use the low ten bytes
+/// and keep the six ABI padding bytes deterministically cleared.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LongDoubleConstant {
+    pub format: LongDoubleFormat,
+    pub bytes: [u8; 16],
+}
+
+impl LongDoubleConstant {
+    pub fn from_bits(format: LongDoubleFormat, bits: u128) -> Self {
+        let mut bytes = bits.to_le_bytes();
+        if format == LongDoubleFormat::X87Extended {
+            bytes[10..].fill(0);
+        }
+        Self { format, bytes }
+    }
+
+    pub fn bits(self) -> u128 {
+        u128::from_le_bytes(self.bytes)
+    }
+
+    pub fn is_zero(self) -> bool {
+        match self.format {
+            LongDoubleFormat::Binary64 => false,
+            LongDoubleFormat::X87Extended => self.bits() & ((1_u128 << 79) - 1) == 0,
+            LongDoubleFormat::IeeeBinary128 => self.bits() & !(1_u128 << 127) == 0,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -430,7 +542,7 @@ impl ConstantValue {
         match self {
             Self::Signed(value) => Some(value),
             Self::Unsigned(value) => i128::try_from(value).ok(),
-            Self::Floating(_) | Self::NullPointer | Self::Address(_) => None,
+            Self::Floating(_) | Self::LongDouble(_) | Self::NullPointer | Self::Address(_) => None,
         }
     }
 
@@ -439,6 +551,7 @@ impl ConstantValue {
             Self::Signed(value) => value == 0,
             Self::Unsigned(value) => value == 0,
             Self::Floating(value) => value == 0.0,
+            Self::LongDouble(value) => value.is_zero(),
             Self::NullPointer => true,
             Self::Address(_) => false,
         }
@@ -450,6 +563,21 @@ pub enum FullTypedExpressionKind {
     Constant(ConstantValue),
     StringLiteral(StringId),
     DeclRef(SymbolReference),
+    /// A generic selection retains only the selected association. The
+    /// controlling expression's converted type is recorded for typed-tree
+    /// inspection, but the expression itself is deliberately absent so later
+    /// stages cannot evaluate it.
+    GenericSelection {
+        controlling_ty: QualifiedType,
+        selected: Box<FullTypedExpression>,
+    },
+    /// Evaluates type-name array bounds once before producing the wrapped
+    /// expression. The IDs make those saved values available to runtime layout
+    /// operations and pointer arithmetic in the wrapped expression.
+    VariableLengthBoundEvaluation {
+        bounds: Vec<FullTypedVariableLengthBound>,
+        expression: Box<FullTypedExpression>,
+    },
     Conversion {
         kind: ConversionKind,
         expression: Box<FullTypedExpression>,
@@ -477,7 +605,7 @@ pub enum FullTypedExpressionKind {
         bitfield: Option<Box<BitfieldPlace>>,
     },
     CompoundLiteral {
-        local: FullLocalId,
+        storage: CompoundLiteralStorage,
         initializer: Box<FullTypedInitializer>,
     },
     Assignment {
@@ -514,8 +642,11 @@ pub enum FullTypedExpressionKind {
         expected: Box<FullTypedExpression>,
     },
     Sizeof {
+        /// Present when an expression operand has runtime-sized array type and
+        /// must therefore be evaluated by C11 6.5.3.4.
+        operand: Option<Box<FullTypedExpression>>,
         operand_ty: QualifiedType,
-        size: u64,
+        size: Option<u64>,
     },
     Alignof {
         operand_ty: QualifiedType,
@@ -561,6 +692,17 @@ pub enum FullTypedExpressionKind {
         write: bool,
         locality: u8,
     },
+    AtomicLoad {
+        pointer: Box<FullTypedExpression>,
+        object: QualifiedType,
+        order: MemoryOrder,
+    },
+    AtomicStore {
+        pointer: Box<FullTypedExpression>,
+        value: Box<FullTypedExpression>,
+        object: QualifiedType,
+        order: MemoryOrder,
+    },
     AtomicReadModifyWrite {
         operation: AtomicReadModifyWriteOperation,
         pointer: Box<FullTypedExpression>,
@@ -575,6 +717,7 @@ pub enum FullTypedExpressionKind {
         replacement: Box<FullTypedExpression>,
         object: QualifiedType,
         return_boolean: bool,
+        expected_is_pointer: bool,
         order: MemoryOrder,
     },
     MemoryFence {
@@ -634,7 +777,7 @@ pub struct FullTypedInitializer {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum FullTypedInitializerKind {
-    Scalar(FullTypedExpression),
+    Scalar(Box<FullTypedExpression>),
     Aggregate(Vec<FullTypedInitializerEntry>),
     String(StringId),
     Zero,

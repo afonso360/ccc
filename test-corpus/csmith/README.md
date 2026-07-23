@@ -1,8 +1,9 @@
 # Csmith differential tests
 
 This opt-in suite generates deterministic C programs, establishes an output
-consensus with GCC and Clang at `-O0` and `-O2`, and compares CCC with that
-consensus. It is intentionally separate from the ordinary Cargo test run.
+consensus with GCC and Clang at `-O0` and `-O2`, and compares CCC at `-O0`,
+`-O2`, and `-Oz` with that consensus. It is intentionally separate from the
+ordinary Cargo test run.
 
 The default profile uses an exact Csmith 2.4.0 source commit with consecutive
 seeds and a bounded program shape. Floating-point generation, compiler
@@ -76,9 +77,8 @@ list. Defaults can also be set with `CSMITH_CASES`, `CSMITH_START_SEED`,
 `CSMITH_ARCHIVE`, `CSMITH`, `CSMITH_RUNTIME`, `CSMITH_GCC`, `CSMITH_CLANG`,
 `CSMITH_OBJCOPY`, `CSMITH_NMEDIT`, `CSMITH_SDKROOT`,
 `CSMITH_DEPLOYMENT_TARGET`, `CSMITH_CXX`, `CCC`, and `CCC_RESOURCE_DIR`;
-command-line values take precedence. The **Csmith differential tests**
-workflow exposes the eligible case count and first attempted seed through a
-manual Linux dispatch; it does not run for pushes or pull requests.
+command-line values take precedence. `--cases` selects the number of eligible
+programs to complete, and `--start-seed` selects the first candidate seed.
 
 ## Results and reproduction
 
@@ -104,11 +104,12 @@ Every case retains `program.c`, shell-escaped commands, compile and execution
 statuses, stdout, stderr, and a concise result. `run-config.txt` records the
 seed range, generator arguments, timeouts, target assumptions, and reference
 matrix. `tool-identities/` records generator/runtime hashes, the exact CCC
-binary and resource tree, a dirty-source patch, compiler/object-copier
+binary and resource tree, a dirty-source patch, compiler/symbol-localizer
 identities, targets, hashes, and predefined macros. The runner binds
-CCC's native header discovery to the same validated GCC used by the reference
-matrix and rejects non-LP64 or mismatched target configurations before case
-generation.
+CCC's native header discovery to the selected validated native driver and
+rejects non-LP64 or mismatched target configurations before case generation.
+The CCC matrix is recorded separately so retained artifacts state which speed
+and size profiles were exercised.
 
 To reproduce one finding with the same checked-in profile, pass its seed as a
 one-case range and use the same tools recorded in the original artifact:
@@ -120,10 +121,11 @@ test-corpus/csmith/run.sh --cases 1 --start-seed SEED --work-dir EMPTY_PATH
 The suite treats reference disagreement as a failed oracle, not as evidence
 against CCC. A timeout shared by all references is inconclusive and causes the
 suite to try the next seed; partial timeouts are failed oracles. CCC emits one
-object, which the recorded GCC driver links with `-lm` under its default
-relocation policy. Neither the reference executables nor CCC's linked
-executable receive a non-PIE override, so CCC compile and link failures remain
-distinct and the suite exercises the platform's default PIE configuration.
+object for each configured optimization profile. The recorded native driver
+links each one with `-lm` under its default relocation policy. Neither the
+reference executables nor CCC's linked executables receive a non-PIE override,
+so CCC compile and link failures remain distinct and the suite exercises the
+platform's default PIE configuration.
 Sanitizers may be useful while investigating a retained source, but their
 silence is not treated as proof that a program is defined.
 

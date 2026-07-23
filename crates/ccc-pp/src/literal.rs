@@ -22,9 +22,12 @@ pub enum FloatingConstantSuffix {
     LongDouble,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FloatingConstant {
-    pub value: f64,
+    /// Exact source spelling with the type suffix removed. Target rounding is
+    /// deliberately deferred until semantic analysis knows the destination
+    /// floating format.
+    pub number: String,
     pub radix: u32,
     pub suffix: FloatingConstantSuffix,
 }
@@ -143,42 +146,67 @@ pub fn decode_floating_constant(spelling: &str) -> Result<FloatingConstant, Lite
         return Err(literal_error("floating constant has no digits"));
     }
 
-    let (value, radix) = if let Some(hexadecimal) = number
+    let radix = if let Some(hexadecimal) = number
         .strip_prefix("0x")
         .or_else(|| number.strip_prefix("0X"))
     {
-        (decode_hexadecimal_float(hexadecimal)?, 16)
+        validate_hexadecimal_float(hexadecimal)?;
+        16
     } else {
-        if !number.contains('.') && !number.contains('e') && !number.contains('E') {
-            return Err(literal_error(
-                "decimal floating constant requires a decimal point or exponent",
-            ));
-        }
-        let value = number
-            .parse::<f64>()
-            .map_err(|_| literal_error("invalid decimal floating constant"))?;
-        (value, 10)
+        validate_decimal_float(number)?;
+        10
     };
-    if !value.is_finite() {
-        return Err(literal_error(
-            "floating constant is outside the supported range",
-        ));
-    }
     Ok(FloatingConstant {
-        value,
+        number: number.to_owned(),
         radix,
         suffix,
     })
 }
 
-fn decode_hexadecimal_float(spelling: &str) -> Result<f64, LiteralError> {
+fn validate_decimal_float(spelling: &str) -> Result<(), LiteralError> {
+    let exponent_index = spelling.find(['e', 'E']);
+    if exponent_index.is_some_and(|index| spelling[index + 1..].contains(['e', 'E'])) {
+        return Err(literal_error("invalid decimal floating constant"));
+    }
+    let (mantissa, exponent) = exponent_index.map_or((spelling, None), |index| {
+        (&spelling[..index], Some(&spelling[index + 1..]))
+    });
+    if !mantissa.contains('.') && exponent.is_none() {
+        return Err(literal_error(
+            "decimal floating constant requires a decimal point or exponent",
+        ));
+    }
+    let (integer, fraction) = mantissa
+        .split_once('.')
+        .map_or((mantissa, None), |(integer, fraction)| {
+            (integer, Some(fraction))
+        });
+    if fraction.is_some_and(|fraction| fraction.contains('.'))
+        || (integer.is_empty() && fraction.is_none_or(str::is_empty))
+        || !integer.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.is_none_or(|fraction| fraction.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Err(literal_error("invalid decimal floating constant"));
+    }
+    if let Some(exponent) = exponent {
+        let digits = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err(literal_error("invalid decimal floating exponent"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_hexadecimal_float(spelling: &str) -> Result<(), LiteralError> {
     let exponent_index = spelling
         .find(['p', 'P'])
         .ok_or_else(|| literal_error("hexadecimal floating constant requires a binary exponent"))?;
     let mantissa = &spelling[..exponent_index];
-    let exponent = spelling[exponent_index + 1..]
-        .parse::<i32>()
-        .map_err(|_| literal_error("invalid hexadecimal floating exponent"))?;
+    let exponent = &spelling[exponent_index + 1..];
+    let exponent_digits = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+    if exponent_digits.is_empty() || !exponent_digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(literal_error("invalid hexadecimal floating exponent"));
+    }
     let (integer, fraction) = mantissa
         .split_once('.')
         .map_or((mantissa, ""), |parts| parts);
@@ -193,25 +221,7 @@ fn decode_hexadecimal_float(spelling: &str) -> Result<f64, LiteralError> {
         return Err(literal_error("invalid hexadecimal floating mantissa"));
     }
 
-    let mut value = 0.0_f64;
-    for byte in integer.bytes() {
-        value = value * 16.0 + f64::from(hexadecimal_digit(byte));
-    }
-    let mut place = 1.0_f64 / 16.0;
-    for byte in fraction.bytes() {
-        value += f64::from(hexadecimal_digit(byte)) * place;
-        place /= 16.0;
-    }
-    Ok(value * 2.0_f64.powi(exponent))
-}
-
-fn hexadecimal_digit(byte: u8) -> u8 {
-    match byte {
-        b'0'..=b'9' => byte - b'0',
-        b'a'..=b'f' => byte - b'a' + 10,
-        b'A'..=b'F' => byte - b'A' + 10,
-        _ => unreachable!("caller validates hexadecimal digits"),
-    }
+    Ok(())
 }
 
 pub fn decode_character_constant(spelling: &str) -> Result<CharacterConstant, LiteralError> {
@@ -525,17 +535,20 @@ mod tests {
         assert_eq!(
             decode_floating_constant("1.25f").unwrap(),
             FloatingConstant {
-                value: 1.25,
+                number: "1.25".to_owned(),
                 radix: 10,
                 suffix: FloatingConstantSuffix::Float,
             }
         );
-        assert_eq!(decode_floating_constant("1e2").unwrap().value, 100.0);
-        assert_eq!(decode_floating_constant("0x1.8p+2").unwrap().value, 6.0);
+        assert_eq!(decode_floating_constant("1e2").unwrap().number, "1e2");
+        assert_eq!(
+            decode_floating_constant("0x1.8p+2").unwrap().number,
+            "0x1.8p+2"
+        );
         assert_eq!(
             decode_floating_constant("0x1p-2L").unwrap(),
             FloatingConstant {
-                value: 0.25,
+                number: "0x1p-2".to_owned(),
                 radix: 16,
                 suffix: FloatingConstantSuffix::LongDouble,
             }
@@ -544,9 +557,20 @@ mod tests {
 
     #[test]
     fn rejects_malformed_floating_constants() {
-        for spelling in ["1f", "0x1.0", "0xp1", "0x1p", "1e9999"] {
+        for spelling in ["1f", "0x1.0", "0xp1", "0x1p", "1e+"] {
             assert!(decode_floating_constant(spelling).is_err(), "{spelling}");
         }
+    }
+
+    #[test]
+    fn preserves_values_wider_than_the_host_double_format() {
+        let literal = decode_floating_constant("1.0000000000000000001L").unwrap();
+        assert_eq!(literal.number, "1.0000000000000000001");
+        assert_eq!(literal.suffix, FloatingConstantSuffix::LongDouble);
+        assert_eq!(
+            decode_floating_constant("1e4000L").unwrap().number,
+            "1e4000"
+        );
     }
 
     #[test]

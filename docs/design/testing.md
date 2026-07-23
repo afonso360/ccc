@@ -10,6 +10,23 @@ Correctness is checked at each explicit compiler boundary and at binary interfac
 - **Compile-fail tests:** stable diagnostic codes, primary spans, macro/include provenance, and essential wording; incidental formatting is normalized.
 - **Object/disassembly tests:** sections, symbols, visibility, relocations, TLS, DWARF, calling-sequence details, PIE/PIC behavior, and generated bridges.
 
+Debug-object inspection distinguishes `-g0` from every enabled debug level,
+requires `.debug_info`, `.debug_abbrev`, `.debug_line`, range data, and the
+existing call-frame section, and parses the emitted DWARF independently. It
+checks compilation-unit, subprogram, core-type, member, parameter, variable,
+and single function-wide lexical-block DIEs. Fixed frame locations, ordinary
+data addresses, x86-64 ELF and Darwin TLV TLS address expressions, prototype markers,
+multiple source rows, and object-format relocations from debug sections to
+code, data, TLS data, and other debug sections are inspected directly.
+Register/SSA value tracking and nested lexical ranges are not claimed.
+The native Darwin gate also performs a one-step `-g` compile and link through a
+generated TLS accessor, requires
+the executable and staged `.dSYM` UUIDs to match, then uses LLDB to stop on a C
+source line, recover a fixed-frame local value, and confirm the TLS definition's
+certified location expression. A command/cleanup fixture
+separately proves that `dsymutil` runs before registered link objects are
+released and that incomplete bundle trees never replace an existing bundle.
+
 Preprocessor fixtures separately cover normalization, object-like and
 function-like macros, conditionals, computed includes, include ordering,
 pragmas, predefined macros, dependency output, linemarkers, and provenance.
@@ -67,59 +84,95 @@ the `C` locale. Generated CFI is exercised by the real libgcc
 debugger checks. Long-double tests verify
 size/alignment/macros and object representation; profiles that support boundary
 transport also test calls in both directions, while profiles that do not must
-reject those boundaries exactly. Explicit compatibility-mode objects must be
-rejected when mixed with incompatible CCC objects.
+reject those boundaries exactly. The native x86-64 matrix cross-links f80
+fixed and variadic calls, `%st(0)` returns, memory-class aggregates, direct and
+function-pointer calls, arithmetic, ordered and unordered comparison, integer
+and binary32/binary64 conversions, volatile access, and `va_arg` with GCC at
+both `-O0` and `-O2`.
+Volatile half-ULP additions under `FE_UPWARD` and `FE_DOWNWARD` prove that the
+localized x87 arithmetic observes and preserves the active control word.
+An additional native gate uses the pinned
+[Berkeley oracle manifest](../../tests/target-oracle/berkeley-testfloat.toml).
+Official SoftFloat and TestFloat 3e archives are downloaded by exact byte
+length, SHA-256, and SHA3-256, and their BSD-3-Clause license files are checked
+before use. TestFloat's verifier and SoftFloat reference are built with GCC;
+the small subject-operation object is produced by CCC and linked directly with
+the pinned verifier objects.
+Neither package is a compiler dependency or production-linked runtime.
+The subject transfers TestFloat representation structs through
+`__builtin_memcpy`, guarded by compile-time size equality, so no effective-type
+or alignment assumption enters the comparison. For float-to-integer inputs
+whose C cast would be undefined, the adapter first returns the pinned
+8086-SSE specialization's integer-indefinite value and raises `FE_INVALID`;
+representable inputs still exercise CCC's ordinary C cast and exception path.
 
-TLS tests inspect `.tdata`/`.tbss`, symbol type and binding, and the exact
-`R_X86_64_TLSGD`, `R_X86_64_TLSLD`, `R_X86_64_DTPOFF32`,
-`R_X86_64_GOTTPOFF`, and `R_X86_64_TPOFF32` relocation families. Each model
-links and executes in a default PIE. A pthread fixture proves distinct
-addresses and initializer values per thread for external and block-local TLS,
-while two-direction reference-compiler links verify ELF TLS symbol
-interoperability. Generated accessors must retain unwind information, a
-non-executable stack note, deterministic manifest ownership, and exact local
-binding after packaging.
+The deterministic level-1 seed exercises extended-precision addition,
+subtraction, multiplication, and division at full 80-bit precision in the four
+x87 rounding modes; signed/unsigned 64-bit and binary32/binary64 conversions;
+quiet equality; and signaling ordered comparisons. TestFloat compares result
+bits and floating-point exception flags across 894,816 weighted boundary and
+random cases at each of `-O0` and `-O2`. Exact NaN payload matching remains off
+because TestFloat documents that option as valid only when the subject's NaN
+selection policy matches SoftFloat; quietness and required invalid exceptions
+are still checked. A reported discrepancy is an oracle failure that requires
+case-level interpretation, not an automatic claim about which implementation
+is wrong.
+Driver tests require ABI-changing `long double` mode options to fail before
+translation; no partial object is emitted.
+
+TLS tests inspect `.tdata`/`.tbss` or Darwin `__thread_*` sections, symbol type
+and binding, and the exact target relocation families. The required families
+are TLSGD/TLSLD/DTPOFF/GOTTPOFF/TPOFF on x86-64, TLSDESC/TLSIE/TLSLE on
+AArch64 Linux, TLS GD/TLS GOT/TPREL on RISC-V, and TLV page/page-offset pairs on
+Darwin arm64. Each source model links and executes in a default PIE. A pthread
+fixture proves distinct addresses and initializer values per thread for
+external and block-local TLS, while two-direction reference-compiler links
+verify TLS symbol interoperability. Generated accessors must retain unwind
+information, a non-executable stack note on ELF, deterministic manifest
+ownership, target symbol spelling, and exact local binding after packaging.
 
 Planner, IR, digest, renderer, fake-command, and manifest tests run on every
-host. Native `x86_64-unknown-linux-gnu` execution and object suites compile only
-on Linux x86-64. The required CI feature rejects the wrong host at compile time,
-preflights every reference and packaging tool, and invokes each named native
-test binary explicitly. A missing tool or zero-test configuration is a hard
-failure, never an implicit skip.
+host. Native TLS execution runs on every enabled host profile. The broader
+x86-specific ABI and object suites compile only on Linux x86-64, reject the
+wrong host at compile time, preflight every reference and packaging tool, and
+invoke each named native test binary explicitly. A missing tool or zero-test
+configuration is a hard failure, never an implicit skip.
 
-The enabled non-x86 profiles use the same fail-closed rule. AArch64 Linux and
-RISC-V Linux run two-way CCC/reference-compiler fixed and variadic calls at
-`-O0` and `-O2` under QEMU, inspect the resulting ELF objects, exercise static
-CFI through `_Unwind_Backtrace`, and attach `gdb-multiarch` to a QEMU gdbstub.
+The standalone target-oracle harness uses the same fail-closed rule. AArch64
+Linux and RISC-V Linux run two-way CCC/reference-compiler fixed, variadic, and
+TLS calls at `-O0` and `-O2`, inspect the resulting ELF objects, and exercise
+static CFI through `_Unwind_Backtrace`. Native target hosts use GDB; cross hosts
+execute through QEMU and attach `gdb-multiarch` to its gdbstub.
+Both optimization profiles also execute returns-twice control flow and native
+1-, 2-, 4-, and 8-byte scalar atomics; the atomic object must not import a
+generic `__atomic_*` or `__sync_*` library entry point.
 Darwin arm64 runs the equivalent native matrix with Apple Clang, Mach-O object
 inspection, libunwind, and LLDB. Each runner records its compiler, sysroot or
 SDK, emulator/debugger, deployment target, and linker identities. Header and
 predefined-macro sentinels must agree with the selected profile. The corpus
 harness reports an explicit applicable, inapplicable-with-reason, or failed
 result for every case; an empty applicable set, absent runner, or missing tool
-fails the required job.
+fails the harness invocation.
 
 ## Runtime-sized automatic storage
 
 Provider-independent tests first prove that nonconstant array extents are
-evaluated once and retained in the typed AST, including parameter-order binding,
-and multidimensional pointer strides. Diagnostics distinguish prototype-scope
+evaluated once and retained in the typed AST for parameters, declarations,
+typedefs, and evaluated type names, including parameter-order binding and
+multidimensional pointer strides. Diagnostics distinguish prototype-scope
 `[*]`, legal fixed-size objects with variably modified types, nonautomatic VLA
-objects, invalid bounds, and illegal storage classes. Runtime `sizeof` and
-several variably modified typedef/type-name contexts remain explicit gates
-before the complete VLA capability can be advertised. Named-goto and switch
+objects, invalid bounds, and illegal storage classes. Named-goto and switch
 tests reject ingress that bypasses a declaration, and a computed goto is
-rejected conservatively in any function that also declares a variably modified
-automatic object.
+rejected conservatively in any function that also has a variably modified
+declaration.
 
 CCC-IR tests pin runtime storage identities, allocation effects, retained
-extents, dynamic pointer strides, verifier type/dominance checks, and append-only
-digest tags. Execution fixtures cover bound-once evaluation, multidimensional
-access, normal return cleanup, recursion, concurrent invocations, and
-over-alignment. Aggregate returns sourced from arena storage are copied before
-the provider is released. Named/switch/computed-goto ingress diagnostics and
-runtime `sizeof` remain negative capability gates rather than silently
-approximated behavior.
+extents, explicit checked `RuntimeSize` operations, runtime `sizeof`, dynamic
+pointer strides, verifier type/dominance checks, and append-only digest tags.
+Execution fixtures cover bound-once evaluation, multidimensional access,
+normal return cleanup, recursion, concurrent invocations, and over-alignment.
+Aggregate returns sourced from arena storage are copied before the provider is
+released.
 
 Provider tests inject nonpositive bounds, extent and alignment overflow,
 allocation failure, and alignments through over-aligned `_Alignas` declarations.
@@ -127,10 +180,11 @@ On System V AMD64 every VLA allocation is checked for the target's 16-byte
 minimum as well as stronger declared alignment. An instrumented descending-size
 loop proves that one growth serves every later execution of the declaration and
 that normal return releases it once. An external GCC default-PIE link runs the
-same provider surface under AddressSanitizer and LeakSanitizer. Native x86 tests
-execute the nonpositive and overflow traps; object inspection verifies their
-`ud2` failure paths when the development host's amd64 emulator cannot deliver
-those trap signals correctly.
+same provider surface under AddressSanitizer and LeakSanitizer. Every enabled
+native host profile executes the nonpositive, overflow, and provider-failure
+traps. Object inspection additionally verifies the System V AMD64 `ud2`
+failure paths when a development host's amd64 emulator cannot deliver those
+trap signals correctly.
 
 Returns-twice and cross-language unwinding remain separate hard gates. A
 nonlocal exit may strand the abandoned invocation's cached allocations, as C
@@ -140,8 +194,12 @@ The provider is not async-signal-safe because growth calls the hosted allocator.
 Object and disassembly checks prove that affected user functions keep their
 ordinary Cranelift frame and import only the declared hosted dependencies. A
 mixed-link test links a CCC-produced object with an external GCC-compatible
-driver as PIE. Negative feature-predicate tests keep `__builtin_alloca`
-unavailable for an arena-only profile.
+driver as PIE. Runtime layout without an automatic object, such as VLA
+`sizeof`, is checked separately and must not import the allocation provider.
+The target-oracle runner compiles, links against the real hosted provider, and
+executes the VLA bound/`sizeof` fixture and its provider-failure companion at
+`-O0` and `-O2` for every enabled target. Negative feature-predicate tests keep
+`__builtin_alloca` unavailable for an arena-only profile.
 
 ## C11 and GNU capability fixtures
 
@@ -177,7 +235,11 @@ Wide-integer proof covers high-bit constants, signed and unsigned arithmetic,
 division and remainder traps, floating conversions, layout, varargs, mixed
 register pressure, and GCC/Clang cross-linking in both directions. Object and
 link-plan checks require the exact `ti` helper symbols selected by each
-operation. LLVM 18 and 19 have a documented x86-64 ABI bug that keeps `%r9`
+operation. Focused linker-model fixtures cover ordered and grouped archive
+extraction, `-L`/`-l`, forced undefined and entry symbols, COMMON and weak
+precedence, thin members, dynamic-library state, startup-file suppression, and
+isolation of the compiler-runtime
+provider from user whole-archive state. LLVM 18 and 19 have a documented x86-64 ABI bug that keeps `%r9`
 reserved after atomically spilling an `__int128` argument
 ([LLVM #123935](https://github.com/llvm/llvm-project/issues/123935)). Those
 versions still execute the spilled wide argument in both cross-link directions,
@@ -197,21 +259,33 @@ Differential tests compare only outputs whose relevant behavior is defined for t
 
 ## Target execution matrix
 
-- x86-64 Linux GNU and musl run natively in matching environments;
-- AArch64 Linux and RISC-V64 Linux run natively where available and under matching QEMU user/system environments for cross coverage;
-- Darwin arm64 runs on native macOS CI with the selected SDK/deployment target;
-- compile-only object inspection supplements execution but never substitutes for a claimed runnable target.
+Hosted CI runs the Rust workspace test suite on native x86-64 Linux, AArch64
+Linux, and AArch64 macOS runners. The RISC-V64 workspace tests are
+cross-compiled with Rust's `riscv64gc-unknown-linux-gnu` target and executed
+through QEMU user mode with the matching GNU sysroot. The same Rust suite is
+required on every matrix row, followed by that row's matching target oracle.
 
-Every enabled target has a required matrix entry. A target without an execution environment is labeled compile-only and cannot be advertised as execution-tested.
+The standalone ABI, target-oracle, differential, and exhaustive real-code
+corpus harnesses remain available for focused local qualification. A separate
+x86-64 Linux job runs the bounded SQLite, Lua, bzip2, zlib, Redis, and zstd
+profiles. Dedicated AArch64 Linux, RISC-V Linux, and arm64 Darwin jobs run the
+complete bzip2 target contract, including target-object inspection and the
+upstream and extended execution suites. Compile-only object inspection
+supplements execution but never substitutes for a claimed runnable target.
 
 ## Real-code corpus
 
-SQLite, Lua, Redis, bzip2, zstd, zlib, musl, tcc, selected libc-header
-fixtures, and c-testsuite exercise drop-in compatibility. Each integration
+The implemented SQLite, Lua, Redis, bzip2, zstd, zlib, and selected
+libc-header gates exercise drop-in compatibility. Each integration
 records the exact build command, enabled features, patches if any, expected
 exclusions, and whether success means preprocess, compile, link, or run.
 “Builds unmodified” is used
 only when no source or build-system patch is applied.
+
+musl, tcc, and c-testsuite remain catalog-only, non-blocking candidates. They
+do not count as supported integrations until each has a pinned source and
+hash, a target-applicability entry, a deterministic adapter, and an explicit
+compile/link/run contract.
 
 Hosted-header preprocessing, parsing, and code generation are separate gates.
 A licensed, pinned glibc-like fixture has both a deterministic preprocessing
@@ -234,17 +308,15 @@ review as well as a C-surface inventory. The default gate runs the `veryquick`
 Tcl set through `testfixture`, which needs Tcl and zlib development
 environments. Explicit `quick`, `all`, and `full` adapter modes retain the
 upstream test grouping; TH3 remains out of scope. Under CCC's effective identity
-the build selects `__sync_synchronize` but no inline assembly, wide integers,
-VLA objects, computed goto, or statement expressions. The `full` mode keeps
-SQLite's `SQLITE_ENABLE_STMT_SCANSTATUS` fuzzcheck profile. For its one
-generated `sqlite3.c` translation, the wrapper defines the upstream
-`__STRICT_ANSI__` predicate while retaining GNU C11 mode, selecting SQLite's
-zero-valued hardware timing fallback instead of the GNU x86-64 `rdtsc`
-inline-assembly path. In this release that predicate also suppresses only the
-`SQLITE_INLINE` optimization hint. The eight fuzzcheck support inputs,
-`alltest`, and `sessionfuzz` receive no override. Normal translations use
-CCC's GNU11 driver default, while the wrapper audits the effective language
-mode and predicate state for every translation. Corpus
+`testfixture` selects `__sync_synchronize` but no inline assembly, wide
+integers, VLA objects, computed goto, or statement expressions. The `full` mode
+keeps SQLite's `SQLITE_ENABLE_STMT_SCANSTATUS` fuzzcheck profile. Its one
+generated `sqlite3.c` translation selects the volatile GNU x86-64 `rdtsc` form
+with `=a` and `=d` outputs, which CCC retains explicitly and implements through
+a deterministic hidden support routine. No source predicate is overridden.
+The eight fuzzcheck support inputs, `alltest`, and `sessionfuzz` use the same
+GNU C11 profile. The wrapper audits the effective language mode and strict-ANSI
+state for every translation. Corpus
 success is integration evidence rather than proof of the unselected constructs;
 their focused fixtures remain required.
 
@@ -259,10 +331,13 @@ so passing the corpus cannot hide unimplemented GNU payload encoding.
 
 Lua is pinned by its [corpus manifest](../../test-corpus/lua/manifest.toml) to
 the official 5.5.0 source and matching test archives. The adapter uses the
-upstream Linux make target with CCC's GNU11 driver default and requires all 34
-`.c` files in the source directory to appear exactly once in CCC's source-input
-log. GCC receives
-only CCC-produced objects and archives for the two final program links. Those
+upstream Linux make target directly with `CC=ccc` and requires all 34 `.c`
+files in the source directory to appear exactly once in CCC's source-input log.
+The `CC=ccc` substitution replaces Lua's bundled `gcc -std=gnu99` command, so
+CCC uses its documented GNU C default with no adapter language override. It
+produces the exact 34-object inventory and 32-member archive, then drives both
+final program links through the resolved target toolchain. Their normalized
+arguments are checked against Lua's two upstream Linux link recipes. Those
 links use the platform default without an adapter relocation flag, and the gate
 verifies PIE ELF type `DYN` plus the absence of dynamic text relocations.
 
@@ -276,7 +351,7 @@ module-path variables, and requires its `final OK !!!` marker. This integration
 does not replace focused computed-goto or nonlocal-control tests. The official
 complete and internal profiles remain distinct contracts because they add
 position-independent shared test modules, GNU assertion statement expressions,
-and an instrumented runtime. musl feeds `$CC` assembly files.
+and an instrumented runtime.
 
 Redis is pinned by its [corpus manifest](../../test-corpus/redis/manifest.toml)
 to the official 8.8.0 core archive. The selected upstream build produces
@@ -292,16 +367,17 @@ optimization arguments. The adapter requires exactly 178 nonempty captures,
 compares their relative paths to the pinned source set, and records exact
 expanded-builtin counts. It also audits the complete compiled source multiset,
 compiler identity, link inputs, ELF executable type, and absence of dynamic
-text relocations.
+text relocations. Native `long double` arithmetic and conversions use localized
+x87 helpers, while generated System V bridges preserve f80 fixed, variadic,
+indirect, aggregate, and `va_arg` boundaries to internal code and libc.
 
 Redis assertions remain enabled through the unmodified system header; CCC
 implements its GNU statement expression and `__PRETTY_FUNCTION__` surface.
 The hosted `math.h` wrapper supplies single-evaluation binary64 classification
-macros without exposing unselected native-`long double` arms. Two exact-hash
-source adjustments replace the bundled HDR Histogram x86 atomic assembly with
-the selected sequentially consistent legacy builtins and select a
-behavior-compatible C no-op for xxHash's compiler guard. The adapter audits
-each remaining adjustment and its replacement count explicitly.
+macros without exposing unselected native-`long double` arms. Redis's two
+compiler barriers, four locked atomic statements, and one xxHash read/write
+register guard reach CCC unchanged. The adapter audits their exact expansion
+counts and rejects any neighboring inline-assembly form.
 
 The Redis execution profile starts the CCC-built server on a private Unix
 domain socket and drives `PING`, string, counter, list, hash, Lua `EVAL`, and
@@ -332,16 +408,27 @@ only objects for four source-free links. Pthread support and legacy decoding
 are enabled; optional zlib, liblzma, and liblz4 format wrappers, stand-alone
 assembly, and host-dependent unaligned scalar accesses are disabled.
 
-The zstd adapter applies an exact-hash extension of upstream's no-assembly
-guards to existing generic C fallbacks. Its unmodified dependency and system
-assertion headers use CCC's native memory builtins, GNU statement expressions,
-and function-name aliases. Every remaining source adjustment is hashed and
-audited on each run. Native links use the platform PIE default without a
-relocation flag. Upstream's bounded quick smoke target covers
+The zstd adapter uses the upstream `ZSTD_NO_ASM=1` switch to exclude the
+stand-alone amd64 translation unit while compiling the selected inline forms
+unchanged. They comprise CPUID, an empty compiler barrier, a
+conditional move, and `nop`/`.p2align` layout hints. Its unmodified dependency
+and system assertion headers use CCC's native memory builtins, GNU statement
+expressions, and function-name aliases. Native links use the platform PIE
+default without a relocation flag. Upstream's bounded quick smoke target covers
 compression, decompression, streaming, dictionaries, file handling, corruption
 rejection, sparse files, and the selected threaded path; deterministic file and
 stream round trips add byte-for-byte checks. Long-running fuzz and stress
 profiles are not part of this gate.
+
+zlib is pinned by its [corpus manifest](../../test-corpus/zlib/manifest.toml)
+to the official 1.3.2 release archive. Its configure script and generated
+Makefile run without a compiler wrapper or source adjustment: CCC performs all
+core, example, shared-object, archive, and executable compile/link commands.
+The gate compares the exact 34-entry C source multiset, runs upstream's static,
+shared, and large-file tests, inspects PIE and shared ELF metadata, and performs
+an independent byte-for-byte `minigzip` round trip. The default x86-64 release
+uses checked-in lookup tables, so optional atomic table initialization remains
+covered by focused compiler tests rather than inferred from this integration.
 
 A curated execute-only compiler torture subset may supplement focused fixtures.
 It is fetched rather than vendored, and its corpus manifest records the exact
@@ -353,9 +440,13 @@ the supported constructs.
 ## Licensing, pinning, and supply-chain policy
 
 - Csmith uses its BSD-style license; C-Reduce uses the University of Illinois/NCSA-style license; GCC tests are governed by the applicable GCC GPL terms. Each corpus/tool is recorded individually instead of being grouped under one license label.
-- Only compatible, small fixtures are vendored. External corpora are fetched by immutable revision and cryptographic hash into a CI cache or project-controlled mirror.
+- Only compatible, small fixtures are vendored. External corpora are fetched by immutable revision and cryptographic hash into a local cache or project-controlled mirror.
 - Fetch scripts verify hashes and licenses before use; a network outage cannot silently select a different revision.
 - Minimized fixtures derived from third-party tests retain the source license and provenance when the license requires it.
 - External GPL tools may be executed without being linked into CCC; source-copying and distribution decisions are handled separately from tool execution.
 
-Fast unit/snapshot/execution tiers run per change. Fuzzing, differential matrices, full corpora, QEMU, native Darwin, and exhaustive ABI shapes run on scheduled and release CI, with failures retained as reproducible seeds/artifacts.
+Hosted CI runs the workspace Rust tests on every supported host profile, using
+QEMU for RISC-V64, plus the bounded x86-64 real-code corpus job. Fuzzing,
+differential matrices, full corpus modes, target oracles, and exhaustive ABI
+shapes are explicit local qualification commands; their harnesses retain
+failures as reproducible seeds and artifacts.

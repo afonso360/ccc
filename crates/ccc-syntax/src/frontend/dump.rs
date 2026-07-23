@@ -212,6 +212,7 @@ impl AstDumper {
             StatementKind::For { .. } => "for",
             StatementKind::Goto(_) => "goto",
             StatementKind::ComputedGoto(_) => "computed-goto",
+            StatementKind::Asm(_) => "asm-statement",
             StatementKind::Continue => "continue",
             StatementKind::Break => "break",
             StatementKind::Return(_) => "return",
@@ -236,6 +237,46 @@ impl AstDumper {
             StatementKind::Expression(Some(expression))
             | StatementKind::Return(Some(expression))
             | StatementKind::ComputedGoto(expression) => self.expression(expression, indent + 1),
+            StatementKind::Asm(asm) => {
+                let qualifiers = asm
+                    .qualifiers
+                    .iter()
+                    .map(|qualifier| qualifier.spelling.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                self.line(
+                    indent + 1,
+                    &format!(
+                        "asm template={:?} qualifiers=[{}] colon-groups={}",
+                        asm.template.code_units, qualifiers, asm.colon_group_count
+                    ),
+                );
+                for (kind, operands) in [("output", &asm.outputs), ("input", &asm.inputs)] {
+                    for operand in operands {
+                        self.line(
+                            indent + 2,
+                            &format!(
+                                "{kind} name={} constraint={:?}",
+                                operand
+                                    .symbolic_name
+                                    .as_ref()
+                                    .map_or("_", |name| name.name.as_str()),
+                                operand.constraint.literal.code_units
+                            ),
+                        );
+                        self.expression(&operand.expression, indent + 3);
+                    }
+                }
+                for clobber in &asm.clobbers {
+                    self.line(
+                        indent + 2,
+                        &format!("clobber {:?}", clobber.literal.code_units),
+                    );
+                }
+                for label in &asm.goto_labels {
+                    self.line(indent + 2, &format!("goto-label {}", label.name));
+                }
+            }
             StatementKind::If {
                 condition,
                 then_statement,
@@ -420,6 +461,15 @@ impl AstDumper {
             }
             ExpressionKind::BuiltinSyncSynchronize => {
                 self.line(indent, "builtin-sync-synchronize");
+            }
+            ExpressionKind::BuiltinAtomicOperation {
+                operation,
+                arguments,
+            } => {
+                self.line(indent, operation.spelling());
+                for argument in arguments {
+                    self.expression(argument, indent + 1);
+                }
             }
             ExpressionKind::Comma(expressions) => {
                 self.line(indent, "comma");

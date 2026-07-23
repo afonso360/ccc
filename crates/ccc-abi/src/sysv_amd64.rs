@@ -1,6 +1,6 @@
 use ccc_target::{
     Architecture, BinaryFormat, CallingConvention, EffectiveCompilationConfig, Environment,
-    OperatingSystem,
+    LongDoubleFormat, OperatingSystem,
 };
 use ccc_types::{
     BuiltinType, FunctionParameters, FunctionType, LayoutShape, RecordKind, TypeId, TypeKind,
@@ -22,10 +22,10 @@ pub fn plan_function_type(
             "a variadic boundary must use an explicit bridge plan",
         ));
     }
-    if signature_contains_int128(types, &signature) {
+    if signature_requires_bridge(types, &signature) {
         return Err(AbiError::new(
             "CCC3510",
-            "a fixed wide-integer boundary requires the explicit System V bridge plan",
+            "this fixed boundary requires the explicit System V bridge plan",
         ));
     }
     plan_native_signature(types, &signature, config)
@@ -58,7 +58,7 @@ pub fn plan_boundary_type(
             BridgeKind::VariadicEntry,
             config,
         )?))
-    } else if signature_contains_int128(types, &signature) {
+    } else if signature_requires_bridge(types, &signature) {
         let FunctionParameters::Prototype(parameters) = &signature.parameters else {
             return Err(AbiError::new(
                 "CCC3506",
@@ -105,10 +105,10 @@ pub fn plan_fixed_call(
             "a function type without a prototype has no fixed call plan",
         ));
     };
-    if !signature_contains_int128(types, &signature) {
+    if !signature_requires_bridge(types, &signature) {
         return Err(AbiError::new(
             "CCC3511",
-            "a fixed call bridge is reserved for a wide-integer boundary",
+            "this fixed call does not require an explicit System V bridge",
         ));
     }
     plan_bridge(
@@ -273,11 +273,11 @@ fn function_signature(types: &TypeStore, signature: TypeId) -> Result<FunctionTy
     })
 }
 
-fn signature_contains_int128(types: &TypeStore, signature: &FunctionType) -> bool {
+fn signature_requires_bridge(types: &TypeStore, signature: &FunctionType) -> bool {
     fn contains(types: &TypeStore, ty: TypeId, active: &mut Vec<TypeId>) -> bool {
         if matches!(
             types.builtin_type(ty),
-            Some(BuiltinType::Int128 | BuiltinType::UnsignedInt128)
+            Some(BuiltinType::Int128 | BuiltinType::UnsignedInt128 | BuiltinType::LongDouble)
         ) {
             return true;
         }
@@ -572,7 +572,9 @@ fn plan_bridge(
                 "`void` cannot appear as a function parameter type",
             ));
         }
-        let extension = if classified.passing == PassingMode::Scalar {
+        let extension = if classified.passing == PassingMode::Scalar
+            && types.builtin_type(ty) != Some(BuiltinType::LongDouble)
+        {
             scalar_extension(boundary_scalar(types, ty, config, "parameter")?)
         } else {
             IntegerExtension::None
@@ -595,7 +597,9 @@ fn plan_bridge(
     let fixed_stack_end = fixed_stack_end.unwrap_or(stack_size);
     let stack_size = u32::try_from(align_up(stack_size, 16)?)
         .map_err(|_| AbiError::new("CCC3503", "variadic bridge stack payload is too large"))?;
-    let result_extension = if result.passing == PassingMode::Scalar {
+    let result_extension = if result.passing == PassingMode::Scalar
+        && types.builtin_type(signature.result.ty) != Some(BuiltinType::LongDouble)
+    {
         scalar_extension(boundary_scalar(
             types,
             signature.result.ty,
@@ -637,7 +641,14 @@ fn allocate_bridge_argument(
     pieces: &mut Vec<BridgePiecePlan>,
 ) -> Result<(), AbiError> {
     let (gp_needed, sse_needed) = register_counts(classified);
+    let has_x87 = classified.classes.iter().any(|class| {
+        matches!(
+            class,
+            AbiClass::X87 | AbiClass::X87Up | AbiClass::ComplexX87
+        )
+    });
     let registers_fit = classified.passing != PassingMode::Memory
+        && !has_x87
         && *gp_used + gp_needed <= 6
         && *sse_used + sse_needed <= 8;
     if registers_fit {
@@ -696,6 +707,20 @@ fn bridge_result_pieces(
     ) {
         return Vec::new();
     }
+    if classified.classes.first() == Some(&AbiClass::X87) {
+        return vec![BridgePiecePlan {
+            source_index: None,
+            piece: AbiPiece {
+                index: 0,
+                offset: 0,
+                valid_bytes: 10,
+                class: AbiClass::X87,
+            },
+            extension: IntegerExtension::None,
+            indirect: false,
+            location: BridgeLocation::Register(RegisterSlot::x87()),
+        }];
+    }
     let mut gp = 0usize;
     let mut sse = 0usize;
     effective_pieces(classified)
@@ -744,6 +769,33 @@ fn classify(
     reject_unsupported_recursive(types, ty, config, boundary)?;
     let layout = target_layout(types, ty, config)?;
     if !is_aggregate(types, ty) {
+        if types.builtin_type(ty) == Some(BuiltinType::LongDouble) {
+            if layout.size != 16
+                || layout.align != 16
+                || config.target.data_layout.long_double_format != LongDoubleFormat::X87Extended
+            {
+                return Err(AbiError::new(
+                    "CCC3509",
+                    format!(
+                        "native `long double` {boundary} type `{}` is not the enabled x87 storage format",
+                        types.display(ty)
+                    ),
+                ));
+            }
+            return Ok(ClassifiedType {
+                ty,
+                size: layout.size,
+                align: layout.align,
+                classes: vec![AbiClass::X87, AbiClass::X87Up],
+                pieces: vec![AbiPiece {
+                    index: 0,
+                    offset: 0,
+                    valid_bytes: 10,
+                    class: AbiClass::X87,
+                }],
+                passing: PassingMode::Scalar,
+            });
+        }
         let scalar = boundary_scalar(types, ty, config, boundary)?;
         let class = scalar_class(scalar);
         let valid_bytes = u8::try_from(layout.size)
@@ -839,7 +891,7 @@ fn classify_at(
     {
         TypeKind::Builtin(builtin) => {
             let class = match builtin {
-                BuiltinType::Float | BuiltinType::Double => AbiClass::Sse,
+                BuiltinType::Float16 | BuiltinType::Float | BuiltinType::Double => AbiClass::Sse,
                 BuiltinType::LongDouble => AbiClass::X87,
                 BuiltinType::Void => AbiClass::NoClass,
                 _ => AbiClass::Integer,
@@ -1012,15 +1064,6 @@ fn reject_unsupported_recursive(
     boundary: &str,
 ) -> Result<(), AbiError> {
     let layout = target_layout(types, ty, config)?;
-    if types.builtin_type(ty) == Some(BuiltinType::LongDouble) {
-        return Err(AbiError::new(
-            "CCC3509",
-            format!(
-                "native `long double` {boundary} type `{}` is outside the enabled boundary profile",
-                types.display(ty)
-            ),
-        ));
-    }
     if layout.align > 16 {
         return Err(AbiError::new(
             "CCC3513",
@@ -1032,7 +1075,7 @@ fn reject_unsupported_recursive(
         ));
     }
     match types.try_kind(ty) {
-        Some(TypeKind::Builtin(BuiltinType::LongDouble)) => unreachable!(),
+        Some(TypeKind::Builtin(BuiltinType::LongDouble)) => Ok(()),
         Some(TypeKind::Array(array)) => {
             reject_unsupported_recursive(types, array.element.ty, config, boundary)
         }
@@ -1128,10 +1171,11 @@ fn builtin_scalar(
         BuiltinType::LongDouble => Err(AbiError::new(
             "CCC3509",
             format!(
-                "native `long double` {boundary} type `{}` is outside the enabled boundary profile",
+                "native x87 `long double` {boundary} type `{}` requires the explicit System V bridge",
                 types.display(ty)
             ),
         )),
+        BuiltinType::Float16 => Ok(AbiScalar::Float16),
         BuiltinType::Float => Ok(AbiScalar::Float32),
         BuiltinType::Double => Ok(AbiScalar::Float64),
         builtin if builtin.is_integer() => {
@@ -1232,7 +1276,7 @@ fn consume_scalar_register(scalar: AbiScalar, gp_used: &mut u8, sse_used: &mut u
 
 fn scalar_class(scalar: AbiScalar) -> AbiClass {
     match scalar {
-        AbiScalar::Float32 | AbiScalar::Float64 => AbiClass::Sse,
+        AbiScalar::Float16 | AbiScalar::Float32 | AbiScalar::Float64 => AbiClass::Sse,
         _ => AbiClass::Integer,
     }
 }
@@ -1242,6 +1286,7 @@ fn scalar_size(scalar: AbiScalar) -> u8 {
         AbiScalar::SignedInteger { bits }
         | AbiScalar::UnsignedInteger { bits }
         | AbiScalar::Pointer { bits } => bits / 8,
+        AbiScalar::Float16 => 2,
         AbiScalar::Float32 => 4,
         AbiScalar::Float64 => 8,
     }
@@ -1259,6 +1304,7 @@ fn scalar_carrier(scalar: AbiScalar) -> AbiCarrier {
             128 => AbiCarrier::I128,
             _ => unreachable!("unsupported scalar width"),
         },
+        AbiScalar::Float16 => AbiCarrier::F16,
         AbiScalar::Float32 => AbiCarrier::F32,
         AbiScalar::Float64 => AbiCarrier::F64,
     }
@@ -1741,6 +1787,82 @@ mod tests {
         let va_arg = plan_va_arg(&types, TypeId::UNSIGNED_INT128, &config).unwrap();
         assert_eq!((va_arg.gp_slots, va_arg.sse_slots), (2, 0));
         assert_eq!((va_arg.overflow_size, va_arg.overflow_align), (16, 16));
+    }
+
+    #[test]
+    fn x87_scalars_use_aligned_stack_arguments_and_st0_results() {
+        let mut types = TypeStore::default();
+        let config = EffectiveCompilationConfig::default();
+        let classified = classify_type(&types, TypeId::LONG_DOUBLE, &config).unwrap();
+        assert_eq!(classified.size, 16);
+        assert_eq!(classified.align, 16);
+        assert_eq!(classified.passing, PassingMode::Scalar);
+        assert_eq!(classified.classes, [AbiClass::X87, AbiClass::X87Up]);
+        assert_eq!(
+            classified.pieces,
+            [AbiPiece {
+                index: 0,
+                offset: 0,
+                valid_bytes: 10,
+                class: AbiClass::X87,
+            }]
+        );
+
+        let signature = types.function_type(FunctionType::prototype(
+            TypeId::LONG_DOUBLE,
+            vec![TypeId::LONG_DOUBLE.into()],
+        ));
+        let BoundaryPlan::Bridge(entry) = plan_boundary_type(&types, signature, &config).unwrap()
+        else {
+            panic!("x87 definition must use a generated bridge")
+        };
+        assert_eq!(entry.kind, BridgeKind::FixedEntry);
+        assert_eq!(entry.stack_size, 16);
+        assert_eq!((entry.gp_used, entry.xmm_used), (0, 0));
+        assert_eq!(
+            entry
+                .parameter_pieces
+                .iter()
+                .map(|piece| (piece.piece.offset, piece.location))
+                .collect::<Vec<_>>(),
+            [
+                (0, BridgeLocation::Stack { offset: 0 }),
+                (8, BridgeLocation::Stack { offset: 8 }),
+            ]
+        );
+        assert_eq!(entry.result_pieces.len(), 1);
+        assert_eq!(
+            entry.result_pieces[0].location,
+            BridgeLocation::Register(RegisterSlot::x87())
+        );
+        assert!(!entry.hidden_return);
+
+        let call = plan_fixed_call(&types, signature, &[TypeId::LONG_DOUBLE], &config).unwrap();
+        assert_eq!(call.kind, BridgeKind::FixedCall);
+        assert_eq!(call.stack_size, 16);
+
+        let va_arg = plan_va_arg(&types, TypeId::LONG_DOUBLE, &config).unwrap();
+        assert_eq!((va_arg.gp_slots, va_arg.sse_slots), (0, 0));
+        assert_eq!((va_arg.overflow_align, va_arg.overflow_size), (16, 16));
+    }
+
+    #[test]
+    fn aggregates_containing_x87_values_remain_memory_classified() {
+        let mut types = TypeStore::default();
+        let wrapper = record(&mut types, vec![Field::named("value", TypeId::LONG_DOUBLE)]);
+        let config = EffectiveCompilationConfig::default();
+        let classified = classify_type(&types, wrapper, &config).unwrap();
+        assert_eq!(classified.passing, PassingMode::Memory);
+        assert_eq!((classified.size, classified.align), (16, 16));
+
+        let signature = types.function_type(FunctionType::prototype(wrapper, vec![wrapper.into()]));
+        let BoundaryPlan::Bridge(plan) = plan_boundary_type(&types, signature, &config).unwrap()
+        else {
+            panic!("an x87-containing aggregate must use a generated bridge")
+        };
+        assert!(plan.hidden_return);
+        assert_eq!(plan.gp_used, 1);
+        assert_eq!(plan.stack_size, 16);
     }
 
     #[test]

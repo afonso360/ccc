@@ -6,10 +6,10 @@ use ccc_types::{
 };
 
 use super::{
-    AggregateProjection, BlockId, DataOrigin, FullEdge, FullFunction, FullInstruction,
+    AggregateProjection, BlockId, CallEffects, DataOrigin, FullEdge, FullFunction, FullInstruction,
     FullInstructionKind, FullModule, FullTerminator, InitializerGraph, InitializerNodeId,
-    InitializerNodeKind, InitializerPath, IrError, MemoryAccess, RelocationKind, RelocationTarget,
-    ScalarConversion, StorageLocation, ValueId,
+    InitializerNodeKind, InitializerPath, IrError, MemoryAccess, MemoryResidencyReason,
+    RelocationKind, RelocationTarget, ScalarConstant, ScalarConversion, StorageLocation, ValueId,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -152,12 +152,13 @@ fn verify_initializer_node(
     verify_type(&module.types, node.ty, "initializer node")?;
     match &node.kind {
         InitializerNodeKind::Zero => {}
-        InitializerNodeKind::Scalar(_) => {
+        InitializerNodeKind::Scalar(constant) => {
             if is_aggregate(&module.types, node.ty.ty) {
                 return Err(IrError::verify(
                     "aggregate initializer node contains a scalar leaf directly",
                 ));
             }
+            verify_long_double_constant(&module.types, node.ty.ty, *constant)?;
         }
         InitializerNodeKind::Relocation { target, kind, .. } => {
             verify_relocation(module, *target, *kind)?;
@@ -496,6 +497,35 @@ fn verify_function(module: &FullModule, function: &FullFunction) -> Result<(), I
         }
     }
 
+    let contains_returns_twice = function.blocks.iter().any(|block| {
+        block.instructions.iter().any(|instruction| {
+            matches!(
+                &instruction.kind,
+                FullInstructionKind::DirectCall { effects, .. }
+                    | FullInstructionKind::IndirectCall { effects, .. }
+                    if effects.returns_twice
+            )
+        })
+    });
+    if contains_returns_twice {
+        for storage in &function.storage {
+            if storage.location == StorageLocation::RuntimeSized {
+                return Err(IrError::verify(
+                    "returns-twice function contains runtime-sized automatic storage",
+                ));
+            }
+            if storage.location == StorageLocation::Automatic
+                && !storage
+                    .required_by
+                    .contains(&MemoryResidencyReason::ReturnsTwice)
+            {
+                return Err(IrError::verify(
+                    "automatic storage across a returns-twice call is not memory-resident",
+                ));
+            }
+        }
+    }
+
     let mut definitions = vec![None; function.value_types.len()];
     let mut instruction_ids = vec![false; function.instruction_count as usize];
     for (index, block) in function.blocks.iter().enumerate() {
@@ -730,11 +760,12 @@ impl FunctionVerifier<'_> {
             .map(|value| value_type(self.function, value))
             .transpose()?;
         match &instruction.kind {
-            FullInstructionKind::Constant(_) => {
+            FullInstructionKind::Constant(constant) => {
                 let ty = require_result(result, instruction, "constant")?;
                 if is_aggregate(types, ty.ty) || is_void(types, ty.ty) {
                     return Err(IrError::verify("constant has a non-scalar result type"));
                 }
+                verify_long_double_constant(types, ty.ty, *constant)?;
             }
             FullInstructionKind::AddressConstant { target, .. } => {
                 let ty = require_result(result, instruction, "address constant")?;
@@ -810,11 +841,33 @@ impl FunctionVerifier<'_> {
                 }
                 require_pointer_result(types, result, object.ty, instruction)?;
             }
-            FullInstructionKind::RuntimeSizedAllocate {
-                storage,
+            FullInstructionKind::RuntimeSize {
                 extents,
                 element,
                 constant_factor,
+            } => {
+                if extents.is_empty() || *constant_factor == 0 {
+                    return Err(IrError::verify(
+                        "runtime size has no dynamic extent or has a zero constant factor",
+                    ));
+                }
+                for extent in extents {
+                    if !types.is_integer(self.value_type(*extent)?.ty) {
+                        return Err(IrError::verify("runtime size extent is not an integer"));
+                    }
+                }
+                verify_type(types, *element, "runtime size element")?;
+                let result = require_result(result, instruction, "runtime size")?;
+                if result.ty != TypeId::UNSIGNED_LONG {
+                    return Err(IrError::verify(
+                        "runtime size result does not have size_t type",
+                    ));
+                }
+            }
+            FullInstructionKind::RuntimeSizedAllocate {
+                storage,
+                size,
+                element,
                 requested_alignment,
             } => {
                 let object = self
@@ -833,17 +886,10 @@ impl FunctionVerifier<'_> {
                         "runtime allocation references fixed-size storage",
                     ));
                 }
-                if extents.is_empty() || *constant_factor == 0 {
+                if self.value_type(*size)?.ty != TypeId::UNSIGNED_LONG {
                     return Err(IrError::verify(
-                        "runtime allocation has no dynamic extent or has a zero constant factor",
+                        "runtime allocation size does not have size_t type",
                     ));
-                }
-                for extent in extents {
-                    if !types.is_integer(self.value_type(*extent)?.ty) {
-                        return Err(IrError::verify(
-                            "runtime allocation extent is not an integer",
-                        ));
-                    }
                 }
                 verify_type(types, *element, "runtime allocation element")?;
                 if requested_alignment.is_some_and(|alignment| !alignment.is_power_of_two()) {
@@ -900,21 +946,19 @@ impl FunctionVerifier<'_> {
                 base,
                 index,
                 element,
-                extents,
+                stride,
                 ..
             } => {
                 require_address(types, self.value_type(*base)?, *element, "pointer offset")?;
-                if !types.is_integer(self.value_type(*index)?.ty) || extents.is_empty() {
+                if !types.is_integer(self.value_type(*index)?.ty) {
                     return Err(IrError::verify(
-                        "runtime pointer offset has an invalid index or no extents",
+                        "runtime pointer offset index is not an integer",
                     ));
                 }
-                for extent in extents {
-                    if !types.is_integer(self.value_type(*extent)?.ty) {
-                        return Err(IrError::verify(
-                            "runtime pointer offset extent is not an integer",
-                        ));
-                    }
+                if self.value_type(*stride)?.ty != TypeId::UNSIGNED_LONG {
+                    return Err(IrError::verify(
+                        "runtime pointer offset stride does not have size_t type",
+                    ));
                 }
                 require_pointer_result(types, result, *element, instruction)?;
             }
@@ -946,7 +990,7 @@ impl FunctionVerifier<'_> {
                 left,
                 right,
                 element,
-                extents,
+                stride,
             } => {
                 require_address_ignoring_pointee_qualifiers(
                     types,
@@ -960,15 +1004,10 @@ impl FunctionVerifier<'_> {
                     *element,
                     "pointer difference",
                 )?;
-                if extents.is_empty() {
-                    return Err(IrError::verify("runtime pointer difference has no extents"));
-                }
-                for extent in extents {
-                    if !types.is_integer(self.value_type(*extent)?.ty) {
-                        return Err(IrError::verify(
-                            "runtime pointer difference extent is not an integer",
-                        ));
-                    }
+                if self.value_type(*stride)?.ty != TypeId::UNSIGNED_LONG {
+                    return Err(IrError::verify(
+                        "runtime pointer difference stride does not have size_t type",
+                    ));
                 }
                 let result = require_result(result, instruction, "pointer difference")?;
                 if !types.is_integer(result.ty) {
@@ -1277,10 +1316,32 @@ impl FunctionVerifier<'_> {
                     }
                 }
             }
-            FullInstructionKind::Unary { operand, .. } => {
+            FullInstructionKind::Unary { operator, operand } => {
                 let result = require_result(result, instruction, "unary operation")?;
-                if result.ty != self.value_type(*operand)?.ty && !types.is_integer(result.ty) {
-                    return Err(IrError::verify("unary operation has inconsistent types"));
+                let operand = self.value_type(*operand)?.ty;
+                use super::UnaryOperation as U;
+                match operator {
+                    U::Plus | U::Negate => {
+                        if !types.is_arithmetic(operand) || result.ty != operand {
+                            return Err(IrError::verify(
+                                "arithmetic unary operation has inconsistent types",
+                            ));
+                        }
+                    }
+                    U::BitwiseNot => {
+                        if !types.is_integer(operand) || result.ty != operand {
+                            return Err(IrError::verify(
+                                "bitwise unary operation has inconsistent types",
+                            ));
+                        }
+                    }
+                    U::LogicalNot => {
+                        if !is_scalar(types, operand) || result.ty != TypeId::INT {
+                            return Err(IrError::verify(
+                                "logical unary operation has inconsistent types",
+                            ));
+                        }
+                    }
                 }
             }
             FullInstructionKind::Binary {
@@ -1288,19 +1349,54 @@ impl FunctionVerifier<'_> {
                 left,
                 right,
             } => {
-                require_result(result, instruction, "binary operation")?;
+                let result = require_result(result, instruction, "binary operation")?;
                 let left = self.value_type(*left)?;
                 let right = self.value_type(*right)?;
-                let shift = matches!(
-                    operator,
-                    super::BinaryOperation::LeftShift | super::BinaryOperation::RightShift
-                );
-                if left.ty != right.ty
-                    && !(shift && types.is_integer(left.ty) && types.is_integer(right.ty))
-                {
-                    return Err(IrError::verify(
-                        "ordinary binary operation operands have different types",
-                    ));
+                use super::BinaryOperation as B;
+                match operator {
+                    B::LeftShift | B::RightShift => {
+                        if !types.is_integer(left.ty)
+                            || !types.is_integer(right.ty)
+                            || result.ty != left.ty
+                        {
+                            return Err(IrError::verify(
+                                "shift operation has inconsistent integer types",
+                            ));
+                        }
+                    }
+                    B::Less
+                    | B::LessEqual
+                    | B::Greater
+                    | B::GreaterEqual
+                    | B::Equal
+                    | B::NotEqual => {
+                        if left.ty != right.ty
+                            || !is_scalar(types, left.ty)
+                            || !matches!(result.ty, TypeId::INT | TypeId::BOOL)
+                        {
+                            return Err(IrError::verify(
+                                "comparison operation has inconsistent scalar types",
+                            ));
+                        }
+                    }
+                    B::Remainder | B::BitwiseAnd | B::BitwiseXor | B::BitwiseOr => {
+                        if left.ty != right.ty || !types.is_integer(left.ty) || result.ty != left.ty
+                        {
+                            return Err(IrError::verify(
+                                "integer binary operation has inconsistent types",
+                            ));
+                        }
+                    }
+                    B::Multiply | B::Divide | B::Add | B::Subtract => {
+                        if left.ty != right.ty
+                            || !types.is_arithmetic(left.ty)
+                            || result.ty != left.ty
+                        {
+                            return Err(IrError::verify(
+                                "arithmetic binary operation has inconsistent types",
+                            ));
+                        }
+                    }
                 }
             }
             FullInstructionKind::IntegerIntrinsic { operation, operand } => {
@@ -1380,6 +1476,7 @@ impl FunctionVerifier<'_> {
                     result,
                     instruction,
                 )?;
+                self.verify_returns_twice(effects)?;
                 self.verify_noreturn(block, position, effects.no_return)?;
             }
             FullInstructionKind::IndirectCall {
@@ -1402,6 +1499,7 @@ impl FunctionVerifier<'_> {
                     result,
                     instruction,
                 )?;
+                self.verify_returns_twice(effects)?;
                 self.verify_noreturn(block, position, effects.no_return)?;
             }
             FullInstructionKind::AtomicReadModifyWrite {
@@ -1479,6 +1577,67 @@ impl FunctionVerifier<'_> {
             }
             FullInstructionKind::MemoryFence { order: _ } => {
                 require_no_result(result, instruction, "memory fence")?;
+            }
+            FullInstructionKind::CompilerBarrier { memory: _ } => {
+                require_no_result(result, instruction, "compiler barrier")?;
+            }
+            FullInstructionKind::OpaqueScalar { operand } => {
+                let result = require_result(result, instruction, "opaque scalar")?;
+                let operand = self.value_type(*operand)?;
+                if result.ty != operand.ty || !is_pointer_or_integer(types, result.ty) {
+                    return Err(IrError::verify(
+                        "opaque scalar operand and result must have the same integer or pointer type",
+                    ));
+                }
+            }
+            FullInstructionKind::CodeLayoutHint(hint) => {
+                require_no_result(result, instruction, "code layout hint")?;
+                if matches!(hint, super::CodeLayoutHint::AlignToPowerOfTwo(power) if !matches!(power, 3..=6))
+                {
+                    return Err(IrError::verify(
+                        "code alignment hint is outside the certified range",
+                    ));
+                }
+            }
+            FullInstructionKind::X86Cpuid {
+                leaf,
+                subleaf,
+                eax,
+                ebx,
+                ecx,
+                edx,
+            } => {
+                require_no_result(result, instruction, "x86 CPUID")?;
+                if self.value_type(*leaf)?.ty != TypeId::UNSIGNED_INT {
+                    return Err(IrError::verify("CPUID leaf is not unsigned int"));
+                }
+                if let Some(subleaf) = subleaf
+                    && self.value_type(*subleaf)?.ty != TypeId::UNSIGNED_INT
+                {
+                    return Err(IrError::verify("CPUID subleaf is not unsigned int"));
+                }
+                if [eax, ebx, ecx, edx].iter().all(|output| output.is_none()) {
+                    return Err(IrError::verify("CPUID has no retained output"));
+                }
+                for output in [eax, ebx, ecx, edx].into_iter().flatten() {
+                    require_address(
+                        types,
+                        self.value_type(*output)?,
+                        QualifiedType::unqualified(TypeId::UNSIGNED_INT),
+                        "CPUID output",
+                    )?;
+                }
+            }
+            FullInstructionKind::X86Rdtsc { low, high } => {
+                require_no_result(result, instruction, "x86 RDTSC")?;
+                for output in [low, high] {
+                    require_address(
+                        types,
+                        self.value_type(*output)?,
+                        QualifiedType::unqualified(TypeId::UNSIGNED_INT),
+                        "RDTSC output",
+                    )?;
+                }
             }
             FullInstructionKind::VaStart {
                 list,
@@ -1641,6 +1800,22 @@ impl FunctionVerifier<'_> {
             let result = require_result(result, instruction, "call")?;
             if result.ty != signature.result.ty {
                 return Err(IrError::verify("call result has the wrong type"));
+            }
+        }
+        Ok(())
+    }
+
+    fn verify_returns_twice(&self, effects: &CallEffects) -> Result<(), IrError> {
+        if effects.returns_twice {
+            if effects.no_return {
+                return Err(IrError::verify(
+                    "a call cannot be both noreturn and returns-twice",
+                ));
+            }
+            if !effects.reads_memory || !effects.writes_memory {
+                return Err(IrError::verify(
+                    "a returns-twice call must conservatively read and write memory",
+                ));
             }
         }
         Ok(())
@@ -1914,7 +2089,7 @@ impl FunctionVerifier<'_> {
     }
 }
 
-fn instruction_operands(kind: &FullInstructionKind) -> Vec<ValueId> {
+pub(super) fn instruction_operands(kind: &FullInstructionKind) -> Vec<ValueId> {
     match kind {
         FullInstructionKind::Constant(_)
         | FullInstructionKind::AddressConstant { .. }
@@ -1922,30 +2097,27 @@ fn instruction_operands(kind: &FullInstructionKind) -> Vec<ValueId> {
         | FullInstructionKind::AddressOfFunction { .. }
         | FullInstructionKind::AddressOfString { .. }
         | FullInstructionKind::AddressOfStorage { .. }
-        | FullInstructionKind::MemoryFence { .. } => Vec::new(),
-        FullInstructionKind::RuntimeSizedAllocate { extents, .. } => extents.clone(),
+        | FullInstructionKind::MemoryFence { .. }
+        | FullInstructionKind::CompilerBarrier { .. }
+        | FullInstructionKind::CodeLayoutHint(_) => Vec::new(),
+        FullInstructionKind::RuntimeSize { extents, .. } => extents.clone(),
+        FullInstructionKind::RuntimeSizedAllocate { size, .. } => vec![*size],
         FullInstructionKind::ProjectField { base, .. } => vec![*base],
         FullInstructionKind::PointerOffset { base, index, .. } => vec![*base, *index],
         FullInstructionKind::RuntimePointerOffset {
             base,
             index,
-            extents,
+            stride,
             ..
-        } => std::iter::once(*base)
-            .chain(std::iter::once(*index))
-            .chain(extents.iter().copied())
-            .collect(),
+        } => vec![*base, *index, *stride],
         FullInstructionKind::PointerDifference { left, right, .. }
         | FullInstructionKind::Binary { left, right, .. } => vec![*left, *right],
         FullInstructionKind::RuntimePointerDifference {
             left,
             right,
-            extents,
+            stride,
             ..
-        } => std::iter::once(*left)
-            .chain(std::iter::once(*right))
-            .chain(extents.iter().copied())
-            .collect(),
+        } => vec![*left, *right, *stride],
         FullInstructionKind::Load { address, .. }
         | FullInstructionKind::BitfieldLoad { address, .. }
         | FullInstructionKind::ZeroInitialize {
@@ -2000,7 +2172,20 @@ fn instruction_operands(kind: &FullInstructionKind) -> Vec<ValueId> {
         } => vec![*destination, *value, *length],
         FullInstructionKind::Convert { operand, .. }
         | FullInstructionKind::Unary { operand, .. }
-        | FullInstructionKind::IntegerIntrinsic { operand, .. } => vec![*operand],
+        | FullInstructionKind::IntegerIntrinsic { operand, .. }
+        | FullInstructionKind::OpaqueScalar { operand } => vec![*operand],
+        FullInstructionKind::X86Cpuid {
+            leaf,
+            subleaf,
+            eax,
+            ebx,
+            ecx,
+            edx,
+        } => std::iter::once(*leaf)
+            .chain(subleaf.iter().copied())
+            .chain([eax, ebx, ecx, edx].into_iter().filter_map(|value| *value))
+            .collect(),
+        FullInstructionKind::X86Rdtsc { low, high } => vec![*low, *high],
         FullInstructionKind::Prefetch { address, .. } => vec![*address],
         FullInstructionKind::DirectCall { arguments, .. } => arguments.clone(),
         FullInstructionKind::IndirectCall {
@@ -2018,7 +2203,7 @@ fn instruction_operands(kind: &FullInstructionKind) -> Vec<ValueId> {
     }
 }
 
-fn terminator_operands(terminator: &FullTerminator) -> Vec<ValueId> {
+pub(super) fn terminator_operands(terminator: &FullTerminator) -> Vec<ValueId> {
     match terminator {
         FullTerminator::Branch(edge) => edge.arguments.clone(),
         FullTerminator::Conditional {
@@ -2159,8 +2344,7 @@ fn verify_atomic_object(types: &TypeStore, object: QualifiedType) -> Result<(), 
     if object.qualifiers.contains(TypeQualifiers::CONST) {
         return Err(IrError::verify("atomic operation modifies a const object"));
     }
-    let integer =
-        types.is_integer(object.ty) && types.builtin_type(object.ty) != Some(BuiltinType::Bool);
+    let integer = types.is_integer(object.ty);
     if !integer && pointer_pointee(types, object.ty).is_none() {
         return Err(IrError::verify(
             "atomic operation object is not an integer or pointer",
@@ -2289,6 +2473,32 @@ fn is_aggregate(types: &TypeStore, ty: TypeId) -> bool {
         types.try_kind(ty),
         Some(TypeKind::Array(_) | TypeKind::Record(_))
     )
+}
+
+fn verify_long_double_constant(
+    types: &TypeStore,
+    ty: TypeId,
+    constant: ScalarConstant,
+) -> Result<(), IrError> {
+    let ScalarConstant::LongDouble(value) = constant else {
+        return Ok(());
+    };
+    if types.builtin_type(ty) != Some(BuiltinType::LongDouble) {
+        return Err(IrError::verify(
+            "exact long-double constant has a non-long-double result type",
+        ));
+    }
+    match value.format {
+        ccc_target::LongDoubleFormat::Binary64 => Err(IrError::verify(
+            "binary64 long double must use the native floating constant representation",
+        )),
+        ccc_target::LongDoubleFormat::X87Extended if value.bytes[10..] != [0; 6] => Err(
+            IrError::verify("x87 long-double constant has nonzero ABI padding"),
+        ),
+        ccc_target::LongDoubleFormat::X87Extended | ccc_target::LongDoubleFormat::IeeeBinary128 => {
+            Ok(())
+        }
+    }
 }
 
 fn is_pointer_or_integer(types: &TypeStore, ty: TypeId) -> bool {

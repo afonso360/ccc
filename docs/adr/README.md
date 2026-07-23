@@ -12,7 +12,7 @@ The high-level introduction is [`../ARCHITECTURE.md`](../ARCHITECTURE.md); topic
 | [0004](0004-recursive-descent-parser.md)                     | Hand-written recursive-descent parser                             | accepted |
 | [0005](0005-preprocessor-owns-pp-token-lexing.md)            | Preprocessor owns pp-token lexing                                 | accepted |
 | [0006](0006-link-via-target-driver.md)                       | Link via a resolved target compiler driver                        | accepted |
-| [0007](0007-long-double-and-complex.md)                      | Preserve target `long double` ABI; explicit compatibility mode    | accepted |
+| [0007](0007-long-double-and-complex.md)                      | Preserve target `long double` ABI; reject ABI-changing overrides  | accepted |
 | [0008](0008-pin-cranelift.md)                                | Pin Cranelift; upgrade deliberately                               | accepted |
 | [0009](0009-shared-type-and-layout-crate.md)                 | Shared `ccc-types` crate: one type representation + layout engine | accepted |
 | [0010](0010-generate-abi-bridges-as-assembly.md)             | Generate ABI bridges as auditable target assembly                 | accepted |
