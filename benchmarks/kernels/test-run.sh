@@ -27,6 +27,9 @@ kernels=(
   branch-switch
   memory-traffic
   aggregate-copy
+  tls-access
+  atomic-rmw
+  variadic-call
 )
 kernel_count=${#kernels[@]}
 performance_sample_count=$((kernel_count * 3 * 2))
@@ -140,6 +143,33 @@ if "--emit=codegen-stats" in sys.argv:
             "constants": 7,
             "jump_tables": 0,
         },
+        "tls-access": {
+            "functions": 1,
+            "calls": 4 if profile == "-O0" else 2,
+            "blocks": 4,
+            "instructions": 28,
+            "global_values": 2,
+            "constants": 5,
+            "jump_tables": 0,
+        },
+        "atomic-rmw": {
+            "functions": 1,
+            "calls": 0,
+            "blocks": 6,
+            "instructions": 39,
+            "global_values": 2,
+            "constants": 6,
+            "jump_tables": 0,
+        },
+        "variadic-call": {
+            "functions": 2,
+            "calls": 1,
+            "blocks": 9,
+            "instructions": 63,
+            "global_values": 3,
+            "constants": 8,
+            "jump_tables": 0,
+        },
     }
     if case_name not in structures:
         print(f"unknown fake kernel case: {case_name}", file=sys.stderr)
@@ -250,11 +280,26 @@ for kernel in "${kernels[@]}"; do
     branch-switch) family=branches-switches ;;
     memory-traffic) family=memory-loads-stores ;;
     aggregate-copy) family=aggregate-copies ;;
+    tls-access) family=thread-local-storage ;;
+    atomic-rmw) family=c11-atomics ;;
+    variadic-call)
+      family=variadic-abi
+      expected_functions=2
+      ;;
   esac
   for profile in O0 O2 Oz; do
     expected_calls=0
     if [[ "$kernel" == direct-call && "$profile" != O2 ]]; then
       expected_calls=1
+    fi
+    if [[ "$kernel" == variadic-call ]]; then
+      expected_calls=1
+    fi
+    if [[ "$kernel" == tls-access ]]; then
+      expected_calls=2
+      if [[ "$profile" == O0 ]]; then
+        expected_calls=4
+      fi
     fi
     grep -Fq \
       "$kernel"$'\t'"$family"$'\t'"$profile"$'\tpost_inline_ir.functions\t'"$expected_functions" \

@@ -104,9 +104,8 @@ target/debug/ccc --emit=codegen-stats -O2 path/to/input.c
 Cranelift's optimization and machine-code pipeline. In schema version 2,
 `post_inline_ir.values` counts block parameters plus instruction results
 reachable through the final layout; detached data-flow-graph entities are not
-reported. The
-`primary_object.*` rows count disjoint logical section sizes, symbols, and
-relocations in CCC's primary relocatable object. Generated assembly bridge
+reported. The `primary_object.*` rows count disjoint logical section sizes,
+symbols, and relocations in CCC's primary relocatable object. Generated assembly bridge
 units are deliberately excluded from that primary-object view; benchmark
 runners which care about packaged output must inspect the final `-c` artifact
 as C-Ray does. The schema starts with `schema_version` and retains a stable row
@@ -364,12 +363,14 @@ benchmarks/codegen/test-run.sh
 ## Defined-behavior kernel benchmarks
 
 The executable kernel runner is separate from the compiler-only suite. Its
-current scalar, control-flow, and memory slice performs fixed-work direct-call,
-unsigned-integer, binary32/binary64, branch/switch, indexed load/store, and
-32-byte aggregate-copy workloads. Every case validates its exact result. The
-direct-call case additionally records whether its leaf call remains in the
-post-inlining CLIF at `-O0`, `-O2`, and `-Oz`; the other five contain one
-source function and no calls. Run a quick native correctness check with:
+nine fixed-work cases cover direct calls, unsigned integers,
+binary32/binary64, branch/switch control flow, indexed load/store traffic,
+32-byte aggregate copies, TLS access, C11 atomic read-modify-write operations,
+and a variadic definition plus caller. Every case validates its exact result.
+The direct-call case records whether its leaf call remains in the
+post-inlining CLIF at `-O0`, `-O2`, and `-Oz`; TLS records the expected
+target-accessor calls, while the variadic case retains two functions and one
+call at every profile. Run a quick native correctness check with:
 
 ```sh
 benchmarks/kernels/run.py \
@@ -423,8 +424,8 @@ benchmarks/kernels/test-run.sh
 ```
 
 Only this fake-tool regression is in the fast CI job in the initial slice.
-All-target correctness execution and the remaining TLS, atomic, and variadic
-kernels remain follow-up work. QEMU results will be correctness and rough-trend
+All-target correctness execution and controlled native runtime baselines
+remain follow-up work. QEMU results will be correctness and rough-trend
 evidence, never native performance evidence.
 
 ## C-Ray generated-code benchmark

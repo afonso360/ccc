@@ -83,3 +83,45 @@ expected_post_inline_functions = 1
 O0 = 0
 O2 = 0
 Oz = 0
+
+[[case]]
+name = "tls-access"
+family = "thread-local-storage"
+source = "cases/tls-access.c"
+work_unit = "thread-local-update"
+work_count = 1000000
+expected_result = "0x19138677"
+expected_post_inline_functions = 1
+
+[case.expected_post_inline_calls]
+O0 = 4
+O2 = 2
+Oz = 2
+
+[[case]]
+name = "atomic-rmw"
+family = "c11-atomics"
+source = "cases/atomic-rmw.c"
+work_unit = "atomic-operation"
+work_count = 4000000
+expected_result = "0xf133366f"
+expected_post_inline_functions = 1
+
+[case.expected_post_inline_calls]
+O0 = 0
+O2 = 0
+Oz = 0
+
+[[case]]
+name = "variadic-call"
+family = "variadic-abi"
+source = "cases/variadic-call.c"
+work_unit = "variadic-call"
+work_count = 1000000
+expected_result = "0xb4ceb671"
+expected_post_inline_functions = 2
+
+[case.expected_post_inline_calls]
+O0 = 1
+O2 = 1
+Oz = 1

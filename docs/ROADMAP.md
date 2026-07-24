@@ -151,14 +151,14 @@ structural-stat query is separate and untimed.
 
 The current executable slice and next benchmark targets are:
 
-- The first six focused, defined-behavior kernels are checked in: fixed-work
+- The compact nine-case defined-behavior suite is checked in: fixed-work
   direct-call/inlining, unsigned-integer, exact binary32/binary64,
-  branch/switch, indexed load/store, and 32-byte aggregate-copy workloads all
-  validate their results and run through separate object-only, correctness,
-  and native-performance modes. Their versioned evidence keeps compiler-side
-  primary-object statistics distinct from final packaged objects. Complete
-  the compact suite with TLS, atomics, and variadic calls; every added kernel
-  must retain a fixed work count and self-validation.
+  branch/switch, indexed load/store, 32-byte aggregate-copy, TLS, C11 atomic,
+  and variadic-call workloads all self-validate. They run through separate
+  object-only, correctness, and native-performance modes, and their versioned
+  evidence keeps compiler-side primary-object statistics distinct from final
+  packaged objects. Establish controlled native baselines and extend
+  cross-target correctness execution next.
 - Independent block-count, live-SSA-value, referenced-global, and
   string-literal scaling now joins the declaration and live-function axes.
   Each family rejects dead fixtures and superlinear structural growth. Add
@@ -171,9 +171,9 @@ The current executable slice and next benchmark targets are:
 - Add CCC frontend and Cranelift phase timing to C-Ray. Its result schema now
   includes post-inlining CLIF instruction, block, live-value, call, stack-slot,
   signature, external-reference, and global-value counts plus parsed
-  final-object section sizes. The correctness and performance profiles also retain whole
-  compile/link/render timing, CPU, peak-memory, file-size, command, image-hash,
-  and exact same-host reference evidence.
+  final-object section sizes. The correctness and performance profiles also
+  retain whole compile/link/render timing, CPU, peak-memory, file-size, command,
+  image-hash, and exact same-host reference evidence.
 
 Run IR and object-size measurements for every enabled target. Runtime
 comparisons are native-target evidence; QEMU runs remain correctness and rough
