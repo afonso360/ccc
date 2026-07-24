@@ -6,25 +6,22 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use object::read::{Object as _, ObjectSection as _, ObjectSymbol as _};
 use object::{RelocationTarget, SectionFlags, SymbolScope};
 
-static TEST_ID: AtomicU64 = AtomicU64::new(0);
+mod support;
 
-fn test_directory(name: &str, compiler: &str, optimization: &str) -> PathBuf {
-    let directory = std::env::temp_dir().join(format!(
-        "ccc-sysv-amd64-{}-{}-{name}-{compiler}-{}",
-        std::process::id(),
-        TEST_ID.fetch_add(1, Ordering::Relaxed),
-        optimization.trim_start_matches('-')
-    ));
-    let _ = fs::remove_dir_all(&directory);
-    fs::create_dir_all(&directory).unwrap();
-    directory
+use support::TestWorkspace;
+
+fn test_workspace(name: &str, compiler: &str, optimization: &str) -> TestWorkspace {
+    TestWorkspace::new(
+        "sysv-amd64",
+        &format!("{name}-{compiler}-{}", optimization.trim_start_matches('-')),
+    )
+    .retain_on_failure()
 }
 
 #[test]
@@ -279,13 +276,13 @@ int main(void) {
 "#;
 
     for (compiler, optimization) in reference_configurations() {
-        let directory = test_directory("wide-integers", compiler, optimization);
-        let callee = write(&directory, "callee.c", CALLEE);
-        let caller = write(&directory, "caller.c", CALLER);
+        let workspace = test_workspace("wide-integers", compiler, optimization);
+        let callee = workspace.write("callee.c", CALLEE);
+        let caller = workspace.write("caller.c", CALLER);
         let compatibility_flags = reference_compatibility_flags(compiler);
 
-        let ccc_callee = directory.join("ccc-callee.o");
-        let reference_caller = directory.join("reference-caller.o");
+        let ccc_callee = workspace.join("ccc-callee.o");
+        let reference_caller = workspace.join("reference-caller.o");
         compile_ccc_optimized_with_args(
             compiler,
             optimization,
@@ -304,10 +301,14 @@ int main(void) {
             &reference_caller,
             &compatibility_flags,
         );
-        link_and_run(compiler, &directory, &[&ccc_callee, &reference_caller]);
+        link_and_run(
+            compiler,
+            workspace.path(),
+            &[&ccc_callee, &reference_caller],
+        );
 
-        let reference_callee = directory.join("reference-callee.o");
-        let ccc_caller = directory.join("ccc-caller.o");
+        let reference_callee = workspace.join("reference-callee.o");
+        let ccc_caller = workspace.join("ccc-caller.o");
         compile_reference_with_args(
             compiler,
             optimization,
@@ -322,17 +323,18 @@ int main(void) {
             &ccc_caller,
             &compatibility_flags,
         );
-        link_and_run(compiler, &directory, &[&reference_callee, &ccc_caller]);
-
-        fs::remove_dir_all(directory).unwrap();
+        link_and_run(
+            compiler,
+            workspace.path(),
+            &[&reference_callee, &ccc_caller],
+        );
     }
 }
 
 #[test]
 fn wide_integer_abi_dump_records_exact_pair_rollback_placement() {
-    let directory = test_directory("wide-abi-dump", "gcc", "-O0");
-    let source = write(
-        &directory,
+    let workspace = test_workspace("wide-abi-dump", "gcc", "-O0");
+    let source = workspace.write(
         "wide-abi.c",
         "typedef unsigned __int128 u128;\n\
          u128 pressure(long a, long b, long c, long d, long e, u128 value, long tail) {\n\
@@ -365,13 +367,6 @@ fn wide_integer_abi_dump_records_exact_pair_rollback_placement() {
     ] {
         assert_eq!(dump.matches(exact).count(), 2, "{exact}\n{dump}");
     }
-    fs::remove_dir_all(directory).unwrap();
-}
-
-fn write(directory: &Path, name: &str, contents: &str) -> PathBuf {
-    let path = directory.join(name);
-    fs::write(&path, contents).unwrap();
-    path
 }
 
 fn run(command: &mut Command) -> Output {
@@ -430,10 +425,7 @@ fn reference_compatibility_flags(compiler: &str) -> Vec<&'static str> {
 }
 
 fn compile_ccc(compiler: &str, source: &Path, object: &Path) {
-    let staging_directory = object.parent().unwrap().join(format!(
-        "ccc-stage-{}",
-        TEST_ID.fetch_add(1, Ordering::Relaxed)
-    ));
+    let staging_directory = object.with_extension("ccc-stage");
     fs::create_dir(&staging_directory).unwrap();
     let staged_object = staging_directory.join("translation-unit.o");
     run(Command::new(env!("CARGO_BIN_EXE_ccc"))
@@ -443,7 +435,6 @@ fn compile_ccc(compiler: &str, source: &Path, object: &Path) {
         .arg("-o")
         .arg(&staged_object));
     fs::rename(&staged_object, object).unwrap();
-    fs::remove_dir_all(&staging_directory).unwrap();
 }
 
 fn compile_ccc_optimized_with_args(
@@ -453,10 +444,7 @@ fn compile_ccc_optimized_with_args(
     object: &Path,
     extra_arguments: &[&str],
 ) {
-    let staging_directory = object.parent().unwrap().join(format!(
-        "ccc-stage-{}",
-        TEST_ID.fetch_add(1, Ordering::Relaxed)
-    ));
+    let staging_directory = object.with_extension("ccc-stage");
     fs::create_dir(&staging_directory).unwrap();
     let staged_object = staging_directory.join("translation-unit.o");
     run(Command::new(env!("CARGO_BIN_EXE_ccc"))
@@ -468,7 +456,6 @@ fn compile_ccc_optimized_with_args(
         .arg("-o")
         .arg(&staged_object));
     fs::rename(&staged_object, object).unwrap();
-    fs::remove_dir_all(&staging_directory).unwrap();
 }
 
 fn compile_reference(compiler: &str, optimization: &str, source: &Path, object: &Path) {
@@ -799,19 +786,16 @@ fn deterministic_classifier_corpus_cross_links_with_gcc_and_clang() {
                 .or_default()
                 .extend(cases.iter().map(|(index, _)| *index));
 
-            let directory = test_directory("classifier-corpus", compiler, optimization);
+            let directory = test_workspace("classifier-corpus", compiler, optimization);
             let ccc_caller_source =
                 corpus_caller(&cases, "reference_corpus", "ccc_corpus_entry", false);
             let mut reference_callee_source = corpus_definitions(&cases, "reference_corpus");
             reference_callee_source.push_str(
                 "int ccc_corpus_entry(void);\nint main(void) { return ccc_corpus_entry(); }\n",
             );
-            let ccc_caller = write(&directory, "ccc-corpus-caller.c", &ccc_caller_source);
-            let reference_callee = write(
-                &directory,
-                "reference-corpus-callee.c",
-                &reference_callee_source,
-            );
+            let ccc_caller = directory.write("ccc-corpus-caller.c", &ccc_caller_source);
+            let reference_callee =
+                directory.write("reference-corpus-callee.c", &reference_callee_source);
             let ccc_caller_object = directory.join("ccc-corpus-caller.o");
             let reference_callee_object = directory.join("reference-corpus-callee.o");
             compile_ccc(compiler, &ccc_caller, &ccc_caller_object);
@@ -823,7 +807,7 @@ fn deterministic_classifier_corpus_cross_links_with_gcc_and_clang() {
             );
             let output = link_and_run(
                 compiler,
-                &directory,
+                directory.path(),
                 &[&ccc_caller_object, &reference_callee_object],
             );
             assert!(output.stdout.is_empty());
@@ -832,12 +816,9 @@ fn deterministic_classifier_corpus_cross_links_with_gcc_and_clang() {
             let ccc_callee_source = corpus_definitions(&cases, "ccc_corpus");
             let reference_caller_source =
                 corpus_caller(&cases, "ccc_corpus", "reference_corpus_entry", true);
-            let ccc_callee = write(&directory, "ccc-corpus-callee.c", &ccc_callee_source);
-            let reference_caller = write(
-                &directory,
-                "reference-corpus-caller.c",
-                &reference_caller_source,
-            );
+            let ccc_callee = directory.write("ccc-corpus-callee.c", &ccc_callee_source);
+            let reference_caller =
+                directory.write("reference-corpus-caller.c", &reference_caller_source);
             let ccc_callee_object = directory.join("ccc-corpus-callee.o");
             let reference_caller_object = directory.join("reference-corpus-caller.o");
             compile_ccc(compiler, &ccc_callee, &ccc_callee_object);
@@ -849,12 +830,11 @@ fn deterministic_classifier_corpus_cross_links_with_gcc_and_clang() {
             );
             let output = link_and_run(
                 compiler,
-                &directory,
+                directory.path(),
                 &[&ccc_callee_object, &reference_caller_object],
             );
             assert!(output.stdout.is_empty());
             assert!(output.stderr.is_empty());
-            fs::remove_dir_all(directory).unwrap();
         }
     }
 
@@ -1095,17 +1075,20 @@ int main(void) {
 "#;
 
         for (compiler, optimization) in reference_configurations() {
-            let directory = test_directory("fixed-shapes", compiler, optimization);
-            let ccc_source = write(&directory, "ccc-shapes.c", CCC_SOURCE);
-            let reference_source = write(&directory, "reference-shapes.c", REFERENCE_SOURCE);
+            let directory = test_workspace("fixed-shapes", compiler, optimization);
+            let ccc_source = directory.write("ccc-shapes.c", CCC_SOURCE);
+            let reference_source = directory.write("reference-shapes.c", REFERENCE_SOURCE);
             let ccc_object = directory.join("ccc-shapes.o");
             let reference_object = directory.join("reference-shapes.o");
             compile_ccc(compiler, &ccc_source, &ccc_object);
             compile_reference(compiler, optimization, &reference_source, &reference_object);
-            let output = link_and_run(compiler, &directory, &[&ccc_object, &reference_object]);
+            let output = link_and_run(
+                compiler,
+                directory.path(),
+                &[&ccc_object, &reference_object],
+            );
             assert!(output.stdout.is_empty());
             assert!(output.stderr.is_empty());
-            fs::remove_dir_all(directory).unwrap();
         }
     }
     const REFERENCE_CALLEE: &str = r#"
@@ -1167,9 +1150,9 @@ int main(void) {
 "#;
 
     for (compiler, optimization) in reference_configurations() {
-        let directory = test_directory("fixed", compiler, optimization);
-        let ccc_caller = write(&directory, "ccc-caller.c", CCC_CALLER);
-        let reference_callee = write(&directory, "reference-callee.c", REFERENCE_CALLEE);
+        let directory = test_workspace("fixed", compiler, optimization);
+        let ccc_caller = directory.write("ccc-caller.c", CCC_CALLER);
+        let reference_callee = directory.write("reference-callee.c", REFERENCE_CALLEE);
         let ccc_caller_o = directory.join("ccc-caller.o");
         let reference_callee_o = directory.join("reference-callee.o");
         compile_ccc(compiler, &ccc_caller, &ccc_caller_o);
@@ -1179,10 +1162,14 @@ int main(void) {
             &reference_callee,
             &reference_callee_o,
         );
-        link_and_run(compiler, &directory, &[&ccc_caller_o, &reference_callee_o]);
+        link_and_run(
+            compiler,
+            directory.path(),
+            &[&ccc_caller_o, &reference_callee_o],
+        );
 
-        let ccc_callee = write(&directory, "ccc-callee.c", CCC_CALLEE);
-        let reference_caller = write(&directory, "reference-caller.c", REFERENCE_CALLER);
+        let ccc_callee = directory.write("ccc-callee.c", CCC_CALLEE);
+        let reference_caller = directory.write("reference-caller.c", REFERENCE_CALLER);
         let ccc_callee_o = directory.join("ccc-callee.o");
         let reference_caller_o = directory.join("reference-caller.o");
         compile_ccc(compiler, &ccc_callee, &ccc_callee_o);
@@ -1192,8 +1179,11 @@ int main(void) {
             &reference_caller,
             &reference_caller_o,
         );
-        link_and_run(compiler, &directory, &[&ccc_callee_o, &reference_caller_o]);
-        fs::remove_dir_all(directory).unwrap();
+        link_and_run(
+            compiler,
+            directory.path(),
+            &[&ccc_callee_o, &reference_caller_o],
+        );
     }
     fixed_aggregate_classifier_shapes_cross_link_in_both_directions();
 }
@@ -1262,9 +1252,9 @@ int main(void) {
 "#;
 
     for (compiler, optimization) in reference_configurations() {
-        let directory = test_directory("variadic", compiler, optimization);
-        let ccc_caller = write(&directory, "ccc-caller.c", CCC_CALLER);
-        let reference_callee = write(&directory, "reference-callee.c", REFERENCE_CALLEE);
+        let directory = test_workspace("variadic", compiler, optimization);
+        let ccc_caller = directory.write("ccc-caller.c", CCC_CALLER);
+        let reference_callee = directory.write("reference-callee.c", REFERENCE_CALLEE);
         let ccc_caller_o = directory.join("ccc-caller.o");
         let reference_callee_o = directory.join("reference-callee.o");
         compile_ccc(compiler, &ccc_caller, &ccc_caller_o);
@@ -1274,10 +1264,14 @@ int main(void) {
             &reference_callee,
             &reference_callee_o,
         );
-        link_and_run(compiler, &directory, &[&ccc_caller_o, &reference_callee_o]);
+        link_and_run(
+            compiler,
+            directory.path(),
+            &[&ccc_caller_o, &reference_callee_o],
+        );
 
-        let ccc_callee = write(&directory, "ccc-callee.c", CCC_CALLEE);
-        let reference_caller = write(&directory, "reference-caller.c", REFERENCE_CALLER);
+        let ccc_callee = directory.write("ccc-callee.c", CCC_CALLEE);
+        let reference_caller = directory.write("reference-caller.c", REFERENCE_CALLER);
         let ccc_callee_o = directory.join("ccc-callee.o");
         let reference_caller_o = directory.join("reference-caller.o");
         compile_ccc(compiler, &ccc_callee, &ccc_callee_o);
@@ -1287,8 +1281,11 @@ int main(void) {
             &reference_caller,
             &reference_caller_o,
         );
-        link_and_run(compiler, &directory, &[&ccc_callee_o, &reference_caller_o]);
-        fs::remove_dir_all(directory).unwrap();
+        link_and_run(
+            compiler,
+            directory.path(),
+            &[&ccc_callee_o, &reference_caller_o],
+        );
     }
 }
 
@@ -1380,15 +1377,18 @@ int main(void) {
 "#;
 
     for (compiler, optimization) in reference_configurations() {
-        let directory = test_directory("va-list", compiler, optimization);
-        let ccc_source = write(&directory, "ccc-source.c", CCC_SOURCE);
-        let reference_source = write(&directory, "reference-source.c", REFERENCE_SOURCE);
+        let directory = test_workspace("va-list", compiler, optimization);
+        let ccc_source = directory.write("ccc-source.c", CCC_SOURCE);
+        let reference_source = directory.write("reference-source.c", REFERENCE_SOURCE);
         let ccc_object = directory.join("ccc-source.o");
         let reference_object = directory.join("reference-source.o");
         compile_ccc(compiler, &ccc_source, &ccc_object);
         compile_reference(compiler, optimization, &reference_source, &reference_object);
-        link_and_run(compiler, &directory, &[&ccc_object, &reference_object]);
-        fs::remove_dir_all(directory).unwrap();
+        link_and_run(
+            compiler,
+            directory.path(),
+            &[&ccc_object, &reference_object],
+        );
     }
 }
 
@@ -1465,17 +1465,20 @@ int main(void) {
 "#;
 
     for (compiler, optimization) in reference_configurations() {
-        let directory = test_directory("default-promotions", compiler, optimization);
-        let ccc_source = write(&directory, "ccc-promotions.c", CCC_SOURCE);
-        let reference_source = write(&directory, "reference-promotions.c", REFERENCE_SOURCE);
+        let directory = test_workspace("default-promotions", compiler, optimization);
+        let ccc_source = directory.write("ccc-promotions.c", CCC_SOURCE);
+        let reference_source = directory.write("reference-promotions.c", REFERENCE_SOURCE);
         let ccc_object = directory.join("ccc-promotions.o");
         let reference_object = directory.join("reference-promotions.o");
         compile_ccc(compiler, &ccc_source, &ccc_object);
         compile_reference(compiler, optimization, &reference_source, &reference_object);
-        let output = link_and_run(compiler, &directory, &[&ccc_object, &reference_object]);
+        let output = link_and_run(
+            compiler,
+            directory.path(),
+            &[&ccc_object, &reference_object],
+        );
         assert!(output.stdout.is_empty());
         assert!(output.stderr.is_empty());
-        fs::remove_dir_all(directory).unwrap();
     }
 }
 
@@ -1528,17 +1531,20 @@ int main(void) {
 "#;
 
     for (compiler, optimization) in reference_configurations() {
-        let directory = test_directory("unprototyped-calls", compiler, optimization);
-        let ccc_source = write(&directory, "ccc-source.c", CCC_SOURCE);
-        let reference_source = write(&directory, "reference-source.c", REFERENCE_SOURCE);
+        let directory = test_workspace("unprototyped-calls", compiler, optimization);
+        let ccc_source = directory.write("ccc-source.c", CCC_SOURCE);
+        let reference_source = directory.write("reference-source.c", REFERENCE_SOURCE);
         let ccc_object = directory.join("ccc-source.o");
         let reference_object = directory.join("reference-source.o");
         compile_ccc(compiler, &ccc_source, &ccc_object);
         compile_reference(compiler, optimization, &reference_source, &reference_object);
-        let output = link_and_run(compiler, &directory, &[&ccc_object, &reference_object]);
+        let output = link_and_run(
+            compiler,
+            directory.path(),
+            &[&ccc_object, &reference_object],
+        );
         assert!(output.stdout.is_empty());
         assert!(output.stderr.is_empty());
-        fs::remove_dir_all(directory).unwrap();
     }
 }
 
@@ -1573,17 +1579,20 @@ int main(void) { return ccc_entry(); }
 "#;
 
     for (compiler, optimization) in reference_configurations() {
-        let directory = test_directory("al", compiler, optimization);
-        let ccc_source = write(&directory, "ccc-source.c", CCC_SOURCE);
-        let reference_source = write(&directory, "reference-source.c", REFERENCE_SOURCE);
+        let directory = test_workspace("al", compiler, optimization);
+        let ccc_source = directory.write("ccc-source.c", CCC_SOURCE);
+        let reference_source = directory.write("reference-source.c", REFERENCE_SOURCE);
         let ccc_object = directory.join("ccc-source.o");
         let reference_object = directory.join("reference-source.o");
         compile_ccc(compiler, &ccc_source, &ccc_object);
         compile_reference(compiler, optimization, &reference_source, &reference_object);
-        let output = link_and_run(compiler, &directory, &[&ccc_object, &reference_object]);
+        let output = link_and_run(
+            compiler,
+            directory.path(),
+            &[&ccc_object, &reference_object],
+        );
         assert!(output.stdout.is_empty());
         assert!(output.stderr.is_empty());
-        fs::remove_dir_all(directory).unwrap();
     }
 }
 
@@ -1806,17 +1815,20 @@ int main(void) {
 "#;
 
     for (compiler, optimization) in reference_configurations() {
-        let directory = test_directory("variadic-matrix", compiler, optimization);
-        let ccc_source = write(&directory, "ccc-matrix.c", CCC_SOURCE);
-        let reference_source = write(&directory, "reference-matrix.c", REFERENCE_SOURCE);
+        let directory = test_workspace("variadic-matrix", compiler, optimization);
+        let ccc_source = directory.write("ccc-matrix.c", CCC_SOURCE);
+        let reference_source = directory.write("reference-matrix.c", REFERENCE_SOURCE);
         let ccc_object = directory.join("ccc-matrix.o");
         let reference_object = directory.join("reference-matrix.o");
         compile_ccc(compiler, &ccc_source, &ccc_object);
         compile_reference(compiler, optimization, &reference_source, &reference_object);
-        let output = link_and_run(compiler, &directory, &[&ccc_object, &reference_object]);
+        let output = link_and_run(
+            compiler,
+            directory.path(),
+            &[&ccc_object, &reference_object],
+        );
         assert!(output.stdout.is_empty());
         assert!(output.stderr.is_empty());
-        fs::remove_dir_all(directory).unwrap();
     }
 }
 
@@ -1858,9 +1870,9 @@ int calls_reference(void) {
 }
 "#;
 
-    let directory = test_directory("object-contract", "gcc", "-O0");
-    let first_source = write(&directory, "first.c", SOURCE);
-    let second_source = write(&directory, "second.c", SOURCE);
+    let directory = test_workspace("object-contract", "gcc", "-O0");
+    let first_source = directory.write("first.c", SOURCE);
+    let second_source = directory.write("second.c", SOURCE);
     let first_object = directory.join("first.o");
     let second_object = directory.join("second.o");
 
@@ -2054,7 +2066,6 @@ int calls_reference(void) {
             "generated function {name} at {start:#x}..{end:#x} has no covering FDE:\n{frames}"
         );
     }
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -2080,22 +2091,24 @@ int exercise(void) {
 "#;
 
     for compiler in reference_compilers() {
-        let directory = test_directory("cwd-determinism", compiler, "-O0");
+        let directory = test_workspace("cwd-determinism", compiler, "-O0");
         let source_directory = directory.join("shared-source");
         let first_directory = directory.join("first-working-directory");
         let second_directory = directory.join("second-working-directory");
         for path in [&source_directory, &first_directory, &second_directory] {
             fs::create_dir(path).unwrap();
         }
-        let source = write(&source_directory, "same-input.c", SOURCE);
+        let source = directory.write("shared-source/same-input.c", SOURCE);
         let first_object = first_directory.join("artifact.o");
         let second_object = second_directory.join("artifact.o");
 
         let bridge =
             ccc_link::bridge::render_generic_call_helper("__ccc_call_helper_cwd_reproducibility")
                 .unwrap();
-        let first_bridge_source = write(&first_directory, "same-bridge.s", bridge.source());
-        let second_bridge_source = write(&second_directory, "same-bridge.s", bridge.source());
+        let first_bridge_source =
+            directory.write("first-working-directory/same-bridge.s", bridge.source());
+        let second_bridge_source =
+            directory.write("second-working-directory/same-bridge.s", bridge.source());
         let first_bridge_object = first_directory.join("same-bridge.o");
         let second_bridge_object = second_directory.join("same-bridge.o");
         for (working_directory, source, object) in [
@@ -2172,7 +2185,6 @@ int exercise(void) {
             SectionFlags::Elf { sh_flags }
                 if sh_flags & u64::from(object::elf::SHF_EXECINSTR) != 0
         ));
-        fs::remove_dir_all(directory).unwrap();
     }
 }
 
@@ -2265,9 +2277,9 @@ int main(int argc, char **argv) {
 "#;
 
     for (compiler, optimization) in reference_configurations() {
-        let directory = test_directory("libgcc-unwind", compiler, optimization);
-        let ccc_source = write(&directory, "ccc-unwind.c", CCC_SOURCE);
-        let reference_source = write(&directory, "reference-unwind.c", REFERENCE_SOURCE);
+        let directory = test_workspace("libgcc-unwind", compiler, optimization);
+        let ccc_source = directory.write("ccc-unwind.c", CCC_SOURCE);
+        let reference_source = directory.write("reference-unwind.c", REFERENCE_SOURCE);
         let ccc_object = directory.join("ccc-unwind.o");
         let reference_object = directory.join("reference-unwind.o");
         compile_ccc(compiler, &ccc_source, &ccc_object);
@@ -2313,7 +2325,6 @@ int main(int argc, char **argv) {
             .arg(format!("{main_address:x}")));
         assert!(output.stdout.is_empty());
         assert!(output.stderr.is_empty());
-        fs::remove_dir_all(directory).unwrap();
     }
 }
 
@@ -2361,14 +2372,14 @@ int main(void) {
 }
 "#;
 
-    let directory = test_directory("debugger", "gcc", "-O0");
-    let ccc_source = write(&directory, "ccc-debugger.c", CCC_SOURCE);
-    let reference_source = write(&directory, "reference-debugger.c", REFERENCE_SOURCE);
+    let directory = test_workspace("debugger", "gcc", "-O0");
+    let ccc_source = directory.write("ccc-debugger.c", CCC_SOURCE);
+    let reference_source = directory.write("reference-debugger.c", REFERENCE_SOURCE);
     let ccc_object = directory.join("ccc-debugger.o");
     let reference_object = directory.join("reference-debugger.o");
     compile_ccc("gcc", &ccc_source, &ccc_object);
     compile_reference("gcc", "-O0", &reference_source, &reference_object);
-    link_and_run("gcc", &directory, &[&ccc_object, &reference_object]);
+    link_and_run("gcc", directory.path(), &[&ccc_object, &reference_object]);
     let executable = directory.join("program");
 
     let debug = |break_command: &str| {
@@ -2406,7 +2417,6 @@ int main(void) {
     assert!(call.contains("__ccc_call_helper_"), "{call}");
     assert!(call.contains("call_bridge"), "{call}");
     assert!(call.contains("main"), "{call}");
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -2526,16 +2536,19 @@ int main(void) {
 "#;
 
     for (compiler, optimization) in reference_configurations() {
-        let directory = test_directory("scalar", compiler, optimization);
-        let ccc_source = write(&directory, "ccc-scalar.c", CCC_SOURCE);
-        let reference_source = write(&directory, "reference-scalar.c", REFERENCE_SOURCE);
+        let directory = test_workspace("scalar", compiler, optimization);
+        let ccc_source = directory.write("ccc-scalar.c", CCC_SOURCE);
+        let reference_source = directory.write("reference-scalar.c", REFERENCE_SOURCE);
         let ccc_object = directory.join("ccc-scalar.o");
         let reference_object = directory.join("reference-scalar.o");
         compile_ccc(compiler, &ccc_source, &ccc_object);
         compile_reference(compiler, optimization, &reference_source, &reference_object);
-        let output = link_and_run(compiler, &directory, &[&ccc_object, &reference_object]);
+        let output = link_and_run(
+            compiler,
+            directory.path(),
+            &[&ccc_object, &reference_object],
+        );
         assert!(output.stdout.is_empty());
         assert!(output.stderr.is_empty());
-        fs::remove_dir_all(directory).unwrap();
     }
 }
