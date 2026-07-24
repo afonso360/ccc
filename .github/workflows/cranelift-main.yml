@@ -95,6 +95,7 @@ jobs:
         run: |
           cargo update -p cranelift-codegen
           python3 - <<'PY'
+          import os
           from pathlib import Path
           import re
 
@@ -112,6 +113,9 @@ jobs:
               )
 
           revision = revisions.pop()
+          Path(os.environ["RUNNER_TEMP"], "cranelift-main-revision.txt").write_text(
+              revision + "\n"
+          )
           digest_path = Path("crates/ccc-abi/src/digest.rs")
           digest = digest_path.read_text()
           digest, replacements = re.subn(
@@ -126,6 +130,14 @@ jobs:
           cargo fmt --all --check
           git diff -- Cargo.lock crates/ccc-abi/src/digest.rs \
             > "$RUNNER_TEMP/cranelift-main-candidate.patch"
+
+      - name: Capture the candidate dependency graph
+        run: >-
+          cargo tree
+          --locked
+          --workspace
+          --edges normal,build,dev
+          > "$RUNNER_TEMP/cranelift-main-cargo-tree.txt"
 
       - name: Verify the candidate dependency graph
         run: cargo test -p ccc-abi cranelift_packages_use_the_audited_backend_revision
@@ -175,6 +187,8 @@ jobs:
           name: cranelift-main-candidate-${{ matrix.oracle }}
           path: |
             ${{ runner.temp }}/cranelift-main-candidate.patch
+            ${{ runner.temp }}/cranelift-main-revision.txt
+            ${{ runner.temp }}/cranelift-main-cargo-tree.txt
             ${{ runner.temp }}/ccc-target-oracle-${{ matrix.oracle }}
             ${{ runner.temp }}/ccc-benchmark-smoke-${{ matrix.oracle }}
           if-no-files-found: ignore

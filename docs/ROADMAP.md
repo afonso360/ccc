@@ -37,8 +37,10 @@ to:
   object relocations, unwind information, debug value locations, and target
   flags before accepting each lockfile update. A newly available API is not an
   enabled CCC capability by itself.
-- Keep `cargo tree` evidence with each accepted refresh and make the smallest
-  failing target/corpus command available for upstream regression bisection.
+- The scheduled artifact now retains the exact candidate revision and complete
+  workspace `cargo tree` beside its lockfile/provenance patch, target oracles,
+  and benchmark evidence. Make the smallest failing target or corpus command
+  available for upstream regression bisection next.
 
 ## Second: broaden and measure Cranelift inlining
 
