@@ -89,8 +89,9 @@ cargo test --workspace --all-targets
 Hosted CI runs the Rust test suite natively on x86-64 Linux, AArch64 Linux, and
 AArch64 macOS. The RISC-V Rust tests are cross-compiled and run under QEMU.
 A separate x86-64 Linux job builds and runs the bounded SQLite, Lua, bzip2,
-zlib, Redis, and zstd corpus profiles. Additional AArch64 Linux, RISC-V Linux,
-and arm64 Darwin jobs run bzip2's complete target-specific corpus contract.
+zlib, Redis, and zstd corpus profiles, the codegen microbenchmark matrix, and
+the C-Ray correctness benchmark. Additional AArch64 Linux, RISC-V Linux, and
+arm64 Darwin jobs run bzip2's complete target-specific corpus contract.
 
 The complete local commands and target-specific prerequisites are in
 [Test commands and prerequisites](docs/testing.md).

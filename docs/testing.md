@@ -305,6 +305,43 @@ x86-64 profile shares the full corpus job; the other three profiles have
 dedicated target-matrix jobs and retain their object, toolchain, and execution
 evidence as artifacts.
 
+## Code-generation microbenchmarks
+
+The local compiler-only suite measures minimal return, direct `puts`, variadic
+`printf`, unused-declaration scaling, and live-function scaling without link or
+runtime noise:
+
+```sh
+cargo build --locked --release -p ccc-driver
+benchmarks/codegen/run.py \
+  --ccc target/release/ccc \
+  --output "$CCC_TEST_ROOT/codegen-benchmarks"
+```
+
+The default matrix runs `-O0`, `-O2`, and `-Oz`, with one warmup and five
+samples. It retains every versioned codegen-stat dump, per-process wall/CPU/RSS
+measurement, generated source and hash, exact command, and a comparison-ready
+`summary.tsv`. Timed samples are ordinary `-c` object builds; one separate,
+untimed structural-stat query runs for each case and optimization profile. The
+evidence also records the compiler executable hash, effective target, resource
+directory, sysroot, and selected external-tool configuration. The
+unused-declaration family requires every post-inlining CLIF metric to remain
+identical from zero through 1,024 declarations; the live-function family
+supplies increasing backend work. Use a release compiler for timing
+comparisons; debug builds are only suitable for exercising the harness. Use
+`--declaration-scales`, `--function-scales`, `--profiles`, `--warmups`, and
+`--samples` for focused investigations. See `benchmarks/codegen/README.md` for
+the complete result contract.
+
+The Linux x86-64 corpus job runs a one-sample matrix and uploads its evidence.
+That gate proves the metrics and no-unused-CLIF invariant; timing comparisons
+must use repeated runs on a controlled host. The runner's independent fake-tool
+regression is:
+
+```sh
+benchmarks/codegen/test-run.sh
+```
+
 ## C-Ray generated-code benchmark
 
 C-Ray 1.1 is a native-only benchmark with correctness checks enabled for every

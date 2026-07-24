@@ -132,23 +132,33 @@ benchmark so faster wrong code can never appear as an improvement.
 ### Benchmark set
 
 Keep the suite small enough for regular development while covering different
-sources of compiler and generated-code cost:
+sources of compiler and generated-code cost. The checked-in compiler-only
+runner now measures minimal return, separate `puts` and variadic `printf`
+calls, zero-to-1,024 unused declarations, and 8-to-128 live functions at each
+optimization level. It retains raw timing/RSS samples and the complete
+versioned codegen-stat stream, and fails when unused declarations change any
+post-inlining CLIF metric. Timed samples use ordinary object-only compilation;
+the structural-stat query is separate and untimed.
 
-- A minimal `int main(void) { return 0; }` translation establishes the fixed
-  frontend, ABI, CLIF, object, and link overhead.
-- Separate `puts("hello")` and `printf("hello\n")` programs expose direct
-  external calls, string data, relocations, and the generated variadic-call
-  protocol without mixing them together.
-- A declaration-heavy translation includes a large hosted header surface but
-  references only one function and one object. Its CLIF size must scale with
-  used declarations, not every declaration visible in the translation unit.
+The next benchmark targets are:
+
+- Make ObjectModule declarations lazy as well as CLIF references. The
+  declaration-scaling benchmark now proves that post-inlining CLIF and text
+  remain constant, but each unused `extern` still creates an undefined object
+  symbol and grows the relocatable file. Preserve visibility, weak binding,
+  assembly-label, bridge, and runtime-helper behavior while removing that
+  residual growth.
+- Add a declaration-heavy hosted-header translation which references only one
+  function and one object. Its CLIF size must match the equivalent minimal
+  declarations even when preprocessing and semantic-analysis work grows.
 - Focused, defined-behavior kernels cover direct calls, inlining, integer and
   floating loops, branches and switches, loads and stores, aggregate copies,
   TLS, atomics, and variadic calls. Each kernel validates its result and has a
   fixed work count.
-- Generated scaling cases vary function count, declarations per function,
-  block count, SSA values, globals, and string literals independently. Use
-  them to detect accidental quadratic behavior and peak-memory growth.
+- Extend generated scaling beyond the implemented declaration and live-function
+  axes to declarations per function, block count, SSA values, globals, and
+  string literals independently. Use them to detect accidental quadratic
+  behavior and peak-memory growth.
 - Whole-program measurements use the existing bzip2, zlib, and zstd adapters
   with fixed inputs. Record translation time, link time, aggregate object
   size, executable text size, and execution throughput without weakening their
@@ -314,10 +324,10 @@ performed by Cranelift merely to improve a benchmark score.
 - Extract target-neutral ABI helpers duplicated by the System V AMD64,
   AArch64, and RISC-V classifiers, while leaving each psABI classifier and its
   allocation rules independent. Snapshot ABI-plan digests before and after.
-- Expose one enabled-target catalogue from `ccc-target` and generate or check
-  the Rust test lists, corpus applicability table, scripts, and documentation
-  from it. Adding a target must not require hand-editing several unrelated
-  arrays.
+- Extend the shared enabled-target catalogue beyond the Rust backend/header
+  tests and the checked corpus-applicability catalog to scripts and
+  documentation. Adding a target must not require hand-editing several
+  unrelated arrays.
 - Extend the shared Rust integration-test support module beyond its current
   target-driver and glibc-identity helpers with RAII temporary directories,
   compiler invocations, retained failure artifacts, and command diagnostics.

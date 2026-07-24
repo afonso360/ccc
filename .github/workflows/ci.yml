@@ -47,6 +47,9 @@ jobs:
       - name: Check whitespace
         run: python3 .github/scripts/check-whitespace.py
 
+      - name: Test codegen benchmark harness
+        run: benchmarks/codegen/test-run.sh
+
   test:
     name: Rust tests (${{ matrix.name }})
     needs: quality
@@ -268,6 +271,26 @@ jobs:
 
       - name: Test zstd
         run: test-corpus/zstd/run.sh --work-dir "$RUNNER_TEMP/ccc-corpus/zstd"
+
+      - name: Build release CCC for codegen measurements
+        run: cargo build --locked --release -p ccc-driver
+
+      - name: Run codegen microbenchmarks
+        run: >-
+          benchmarks/codegen/run.py
+          --ccc "${{ github.workspace }}/target/release/ccc"
+          --output "$RUNNER_TEMP/ccc-corpus/codegen-benchmarks"
+          --profiles O0,O2,Oz --warmups 0 --samples 1
+          --declaration-scales 0,256,1024
+          --function-scales 8,32,128
+
+      - name: Upload codegen microbenchmark evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codegen-microbenchmarks-linux-x86-64
+          path: ${{ runner.temp }}/ccc-corpus/codegen-benchmarks
+          if-no-files-found: ignore
 
       - name: Run C-Ray correctness benchmark
         run: >-
