@@ -8,6 +8,7 @@ manifest="$script_directory/manifest.toml"
 measure_command="$script_directory/measure-command.py"
 validate_ppm="$script_directory/validate-ppm.py"
 summarize="$script_directory/summarize.py"
+collect_object_sections="$script_directory/collect-object-sections.py"
 
 manifest_string() {
   sed -n "s/^$1 = \"\\(.*\\)\"$/\\1/p" "$manifest"
@@ -235,7 +236,7 @@ nonnegative_integer "--warmups" "$warmups"
 positive_integer "--samples" "$samples"
 
 for tool in awk bash cmp find grep mkdir mktemp mv openssl python3 rm sed \
-  size sort tar tr uname wc; do
+  sort tar tr uname wc; do
   require_tool "$tool"
 done
 
@@ -319,6 +320,7 @@ ccc_target_arguments=("--target=$target")
 reference_target_arguments=()
 case "$target" in
   x86_64-unknown-linux-gnu)
+    section_size_tool=$(resolve_executable size)
     [[ -z "$sdk_root" ]] ||
       usage_error "--sdk-root is valid only for the Darwin arm64 profile"
     reported_reference_target=$(LC_ALL=C "$reference_cc" -dumpmachine)
@@ -326,6 +328,10 @@ case "$target" in
       die "reference compiler target is $reported_reference_target rather than x86-64 Linux GNU"
     ;;
   aarch64-apple-darwin)
+    require_tool xcrun
+    section_size_tool=$(xcrun --find llvm-size) ||
+      die "xcrun could not locate llvm-size"
+    section_size_tool=$(resolve_executable "$section_size_tool")
     reference_version=$(LC_ALL=C "$reference_cc" --version)
     [[ "$(printf '%s\n' "$reference_version" | tr '[:upper:]' '[:lower:]')" == *clang* ]] ||
       die "Darwin C-Ray reference/link driver must be Clang"
@@ -374,6 +380,8 @@ LC_ALL=C "$ccc" "${ccc_target_arguments[@]}" -dM -E -x c /dev/null \
   >"$compiler_identity_directory/ccc-macros.txt"
 LC_ALL=C "$reference_cc" --version \
   >"$compiler_identity_directory/reference-version.txt" 2>&1
+LC_ALL=C "$section_size_tool" --version \
+  >"$compiler_identity_directory/section-size-version.txt" 2>&1
 LC_ALL=C "$reference_cc" "${reference_target_arguments[@]}" -dM -E -x c /dev/null \
   >"$compiler_identity_directory/reference-macros.txt"
 printf '%s\n' "$reported_reference_target" \
@@ -434,6 +442,7 @@ archive_sha3=$(hash_file sha3-256 "$source_archive")
   printf 'byte_order=little-endian-verified\n'
   printf 'ccc=%s\n' "$ccc"
   printf 'reference_cc=%s\n' "$reference_cc"
+  printf 'section_size_tool=%s\n' "$section_size_tool"
   if [[ -n "$sdk_root" ]]; then
     printf 'sdk_root=%s\n' "$sdk_root"
     printf 'deployment_target=%s\n' "$deployment_target"
@@ -502,6 +511,19 @@ printf '%s\t%s\t%s\n' \
   "$(wc -c <"$reference_executable" | tr -d '[:space:]')" \
   >>"$artifact_sizes"
 
+object_section_arguments=()
+for label in "${labels[@]}"; do
+  object_section_arguments+=(
+    --artifact "$label" "$build_directory/$label.o"
+  )
+done
+"$collect_object_sections" \
+  --size-tool "$section_size_tool" \
+  --sections-output "$work_directory/object-sections.tsv" \
+  --totals-output "$work_directory/object-section-totals.tsv" \
+  --raw-output "$work_directory/object-sections.txt" \
+  "${object_section_arguments[@]}"
+
 : >"$work_directory/object-size.txt"
 : >"$work_directory/executable-size.txt"
 for ((index = 0; index < ${#labels[@]}; index++)); do
@@ -509,11 +531,11 @@ for ((index = 0; index < ${#labels[@]}; index++)); do
   executable=${executables[$index]}
   {
     printf '%s\n' "== $label =="
-    size "$build_directory/$label.o"
+    "$section_size_tool" "$build_directory/$label.o"
   } >>"$work_directory/object-size.txt"
   {
     printf '%s\n' "== $label =="
-    size "$executable"
+    "$section_size_tool" "$executable"
   } >>"$work_directory/executable-size.txt"
 done
 
@@ -603,6 +625,7 @@ done
 "$summarize" \
   --timings "$timings" \
   --artifacts "$artifact_sizes" \
+  --object-sections "$work_directory/object-section-totals.tsv" \
   --hashes "$output_hashes" \
   --output "$work_directory/summary.tsv"
 

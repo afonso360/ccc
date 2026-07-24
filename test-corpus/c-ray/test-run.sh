@@ -101,6 +101,68 @@ grep -Fq '"exit_status":0' "$timing_json"
 grep -Fq $'stage\tlabel\titeration\twall_seconds' "$timings"
 grep -Fq $'render-sample\tfixture\t1\t' "$timings"
 
+fake_size="$temporary_directory/fake-size"
+cat >"$fake_size" <<'EOF'
+#!/bin/sh
+if [ "$1" != "--format=sysv" ]; then
+  echo "expected --format=sysv" >&2
+  exit 2
+fi
+case "$2" in
+  fixture-darwin.o)
+    cat <<'OUTPUT'
+fixture-darwin.o  :
+section        size   addr
+__text          100      0
+__const          20    100
+__const           5    120
+__eh_frame        8    125
+__data            4    133
+__bss            16    137
+__stubs           3    153
+Total           156
+OUTPUT
+    ;;
+  fixture-elf.o)
+    cat <<'OUTPUT'
+fixture-elf.o  :
+section          size   addr
+.text              80      0
+.text.hot          10     80
+.rodata            12     90
+.data               2    102
+.bss                6    104
+.debug_info          9    110
+.eh_frame            7    119
+.comment             1    126
+Total              127
+OUTPUT
+    ;;
+  *)
+    echo "unexpected artifact: $2" >&2
+    exit 2
+    ;;
+esac
+EOF
+chmod +x "$fake_size"
+: >"$temporary_directory/fixture-darwin.o"
+: >"$temporary_directory/fixture-elf.o"
+"$script_directory/collect-object-sections.py" \
+  --size-tool "$fake_size" \
+  --sections-output "$temporary_directory/object-sections.tsv" \
+  --totals-output "$temporary_directory/object-section-totals.tsv" \
+  --raw-output "$temporary_directory/object-sections.txt" \
+  --artifact fixture-darwin "$temporary_directory/fixture-darwin.o" \
+  --artifact fixture-elf "$temporary_directory/fixture-elf.o"
+grep -Fq $'fixture-darwin\t__const\tread_only_data\t25' \
+  "$temporary_directory/object-sections.tsv"
+grep -Fq $'fixture-darwin\t100\t25\t4\t16\t8\t0\t3\t156' \
+  "$temporary_directory/object-section-totals.tsv"
+grep -Fq $'fixture-elf\t90\t12\t2\t6\t7\t9\t1\t127' \
+  "$temporary_directory/object-section-totals.tsv"
+grep -Fq '== fixture-darwin ==' \
+  "$temporary_directory/object-sections.txt"
+
 cat >"$temporary_directory/summary-timings.tsv" <<'EOF'
 stage	label	iteration	wall_seconds	user_seconds	system_seconds	peak_rss_bytes	exit_status
 compile	fixture	0	0.500000000	0.4	0.1	1024	0
@@ -113,6 +175,10 @@ cat >"$temporary_directory/artifacts.tsv" <<'EOF'
 label	object_bytes	executable_bytes
 fixture	123	456
 EOF
+cat >"$temporary_directory/summary-object-sections.tsv" <<'EOF'
+label	text_bytes	read_only_data_bytes	writable_data_bytes	bss_bytes	unwind_bytes	debug_bytes	other_bytes	total_section_bytes
+fixture	100	25	4	16	8	0	3	156
+EOF
 cat >"$temporary_directory/hashes.tsv" <<'EOF'
 label	phase	iteration	sha256
 fixture	check	0	aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
@@ -121,9 +187,12 @@ EOF
 "$script_directory/summarize.py" \
   --timings "$temporary_directory/summary-timings.tsv" \
   --artifacts "$temporary_directory/artifacts.tsv" \
+  --object-sections "$temporary_directory/summary-object-sections.tsv" \
   --hashes "$temporary_directory/hashes.tsv" \
   --output "$temporary_directory/summary.tsv"
 grep -Fq $'fixture\t0.500000000\t0.250000000\t3\t2.000000000\t1.000000000\t3.000000000' \
+  "$temporary_directory/summary.tsv"
+grep -Fq $'\t123\t100\t25\t4\t16\t8\t0\t3\t156\t456\t' \
   "$temporary_directory/summary.tsv"
 
 bash -n "$script_directory/run.sh"

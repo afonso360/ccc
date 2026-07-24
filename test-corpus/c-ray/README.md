@@ -59,7 +59,8 @@ environment with `--target`, `--reference-cc`, `--sdk-root`, and
 rejected.
 
 Required common tools are Bash, Python 3, Curl when the archive is not supplied,
-OpenSSL with SHA3-256, Tar, `size`, and the usual POSIX file/text utilities.
+OpenSSL with SHA3-256, Tar, and the usual POSIX file/text utilities. Linux uses
+GNU-compatible `size`; macOS uses the active developer toolchain's `llvm-size`.
 The compiler and reference/link driver must have libc, libm, and pthreads for
 the selected native target.
 
@@ -72,13 +73,21 @@ records:
 - sample count and median/minimum/maximum render wall time;
 - compile peak RSS and median render peak RSS;
 - object and executable byte size;
+- portable object-section totals for text, read-only data, writable data, BSS,
+  unwind metadata, debug metadata, and uncategorized sections;
 - the validated image SHA-256.
 
 `timings.tsv` and the per-command JSON files under `timings/` retain every raw
 wall, CPU, peak-RSS, exit-status, and command measurement. `commands.txt`,
-compiler identity and macro files, raw `size` output, per-run C-Ray stderr, and
-every validated output hash make a result auditable. `reference.ppm` is the
-correctness oracle retained for the run.
+compiler identity and macro files, per-run C-Ray stderr, and every validated
+output hash make a result auditable. `object-sections.tsv` retains every exact
+section name and its normalized category;
+`object-section-totals.tsv` is the machine-readable input to `summary.tsv`;
+`object-sections.txt`, `object-size.txt`, and `executable-size.txt` preserve the
+raw size-tool output. Section totals include virtual sections such as BSS, so
+they are evidence about the generated program layout rather than a replacement
+for the on-disk `object_bytes` value. `reference.ppm` is the correctness oracle
+retained for the run.
 
 Compare measurements only between runs on the same controlled native host.
 The adapter records evidence; it does not hide noise, normalize results from
