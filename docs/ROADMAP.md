@@ -12,42 +12,32 @@ The ordering below is intentional. CCC should first consume the backend version
 whose APIs it intends to use, then add whole-translation-unit optimization on
 top of that stable integration point.
 
-## First: track Cranelift `main` directly
+## First: keep Cranelift `main` integration reproducible
 
-Replace the crates.io version constraints for `cranelift-codegen`,
-`cranelift-frontend`, `cranelift-module`, and `cranelift-object` with Git
-dependencies on the
+CCC resolves `cranelift-codegen`, `cranelift-frontend`, `cranelift-module`,
+`cranelift-object`, and their transitive Cranelift crates from the
 [Wasmtime repository's `main` branch](https://github.com/bytecodealliance/wasmtime/tree/main/cranelift).
-The committed `Cargo.lock` must still pin one exact Git revision so ordinary
-and release builds remain reproducible.
+The committed `Cargo.lock` pins one exact revision, the ABI configuration key
+records that revision as backend provenance, and a lockfile test rejects mixed
+Cranelift sources or revisions. [ADR-0008](adr/0008-pin-cranelift.md) defines
+the reproducibility and single-owner unwind policy.
 
-The change must include all of the following:
+The scheduled compatibility workflow refreshes an ephemeral candidate lockfile,
+synchronizes candidate provenance, and tests upstream head without modifying
+normal builds. The remaining integration work is to:
 
-- Supersede the exact-release-source decision in
-  [ADR-0008](adr/0008-pin-cranelift.md) while retaining its isolated-update and
-  correctness-gate requirements. Tracking the branch changes the source of
-  updates, not the requirement for bisectable lockfile commits.
-- Resolve every Cranelift crate, including transitive Cranelift crates, from one
-  Wasmtime revision. Reject mixed registry/Git or mixed-revision graphs in CI.
-- Replace the backend version text embedded in the ABI configuration key with
-  one audited backend-provenance value that matches the locked Git revision.
-  Keep that value in one place rather than repeating it in code and documents.
 - Put the small amount of unstable upstream API use behind a codegen adapter so
   routine upstream changes do not spread through ABI planning, object
   packaging, DWARF emission, and tests.
-- Audit changes to signatures, legalizations, atomics, object relocations,
-  unwind information, debug value locations, and target flags before accepting
-  each lockfile update. A newly available API is not an enabled CCC capability
-  by itself.
-- Add a scheduled lockfile-refresh job that tests the current upstream head and
-  reports breakage without silently changing normal builds.
-- Document how to update, bisect, and temporarily roll back the locked
-  revision.
-
-This work is complete when `cargo tree` shows a single Cranelift Git revision
-and the workspace tests, all target oracles, debugger checks, ABI cross-links,
-adapter regressions, Csmith profiles, and real-code corpus gates pass with
-`--locked`.
+- Extend the scheduled candidate from the native workspace suite and target
+  oracle to the remaining target oracles, debugger checks, ABI cross-links,
+  Csmith profiles, and real-code corpus gates.
+- Audit changes to signatures, legalization and verification order, atomics,
+  object relocations, unwind information, debug value locations, and target
+  flags before accepting each lockfile update. A newly available API is not an
+  enabled CCC capability by itself.
+- Keep `cargo tree` evidence with each accepted refresh and make the smallest
+  failing target/corpus command available for upstream regression bisection.
 
 ## Second: enable Cranelift inlining
 
@@ -64,11 +54,15 @@ proof that each selected call is safe.
 - Lower all function definitions to CLIF before compiling any one function.
   Build a deterministic map from a caller's direct `FuncRef` to its
   translation-unit-local definition.
-- Legalize and verify every candidate callee before returning it from the
-  `Inline` implementation. Require the callee body to have exactly the
-  signature referenced by the call site and no remaining `global_value`
-  instructions. Keep legalized bodies local to one target/configuration
-  invocation; never reuse them across ISA or codegen settings.
+- Establish and test the candidate-preparation order before implementing the
+  policy. The current `Inline` documentation still requires legalized callees
+  even though the pinned API no longer exposes `Context::legalize`; resolve
+  that upstream contract rather than guessing. Verify every candidate and
+  require exactly the signature referenced by the call site. The current
+  inliner remaps global values, memory flags, and alias regions, so do not add a
+  blanket rejection for those entities. Keep prepared bodies local to one
+  target/configuration invocation; never reuse them across ISA or codegen
+  settings.
 - Run inlining before the caller's normal Cranelift optimization and machine
   lowering, then let Cranelift simplify the resulting CFG and values.
 - Keep generated ABI bridges, imported functions, indirect calls, patchable
@@ -151,6 +145,22 @@ sources of compiler and generated-code cost:
   with fixed inputs. Record translation time, link time, aggregate object
   size, executable text size, and execution throughput without weakening their
   correctness contracts.
+- Add the classic
+  [C-Ray 1.1](https://github.com/jtsiomb/c-ray/tree/a1bb24ba76b556565e46ec9327a3029f5b7f284e)
+  ray tracer as an explicit generated-code benchmark. Fetch the official
+  release archive by its SHA-256
+  `6f507aae47a9367334b8cb50f50eb4ad0f6fef99aeae9f2f7d55ba9818e798bf`
+  and retain its GPL-2.0-or-later notice in the corpus cache rather than
+  vendoring it into compiler crates. Build the unmodified `c-ray-mt.c` with
+  strict floating-point behavior and the verified target byte-order definition,
+  linking only libc, libm, and pthreads.
+- Use C-Ray's `scene` with `-t 1 -r 1 -s 320x240` as the fast correctness
+  profile and `sphfract` with `-t 1 -r 1 -s 800x600` as the scheduled
+  performance profile. Require a valid `P6` image, byte-identical CCC output
+  across `-O0`, `-O2`, and `-Oz`, and same-host agreement with a strict-FP GCC
+  or Clang reference before accepting timings. Record frontend and Cranelift
+  time, peak memory, CLIF instruction/block/stack-slot counts, executable text
+  size, and median render time with raw samples.
 
 Run IR and object-size measurements for every enabled target. Runtime
 comparisons are native-target evidence; QEMU runs remain correctness and rough
@@ -208,6 +218,10 @@ trend evidence and must not be compared numerically with native execution.
   reference text size on the scalar integer, branch, call, and memory kernels.
   Track vectorization-dependent cases separately until CCC has an explicit
   vectorization strategy.
+- Apply the suite-wide 5% regression limit to C-Ray compile time, text size,
+  and render time after its first stable baseline. Bring CCC `-O2` within 1.5
+  times the faster same-host strict-FP GCC/Clang render time and within 1.25
+  times the smaller reference text size before tightening the runtime target.
 
 Publish benchmark summaries for pull requests without making noisy shared
 runners authoritative. A scheduled run on pinned hardware owns regression
