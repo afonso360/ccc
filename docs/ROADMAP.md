@@ -29,9 +29,9 @@ normal builds. The remaining integration work is to:
 - Put the small amount of unstable upstream API use behind a codegen adapter so
   routine upstream changes do not spread through ABI planning, object
   packaging, DWARF emission, and tests.
-- Extend the scheduled candidate from the native workspace suite and target
-  oracle to the remaining target oracles, debugger checks, ABI cross-links,
-  Csmith profiles, and real-code corpus gates.
+- Extend the scheduled candidate beyond the workspace suite and all target
+  oracles to dedicated debugger checks, ABI cross-links, Csmith profiles, and
+  real-code corpus gates.
 - Audit changes to signatures, legalization and verification order, atomics,
   object relocations, unwind information, debug value locations, and target
   flags before accepting each lockfile update. A newly available API is not an

@@ -10,20 +10,81 @@ permissions:
 
 jobs:
   upstream-main:
-    name: Test current upstream head
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    name: Test current upstream head (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86-64
+            runner: ubuntu-24.04
+            packages: >-
+              binutils build-essential clang coreutils gdb libc-bin procps
+            rust_target: ""
+            qemu: false
+            oracle: x86_64-linux
+            ccc_bin: target/debug/ccc
+          - name: Linux AArch64
+            runner: ubuntu-24.04-arm
+            packages: >-
+              binutils binutils-aarch64-linux-gnu build-essential clang
+              coreutils gdb gcc-aarch64-linux-gnu libc-bin procps
+            rust_target: ""
+            qemu: false
+            oracle: aarch64-linux
+            ccc_bin: target/debug/ccc
+          - name: Linux RISC-V64 under QEMU
+            runner: ubuntu-24.04
+            packages: >-
+              binutils-riscv64-linux-gnu build-essential coreutils
+              gcc-riscv64-linux-gnu gdb-multiarch libc-bin
+              libc6-dev-riscv64-cross procps qemu-user qemu-user-binfmt
+            rust_target: riscv64gc-unknown-linux-gnu
+            qemu: true
+            oracle: riscv64-linux
+            ccc_bin: target/riscv64gc-unknown-linux-gnu/debug/ccc
+          - name: macOS AArch64
+            runner: macos-26
+            packages: ""
+            rust_target: ""
+            qemu: false
+            oracle: darwin-arm64
+            ccc_bin: target/debug/ccc
 
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install test dependencies
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends \
-            binutils build-essential clang coreutils gdb libc-bin procps
+          sudo apt-get install --yes --no-install-recommends ${{ matrix.packages }}
 
       - uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Install cross-compilation target
+        if: matrix.rust_target != ''
+        run: rustup target add ${{ matrix.rust_target }}
+
+      - name: Configure RISC-V QEMU
+        if: matrix.qemu
+        run: |
+          echo 'CARGO_BUILD_TARGET=riscv64gc-unknown-linux-gnu' >> "$GITHUB_ENV"
+          echo 'CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER=riscv64-linux-gnu-gcc' >> "$GITHUB_ENV"
+          echo 'CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_RUNNER=qemu-riscv64 -L /usr/riscv64-linux-gnu' >> "$GITHUB_ENV"
+          echo 'CARGO_PROFILE_DEV_OPT_LEVEL=2' >> "$GITHUB_ENV"
+          echo 'CCC_CC=riscv64-linux-gnu-gcc' >> "$GITHUB_ENV"
+          echo 'QEMU_LD_PREFIX=/usr/riscv64-linux-gnu' >> "$GITHUB_ENV"
+
+      - name: Verify RISC-V QEMU
+        if: matrix.qemu
+        run: |
+          sudo systemctl restart systemd-binfmt.service
+          grep -q '^enabled' /proc/sys/fs/binfmt_misc/qemu-riscv64
+          printf '%s\n' 'int main(void) { return 0; }' > "$RUNNER_TEMP/qemu-smoke.c"
+          riscv64-linux-gnu-gcc "$RUNNER_TEMP/qemu-smoke.c" -o "$RUNNER_TEMP/qemu-smoke"
+          "$RUNNER_TEMP/qemu-smoke"
 
       - name: Refresh the candidate lockfile and provenance
         run: |
@@ -67,19 +128,19 @@ jobs:
       - name: Test the workspace
         run: cargo test --workspace --all-targets
 
-      - name: Run the native target oracle
+      - name: Run the target oracle
         env:
-          CCC_BIN: ${{ github.workspace }}/target/debug/ccc
+          CCC_BIN: ${{ github.workspace }}/${{ matrix.ccc_bin }}
           CCC_REQUIRE_TARGET_ORACLE: "1"
-          CCC_TARGET_ORACLE_ARTIFACTS: ${{ runner.temp }}/ccc-target-oracle-x86_64-linux
-        run: tests/target-oracle/run.sh x86_64-linux
+          CCC_TARGET_ORACLE_ARTIFACTS: ${{ runner.temp }}/ccc-target-oracle-${{ matrix.oracle }}
+        run: tests/target-oracle/run.sh ${{ matrix.oracle }}
 
       - name: Upload the candidate and oracle evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cranelift-main-candidate
+          name: cranelift-main-candidate-${{ matrix.oracle }}
           path: |
             ${{ runner.temp }}/cranelift-main-candidate.patch
-            ${{ runner.temp }}/ccc-target-oracle-x86_64-linux
+            ${{ runner.temp }}/ccc-target-oracle-${{ matrix.oracle }}
           if-no-files-found: ignore
