@@ -85,13 +85,13 @@ compiler identity and macro files, per-run C-Ray stderr, and every validated
 output hash make a result auditable. `object-sections.tsv` retains every exact
 section name and its normalized category;
 `object-section-totals.tsv` is the machine-readable input to `summary.tsv`;
-`object-sections.txt`, `object-size.txt`, and `executable-size.txt` preserve the
-raw size-tool output. `codegen-stats.tsv` retains CCC's complete versioned
-compiler-side metric set, while each profile's original key/value dump remains
-under `tool-output/`. Section totals include virtual sections such as BSS, so
-they are evidence about the generated program layout rather than a replacement
-for the on-disk `object_bytes` value. The strict-FP reference has no CLIF
-columns. `reference.ppm` is the correctness oracle retained for the run.
+`object-sections.txt` and `executable-size.txt` preserve the raw size-tool
+output. `codegen-stats.tsv` retains CCC's complete versioned compiler-side
+metric set, while each profile's original key/value dump remains under
+`tool-output/`. Section totals include virtual sections such as BSS, so they
+are evidence about the generated program layout rather than a replacement for
+the on-disk `object_bytes` value. The strict-FP reference has no CLIF columns.
+`reference.ppm` is the correctness oracle retained for the run.
 
 Compare measurements only between runs on the same controlled native host.
 The adapter records evidence; it does not hide noise, normalize results from

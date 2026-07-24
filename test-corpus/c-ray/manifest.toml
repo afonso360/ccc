@@ -60,7 +60,6 @@ run = [
     "object-section-totals.tsv",
     "object-sections.tsv",
     "object-sections.txt",
-    "object-size.txt",
     "output-sha256.tsv",
     "reference.ppm",
     "run-config.txt",

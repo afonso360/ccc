@@ -547,15 +547,10 @@ done
   --raw-output "$work_directory/object-sections.txt" \
   "${object_section_arguments[@]}"
 
-: >"$work_directory/object-size.txt"
 : >"$work_directory/executable-size.txt"
 for ((index = 0; index < ${#labels[@]}; index++)); do
   label=${labels[$index]}
   executable=${executables[$index]}
-  {
-    printf '%s\n' "== $label =="
-    "$section_size_tool" "$build_directory/$label.o"
-  } >>"$work_directory/object-size.txt"
   {
     printf '%s\n' "== $label =="
     "$section_size_tool" "$executable"
