@@ -41,6 +41,9 @@ jobs:
           git ls-files -z -- '*.sh' |
             xargs -0 shellcheck --severity=warning --exclude=SC2034,SC2154
 
+      - name: Test target-oracle case plans
+        run: tests/target-oracle/test-case-plan.sh
+
       - name: Check Markdown links
         run: python3 .github/scripts/check-markdown-links.py
 

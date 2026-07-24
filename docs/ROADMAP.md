@@ -373,6 +373,8 @@ performed by Cranelift merely to improve a benchmark score.
 - Factor the common audited compiler-wrapper mechanics used by the bzip2,
   Redis, SQLite, and zstd adapters into a shared tested tool with
   corpus-specific policy hooks.
-- Split the large target-oracle and corpus shell runners into shared libraries
-  plus target/corpus entry points. Derive executed-case totals from declared
-  cases instead of maintaining numeric totals beside the tests.
+- The target oracle now validates every completed case against a declarative,
+  per-target case plan, and the fast quality job proves that skipped, reordered,
+  missing, and extra cases fail with the exact plan position. Continue splitting
+  the large target-oracle and corpus shell runners into shared libraries plus
+  target/corpus entry points.

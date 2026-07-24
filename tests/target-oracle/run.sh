@@ -13,6 +13,8 @@ fi
 target_name=$1
 root=$(cd "$(dirname "$0")/../.." && pwd)
 fixtures=$root/tests/target-oracle
+# shellcheck disable=SC1091
+source "$fixtures/case-plan.sh"
 ccc_bin=${CCC_BIN:-$root/target/debug/ccc}
 artifact_dir=${CCC_TARGET_ORACLE_ARTIFACTS:-${TMPDIR:-/tmp}/ccc-target-oracle-$target_name}
 mkdir -p "$artifact_dir"
@@ -30,6 +32,7 @@ trap 'show_log_on_failure "$?"' EXIT
 
 case_count=0
 pass() {
+    target_oracle_expect_case "$case_count" "$1"
     case_count=$((case_count + 1))
     printf 'PASS [%02d] %s\n' "$case_count" "$1"
 }
@@ -159,6 +162,7 @@ case $target_name in
         ;;
 esac
 
+target_oracle_build_case_plan "$target_name"
 require_tool "$reference_driver"
 
 if [[ $platform == elf ]]; then
@@ -834,17 +838,7 @@ else
 fi
 pass "debugger stops in the variadic entry and generated call helper with caller frames"
 
-if [[ $target_name == x86_64-linux ]]; then
-    expected_cases=36
-elif [[ $platform == elf ]]; then
-    expected_cases=38
-else
-    expected_cases=33
-fi
-if (( case_count != expected_cases )); then
-    echo "target oracle ran $case_count cases; expected exactly $expected_cases" >&2
-    exit 1
-fi
+target_oracle_expect_plan_complete "$case_count"
 printf 'Target oracle complete: %d checks for %s\n' "$case_count" "$target_name"
 cat "$artifact_dir/run.log" >&3
 trap - EXIT
