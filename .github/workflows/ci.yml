@@ -138,6 +138,42 @@ jobs:
       - name: Run Rust test suite
         run: cargo test --locked --workspace --all-targets
 
+      - name: Check structural codegen benchmark axes
+        run: >-
+          benchmarks/codegen/run.py
+          --ccc "${{ github.workspace }}/${{ matrix.ccc_bin }}"
+          --output
+          "$RUNNER_TEMP/ccc-benchmark-smoke-${{ matrix.oracle }}/codegen"
+          --cases block-count,ssa-values,live-globals,string-literals
+          --profiles O0,O2,Oz
+          --block-scales 0,2
+          --value-scales 0,2
+          --global-scales 0,2
+          --string-scales 0,2
+          --warmups 0
+          --samples 1
+
+      - name: Check kernel object benchmarks
+        run: >-
+          benchmarks/kernels/run.py
+          --ccc "${{ github.workspace }}/${{ matrix.ccc_bin }}"
+          --output
+          "$RUNNER_TEMP/ccc-benchmark-smoke-${{ matrix.oracle }}/kernels"
+          --mode object
+          --cases
+          direct-call,integer-loop,floating-loop,branch-switch,memory-traffic,aggregate-copy,tls-access,atomic-rmw,variadic-call
+          --profiles O0,O2,Oz
+          --compile-warmups 0
+          --compile-samples 1
+
+      - name: Upload object benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: object-benchmarks-${{ matrix.oracle }}
+          path: ${{ runner.temp }}/ccc-benchmark-smoke-${{ matrix.oracle }}
+          if-no-files-found: ignore
+
       - name: Check hosted stdio codegen equivalence
         run: >-
           benchmarks/codegen/run.py

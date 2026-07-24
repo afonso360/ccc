@@ -133,6 +133,34 @@ jobs:
       - name: Test the workspace
         run: cargo test --workspace --all-targets
 
+      - name: Check structural codegen benchmark axes
+        run: >-
+          benchmarks/codegen/run.py
+          --ccc "${{ github.workspace }}/${{ matrix.ccc_bin }}"
+          --output
+          "$RUNNER_TEMP/ccc-benchmark-smoke-${{ matrix.oracle }}/codegen"
+          --cases block-count,ssa-values,live-globals,string-literals
+          --profiles O0,O2,Oz
+          --block-scales 0,2
+          --value-scales 0,2
+          --global-scales 0,2
+          --string-scales 0,2
+          --warmups 0
+          --samples 1
+
+      - name: Check kernel object benchmarks
+        run: >-
+          benchmarks/kernels/run.py
+          --ccc "${{ github.workspace }}/${{ matrix.ccc_bin }}"
+          --output
+          "$RUNNER_TEMP/ccc-benchmark-smoke-${{ matrix.oracle }}/kernels"
+          --mode object
+          --cases
+          direct-call,integer-loop,floating-loop,branch-switch,memory-traffic,aggregate-copy,tls-access,atomic-rmw,variadic-call
+          --profiles O0,O2,Oz
+          --compile-warmups 0
+          --compile-samples 1
+
       - name: Run the target oracle
         env:
           CCC_BIN: ${{ github.workspace }}/${{ matrix.ccc_bin }}
@@ -140,7 +168,7 @@ jobs:
           CCC_TARGET_ORACLE_ARTIFACTS: ${{ runner.temp }}/ccc-target-oracle-${{ matrix.oracle }}
         run: tests/target-oracle/run.sh ${{ matrix.oracle }}
 
-      - name: Upload the candidate and oracle evidence
+      - name: Upload the candidate, oracle, and benchmark evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -148,4 +176,5 @@ jobs:
           path: |
             ${{ runner.temp }}/cranelift-main-candidate.patch
             ${{ runner.temp }}/ccc-target-oracle-${{ matrix.oracle }}
+            ${{ runner.temp }}/ccc-benchmark-smoke-${{ matrix.oracle }}
           if-no-files-found: ignore

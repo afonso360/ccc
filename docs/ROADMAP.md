@@ -24,13 +24,15 @@ the reproducibility and single-owner unwind policy.
 
 The scheduled compatibility workflow refreshes an ephemeral candidate lockfile,
 synchronizes candidate provenance, and tests upstream head without modifying
-normal builds. Backend construction, settings, frontend finalization, empty
-memory flags, symbol materialization, and custom data sections now pass through
-one narrow compatibility module; CLIF instruction selection and optimization
-remain direct. The remaining integration work is to:
-- Extend the scheduled candidate beyond the workspace suite and all target
-  oracles to dedicated debugger checks, ABI cross-links, Csmith profiles, and
-  real-code corpus gates.
+normal builds. It runs the workspace suite, every target oracle, bounded
+structural-scaling axes, and all nine kernel objects at every optimization
+profile and enabled target. Backend construction, settings, frontend
+finalization, empty memory flags, symbol materialization, and custom data
+sections now pass through one narrow compatibility module; CLIF instruction
+selection and optimization remain direct. The remaining integration work is
+to:
+- Extend the scheduled candidate to dedicated debugger checks, ABI
+  cross-links, Csmith profiles, and real-code corpus gates.
 - Audit changes to signatures, legalization and verification order, atomics,
   object relocations, unwind information, debug value locations, and target
   flags before accepting each lockfile update. A newly available API is not an

@@ -423,10 +423,13 @@ result or nondeterministic final object fails the run:
 benchmarks/kernels/test-run.sh
 ```
 
-Only this fake-tool regression is in the fast CI job in the initial slice.
+The fast CI job runs the fake-tool regression. The all-target matrix also runs
+all nine kernels in object mode at `-O0`, `-O2`, and `-Oz`, retains their
+structural evidence, and checks the four generated codegen-scaling axes at two
+bounded scales. The scheduled Cranelift-`main` candidate runs the same gate.
 All-target correctness execution and controlled native runtime baselines
-remain follow-up work. QEMU results will be correctness and rough-trend
-evidence, never native performance evidence.
+remain follow-up work. QEMU results are correctness and rough-trend evidence,
+never native performance evidence.
 
 ## C-Ray generated-code benchmark
 
