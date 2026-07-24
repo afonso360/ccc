@@ -1,9 +1,10 @@
 # CCC defined-behavior kernel benchmarks
 
 This suite measures small executable workloads with fixed work counts and
-built-in correctness checks. The current scalar/control slice covers direct
-calls and inlining, an unsigned-integer loop, exact binary32/binary64 loops,
-and data-dependent branches plus a dense switch.
+built-in correctness checks. The current scalar, control-flow, and memory slice
+covers direct calls and inlining, an unsigned-integer loop, exact
+binary32/binary64 loops, data-dependent branches plus a dense switch, indexed
+loads/stores, and aggregate copies.
 
 The suite is intentionally separate from the compiler-only runner in
 `benchmarks/codegen`. Kernel results distinguish CCC's compiler-side
@@ -19,12 +20,16 @@ primary object is measured, so the two sizes must not be treated as equal.
 | `integer-loop` | 4,000,000 integer iterations | Unsigned result `0x2b37aed1`. |
 | `floating-loop` | 4,000,000 additions in 2,000,000 paired iterations | Both the binary32 and binary64 results equal exactly `1250001`. |
 | `branch-switch` | 4,000,000 switch/branch iterations | Unsigned result `0x2f58cc08`. |
+| `memory-traffic` | 4,000,000 indexed updates of a 256-word working set | Unsigned result `0xf8599ec7`; each update consumes two dynamic loads and publishes one store. |
+| `aggregate-copy` | 1,000,000 assignments of a 32-byte structure | Unsigned result `0x294ffa8f`; copied destination fields feed the checksum. |
 
 All wrapping calculations use unsigned arithmetic, every shift count is in
 range, and all inputs are initialized. The floating-point steps and every
 intermediate result are exactly representable in the enabled targets'
 binary32/binary64 formats. Volatile seeds prevent a compiler from replacing a
-kernel with its recorded answer.
+kernel with its recorded answer. The memory kernels use separate statically
+allocated working sets with in-range unsigned indices; the aggregate-copy
+source and destination never overlap.
 
 ## Modes
 

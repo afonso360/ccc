@@ -55,3 +55,31 @@ expected_post_inline_functions = 1
 O0 = 0
 O2 = 0
 Oz = 0
+
+[[case]]
+name = "memory-traffic"
+family = "memory-loads-stores"
+source = "cases/memory-traffic.c"
+work_unit = "indexed-memory-update"
+work_count = 4000000
+expected_result = "0xf8599ec7"
+expected_post_inline_functions = 1
+
+[case.expected_post_inline_calls]
+O0 = 0
+O2 = 0
+Oz = 0
+
+[[case]]
+name = "aggregate-copy"
+family = "aggregate-copies"
+source = "cases/aggregate-copy.c"
+work_unit = "32-byte-struct-copy"
+work_count = 1000000
+expected_result = "0x294ffa8f"
+expected_post_inline_functions = 1
+
+[case.expected_post_inline_calls]
+O0 = 0
+O2 = 0
+Oz = 0

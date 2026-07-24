@@ -151,14 +151,14 @@ structural-stat query is separate and untimed.
 
 The current executable slice and next benchmark targets are:
 
-- The first four focused, defined-behavior kernels are checked in: fixed-work
-  direct-call/inlining, unsigned-integer, exact binary32/binary64, and
-  branch/switch workloads all validate their results and run through separate
-  object-only, correctness, and native-performance modes. Their versioned
-  evidence keeps compiler-side primary-object statistics distinct from final
-  packaged objects. Complete the compact suite with loads and stores,
-  aggregate copies, TLS, atomics, and variadic calls; every added kernel must
-  retain a fixed work count and self-validation.
+- The first six focused, defined-behavior kernels are checked in: fixed-work
+  direct-call/inlining, unsigned-integer, exact binary32/binary64,
+  branch/switch, indexed load/store, and 32-byte aggregate-copy workloads all
+  validate their results and run through separate object-only, correctness,
+  and native-performance modes. Their versioned evidence keeps compiler-side
+  primary-object statistics distinct from final packaged objects. Complete
+  the compact suite with TLS, atomics, and variadic calls; every added kernel
+  must retain a fixed work count and self-validation.
 - Extend generated scaling beyond the implemented declaration and live-function
   axes to declarations per function, block count, SSA values, globals, and
   string literals independently. Use them to detect accidental quadratic

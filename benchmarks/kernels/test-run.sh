@@ -20,6 +20,17 @@ case "$(uname -s):$(uname -m)" in
     ;;
 esac
 
+kernels=(
+  direct-call
+  integer-loop
+  floating-loop
+  branch-switch
+  memory-traffic
+  aggregate-copy
+)
+kernel_count=${#kernels[@]}
+performance_sample_count=$((kernel_count * 3 * 2))
+
 fake_ccc="$temporary_directory/fake-ccc"
 cat >"$fake_ccc" <<'PYTHON'
 #!/usr/bin/env python3
@@ -109,6 +120,24 @@ if "--emit=codegen-stats" in sys.argv:
             "instructions": 45,
             "global_values": 1,
             "constants": 4,
+            "jump_tables": 0,
+        },
+        "memory-traffic": {
+            "functions": 1,
+            "calls": 0,
+            "blocks": 7,
+            "instructions": 38,
+            "global_values": 3,
+            "constants": 5,
+            "jump_tables": 0,
+        },
+        "aggregate-copy": {
+            "functions": 1,
+            "calls": 0,
+            "blocks": 10,
+            "instructions": 92,
+            "global_values": 4,
+            "constants": 7,
             "jump_tables": 0,
         },
     }
@@ -205,7 +234,7 @@ grep -Fq $'benchmark\tfamily\tprofile\ttarget\tmode\texecution_kind' \
   "$performance_results/summary.tsv"
 grep -Fq $'direct-call\tdirect-calls\tO2\t'"$native_target"$'\tperformance\tnative\t1' \
   "$performance_results/summary.tsv"
-for kernel in direct-call integer-loop floating-loop branch-switch; do
+for kernel in "${kernels[@]}"; do
   expected_functions=1
   case "$kernel" in
     direct-call)
@@ -215,6 +244,8 @@ for kernel in direct-call integer-loop floating-loop branch-switch; do
     integer-loop) family=integer-loops ;;
     floating-loop) family=floating-loops ;;
     branch-switch) family=branches-switches ;;
+    memory-traffic) family=memory-loads-stores ;;
+    aggregate-copy) family=aggregate-copies ;;
   esac
   for profile in O0 O2 Oz; do
     expected_calls=0
@@ -237,9 +268,10 @@ grep -Fq '"format_version":1' "$performance_results/environment.json"
 grep -Fq '"mode":"performance"' "$performance_results/environment.json"
 grep -Fq '"kind":"link"' "$performance_results/commands.jsonl"
 grep -Fq '"phase":"validation"' "$performance_results/commands.jsonl"
-[[ "$(grep -c $'\tsample\t' "$performance_results/run-times.tsv")" == 24 ]]
+[[ "$(grep -c $'\tsample\t' "$performance_results/run-times.tsv")" == \
+  "$performance_sample_count" ]]
 [[ "$(find "$performance_results/raw" -name 'compile-sample-*.o' |
-  wc -l | tr -d '[:space:]')" == 24 ]]
+  wc -l | tr -d '[:space:]')" == "$performance_sample_count" ]]
 
 object_results="$temporary_directory/object"
 FAKE_TARGET="$native_target" "$script_directory/run.py" \
@@ -249,7 +281,8 @@ FAKE_TARGET="$native_target" "$script_directory/run.py" \
   --profiles O2 \
   --compile-samples 1
 [[ "$(wc -l <"$object_results/run-times.tsv" | tr -d '[:space:]')" == 1 ]]
-[[ "$(wc -l <"$object_results/summary.tsv" | tr -d '[:space:]')" == 5 ]]
+[[ "$(wc -l <"$object_results/summary.tsv" | tr -d '[:space:]')" == \
+  "$((kernel_count + 1))" ]]
 if grep -Fq $'\texecutable\t' "$object_results/artifacts.tsv"; then
   echo "object mode unexpectedly produced an executable artifact" >&2
   exit 1
@@ -271,7 +304,7 @@ FAKE_TARGET="$cross_target" "$script_directory/run.py" \
 grep -Fq $'\tcorrectness\trunner\t0\t' "$correctness_results/summary.tsv"
 grep -Fq $'\trunner\tvalidation\t1\t' "$correctness_results/run-times.tsv"
 [[ "$(grep -c $'\trunner\tvalidation\t' \
-  "$correctness_results/run-times.tsv")" == 4 ]]
+  "$correctness_results/run-times.tsv")" == "$kernel_count" ]]
 
 nonzero_results="$temporary_directory/nonzero"
 set +e
