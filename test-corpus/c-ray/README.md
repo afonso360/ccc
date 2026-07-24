@@ -72,6 +72,8 @@ records:
 - compile and link wall time;
 - sample count and median/minimum/maximum render wall time;
 - compile peak RSS and median render peak RSS;
+- post-inlining CLIF function, block, instruction, call, stack-slot, signature,
+  external-reference, and global-value counts for every CCC profile;
 - object and executable byte size;
 - portable object-section totals for text, read-only data, writable data, BSS,
   unwind metadata, debug metadata, and uncategorized sections;
@@ -84,10 +86,12 @@ output hash make a result auditable. `object-sections.tsv` retains every exact
 section name and its normalized category;
 `object-section-totals.tsv` is the machine-readable input to `summary.tsv`;
 `object-sections.txt`, `object-size.txt`, and `executable-size.txt` preserve the
-raw size-tool output. Section totals include virtual sections such as BSS, so
+raw size-tool output. `codegen-stats.tsv` retains CCC's complete versioned
+compiler-side metric set, while each profile's original key/value dump remains
+under `tool-output/`. Section totals include virtual sections such as BSS, so
 they are evidence about the generated program layout rather than a replacement
-for the on-disk `object_bytes` value. `reference.ppm` is the correctness oracle
-retained for the run.
+for the on-disk `object_bytes` value. The strict-FP reference has no CLIF
+columns. `reference.ppm` is the correctness oracle retained for the run.
 
 Compare measurements only between runs on the same controlled native host.
 The adapter records evidence; it does not hide noise, normalize results from

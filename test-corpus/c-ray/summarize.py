@@ -33,10 +33,54 @@ def one_object_sections(section_totals: List[dict], label: str) -> dict:
     return matches[0]
 
 
+def codegen_stats_by_label(rows: List[dict]) -> Dict[str, Dict[str, str]]:
+    result: Dict[str, Dict[str, str]] = {}
+    for row in rows:
+        label = row["label"]
+        metric = row["metric"]
+        value = row["value"]
+        if not label or not metric:
+            raise ValueError("codegen-stat labels and metrics must not be empty")
+        try:
+            parsed = int(value)
+        except ValueError as error:
+            raise ValueError(
+                f"{label}: codegen stat {metric!r} is not an integer"
+            ) from error
+        if parsed < 0 or str(parsed) != value:
+            raise ValueError(
+                f"{label}: codegen stat {metric!r} is not canonical unsigned decimal"
+            )
+        metrics = result.setdefault(label, {})
+        if metric in metrics:
+            raise ValueError(f"{label}: duplicate codegen stat {metric!r}")
+        metrics[metric] = value
+
+    for label, metrics in result.items():
+        if metrics.get("schema_version") != "1":
+            raise ValueError(f"{label}: unsupported codegen statistics schema")
+    return result
+
+
+SUMMARY_CODEGEN_METRICS = {
+    "clif_functions": "post_inline_ir.functions",
+    "clif_blocks": "post_inline_ir.blocks",
+    "clif_instructions": "post_inline_ir.instructions",
+    "clif_call_instructions": "post_inline_ir.call_instructions",
+    "clif_fixed_stack_slots": "post_inline_ir.fixed_stack_slots",
+    "clif_fixed_stack_bytes": "post_inline_ir.fixed_stack_bytes",
+    "clif_dynamic_stack_slots": "post_inline_ir.dynamic_stack_slots",
+    "clif_signatures": "post_inline_ir.signatures",
+    "clif_external_functions": "post_inline_ir.external_functions",
+    "clif_global_values": "post_inline_ir.global_values",
+}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--timings", required=True, type=Path)
     parser.add_argument("--artifacts", required=True, type=Path)
+    parser.add_argument("--codegen-stats", required=True, type=Path)
     parser.add_argument("--object-sections", required=True, type=Path)
     parser.add_argument("--hashes", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
@@ -45,6 +89,7 @@ def main() -> int:
     try:
         timings = read_rows(arguments.timings)
         artifacts = read_rows(arguments.artifacts)
+        codegen_stats = codegen_stats_by_label(read_rows(arguments.codegen_stats))
         object_sections = read_rows(arguments.object_sections)
         hashes = read_rows(arguments.hashes)
         if not artifacts:
@@ -60,6 +105,7 @@ def main() -> int:
             "render_max_seconds",
             "compile_peak_rss_bytes",
             "render_peak_rss_median_bytes",
+            *SUMMARY_CODEGEN_METRICS,
             "object_bytes",
             "object_text_bytes",
             "object_read_only_data_bytes",
@@ -78,6 +124,19 @@ def main() -> int:
             compile_timing = one_timing(timings, label, "compile")
             link_timing = one_timing(timings, label, "link")
             section_totals = one_object_sections(object_sections, label)
+            label_codegen_stats = codegen_stats.get(label)
+            if label.startswith("ccc-") and label_codegen_stats is None:
+                raise ValueError(f"{label}: codegen statistics are missing")
+            if label_codegen_stats is not None:
+                missing = [
+                    metric
+                    for metric in SUMMARY_CODEGEN_METRICS.values()
+                    if metric not in label_codegen_stats
+                ]
+                if missing:
+                    raise ValueError(
+                        f"{label}: missing codegen statistics {missing!r}"
+                    )
             render_timings = [
                 row
                 for row in timings
@@ -107,6 +166,14 @@ def main() -> int:
                     "render_peak_rss_median_bytes": str(
                         int(statistics.median(render_rss))
                     ),
+                    **{
+                        output_name: (
+                            label_codegen_stats[metric]
+                            if label_codegen_stats is not None
+                            else ""
+                        )
+                        for output_name, metric in SUMMARY_CODEGEN_METRICS.items()
+                    },
                     "object_bytes": artifact["object_bytes"],
                     "object_text_bytes": section_totals["text_bytes"],
                     "object_read_only_data_bytes": section_totals[

@@ -153,9 +153,10 @@ sources of compiler and generated-code cost:
   with fixed inputs. Record translation time, link time, aggregate object
   size, executable text size, and execution throughput without weakening their
   correctness contracts.
-- Extend the C-Ray result schema with CCC frontend and Cranelift phase timing,
-  CLIF instruction/block/stack-slot counts, and parsed object-section sizes.
-  The existing correctness and performance profiles already retain whole
+- Add CCC frontend and Cranelift phase timing to C-Ray. Its result schema now
+  includes post-inlining CLIF instruction, block, call, stack-slot, signature,
+  external-reference, and global-value counts plus parsed final-object section
+  sizes. The correctness and performance profiles also retain whole
   compile/link/render timing, CPU, peak-memory, file-size, command, image-hash,
   and exact same-host reference evidence.
 
@@ -165,6 +166,11 @@ trend evidence and must not be compared numerically with native execution.
 
 ### Metrics and instrumentation
 
+- `--emit=codegen-stats` now emits a versioned deterministic TSV view of
+  post-inlining CLIF structure and the primary relocatable object on every
+  enabled target. C-Ray archives that complete view and uses the CLIF subset in
+  its summary; its independent final-object parser accounts for generated
+  bridge packaging.
 - Report preprocessing, parsing, semantic analysis, CCC-IR lowering and
   optimization, ABI planning, CLIF lowering, Cranelift compilation, object
   packaging, and linking separately. Also record end-to-end wall time, CPU

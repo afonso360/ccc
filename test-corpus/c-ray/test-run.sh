@@ -57,6 +57,11 @@ grep -Fq \
   'performance_scene_sha256 = "b84ee97d101ebf6eed605ba9b5938019ca0651c128b8b4c8053fdcdd7a7c1741"' \
   "$script_directory/manifest.toml"
 grep -Fq 'source_adjustments = "none"' "$script_directory/manifest.toml"
+for retained in \
+  codegen-stats.tsv object-section-totals.tsv object-sections.tsv \
+  object-sections.txt; do
+  grep -Fq "\"$retained\"" "$script_directory/manifest.toml"
+done
 
 valid_ppm="$temporary_directory/valid.ppm"
 comparison_ppm="$temporary_directory/comparison.ppm"
@@ -175,6 +180,20 @@ cat >"$temporary_directory/artifacts.tsv" <<'EOF'
 label	object_bytes	executable_bytes
 fixture	123	456
 EOF
+cat >"$temporary_directory/codegen-stats.tsv" <<'EOF'
+label	metric	value
+fixture	schema_version	1
+fixture	post_inline_ir.functions	2
+fixture	post_inline_ir.blocks	7
+fixture	post_inline_ir.instructions	40
+fixture	post_inline_ir.call_instructions	3
+fixture	post_inline_ir.fixed_stack_slots	4
+fixture	post_inline_ir.fixed_stack_bytes	64
+fixture	post_inline_ir.dynamic_stack_slots	0
+fixture	post_inline_ir.signatures	3
+fixture	post_inline_ir.external_functions	3
+fixture	post_inline_ir.global_values	2
+EOF
 cat >"$temporary_directory/summary-object-sections.tsv" <<'EOF'
 label	text_bytes	read_only_data_bytes	writable_data_bytes	bss_bytes	unwind_bytes	debug_bytes	other_bytes	total_section_bytes
 fixture	100	25	4	16	8	0	3	156
@@ -187,12 +206,13 @@ EOF
 "$script_directory/summarize.py" \
   --timings "$temporary_directory/summary-timings.tsv" \
   --artifacts "$temporary_directory/artifacts.tsv" \
+  --codegen-stats "$temporary_directory/codegen-stats.tsv" \
   --object-sections "$temporary_directory/summary-object-sections.tsv" \
   --hashes "$temporary_directory/hashes.tsv" \
   --output "$temporary_directory/summary.tsv"
 grep -Fq $'fixture\t0.500000000\t0.250000000\t3\t2.000000000\t1.000000000\t3.000000000' \
   "$temporary_directory/summary.tsv"
-grep -Fq $'\t123\t100\t25\t4\t16\t8\t0\t3\t156\t456\t' \
+grep -Fq $'\t2\t7\t40\t3\t4\t64\t0\t3\t3\t2\t123\t100\t25\t4\t16\t8\t0\t3\t156\t456\t' \
   "$temporary_directory/summary.tsv"
 
 bash -n "$script_directory/run.sh"

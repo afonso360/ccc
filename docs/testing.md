@@ -327,11 +327,14 @@ test-corpus/c-ray/run.sh --profile performance \
 Both profiles build the unmodified source at CCC `-O0`, `-O2`, and `-Oz`,
 compare exact `P6` output with a strict-FP native GCC or Apple Clang build, and
 retain raw JSON/TSV timing, CPU, peak-memory, size, tool-identity, and image-hash
-evidence. They require Python 3, OpenSSL with SHA3-256, Tar, `size`, libc, libm,
-pthreads, and Curl unless `--source-archive` supplies the exact pinned release.
-Use only same-host native runs for performance comparisons; the adapter rejects
-cross-target and emulated timing. The full result schema and override options
-are documented in `test-corpus/c-ray/README.md`.
+evidence. The summary includes post-inlining CLIF structure for CCC and parsed
+section totals from every final CCC/reference object. They require Python 3,
+OpenSSL with SHA3-256, Tar, GNU-compatible `size` on Linux or Xcode
+`llvm-size` on macOS, libc, libm, pthreads, and Curl unless `--source-archive`
+supplies the exact pinned release. Use only same-host native runs for
+performance comparisons; the adapter rejects cross-target and emulated timing.
+The full result schema and override options are documented in
+`test-corpus/c-ray/README.md`.
 
 ## Csmith differential suite
 

@@ -371,9 +371,11 @@ commands="$work_directory/commands.txt"
 timings="$work_directory/timings.tsv"
 artifact_sizes="$work_directory/artifact-sizes.tsv"
 output_hashes="$work_directory/output-sha256.tsv"
+codegen_stats="$work_directory/codegen-stats.tsv"
 : >"$commands"
 printf 'label\tobject_bytes\texecutable_bytes\n' >"$artifact_sizes"
 printf 'label\tphase\titeration\tsha256\n' >"$output_hashes"
+printf 'label\tmetric\tvalue\n' >"$codegen_stats"
 
 LC_ALL=C "$ccc" --version >"$compiler_identity_directory/ccc-version.txt" 2>&1
 LC_ALL=C "$ccc" "${ccc_target_arguments[@]}" -dM -E -x c /dev/null \
@@ -475,6 +477,27 @@ for optimization in -O0 -O2 -Oz; do
     "$object" -o "$executable" -pthread -lm
   [[ -f "$object" && -x "$executable" ]] ||
     die "$label did not produce the expected object and executable"
+  codegen_stats_output="$tool_output_directory/$label-codegen-stats.tsv"
+  record_command \
+    "$ccc" \
+    "${ccc_target_arguments[@]}" \
+    -std=c11 "$optimization" -DLITTLE_ENDIAN=1 -pthread \
+    --emit=codegen-stats "$source_file"
+  LC_ALL=C "$ccc" \
+    "${ccc_target_arguments[@]}" \
+    -std=c11 "$optimization" -DLITTLE_ENDIAN=1 -pthread \
+    --emit=codegen-stats "$source_file" \
+    >"$codegen_stats_output" \
+    2>"$tool_output_directory/$label-codegen-stats.stderr"
+  grep -Fxq $'schema_version\t1' "$codegen_stats_output" ||
+    die "$label emitted an unsupported codegen statistics schema"
+  awk -v label="$label" '
+    BEGIN { FS = OFS = "\t" }
+    NF != 2 || $1 == "" || $2 !~ /^[0-9]+$/ { exit 2 }
+    { print label, $1, $2 }
+    END { if (NR == 0) exit 2 }
+  ' "$codegen_stats_output" >>"$codegen_stats" ||
+    die "$label emitted malformed codegen statistics"
   printf '%s\t%s\t%s\n' \
     "$label" \
     "$(wc -c <"$object" | tr -d '[:space:]')" \
@@ -625,6 +648,7 @@ done
 "$summarize" \
   --timings "$timings" \
   --artifacts "$artifact_sizes" \
+  --codegen-stats "$codegen_stats" \
   --object-sections "$work_directory/object-section-totals.tsv" \
   --hashes "$output_hashes" \
   --output "$work_directory/summary.tsv"
