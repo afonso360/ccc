@@ -20,9 +20,9 @@ pub const BRIDGE_FLAG_X87_RESULT: u8 = 1;
 /// The fixed portion of the call-helper protocol.
 ///
 /// The trailing outgoing stack payload starts immediately after this value.
-/// Producers zero the complete allocation before populating live slots, which
-/// lets the assembly helper load every register slot without data-dependent
-/// dispatch.
+/// Producers initialize the header, live register prefixes, and complete
+/// padded stack payload. Assembly helpers use the header high-water counts to
+/// avoid reading inactive register slots.
 #[repr(C, align(16))]
 #[derive(Clone)]
 pub struct BridgeFrameV2 {
@@ -52,7 +52,8 @@ impl BridgeFrameV2 {
     pub const FIXED_SIZE: usize = 272;
     pub const ALIGNMENT: usize = 16;
 
-    /// Creates a zeroed frame header. The caller owns any trailing stack area.
+    /// Creates a fully zeroed Rust-side frame. Code generation may initialize
+    /// only the protocol fields and live slots consumed by an assembly helper.
     pub fn zeroed(target_address: u64, outgoing_stack_size: u32) -> Self {
         let total_size = u32::try_from(Self::FIXED_SIZE)
             .expect("bridge frame size fits u32")
@@ -804,21 +805,35 @@ pub fn render_generic_call_helper(symbol: &str) -> Result<GeneratedAssembly, Lin
          leaq 272(%r12), %rsi\n\
          movl 16(%r12), %ecx\n\
          rep movsb\n\
-         movq 8(%r12), %r11\n\
-         movdqu 80(%r12), %xmm0\n\
-         movdqu 96(%r12), %xmm1\n\
-         movdqu 112(%r12), %xmm2\n\
-         movdqu 128(%r12), %xmm3\n\
-         movdqu 144(%r12), %xmm4\n\
-         movdqu 160(%r12), %xmm5\n\
-         movdqu 176(%r12), %xmm6\n\
-         movdqu 192(%r12), %xmm7\n\
-         movq 32(%r12), %rdi\n\
-         movq 40(%r12), %rsi\n\
-         movq 48(%r12), %rdx\n\
-         movq 56(%r12), %rcx\n\
-         movq 64(%r12), %r8\n\
-         movq 72(%r12), %r9\n\
+         movq 8(%r12), %r11\n",
+    );
+    source.push_str("movzbl 25(%r12), %r10d\n");
+    for index in 0..8 {
+        writeln!(
+            source,
+            "cmpb ${index}, %r10b\n\
+             jbe .Lccc_call_xmm_inputs_done\n\
+             movdqu {}(%r12), %xmm{index}",
+            80 + index * 16
+        )
+        .unwrap();
+    }
+    source.push_str(".Lccc_call_xmm_inputs_done:\nmovzbl 24(%r12), %r10d\n");
+    for (index, register) in ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"]
+        .into_iter()
+        .enumerate()
+    {
+        writeln!(
+            source,
+            "cmpb ${index}, %r10b\n\
+             jbe .Lccc_call_gp_inputs_done\n\
+             movq {}(%r12), {register}",
+            32 + index * 8
+        )
+        .unwrap();
+    }
+    source.push_str(
+        ".Lccc_call_gp_inputs_done:\n\
          movzbl 26(%r12), %eax\n\
          call *%r11\n\
          movq %rax, 208(%r12)\n\
@@ -1307,23 +1322,29 @@ fn render_arm64_call_helper(
          subs x2, x2, #1\n\
          b.ne 1b\n\
          2:\n\
-         ldr x16, [x19, #8]\n\
-         ldr q0, [x19, #112]\n\
-         ldr q1, [x19, #128]\n\
-         ldr q2, [x19, #144]\n\
-         ldr q3, [x19, #160]\n\
-         ldr q4, [x19, #176]\n\
-         ldr q5, [x19, #192]\n\
-         ldr q6, [x19, #208]\n\
-         ldr q7, [x19, #224]\n\
-         ldr x0, [x19, #48]\n\
-         ldr x1, [x19, #56]\n\
-         ldr x2, [x19, #64]\n\
-         ldr x3, [x19, #72]\n\
-         ldr x4, [x19, #80]\n\
-         ldr x5, [x19, #88]\n\
-         ldr x6, [x19, #96]\n\
-         ldr x7, [x19, #104]\n\
+         ldr x16, [x19, #8]\n",
+    );
+    source.push_str(
+        "ldrb w17, [x19, #25]\n\
+         adr x9, 3f\n\
+         sub x9, x9, x17, lsl #2\n\
+         br x9\n",
+    );
+    for index in (0..8).rev() {
+        writeln!(source, "ldr q{index}, [x19, #{}]", 112 + index * 16).unwrap();
+    }
+    source.push_str(
+        "3:\n\
+         ldrb w17, [x19, #24]\n\
+         adr x9, 4f\n\
+         sub x9, x9, x17, lsl #2\n\
+         br x9\n",
+    );
+    for index in (0..8).rev() {
+        writeln!(source, "ldr x{index}, [x19, #{}]", 48 + index * 8).unwrap();
+    }
+    source.push_str(
+        "4:\n\
          ldr x8, [x19, #32]\n\
          blr x16\n\
          stp x0, x1, [x19, #240]\n\
@@ -1392,23 +1413,34 @@ fn render_riscv64_call_helper(symbol: &str) -> Result<GeneratedAssembly, LinkErr
          addi t2, t2, -1\n\
          bnez t2, 1b\n\
          2:\n\
-         ld t0, 8(s1)\n\
-         fld fa0, 112(s1)\n\
-         fld fa1, 128(s1)\n\
-         fld fa2, 144(s1)\n\
-         fld fa3, 160(s1)\n\
-         fld fa4, 176(s1)\n\
-         fld fa5, 192(s1)\n\
-         fld fa6, 208(s1)\n\
-         fld fa7, 224(s1)\n\
-         ld a0, 48(s1)\n\
-         ld a1, 56(s1)\n\
-         ld a2, 64(s1)\n\
-         ld a3, 72(s1)\n\
-         ld a4, 80(s1)\n\
-         ld a5, 88(s1)\n\
-         ld a6, 96(s1)\n\
-         ld a7, 104(s1)\n\
+         ld t0, 8(s1)\n",
+    );
+    source.push_str("lbu t1, 25(s1)\nbeqz t1, .Lccc_call_riscv_fp_inputs_done\n");
+    for index in 0..8 {
+        writeln!(source, "fld fa{index}, {}(s1)", 112 + index * 16).unwrap();
+        if index != 7 {
+            source.push_str(
+                "addi t1, t1, -1\n\
+                 beqz t1, .Lccc_call_riscv_fp_inputs_done\n",
+            );
+        }
+    }
+    source.push_str(
+        ".Lccc_call_riscv_fp_inputs_done:\n\
+         lbu t1, 24(s1)\n\
+         beqz t1, .Lccc_call_riscv_gp_inputs_done\n",
+    );
+    for index in 0..8 {
+        writeln!(source, "ld a{index}, {}(s1)", 48 + index * 8).unwrap();
+        if index != 7 {
+            source.push_str(
+                "addi t1, t1, -1\n\
+                 beqz t1, .Lccc_call_riscv_gp_inputs_done\n",
+            );
+        }
+    }
+    source.push_str(
+        ".Lccc_call_riscv_gp_inputs_done:\n\
          jalr t0\n\
          sd a0, 240(s1)\n\
          sd a1, 248(s1)\n\
@@ -2241,19 +2273,40 @@ mod tests {
     }
 
     #[test]
-    fn call_helper_has_unconditional_slots_and_a_last_al_write() {
+    fn x86_call_helper_guards_live_prefixes_and_writes_al_last() {
         let assembly = render_generic_call_helper("__ccc_call_helper_test").unwrap();
         let source = assembly.source();
         for index in 0..8 {
-            assert!(source.contains(&format!("%xmm{index}")));
+            assert!(
+                source.contains(&format!("movdqu {}(%r12), %xmm{index}", 80 + index * 16)),
+                "{source}"
+            );
+            assert!(
+                source.contains(&format!("cmpb ${index}, %r10b")),
+                "{source}"
+            );
+        }
+        for (index, register) in ["%rdi", "%rsi", "%rdx", "%rcx", "%r8", "%r9"]
+            .into_iter()
+            .enumerate()
+        {
+            assert!(
+                source.contains(&format!("movq {}(%r12), {register}", 32 + index * 8)),
+                "{source}"
+            );
         }
         let al_instruction = "movzbl 26(%r12), %eax";
         let al = source.find(al_instruction).unwrap();
         let call = source.find("call *%r11").unwrap();
         assert!(al < call);
-        let between = &source[al + al_instruction.len()..call];
-        assert!(!between.contains("%rax"));
-        assert!(!between.contains("%eax\n"));
+        assert_eq!(
+            &source[al..call + "call *%r11".len()],
+            "movzbl 26(%r12), %eax\ncall *%r11"
+        );
+        assert!(source.contains("movzbl 25(%r12), %r10d"));
+        assert!(source.contains("jbe .Lccc_call_xmm_inputs_done"));
+        assert!(source.contains("movzbl 24(%r12), %r10d"));
+        assert!(source.contains("jbe .Lccc_call_gp_inputs_done"));
         assert!(source.contains(".cfi_startproc"));
         assert!(source.contains(".note.GNU-stack"));
         assert!(!source.contains(".file"));
@@ -2265,6 +2318,33 @@ mod tests {
         assert!(source.contains("leaq 272(%r12), %rsi"));
         assert!(source.contains("testb $1, 29(%r12)"));
         assert!(source.contains("fstpt 256(%r12)"));
+    }
+
+    #[test]
+    fn arm64_call_helper_guards_live_prefixes_and_always_restores_x8() {
+        for abi in [AbiIdentity::Aapcs64Lp64, AbiIdentity::DarwinArm64] {
+            let assembly = render_target_call_helper("__ccc_call_helper_arm64_test", abi).unwrap();
+            let source = assembly.source();
+            assert!(source.contains("ldrb w17, [x19, #25]"), "{source}");
+            assert!(source.contains("adr x9, 3f"));
+            assert!(source.contains("ldrb w17, [x19, #24]"), "{source}");
+            assert!(source.contains("adr x9, 4f"));
+            assert_eq!(source.matches("sub x9, x9, x17, lsl #2").count(), 2);
+            assert_eq!(source.matches("br x9").count(), 2);
+            for index in 0..8 {
+                assert!(
+                    source.contains(&format!("ldr q{index}, [x19, #{}]", 112 + index * 16)),
+                    "{source}"
+                );
+                assert!(
+                    source.contains(&format!("ldr x{index}, [x19, #{}]", 48 + index * 8)),
+                    "{source}"
+                );
+            }
+            let x8 = source.find("ldr x8, [x19, #32]").unwrap();
+            let call = source.find("blr x16").unwrap();
+            assert!(x8 < call, "{source}");
+        }
     }
 
     #[test]
@@ -2350,6 +2430,24 @@ mod tests {
         assert!(establish < stable_cfa && stable_cfa < dynamic && dynamic < call);
         assert!(call < restore_sp && restore_sp < restore_cfa);
         assert!(source.contains(".cfi_def_cfa sp, 0"));
+        assert!(
+            source.contains("lbu t1, 25(s1)\nbeqz t1, .Lccc_call_riscv_fp_inputs_done"),
+            "{source}"
+        );
+        assert!(
+            source.contains("lbu t1, 24(s1)\nbeqz t1, .Lccc_call_riscv_gp_inputs_done"),
+            "{source}"
+        );
+        for index in 0..8 {
+            assert!(
+                source.contains(&format!("fld fa{index}, {}(s1)", 112 + index * 16)),
+                "{source}"
+            );
+            assert!(
+                source.contains(&format!("ld a{index}, {}(s1)", 48 + index * 8)),
+                "{source}"
+            );
+        }
     }
 
     #[test]

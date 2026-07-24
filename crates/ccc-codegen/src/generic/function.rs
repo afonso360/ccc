@@ -2777,24 +2777,10 @@ impl FunctionState<'_, '_, '_> {
             .checked_add(u64::from(plan.stack_size))
             .ok_or_else(|| error("variadic call frame size overflow"))?;
         let frame = create_stack_backing(builder, frame_size, 16)?;
-        zero_memory(builder, frame, frame_size)?;
-        if plan.abi_identity == ccc_target::AbiIdentity::RiscvLp64d {
-            // LP64D requires narrower values in an FLEN=64 register to be
-            // NaN-boxed. The helper restores every slot with `fld`, so seed
-            // the high half of each slot before width-specific F32 stores.
-            for index in 0..8_u64 {
-                store_integer(
-                    builder,
-                    frame,
-                    layout.call_float_arguments + index * 16 + 4,
-                    ir::types::I32,
-                    -1,
-                )?;
-            }
-        }
-        store_integer(builder, frame, 0, ir::types::I32, 0x4642_4343)?;
-        store_integer(builder, frame, 4, ir::types::I16, 2)?;
-        store_integer(
+        initialize_bridge_call_frame(builder, frame, plan, layout)?;
+        store_bridge_integer(builder, frame, 0, ir::types::I32, 0x4642_4343)?;
+        store_bridge_integer(builder, frame, 4, ir::types::I16, 2)?;
+        store_bridge_integer(
             builder,
             frame,
             6,
@@ -2805,24 +2791,24 @@ impl FunctionState<'_, '_, '_> {
                 48
             },
         )?;
-        store_value(builder, frame, 8, target)?;
-        store_integer(
+        store_bridge_value(builder, frame, 8, target)?;
+        store_bridge_integer(
             builder,
             frame,
             16,
             ir::types::I32,
             i64::from(plan.stack_size),
         )?;
-        store_integer(
+        store_bridge_integer(
             builder,
             frame,
             20,
             ir::types::I32,
             i64::try_from(frame_size).map_err(|_| error("bridge frame is too large"))?,
         )?;
-        store_integer(builder, frame, 24, ir::types::I8, i64::from(plan.gp_used))?;
-        store_integer(builder, frame, 25, ir::types::I8, i64::from(plan.xmm_used))?;
-        store_integer(
+        store_bridge_integer(builder, frame, 24, ir::types::I8, i64::from(plan.gp_used))?;
+        store_bridge_integer(builder, frame, 25, ir::types::I8, i64::from(plan.xmm_used))?;
+        store_bridge_integer(
             builder,
             frame,
             26,
@@ -2844,18 +2830,18 @@ impl FunctionState<'_, '_, '_> {
                 )
             })
             .count();
-        store_integer(builder, frame, 27, ir::types::I8, gp_results as i64)?;
-        store_integer(builder, frame, 28, ir::types::I8, xmm_results as i64)?;
+        store_bridge_integer(builder, frame, 27, ir::types::I8, gp_results as i64)?;
+        store_bridge_integer(builder, frame, 28, ir::types::I8, xmm_results as i64)?;
         let x87_result = plan
             .result_pieces
             .iter()
             .any(|piece| piece.piece.class == ccc_abi::AbiClass::X87);
-        store_integer(builder, frame, 29, ir::types::I8, i64::from(x87_result))?;
+        store_bridge_integer(builder, frame, 29, ir::types::I8, i64::from(x87_result))?;
 
         let result_storage = if plan.hidden_return {
             let result = create_stack_backing(builder, plan.result.size, plan.result.align)?;
             zero_memory(builder, result, plan.result.size)?;
-            store_value(builder, frame, layout.indirect_result, result)?;
+            store_bridge_value(builder, frame, layout.indirect_result, result)?;
             Some(result)
         } else {
             None
@@ -3748,6 +3734,102 @@ fn bridge_frame_layout(abi: ccc_target::AbiIdentity) -> BridgeFrameLayout {
             entry_indirect_result: 448,
         },
     }
+}
+
+fn initialize_bridge_call_frame(
+    builder: &mut FunctionBuilder<'_>,
+    frame: ir::Value,
+    plan: &ccc_abi::BridgeBoundaryPlan,
+    layout: BridgeFrameLayout,
+) -> Result<(), CodegenError> {
+    let zero = builder.ins().iconst(ir::types::I64, 0);
+    store_bridge_chunks(
+        builder,
+        frame,
+        layout.call_integer_arguments,
+        u64::from(plan.gp_used) * 8,
+        zero,
+    )?;
+    if plan.abi_identity == ccc_target::AbiIdentity::RiscvLp64d {
+        // LP64D requires every narrower value in an FLEN=64 register to be
+        // NaN-boxed. Seed only the live eight-byte lanes before F16/F32
+        // stores; an F64 store replaces the complete seed.
+        let nan_box = builder.ins().iconst(ir::types::I64, -1);
+        for index in 0..u64::from(plan.xmm_used) {
+            store_bridge_value(
+                builder,
+                frame,
+                layout.call_float_arguments + index * 16,
+                nan_box,
+            )?;
+        }
+    } else {
+        store_bridge_chunks(
+            builder,
+            frame,
+            layout.call_float_arguments,
+            u64::from(plan.xmm_used) * 16,
+            zero,
+        )?;
+    }
+    if matches!(
+        plan.abi_identity,
+        ccc_target::AbiIdentity::Aapcs64Lp64 | ccc_target::AbiIdentity::DarwinArm64
+    ) {
+        // The arm64 helper always restores x8. It carries a hidden-result
+        // pointer when present and must otherwise have a defined null value.
+        store_bridge_value(builder, frame, layout.indirect_result, zero)?;
+    }
+    store_bridge_chunks(
+        builder,
+        frame,
+        layout.call_fixed_size,
+        u64::from(plan.stack_size),
+        zero,
+    )
+}
+
+fn store_bridge_chunks(
+    builder: &mut FunctionBuilder<'_>,
+    frame: ir::Value,
+    offset: u64,
+    size: u64,
+    value: ir::Value,
+) -> Result<(), CodegenError> {
+    if !size.is_multiple_of(8) {
+        return Err(error(
+            "bridge register prefixes and padded stack payloads must be eight-byte aligned",
+        ));
+    }
+    for chunk in (0..size).step_by(8) {
+        store_bridge_value(builder, frame, offset + chunk, value)?;
+    }
+    Ok(())
+}
+
+fn store_bridge_integer(
+    builder: &mut FunctionBuilder<'_>,
+    frame: ir::Value,
+    offset: u64,
+    ty: ir::Type,
+    value: i64,
+) -> Result<(), CodegenError> {
+    let value = builder.ins().iconst(ty, value);
+    store_bridge_value(builder, frame, offset, value)
+}
+
+fn store_bridge_value(
+    builder: &mut FunctionBuilder<'_>,
+    frame: ir::Value,
+    offset: u64,
+    value: ir::Value,
+) -> Result<(), CodegenError> {
+    let offset = i32::try_from(offset)
+        .map_err(|_| error("bridge frame offset exceeds Cranelift's immediate range"))?;
+    builder
+        .ins()
+        .store(backend::empty_memory_flags(), value, frame, offset);
+    Ok(())
 }
 
 fn variadic_parameter_piece_address(

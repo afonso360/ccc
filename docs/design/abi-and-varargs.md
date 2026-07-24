@@ -130,13 +130,24 @@ helper. Its 16-byte-aligned fixed area is 272 bytes:
 |    256 | 16-byte x87 result slot; the low ten bytes contain the f80 value     |
 |    272 | outgoing stack payload                                              |
 
-The producer zeroes the complete fixed area. The helper holds the target in
-`%r11`, preserves the frame pointer across the target call, copies the stack
-payload with the required alignment, unconditionally loads all GP and XMM
-slots, and writes `%al` last. It unconditionally captures the supported
-integer and SSE result registers, and captures `%st(0)` when the frame flag
-requests an x87 result. Header counts are diagnostic metadata, not dispatch
-inputs.
+The producer writes every helper input in the header, initializes only the live
+GP and floating-register prefixes, and clears the complete padded outgoing
+stack payload so alignment holes never carry indeterminate data. Result banks
+are write-only until the helper populates every planned result piece. The x86
+helper holds the target in `%r11`, preserves the frame pointer across the
+target call, copies the stack payload with the required alignment, guards GP
+and XMM loads with the header high-water counts, and writes `%al` immediately
+before the call. It unconditionally captures the supported integer and SSE
+result registers, and captures `%st(0)` when the frame flag requests an x87
+result.
+
+The 320-byte arm64 and RISC-V layouts follow the same live-prefix rule.
+AArch64 always receives an initialized x8 hidden-result slot, including a null
+value when the call has no indirect result. RISC-V initializes each live
+eight-byte floating lane to all ones before writing a narrower F16 or F32
+payload, which supplies complete LP64D NaN boxing without touching inactive
+lanes. Their helpers likewise use the GP and floating high-water counts rather
+than loading the full register-bank capacity.
 
 The helper does not use the red zone and does not modify the x87 control word,
 MXCSR control bits, or direction flag. It carries explicit CFI and a

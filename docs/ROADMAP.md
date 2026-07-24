@@ -183,11 +183,6 @@ trend evidence and must not be compared numerically with native execution.
 - Including hosted headers in the two hello programs must not change their
   per-function CLIF instruction or imported-entity counts compared with the
   equivalent minimal declarations.
-- Variadic-call setup must initialize only protocol fields and argument bytes
-  that a helper can read. It must not clear the complete maximum-size frame
-  byte by byte. Reduce the checked-in `printf` CLIF instruction baseline by at
-  least 90%, and require setup instruction and store counts to scale with live
-  arguments rather than frame capacity.
 - On the defined-behavior kernel suite, the `-O2` runtime geometric mean must
   not regress against `-O0`, and `-Oz` text size must not exceed `-O2` in the
   geometric mean. Record and justify individual exceptions rather than hiding

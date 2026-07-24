@@ -1637,6 +1637,200 @@ fn assert_all_clif_entities_are_used(function: &str) {
     }
 }
 
+fn clif_instruction_and_store_counts(function: &str) -> (usize, usize) {
+    let mut in_blocks = false;
+    let mut instructions = 0;
+    let mut stores = 0;
+    for line in function.lines() {
+        let line = line.trim();
+        if line.starts_with("block") && line.ends_with(':') {
+            in_blocks = true;
+            continue;
+        }
+        if !in_blocks || line.is_empty() || line == "}" || line.starts_with(';') {
+            continue;
+        }
+        instructions += 1;
+        stores += usize::from(line.starts_with("store "));
+    }
+    (instructions, stores)
+}
+
+#[test]
+fn variadic_call_frame_setup_scales_with_live_arguments_on_every_target() {
+    const LEGACY_MIXED_PRINTF_INSTRUCTIONS: usize = 1_134;
+    let cases = [
+        (
+            "minimal",
+            "int printf(const char *, ...);\n\
+             int main(void) { return printf(\"hello\\n\"); }",
+        ),
+        (
+            "mixed",
+            "int printf(const char *, ...);\n\
+             int main(void) {\n\
+                 return printf(\"ccc %d %.1f %s\\n\", 7, 2.5, \"ok\") != 13;\n\
+             }",
+        ),
+    ];
+    for (config, expected) in [
+        (EffectiveCompilationConfig::default(), [(36, 14), (55, 21)]),
+        (
+            EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+            [(37, 15), (56, 22)],
+        ),
+        (
+            EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
+            [(37, 14), (55, 20)],
+        ),
+        (
+            EffectiveCompilationConfig::aarch64_apple_darwin(),
+            [(37, 15), (56, 22)],
+        ),
+    ] {
+        let mut observed = Vec::new();
+        for ((name, source), expected) in cases.into_iter().zip(expected) {
+            let output = emit_source_with_config(source, &config);
+            let clif = function_clif(&output.clif, "main");
+            let counts = clif_instruction_and_store_counts(clif);
+            assert_eq!(
+                counts, expected,
+                "{} {name} bridge setup changed:\n{clif}",
+                config.target.triple
+            );
+            observed.push(counts);
+        }
+        assert!(observed[0].0 < observed[1].0);
+        assert!(observed[0].1 < observed[1].1);
+        assert!(
+            observed[1].0 * 10 <= LEGACY_MIXED_PRINTF_INSTRUCTIONS,
+            "{} retained more than ten percent of the checked-in bytewise-clear baseline",
+            config.target.triple
+        );
+    }
+}
+
+#[test]
+fn riscv_bridge_nan_boxes_only_live_fixed_floating_registers() {
+    let output = emit_source_with_config(
+        "int consume(_Float16, float, double, ...);\n\
+         int call(void) { return consume(1.0, 2.0, 3.0, 4); }",
+        &EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
+    );
+    let clif = function_clif(&output.clif, "call");
+    let nan_box_candidates = clif
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            line.strip_suffix(" = iconst.i64 -1")
+        })
+        .collect::<Vec<_>>();
+    let (nan_box, stores) = nan_box_candidates
+        .into_iter()
+        .map(|candidate| {
+            let stores = clif
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with(&format!("store {candidate},")))
+                .collect::<Vec<_>>();
+            (candidate, stores)
+        })
+        .find(|(_, stores)| stores.len() == 3)
+        .expect("one all-ones value seeds the three live FP lanes");
+    assert!(!nan_box.is_empty());
+    assert_eq!(stores.len(), 3, "{clif}");
+    for offset in [112, 128, 144] {
+        assert!(
+            stores
+                .iter()
+                .any(|store| store.contains(&format!("+{offset}"))),
+            "missing live FP lane {offset}:\n{clif}"
+        );
+    }
+    assert!(
+        !stores.iter().any(|store| store.contains("+160")),
+        "an inactive FP lane was seeded:\n{clif}"
+    );
+}
+
+#[test]
+fn variadic_call_setup_counts_track_full_register_banks_and_stack_overflow() {
+    let cases = [
+        (
+            "gp-full",
+            "int consume(long, long, long, long, long, long, long, long, ...);\n\
+             int call(void) { return consume(1, 2, 3, 4, 5, 6, 7, 8); }",
+        ),
+        (
+            "fp-full",
+            "int consume(double, double, double, double, double, double, double, double, ...);\n\
+             int call(void) { return consume(1, 2, 3, 4, 5, 6, 7, 8); }",
+        ),
+        (
+            "overflow",
+            "int consume(long, long, long, long, long, long, long, long, long, long, long, long, ...);\n\
+             int call(void) { return consume(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12); }",
+        ),
+    ];
+    for (config, expected) in [
+        (
+            EffectiveCompilationConfig::default(),
+            [(6, 0, 16, 79, 28), (0, 8, 0, 87, 36), (6, 0, 48, 103, 36)],
+        ),
+        (
+            EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+            [(8, 0, 0, 80, 29), (0, 8, 0, 88, 37), (8, 0, 32, 104, 37)],
+        ),
+        (
+            EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
+            [(8, 0, 0, 80, 28), (0, 8, 0, 80, 28), (8, 0, 32, 104, 36)],
+        ),
+        (
+            EffectiveCompilationConfig::aarch64_apple_darwin(),
+            [(8, 0, 0, 80, 29), (0, 8, 0, 88, 37), (8, 0, 32, 104, 37)],
+        ),
+    ] {
+        let mut observed = Vec::new();
+        for ((name, source), expected) in cases.into_iter().zip(expected) {
+            let module = lower_source_with_config(source, &config);
+            let plan = ccc_abi::plan_module(&module, &config).unwrap();
+            let ccc_abi::BoundaryPlan::Bridge(boundary) =
+                &plan.calls.values().next().unwrap().boundary
+            else {
+                panic!("expected bridge")
+            };
+            let output = emit(
+                &module,
+                &config,
+                Options {
+                    emit_clif: true,
+                    debug_info: None,
+                },
+            )
+            .unwrap();
+            let counts = clif_instruction_and_store_counts(function_clif(&output.clif, "call"));
+            let actual = (
+                boundary.gp_used,
+                boundary.xmm_used,
+                boundary.stack_size,
+                counts.0,
+                counts.1,
+            );
+            assert_eq!(
+                actual, expected,
+                "{} {name} bridge setup changed",
+                config.target.triple
+            );
+            observed.push(actual);
+        }
+        assert!(matches!(observed[0], (6 | 8, 0, _, _, _)));
+        assert_eq!(observed[1].1, 8);
+        assert!(observed[2].2 > observed[0].2);
+        assert!(observed[2].3 > observed[0].3);
+        assert!(observed[2].4 > observed[0].4);
+    }
+}
+
 #[test]
 fn tiny_functions_intern_only_referenced_clif_entities_on_every_target() {
     let source = "int puts(const char *);\n\
@@ -1756,7 +1950,7 @@ fn complete_abi_plan_and_aggregate_clif_have_exact_snapshots() {
     assert!(dump.contains("packaging assembly-units=2"), "{dump}");
     assert_eq!(
         sha256(&dump),
-        "4de89a9f44e8df6e1d5bd8d4a69ca27e9ccedc8bc1e2c8f42d298ae8800744cb"
+        "f966e45b3796025dbf49b0797ca6ae2c04ea251495ea7a4ce1699e48fab1881b"
     );
 
     let output = emit(
@@ -1770,7 +1964,7 @@ fn complete_abi_plan_and_aggregate_clif_have_exact_snapshots() {
     .unwrap();
     assert_eq!(
         sha256(&output.clif),
-        "f901647419fc95b176ec80193242a4b14a01ea5d345276e24eddd17367597868"
+        "25ee0eb9b419e2495567f6cba45ca646ab6e0c2f478bd890432fa8b5085fa468"
     );
 }
 

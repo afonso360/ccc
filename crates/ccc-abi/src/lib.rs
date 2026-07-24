@@ -77,13 +77,14 @@ pub fn plan_boundary_type(
 ) -> Result<BoundaryPlan, AbiError> {
     validate_target(config)?;
     reject_int128_function(types, signature, config)?;
-    match config.target.abi {
+    let boundary = match config.target.abi {
         AbiIdentity::SysvAmd64Lp64 => sysv_amd64::plan_boundary_type(types, signature, config),
         AbiIdentity::Aapcs64Lp64 | AbiIdentity::DarwinArm64 => {
             aarch64::plan_boundary_type(types, signature, config)
         }
         AbiIdentity::RiscvLp64d => riscv64::plan_boundary_type(types, signature, config),
-    }
+    }?;
+    validate_boundary_register_high_water(boundary)
 }
 
 pub fn plan_variadic_call(
@@ -98,7 +99,7 @@ pub fn plan_variadic_call(
     for ty in actual_types {
         reject_int128_type(types, *ty, "variadic call argument", config)?;
     }
-    match config.target.abi {
+    let plan = match config.target.abi {
         AbiIdentity::SysvAmd64Lp64 => sysv_amd64::plan_variadic_call(
             types,
             signature,
@@ -112,7 +113,8 @@ pub fn plan_variadic_call(
         AbiIdentity::RiscvLp64d => {
             riscv64::plan_variadic_call(types, signature, actual_types, variadic_boundary, config)
         }
-    }
+    }?;
+    validate_bridge_register_high_water(plan)
 }
 
 pub fn plan_fixed_call(
@@ -126,7 +128,7 @@ pub fn plan_fixed_call(
     for ty in actual_types {
         reject_int128_type(types, *ty, "fixed call argument", config)?;
     }
-    match config.target.abi {
+    let plan = match config.target.abi {
         AbiIdentity::SysvAmd64Lp64 => {
             sysv_amd64::plan_fixed_call(types, signature, actual_types, config)
         }
@@ -136,7 +138,8 @@ pub fn plan_fixed_call(
                 "the selected target has no fixed wide-integer call bridge",
             ))
         }
-    }
+    }?;
+    validate_bridge_register_high_water(plan)
 }
 
 pub fn plan_unprototyped_call(
@@ -150,7 +153,7 @@ pub fn plan_unprototyped_call(
     for ty in promoted_actual_types {
         reject_int128_type(types, *ty, "unprototyped call argument", config)?;
     }
-    match config.target.abi {
+    let plan = match config.target.abi {
         AbiIdentity::SysvAmd64Lp64 => {
             sysv_amd64::plan_unprototyped_call(types, signature, promoted_actual_types, config)
         }
@@ -160,7 +163,65 @@ pub fn plan_unprototyped_call(
         AbiIdentity::RiscvLp64d => {
             riscv64::plan_unprototyped_call(types, signature, promoted_actual_types, config)
         }
+    }?;
+    validate_bridge_register_high_water(plan)
+}
+
+fn validate_boundary_register_high_water(boundary: BoundaryPlan) -> Result<BoundaryPlan, AbiError> {
+    match boundary {
+        BoundaryPlan::Bridge(plan) => {
+            validate_bridge_register_high_water(plan).map(BoundaryPlan::Bridge)
+        }
+        BoundaryPlan::Native(plan) => Ok(BoundaryPlan::Native(plan)),
     }
+}
+
+fn validate_bridge_register_high_water(
+    plan: BridgeBoundaryPlan,
+) -> Result<BridgeBoundaryPlan, AbiError> {
+    let gp_capacity = if plan.abi_identity == AbiIdentity::SysvAmd64Lp64 {
+        6
+    } else {
+        8
+    };
+    let fp_capacity = 8;
+    if plan.gp_used > gp_capacity || plan.xmm_used > fp_capacity {
+        return Err(AbiError::new(
+            "CCC3515",
+            format!(
+                "bridge register high-water counts gp={} fp={} exceed {} ABI capacities gp={gp_capacity} fp={fp_capacity}",
+                plan.gp_used,
+                plan.xmm_used,
+                plan.abi_identity.name()
+            ),
+        ));
+    }
+    if plan.variadic_sse_count > plan.xmm_used || plan.variadic_sse_count > fp_capacity {
+        return Err(AbiError::new(
+            "CCC3515",
+            "bridge variadic floating-register count exceeds its live prefix",
+        ));
+    }
+    for piece in &plan.parameter_pieces {
+        let BridgeLocation::Register(register) = piece.location else {
+            continue;
+        };
+        let within_prefix = match register.bank {
+            RegisterBank::Integer => register.index < plan.gp_used,
+            RegisterBank::Float => register.index < plan.xmm_used,
+            RegisterBank::X87 => false,
+        };
+        if !within_prefix {
+            return Err(AbiError::new(
+                "CCC3515",
+                format!(
+                    "bridge parameter register {:?} lies outside the declared gp={} fp={} live prefixes",
+                    register, plan.gp_used, plan.xmm_used
+                ),
+            ));
+        }
+    }
+    Ok(plan)
 }
 
 pub fn classify_type(
@@ -297,6 +358,56 @@ pub(crate) fn validate_target(config: &EffectiveCompilationConfig) -> Result<(),
         AbiIdentity::SysvAmd64Lp64 => sysv_amd64::validate_target(config),
         AbiIdentity::Aapcs64Lp64 | AbiIdentity::DarwinArm64 => aarch64::validate_target(config),
         AbiIdentity::RiscvLp64d => riscv64::validate_target(config),
+    }
+}
+
+#[cfg(test)]
+mod bridge_high_water_tests {
+    use ccc_target::{AbiIdentity, EffectiveCompilationConfig};
+    use ccc_types::{FunctionType, QualifiedType, TypeId, TypeStore};
+
+    use super::{plan_variadic_call, validate_bridge_register_high_water};
+
+    #[test]
+    fn bridge_register_high_water_counts_are_bounded_on_every_target() {
+        let mut types = TypeStore::default();
+        let signature = types.function_type(FunctionType::variadic(
+            QualifiedType::unqualified(TypeId::INT),
+            vec![QualifiedType::unqualified(TypeId::INT)],
+        ));
+        for config in [
+            EffectiveCompilationConfig::default(),
+            EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+            EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
+            EffectiveCompilationConfig::aarch64_apple_darwin(),
+        ] {
+            let plan = plan_variadic_call(&types, signature, &[TypeId::INT], 1, &config).unwrap();
+            let gp_capacity = if config.target.abi == AbiIdentity::SysvAmd64Lp64 {
+                6
+            } else {
+                8
+            };
+            assert!(plan.gp_used <= gp_capacity);
+            assert!(plan.xmm_used <= 8);
+
+            let mut excessive_gp = plan.clone();
+            excessive_gp.gp_used = gp_capacity + 1;
+            assert_eq!(
+                validate_bridge_register_high_water(excessive_gp)
+                    .unwrap_err()
+                    .code,
+                "CCC3515"
+            );
+
+            let mut excessive_fp = plan;
+            excessive_fp.xmm_used = 9;
+            assert_eq!(
+                validate_bridge_register_high_water(excessive_fp)
+                    .unwrap_err()
+                    .code,
+                "CCC3515"
+            );
+        }
     }
 }
 
