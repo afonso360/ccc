@@ -1,6 +1,7 @@
 use super::data::{low_mask_u128, scalar_constant_bits, string_unit_bytes};
 use super::*;
 use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, BTreeSet};
 
 const F80_OP_ADD: i64 = 1;
 const F80_OP_SUBTRACT: i64 = 2;
@@ -76,6 +77,14 @@ struct StackStorage {
 /// described by one fixed frame-relative expression.
 pub(super) struct FunctionDebugLayout {
     pub(super) storage_slots: HashMap<u32, StackSlot>,
+    pub(super) promoted_updates: Vec<PromotedDebugUpdate>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct PromotedDebugUpdate {
+    pub(super) local_index: usize,
+    pub(super) boundary: u32,
+    pub(super) label: Option<u32>,
 }
 
 impl<'a> FunctionReferences<'a> {
@@ -424,6 +433,51 @@ pub(super) fn lower_function(
     }
     let mut builder_context = FunctionBuilderContext::new();
     let mut builder = FunctionBuilder::new(clif_function, &mut builder_context);
+    let mut debug_boundaries = BTreeMap::<(gir::BlockId, u32), u32>::new();
+    let mut promoted_updates = Vec::new();
+    let mut promoted_value_labels = BTreeMap::<gir::ValueId, Vec<u32>>::new();
+    let promoted_parameter_locals = function
+        .promoted_locals
+        .iter()
+        .map(|local| local.local)
+        .collect::<BTreeSet<_>>();
+    if collect_debug_values {
+        for local in &function.promoted_locals {
+            for update in &local.updates {
+                let next = u32::try_from(debug_boundaries.len())
+                    .map_err(|_| error("debug boundary exceeds Cranelift's tag space"))?;
+                debug_boundaries
+                    .entry((update.block, update.before_instruction))
+                    .or_insert(next);
+            }
+        }
+        let mut update_index = 0usize;
+        for (local_index, local) in function.promoted_locals.iter().enumerate() {
+            for update in &local.updates {
+                let label = if let Some(value) = update.value {
+                    let raw = function
+                        .parameters
+                        .len()
+                        .checked_add(update_index)
+                        .ok_or_else(|| error("debug value label space overflow"))?;
+                    let raw = u32::try_from(raw)
+                        .map_err(|_| error("debug value label exceeds Cranelift's label space"))?;
+                    promoted_value_labels.entry(value).or_default().push(raw);
+                    Some(raw)
+                } else {
+                    None
+                };
+                promoted_updates.push(PromotedDebugUpdate {
+                    local_index,
+                    boundary: debug_boundaries[&(update.block, update.before_instruction)],
+                    label,
+                });
+                update_index = update_index
+                    .checked_add(1)
+                    .ok_or_else(|| error("debug promoted-local update count overflow"))?;
+            }
+        }
+    }
     let mut blocks = HashMap::with_capacity(function.blocks.len());
     for block in &function.blocks {
         if blocks.insert(block.id.0, builder.create_block()).is_some() {
@@ -554,31 +608,55 @@ pub(super) fn lower_function(
             let entry_values = builder.block_params(state.block(entry.0)?).to_vec();
             state.initialize_runtime_storage(&mut builder);
             state.bind_entry_parameters(&mut builder, &entry_values)?;
-            if collect_debug_values {
-                let parameters = state
-                    .function
-                    .parameters
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, parameter)| {
-                        (parameter.storage.is_none()).then_some((index, parameter.incoming?))
-                    })
-                    .collect::<Vec<_>>();
-                for (index, incoming) in parameters {
-                    let index = u32::try_from(index).map_err(|_| {
-                        error("debug parameter index exceeds Cranelift label space")
-                    })?;
-                    builder.set_val_label(state.value(incoming)?, ir::ValueLabel::from_u32(index));
+        }
+        if collect_debug_values {
+            for parameter in &block.parameters {
+                let value = state.value(*parameter)?;
+                if block.id == entry {
+                    for (index, source_parameter) in state.function.parameters.iter().enumerate() {
+                        if source_parameter.storage.is_none()
+                            && !promoted_parameter_locals.contains(&source_parameter.local)
+                            && source_parameter.incoming == Some(*parameter)
+                        {
+                            let index = u32::try_from(index).map_err(|_| {
+                                error("debug parameter index exceeds Cranelift label space")
+                            })?;
+                            builder.set_val_label(value, ir::ValueLabel::from_u32(index));
+                        }
+                    }
+                }
+                if let Some(labels) = promoted_value_labels.get(parameter) {
+                    for label in labels {
+                        builder.set_val_label(value, ir::ValueLabel::from_u32(*label));
+                    }
                 }
             }
         }
-        for instruction in &block.instructions {
+        for (position, instruction) in block.instructions.iter().enumerate() {
+            if collect_debug_values {
+                let position = u32::try_from(position)
+                    .map_err(|_| error("debug boundary exceeds the 32-bit IR space"))?;
+                if let Some(boundary) = debug_boundaries.get(&(block.id, position)).copied() {
+                    let marker = builder.ins().sequence_point();
+                    builder
+                        .func
+                        .debug_tags
+                        .set(marker, [ir::DebugTag::User(boundary)]);
+                }
+            }
             if let Some(locations) = debug_locations.as_deref_mut() {
                 builder.set_srcloc(locations.intern(instruction.span)?);
             }
             let result = state.lower_instruction(&mut builder, instruction)?;
             match (instruction.result, result) {
-                (Some(id), Some(value)) => state.set_value(id, value)?,
+                (Some(id), Some(value)) => {
+                    state.set_value(id, value)?;
+                    if let Some(labels) = promoted_value_labels.get(&id) {
+                        for label in labels {
+                            builder.set_val_label(value, ir::ValueLabel::from_u32(*label));
+                        }
+                    }
+                }
                 (None, None) => {}
                 (Some(id), None) => {
                     return Err(error(format!(
@@ -592,6 +670,17 @@ pub(super) fn lower_function(
                         instruction.id.0
                     )));
                 }
+            }
+        }
+        if collect_debug_values {
+            let position = u32::try_from(block.instructions.len())
+                .map_err(|_| error("debug boundary exceeds the 32-bit IR space"))?;
+            if let Some(boundary) = debug_boundaries.get(&(block.id, position)).copied() {
+                let marker = builder.ins().sequence_point();
+                builder
+                    .func
+                    .debug_tags
+                    .set(marker, [ir::DebugTag::User(boundary)]);
             }
         }
         let terminator = block.terminator.as_ref().ok_or_else(|| {
@@ -614,7 +703,10 @@ pub(super) fn lower_function(
         .collect();
     builder.seal_all_blocks();
     backend::finalize_frontend(builder, frontend_config);
-    Ok(FunctionDebugLayout { storage_slots })
+    Ok(FunctionDebugLayout {
+        storage_slots,
+        promoted_updates,
+    })
 }
 
 struct FunctionState<'a, 'references, 'object> {

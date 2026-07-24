@@ -332,6 +332,11 @@ pub struct FullFunction {
     pub result_type: QualifiedType,
     pub parameters: Vec<FullParameter>,
     pub storage: Vec<FullStorage>,
+    /// Source automatic scalars represented by SSA rather than retained
+    /// storage. Each update is a verifier-backed program boundary at which
+    /// the source variable either has the stated SSA value or is deliberately
+    /// unavailable to a debugger.
+    pub promoted_locals: Vec<FullPromotedLocal>,
     pub blocks: Vec<FullBlock>,
     pub entry: Option<BlockId>,
     /// Canonical, top-level-unqualified types for SSA values. Qualifiers are
@@ -339,6 +344,27 @@ pub struct FullFunction {
     pub value_types: Vec<TypeId>,
     pub instruction_count: u32,
     pub span: Span,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FullPromotedLocal {
+    pub local: FullLocalId,
+    pub name: String,
+    pub ty: QualifiedType,
+    pub updates: Vec<FullPromotedLocalUpdate>,
+    pub span: Span,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FullPromotedLocalUpdate {
+    pub block: BlockId,
+    /// Number of retained instructions that execute before this update. Zero
+    /// is block entry and `block.instructions.len()` is immediately before
+    /// the terminator.
+    pub before_instruction: u32,
+    /// `None` denotes an intentional location gap: the source object is not
+    /// definitely initialized on every path reaching this boundary.
+    pub value: Option<ValueId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

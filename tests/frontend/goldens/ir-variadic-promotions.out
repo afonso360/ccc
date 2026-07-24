@@ -1,5 +1,8 @@
 declare f0 @sink : int (int, ...) [linkage=External visibility=Default]
 function f1 @forward(v0 %byte: char -> ssa, v1 %half: unsigned short int -> ssa, v2 %real: float -> ssa) -> int [signature=int (char, unsigned short int, float) linkage=External visibility=Default inline=false noreturn=false] {
+  promoted l0 %byte: char [b0@0=v0]
+  promoted l1 %half: unsigned short int [b0@0=v1]
+  promoted l2 %real: float [b0@0=v2]
   b0(v0: char, v1: unsigned short int, v2: float):
     i0: v3: int = const signed:0
     i1: v4: int = convert.integer-promotion v0 char -> int

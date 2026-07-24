@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use super::super::{FullFunction, FullInstructionKind, IrError, ScalarConstant, ValueId};
 use super::resolve_alias;
-use crate::generic::lower::compact_values;
+use crate::generic::lower::{compact_values, remap_promoted_local_update_positions};
 
 /// Eliminates repeated scalar and address expressions within one basic block.
 ///
@@ -12,15 +12,19 @@ use crate::generic::lower::compact_values;
 pub(super) fn eliminate_common_expressions(function: &mut FullFunction) -> Result<bool, IrError> {
     let mut aliases = BTreeMap::<ValueId, ValueId>::new();
     let value_types = function.value_types.clone();
+    let mut retained_instructions = Vec::with_capacity(function.blocks.len());
     for block in &mut function.blocks {
         let mut available = BTreeMap::<String, ValueId>::new();
         let mut retained = Vec::with_capacity(block.instructions.len());
+        let mut retained_mask = Vec::with_capacity(block.instructions.len());
         for instruction in std::mem::take(&mut block.instructions) {
             let Some(result) = instruction.result else {
+                retained_mask.push(true);
                 retained.push(instruction);
                 continue;
             };
             let Some(mut key) = expression_key(&instruction.kind, &aliases)? else {
+                retained_mask.push(true);
                 retained.push(instruction);
                 continue;
             };
@@ -30,16 +34,20 @@ pub(super) fn eliminate_common_expressions(function: &mut FullFunction) -> Resul
             key.push_str(&format!("->{}", result_ty.index()));
             if let Some(existing) = available.get(&key).copied() {
                 aliases.insert(result, existing);
+                retained_mask.push(false);
             } else {
                 available.insert(key, result);
+                retained_mask.push(true);
                 retained.push(instruction);
             }
         }
         block.instructions = retained;
+        retained_instructions.push(retained_mask);
     }
     if aliases.is_empty() {
         return Ok(false);
     }
+    remap_promoted_local_update_positions(function, &retained_instructions)?;
     compact_values(function, &aliases)?;
     Ok(true)
 }

@@ -1030,6 +1030,7 @@ fn dumps_explicit_places_compound_updates_and_volatile_effects_exactly() {
         concat!(
             "data d0 @g : volatile int [file:g0 linkage=External duration=Static visibility=Default definition=TentativeCommon]\n",
             "function f0 @f(v0 %p: pointer to int -> ssa) -> int [signature=int (pointer to int) linkage=External visibility=Default inline=false noreturn=false] {\n",
+            "  promoted l0 %p: pointer to int [b0@0=v0]\n",
             "  b0(v0: pointer to int):\n",
             "    i0: v1: int = load v0 object=int [plain]\n",
             "    i1: v2: int = const signed:2\n",
@@ -1055,6 +1056,8 @@ fn pointer_difference_uses_the_unqualified_compatible_element_type() {
         dump_frontend_ir(&module),
         concat!(
             "function f0 @difference(v0 %cursor: pointer to const char -> ssa, v1 %start: pointer to char -> ssa) -> long int [signature=long int (pointer to const char, pointer to char) linkage=External visibility=Default inline=false noreturn=false] {\n",
+            "  promoted l0 %cursor: pointer to const char [b0@0=v0]\n",
+            "  promoted l1 %start: pointer to char [b0@0=v1]\n",
             "  b0(v0: pointer to const char, v1: pointer to char):\n",
             "    i0: v2: long int = pointer.difference v0, v1 element=char\n",
             "    return v2\n",
@@ -1080,6 +1083,7 @@ fn declaration_assembly_labels_are_exact_in_ir_symbols_and_references() {
             "data d0 @linked_object : int [file:g0 linkage=External duration=Static visibility=Default definition=Declaration]\n",
             "declare f0 @linked_function : int (int) [linkage=External visibility=Default]\n",
             "function f1 @invoke(v0 %value: int -> ssa) -> int [signature=int (int) linkage=External visibility=Default inline=false noreturn=false] {\n",
+            "  promoted l0 %value: int [b0@0=v0]\n",
             "  b0(v0: int):\n",
             "    i0: v1: int = call.direct f0 (v0) signature=int (int) variadic-boundary=1 [read=true write=true unwind=true noreturn=false]\n",
             "    i1: v2: pointer to int = address.data d0\n",
@@ -1103,6 +1107,8 @@ fn unprototyped_calls_record_default_promotions_and_a_zero_fixed_boundary_exactl
         concat!(
             "declare f0 @legacy : int () [linkage=External visibility=Default]\n",
             "function f1 @invoke(v0 %floating: float -> ssa, v1 %narrow: signed char -> ssa) -> int [signature=int (float, signed char) linkage=External visibility=Default inline=false noreturn=false] {\n",
+            "  promoted l0 %floating: float [b0@0=v0]\n",
+            "  promoted l1 %narrow: signed char [b0@0=v1]\n",
             "  b0(v0: float, v1: signed char):\n",
             "    i0: v2: double = convert.floating-conversion v0 float -> double\n",
             "    i1: v3: int = convert.integer-promotion v1 signed char -> int\n",
@@ -1128,6 +1134,7 @@ fn golden_covers_data_strings_places_and_cfg() {
             "  }\n",
             "string s0 Ordinary : array[3] of char = [120, 121, 0]\n",
             "function f0 @f(v0 %x: int -> ssa) -> int [signature=int (int) linkage=External visibility=Default inline=false noreturn=false] {\n",
+            "  promoted l0 %x: int [b0@0=v0,b1@0=v2,b2@0=v9,b3@0=v12]\n",
             "  b0(v0: int):\n",
             "    i0: v1: int = convert.to-boolean v0 int -> int\n",
             "    conditional v1 ? b1(v0) : b2(v0)\n",
@@ -1225,6 +1232,9 @@ fn aggregate_rvalues_are_owned_and_project_field_index_paths() {
         concat!(
             "declare f0 @make : struct Matrix () [linkage=External visibility=Default]\n",
             "function f1 @read(v0 %choose: int -> ssa, v1 %row: int -> ssa, v2 %column: int -> ssa) -> int [signature=int (int, int, int) linkage=External visibility=Default inline=false noreturn=false] {\n",
+            "  promoted l0 %choose: int [b0@0=v0,b1@0=v4,b2@0=v8,b3@0=v13]\n",
+            "  promoted l1 %row: int [b0@0=v1,b1@0=v5,b2@0=v9,b3@0=v14]\n",
+            "  promoted l2 %column: int [b0@0=v2,b1@0=v6,b2@0=v10,b3@0=v15]\n",
             "  b0(v0: int, v1: int, v2: int):\n",
             "    i0: v3: int = convert.to-boolean v0 int -> int\n",
             "    conditional v3 ? b1(v0, v1, v2) : b2(v0, v1, v2)\n",
@@ -1448,6 +1458,8 @@ fn lowers_variadic_builtins_to_abi_neutral_effects() {
             "function f0 @read(v0 %count: int -> ssa) -> int [signature=int (int, ...) linkage=External visibility=Default inline=false noreturn=false] {\n",
             "  storage m0 l1 %list: array[1] of struct __ccc_sysv_va_list_tag [Automatic; AddressTaken,Aggregate]\n",
             "  storage m1 l2 %copy: array[1] of struct __ccc_sysv_va_list_tag [Automatic; AddressTaken,Aggregate]\n",
+            "  promoted l0 %count: int [b0@0=v0]\n",
+            "  promoted l3 %value: int [b0@0=unavailable,b0@8=v6]\n",
             "  b0(v0: int):\n",
             "    i0: v1: int = const signed:0\n",
             "    i1: v2: pointer to array[1] of struct __ccc_sysv_va_list_tag = address.storage m0\n",
@@ -2100,6 +2112,7 @@ fn lowers_scalar_builtins_to_value_preserving_ir_without_calls() {
         dump_frontend_ir(&module),
         concat!(
             "function f0 @choose(v0 %value: int -> ssa) -> long int [signature=long int (int) linkage=External visibility=Default inline=false noreturn=false] {\n",
+            "  promoted l0 %value: int [b0@0=v0]\n",
             "  b0(v0: int):\n",
             "    i0: v1: long int = convert.integer-conversion v0 int -> long int\n",
             "    return v1\n",
@@ -2203,6 +2216,7 @@ fn lowers_block_scope_compound_literals_at_their_evaluation_point() {
         concat!(
             "function f0 @read() -> int [signature=int () linkage=External visibility=Default inline=false noreturn=false] {\n",
             "  storage m0 l1 %<compound-literal-1>: struct Pair [Automatic; AddressTaken,Aggregate]\n",
+            "  promoted l0 %pair: pointer to struct Pair [b0@0=unavailable,b0@10=v6]\n",
             "  b0():\n",
             "    i0: v0: pointer to struct Pair = const null\n",
             "    i1: v1: pointer to struct Pair = address.storage m0\n",
@@ -3099,6 +3113,129 @@ fn verifier_rejects_use_dominance_block_arity_and_ordering_corruption() {
 }
 
 #[test]
+fn verifier_rejects_malformed_promoted_local_metadata() {
+    const SOURCE: &str = "int f(volatile int *source) { int prefix = *source; int value = *source; return prefix + value; }";
+    let lowered = || lower_source(SOURCE);
+
+    let mut module = lowered();
+    let local = module.functions[0]
+        .promoted_locals
+        .iter_mut()
+        .find(|local| local.name == "value")
+        .unwrap();
+    local
+        .updates
+        .retain(|update| update.before_instruction != 0);
+    let error = verify_frontend(&module).unwrap_err();
+    assert!(
+        error.message.contains("missing a block-entry state"),
+        "{error}"
+    );
+
+    let mut module = lowered();
+    let local = module.functions[0]
+        .promoted_locals
+        .iter_mut()
+        .find(|local| local.name == "value")
+        .unwrap();
+    local.updates.insert(1, local.updates[0]);
+    let error = verify_frontend(&module).unwrap_err();
+    assert!(error.message.contains("not in stable order"), "{error}");
+
+    let mut module = lowered();
+    let function = &mut module.functions[0];
+    let local = function
+        .promoted_locals
+        .iter_mut()
+        .find(|local| local.name == "value")
+        .unwrap();
+    let update = local
+        .updates
+        .iter_mut()
+        .find(|update| update.value.is_some())
+        .unwrap();
+    update.before_instruction =
+        u32::try_from(function.blocks[update.block.0 as usize].instructions.len()).unwrap() + 1;
+    let error = verify_frontend(&module).unwrap_err();
+    assert!(error.message.contains("out-of-range boundary"), "{error}");
+
+    let mut module = lowered();
+    let source = module.functions[0]
+        .parameters
+        .iter()
+        .find(|parameter| parameter.name == "source")
+        .unwrap()
+        .incoming
+        .unwrap();
+    let local = module.functions[0]
+        .promoted_locals
+        .iter_mut()
+        .find(|local| local.name == "value")
+        .unwrap();
+    local
+        .updates
+        .iter_mut()
+        .find(|update| update.value.is_some())
+        .unwrap()
+        .value = Some(source);
+    let error = verify_frontend(&module).unwrap_err();
+    assert!(error.message.contains("value of the wrong type"), "{error}");
+
+    let mut module = lowered();
+    let function = &mut module.functions[0];
+    let (block, value) = function
+        .promoted_locals
+        .iter()
+        .find(|local| local.name == "value")
+        .unwrap()
+        .updates
+        .iter()
+        .find_map(|update| update.value.map(|value| (update.block, value)))
+        .unwrap();
+    let definition = function.blocks[block.0 as usize]
+        .instructions
+        .iter()
+        .position(|instruction| instruction.result == Some(value))
+        .unwrap();
+    assert!(definition > 0);
+    function
+        .promoted_locals
+        .iter_mut()
+        .find(|local| local.name == "value")
+        .unwrap()
+        .updates
+        .iter_mut()
+        .find(|update| update.value == Some(value))
+        .unwrap()
+        .before_instruction = u32::try_from(definition).unwrap();
+    let error = verify_frontend(&module).unwrap_err();
+    assert!(error.message.contains("does not dominate"), "{error}");
+
+    let mut module = lowered();
+    let local = module.functions[0]
+        .promoted_locals
+        .iter_mut()
+        .find(|local| local.name == "value")
+        .unwrap();
+    local.ty.qualifiers |= ccc_types::TypeQualifiers::VOLATILE;
+    let error = verify_frontend(&module).unwrap_err();
+    assert!(
+        error.message.contains("requires ordered storage"),
+        "{error}"
+    );
+
+    let mut module = lowered();
+    module.functions[0]
+        .promoted_locals
+        .retain(|local| local.name != "source");
+    let error = verify_frontend(&module).unwrap_err();
+    assert!(
+        error.message.contains("has no promoted-local metadata"),
+        "{error}"
+    );
+}
+
+#[test]
 fn verifier_rejects_invalid_initializer_copy_extents() {
     let mut module = lower_source("char exact[2] = \"xy\";");
     let graph = module.globals[0].initializer.as_mut().unwrap();
@@ -3199,6 +3336,13 @@ fn verifier_rejects_edge_types_storage_terminators_and_relocation_targets() {
         })
         .unwrap();
     module.functions[0].value_types[parameter.0 as usize] = pointer;
+    for local in &mut module.functions[0].promoted_locals {
+        for update in &mut local.updates {
+            if update.value == Some(parameter) {
+                update.value = None;
+            }
+        }
+    }
     let error = verify_frontend(&module).unwrap_err();
     assert!(error.message.contains("argument type mismatch"), "{error}");
 

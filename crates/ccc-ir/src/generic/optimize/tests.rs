@@ -237,6 +237,43 @@ fn dead_resultless_void_conversion_releases_its_pure_operand_chain() {
 }
 
 #[test]
+fn removed_instructions_collapse_promoted_boundaries_to_the_later_state() {
+    let config =
+        EffectiveCompilationConfig::default().with_optimization_level(OptimizationLevel::O1);
+    let mut module = lower_source(
+        "int inspect(int incoming) {
+             int observed = incoming + 1;
+             observed = incoming;
+             return observed;
+         }",
+        &config,
+    );
+    let incoming = module.functions[0].parameters[0].incoming.unwrap();
+    let before = module.functions[0]
+        .promoted_locals
+        .iter()
+        .find(|local| local.name == "observed")
+        .unwrap();
+    assert_eq!(before.updates.len(), 2);
+    assert_eq!(before.updates[0].value, None);
+    assert_eq!(before.updates[1].value, Some(incoming));
+    assert_eq!(binary_count(&module, BinaryOperation::Add), 1);
+
+    optimize_frontend_for_config(&mut module, &config).unwrap();
+
+    let after = module.functions[0]
+        .promoted_locals
+        .iter()
+        .find(|local| local.name == "observed")
+        .unwrap();
+    assert_eq!(binary_count(&module, BinaryOperation::Add), 0);
+    assert_eq!(after.updates.len(), 1);
+    assert_eq!(after.updates[0].before_instruction, 0);
+    assert_eq!(after.updates[0].value, Some(incoming));
+    verify_frontend(&module).unwrap();
+}
+
+#[test]
 fn dead_loop_carried_ssa_cycles_are_removed_by_liveness() {
     let config =
         EffectiveCompilationConfig::default().with_optimization_level(OptimizationLevel::O1);

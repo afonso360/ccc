@@ -15,15 +15,19 @@ requires `.debug_info`, `.debug_abbrev`, `.debug_line`, range data, and the
 existing call-frame section, and parses the emitted DWARF independently. It
 checks compilation-unit, subprogram, core-type, member, parameter, variable,
 and single function-wide lexical-block DIEs. Fixed frame locations, ordinary
-data addresses, x86-64 ELF and Darwin TLV TLS address expressions, prototype markers,
-multiple source rows, and object-format relocations from debug sections to
-code, data, TLS data, and other debug sections are inspected directly.
-Register/SSA value tracking and nested lexical ranges are not claimed.
+data addresses, promoted-scalar location lists with assignment-boundary gaps,
+x86-64 ELF and Darwin TLV TLS address expressions, prototype markers, multiple
+source rows, and object-format relocations from debug sections to code, data,
+TLS data, and other debug sections are inspected directly. Cross-target `-O2`
+tests require every promoted source DIE, ordered non-overlapping ranges for
+values the backend preserves, and conservative omission for unavailable
+versions. Nested lexical ranges are not claimed.
 The native Darwin gate also performs a one-step `-g` compile and link through a
 generated TLS accessor, requires
 the executable and staged `.dSYM` UUIDs to match, then uses LLDB to stop on a C
-source line, recover a fixed-frame local value, and confirm the TLS definition's
-certified location expression. A command/cleanup fixture
+source line, recover both a fixed-frame local and the promoted scalar
+`observed = 42`, and confirm the TLS definition's certified location
+expression. A command/cleanup fixture
 separately proves that `dsymutil` runs before registered link objects are
 released and that incomplete bundle trees never replace an existing bundle.
 

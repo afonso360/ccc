@@ -10,7 +10,7 @@ use ccc_types::{
     ArrayLength, BuiltinType, FunctionParameters, LayoutShape, QualifiedType, RecordKind, TypeId,
     TypeKind, TypeQualifiers, TypeStore,
 };
-use cranelift_codegen::ir::{SourceLoc, ValueLabel};
+use cranelift_codegen::ir::{DebugTag, SourceLoc, ValueLabel};
 use cranelift_codegen::isa::TargetIsa;
 use cranelift_codegen::{Context, LabelValueLoc};
 use cranelift_module::FuncId;
@@ -71,16 +71,17 @@ struct FunctionRecord {
     rows: Vec<(u64, Span)>,
     frame_locations: HashMap<u32, i64>,
     parameter_locations: HashMap<u32, Vec<ValueLocationRange>>,
+    promoted_locations: HashMap<usize, Vec<ValueLocationRange>>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ValueLocationRange {
     start: u64,
     end: u64,
     location: ValueLocation,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ValueLocation {
     Register(Register),
     CfaOffset(i64),
@@ -157,38 +158,56 @@ impl<'a> DebugEmitter<'a> {
         for index in 0..function.parameters.len() {
             let index = u32::try_from(index)
                 .map_err(|_| error("debug parameter index exceeds Cranelift's label space"))?;
-            let Some(ranges) = compiled
-                .value_labels_ranges
-                .get(&ValueLabel::from_u32(index))
-            else {
-                continue;
-            };
-            let mut mapped = Vec::with_capacity(ranges.len());
-            for range in ranges {
-                let start = u64::from(range.start).min(code_size);
-                let end = u64::from(range.end).min(code_size);
-                if start >= end {
-                    continue;
-                }
-                let location = match range.loc {
-                    LabelValueLoc::Reg(register) => ValueLocation::Register(Register(
-                        isa.map_regalloc_reg_to_dwarf(register).map_err(|failure| {
-                            error(format!(
-                                "cannot map a debug value register in `{}`: {failure}",
-                                function.symbol_name
-                            ))
-                        })?,
-                    )),
-                    LabelValueLoc::CFAOffset(offset) => ValueLocation::CfaOffset(offset),
-                };
-                mapped.push(ValueLocationRange {
-                    start,
-                    end,
-                    location,
-                });
-            }
+            let mapped =
+                map_value_label_ranges(compiled, index, code_size, isa, &function.symbol_name)?;
             if !mapped.is_empty() {
                 parameter_locations.insert(index, mapped);
+            }
+        }
+        let mut boundary_offsets = HashMap::<u32, (u64, usize)>::new();
+        for (order, tags) in compiled.buffer.debug_tags().enumerate() {
+            for tag in tags.tags {
+                if let DebugTag::User(boundary) = tag {
+                    boundary_offsets
+                        .entry(*boundary)
+                        .or_insert((u64::from(tags.offset).min(code_size), order));
+                }
+            }
+        }
+        let mut promoted_locations = HashMap::new();
+        for local_index in 0..function.promoted_locals.len() {
+            let updates = lowering
+                .promoted_updates
+                .iter()
+                .filter(|update| update.local_index == local_index)
+                .collect::<Vec<_>>();
+            if updates.is_empty()
+                || updates
+                    .iter()
+                    .any(|update| !boundary_offsets.contains_key(&update.boundary))
+            {
+                continue;
+            }
+            let mut states = updates
+                .into_iter()
+                .map(|update| {
+                    let (offset, order) = boundary_offsets[&update.boundary];
+                    (offset, order, update.label)
+                })
+                .collect::<Vec<_>>();
+            let mut label_locations = HashMap::new();
+            for label in states.iter().filter_map(|(_, _, label)| *label) {
+                if label_locations.contains_key(&label) {
+                    continue;
+                }
+                label_locations.insert(
+                    label,
+                    map_value_label_ranges(compiled, label, code_size, isa, &function.symbol_name)?,
+                );
+            }
+            let mapped = clip_promoted_location_ranges(&mut states, &label_locations, code_size);
+            if !mapped.is_empty() {
+                promoted_locations.insert(local_index, mapped);
             }
         }
         self.functions.push(FunctionRecord {
@@ -198,6 +217,7 @@ impl<'a> DebugEmitter<'a> {
             rows,
             frame_locations,
             parameter_locations,
+            promoted_locations,
         });
         Ok(())
     }
@@ -297,6 +317,9 @@ impl<'a> DebugEmitter<'a> {
             }
             for storage in &function.storage {
                 ensure_span_file(&mut line_program, &mut file_ids, self.sources, storage.span);
+            }
+            for local in &function.promoted_locals {
+                ensure_span_file(&mut line_program, &mut file_ids, self.sources, local.span);
             }
         }
         for global in &self.module.globals {
@@ -431,10 +454,19 @@ impl<'a> DebugEmitter<'a> {
                     .storage
                     .and_then(|storage| record.frame_locations.get(&storage.0).copied());
                 let value_location = if frame_location.is_none() {
-                    let parameter_index = u32::try_from(parameter_index).map_err(|_| {
-                        error("debug parameter index exceeds Cranelift's label space")
-                    })?;
-                    if let Some(ranges) = record.parameter_locations.get(&parameter_index) {
+                    let promoted_index = function
+                        .promoted_locals
+                        .iter()
+                        .position(|local| local.local == parameter.local);
+                    let ranges = if let Some(index) = promoted_index {
+                        record.promoted_locations.get(&index)
+                    } else {
+                        let parameter_index = u32::try_from(parameter_index).map_err(|_| {
+                            error("debug parameter index exceeds Cranelift's label space")
+                        })?;
+                        record.parameter_locations.get(&parameter_index)
+                    };
+                    if let Some(ranges) = ranges {
                         let list = value_location_list(
                             product.object.format(),
                             target,
@@ -501,6 +533,35 @@ impl<'a> DebugEmitter<'a> {
                     entry.set(
                         constants::DW_AT_location,
                         AttributeValue::Exprloc(frame_expression(frame_register, offset)),
+                    );
+                }
+            }
+            for (local_index, local) in function.promoted_locals.iter().enumerate() {
+                if parameter_locals.contains(&local.local) {
+                    continue;
+                }
+                let variable = types.unit.add(lexical, constants::DW_TAG_variable);
+                let type_id = types.qualified(local.ty);
+                let value_location =
+                    if let Some(ranges) = record.promoted_locations.get(&local_index) {
+                        let list = value_location_list(
+                            product.object.format(),
+                            target,
+                            targets[target].addend,
+                            ranges,
+                        )?;
+                        Some(types.unit.locations.add(list))
+                    } else {
+                        None
+                    };
+                let entry = types.unit.get_mut(variable);
+                set_string(entry, constants::DW_AT_name, &local.name);
+                entry.set(constants::DW_AT_type, AttributeValue::UnitRef(type_id));
+                set_decl_location(entry, self.sources, &file_ids, local.span);
+                if let Some(location) = value_location {
+                    entry.set(
+                        constants::DW_AT_location,
+                        AttributeValue::LocationListRef(location),
                     );
                 }
             }
@@ -678,6 +739,97 @@ fn frame_expression(register: Register, offset: i64) -> Expression {
     let mut expression = Expression::new();
     expression.op_breg(register, offset);
     expression
+}
+
+fn map_value_label_ranges(
+    compiled: &cranelift_codegen::CompiledCode,
+    label: u32,
+    code_size: u64,
+    isa: &dyn TargetIsa,
+    function_name: &str,
+) -> Result<Vec<ValueLocationRange>, CodegenError> {
+    let Some(ranges) = compiled
+        .value_labels_ranges
+        .get(&ValueLabel::from_u32(label))
+    else {
+        return Ok(Vec::new());
+    };
+    let mut mapped = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        let start = u64::from(range.start).min(code_size);
+        let end = u64::from(range.end).min(code_size);
+        if start >= end {
+            continue;
+        }
+        let location = match range.loc {
+            LabelValueLoc::Reg(register) => ValueLocation::Register(Register(
+                isa.map_regalloc_reg_to_dwarf(register).map_err(|failure| {
+                    error(format!(
+                        "cannot map a debug value register in `{function_name}`: {failure}"
+                    ))
+                })?,
+            )),
+            LabelValueLoc::CFAOffset(offset) => ValueLocation::CfaOffset(offset),
+        };
+        mapped.push(ValueLocationRange {
+            start,
+            end,
+            location,
+        });
+    }
+    Ok(mapped)
+}
+
+fn clip_promoted_location_ranges(
+    states: &mut Vec<(u64, usize, Option<u32>)>,
+    label_locations: &HashMap<u32, Vec<ValueLocationRange>>,
+    code_size: u64,
+) -> Vec<ValueLocationRange> {
+    states.sort_unstable_by_key(|(offset, order, _)| (*offset, *order));
+    let mut collapsed = Vec::<(u64, Option<u32>)>::new();
+    for (offset, _, label) in states.drain(..) {
+        if let Some((last_offset, last_label)) = collapsed.last_mut()
+            && *last_offset == offset
+        {
+            // Several source states can collapse onto one machine address.
+            // Only the last state in machine-emission order is observable.
+            *last_label = label;
+        } else {
+            collapsed.push((offset, label));
+        }
+    }
+
+    let mut mapped = Vec::<ValueLocationRange>::new();
+    for (index, (start, label)) in collapsed.iter().copied().enumerate() {
+        let end = collapsed
+            .get(index + 1)
+            .map_or(code_size, |(offset, _)| *offset);
+        let Some(label) = label else {
+            continue;
+        };
+        let Some(ranges) = label_locations.get(&label) else {
+            continue;
+        };
+        for range in ranges {
+            let clipped = ValueLocationRange {
+                start: range.start.max(start),
+                end: range.end.min(end),
+                location: range.location,
+            };
+            if clipped.start >= clipped.end {
+                continue;
+            }
+            if let Some(previous) = mapped.last_mut()
+                && previous.end == clipped.start
+                && previous.location == clipped.location
+            {
+                previous.end = clipped.end;
+            } else {
+                mapped.push(clipped);
+            }
+        }
+    }
+    mapped
 }
 
 fn value_location_expression(location: ValueLocation) -> Expression {
@@ -1335,5 +1487,54 @@ fn dwarf_section_name(format: BinaryFormat, id: SectionId) -> Vec<u8> {
         format!("__{}", name.trim_start_matches('.')).into_bytes()
     } else {
         name.as_bytes().to_vec()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn promoted_ranges_use_the_last_same_address_state_and_preserve_gaps() {
+        let register = ValueLocation::Register(Register(3));
+        let mut labels = HashMap::new();
+        labels.insert(
+            1,
+            vec![ValueLocationRange {
+                start: 0,
+                end: 16,
+                location: register,
+            }],
+        );
+        labels.insert(
+            2,
+            vec![ValueLocationRange {
+                start: 0,
+                end: 16,
+                location: ValueLocation::Register(Register(4)),
+            }],
+        );
+        let mut states = vec![
+            (0, 0, Some(1)),
+            (4, 1, Some(2)),
+            (4, 2, None),
+            (8, 3, Some(1)),
+        ];
+
+        assert_eq!(
+            clip_promoted_location_ranges(&mut states, &labels, 12),
+            vec![
+                ValueLocationRange {
+                    start: 0,
+                    end: 4,
+                    location: register,
+                },
+                ValueLocationRange {
+                    start: 8,
+                    end: 12,
+                    location: register,
+                },
+            ]
+        );
     }
 }

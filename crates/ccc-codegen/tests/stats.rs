@@ -53,6 +53,53 @@ fn ordinary_emission_does_not_collect_discarded_statistics() {
 }
 
 #[test]
+fn debug_boundaries_do_not_change_non_debug_clif_or_stats_collection() {
+    for profile in ENABLED_TARGET_SPECS {
+        let config = EffectiveCompilationConfig::for_target(profile.triple.clone())
+            .unwrap()
+            .with_optimization_level(OptimizationLevel::O2);
+        let (sources, module) = lower(&config);
+        let ordinary = emit(
+            &module,
+            &config,
+            Options {
+                emit_clif: true,
+                debug_info: None,
+            },
+        )
+        .unwrap();
+        let measured = emit_with_stats(
+            &module,
+            &config,
+            Options {
+                emit_clif: true,
+                debug_info: None,
+            },
+        )
+        .unwrap();
+        let debug = emit(
+            &module,
+            &config,
+            Options {
+                emit_clif: true,
+                debug_info: Some(&sources),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(ordinary.clif, measured.clif, "{}", profile.triple);
+        assert!(
+            !ordinary.clif.contains("sequence_point"),
+            "{}",
+            profile.triple
+        );
+        assert!(debug.clif.contains("sequence_point"), "{}", profile.triple);
+        assert!(ordinary.stats.is_none());
+        assert!(measured.stats.is_some());
+    }
+}
+
+#[test]
 fn stats_describe_post_inline_ir_and_primary_objects_on_every_target() {
     for profile in ENABLED_TARGET_SPECS {
         let target = EffectiveCompilationConfig::for_target(profile.triple.clone()).unwrap();

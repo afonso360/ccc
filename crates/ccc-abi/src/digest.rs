@@ -169,7 +169,7 @@ pub fn ir_shape_digest(
     module: &gir::FullModule,
     key: &AbiConfigKey,
 ) -> Result<IrShapeDigest, AbiError> {
-    let mut encoder = Encoder::new(b"ccc-ir-shape-v2");
+    let mut encoder = Encoder::new(b"ccc-ir-shape-v3");
     encode_config_key(&mut encoder, key);
     encode_types(&mut encoder, &module.types)?;
     encoder.len(module.globals.len());
@@ -521,6 +521,19 @@ fn encode_function(encoder: &mut Encoder, function: &gir::FullFunction) {
             encoder.tag(*reason as u8);
         }
         encoder.span(storage.span);
+    }
+    encoder.len(function.promoted_locals.len());
+    for local in &function.promoted_locals {
+        encoder.u32(local.local.0);
+        encoder.string(&local.name);
+        encoder.qualified(local.ty);
+        encoder.len(local.updates.len());
+        for update in &local.updates {
+            encoder.u32(update.block.0);
+            encoder.u32(update.before_instruction);
+            encoder.option_u64(update.value.map(|value| u64::from(value.0)));
+        }
+        encoder.span(local.span);
     }
     encoder.option_u64(function.entry.map(|block| u64::from(block.0)));
     encoder.len(function.value_types.len());
@@ -1295,7 +1308,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_module_v2_digests_are_locked() {
+    fn empty_module_v3_digests_are_locked() {
         let module = gir::FullModule {
             types: TypeStore::default(),
             globals: Vec::new(),
@@ -1307,11 +1320,11 @@ mod tests {
         let translation_unit = translation_unit_digest(&module, &key, ir);
         assert_eq!(
             crate::hex(&ir.0),
-            "a296d8c7874287fc2a758f132a5339683cafd1ab6e3b61a18ef9702a8baa3a11"
+            "d532892c9ace8e5c479743406eb30d8c71f454be150efc4d8d18fde8b74143d0"
         );
         assert_eq!(
             crate::hex(&translation_unit.0),
-            "0e2594e692905467ee524af210b495959fef0d20c96f7321b4675f3dd0a209ea"
+            "e3502465cefff4b245d2a7bf3b4ca6e9a16c11d60096b4f664f22852b24d1e9c"
         );
     }
 
@@ -1336,8 +1349,7 @@ mod tests {
         assert_ne!(first, different_alignment);
     }
 
-    #[test]
-    fn function_inlining_properties_are_part_of_provenance_digests() {
+    fn provenance_function_module() -> gir::FullModule {
         let mut sources = ccc_session::SourceMap::new();
         let file = sources.add_file("digest.c", "");
         let span = ccc_session::Span::new(file, 0, 0);
@@ -1346,7 +1358,7 @@ mod tests {
             ccc_types::QualifiedType::unqualified(ccc_types::TypeId::INT),
             Vec::new(),
         ));
-        let mut module = gir::FullModule {
+        gir::FullModule {
             types,
             globals: Vec::new(),
             strings: Vec::new(),
@@ -1364,13 +1376,19 @@ mod tests {
                 result_type: ccc_types::QualifiedType::unqualified(ccc_types::TypeId::INT),
                 parameters: Vec::new(),
                 storage: Vec::new(),
+                promoted_locals: Vec::new(),
                 blocks: Vec::new(),
                 entry: None,
                 value_types: Vec::new(),
                 instruction_count: 0,
                 span,
             }],
-        };
+        }
+    }
+
+    #[test]
+    fn function_inlining_properties_are_part_of_provenance_digests() {
+        let mut module = provenance_function_module();
         let key = abi_config_key(&EffectiveCompilationConfig::default()).unwrap();
         let baseline_ir = ir_shape_digest(&module, &key).unwrap();
         let baseline_unit = translation_unit_digest(&module, &key, baseline_ir);
@@ -1389,6 +1407,44 @@ mod tests {
         assert_ne!(no_inline_ir, always_ir);
         assert_ne!(no_inline_unit, baseline_unit);
         assert_ne!(no_inline_unit, always_unit);
+    }
+
+    #[test]
+    fn promoted_local_updates_are_part_of_provenance_digests() {
+        let mut module = provenance_function_module();
+        let key = abi_config_key(&EffectiveCompilationConfig::default()).unwrap();
+        let baseline_ir = ir_shape_digest(&module, &key).unwrap();
+        let baseline_unit = translation_unit_digest(&module, &key, baseline_ir);
+        let span = module.functions[0].span;
+        module.functions[0]
+            .promoted_locals
+            .push(gir::FullPromotedLocal {
+                local: ccc_sema::generic::FullLocalId(7),
+                name: "observed".to_owned(),
+                ty: ccc_types::QualifiedType::unqualified(ccc_types::TypeId::INT),
+                updates: vec![gir::FullPromotedLocalUpdate {
+                    block: gir::BlockId(0),
+                    before_instruction: 0,
+                    value: None,
+                }],
+                span,
+            });
+        let unavailable_ir = ir_shape_digest(&module, &key).unwrap();
+        let unavailable_unit = translation_unit_digest(&module, &key, unavailable_ir);
+        assert_ne!(unavailable_ir, baseline_ir);
+        assert_ne!(unavailable_unit, baseline_unit);
+
+        module.functions[0].promoted_locals[0].updates[0].value = Some(gir::ValueId(3));
+        let located_ir = ir_shape_digest(&module, &key).unwrap();
+        let located_unit = translation_unit_digest(&module, &key, located_ir);
+        assert_ne!(located_ir, unavailable_ir);
+        assert_ne!(located_unit, unavailable_unit);
+
+        module.functions[0].promoted_locals[0].updates[0].before_instruction = 1;
+        let moved_ir = ir_shape_digest(&module, &key).unwrap();
+        let moved_unit = translation_unit_digest(&module, &key, moved_ir);
+        assert_ne!(moved_ir, located_ir);
+        assert_ne!(moved_unit, located_unit);
     }
 
     #[test]

@@ -10,7 +10,7 @@ mod fold;
 #[cfg(test)]
 mod tests;
 
-use super::lower::compact_values;
+use super::lower::{compact_values, remap_promoted_local_update_positions};
 use super::verify::{instruction_operands, terminator_operands};
 use super::{
     BlockId, FullEdge, FullFunction, FullInstructionKind, FullModule, FullTerminator, IrError,
@@ -506,6 +506,15 @@ fn retain_blocks(function: &mut FullFunction, retained: &[bool]) -> Result<(), I
             })?),
             None => None,
         };
+    for local in &mut function.promoted_locals {
+        local.updates.retain_mut(|update| {
+            let Some(block) = remap.get(update.block.0 as usize).and_then(|block| *block) else {
+                return false;
+            };
+            update.block = block;
+            true
+        });
+    }
     Ok(())
 }
 
@@ -595,24 +604,45 @@ fn eliminate_dead_pure_instructions(function: &mut FullFunction) -> Result<bool,
             }
         }
     }
-    for (block, keep) in function.blocks.iter_mut().zip(&parameter_liveness) {
+    let retained_instructions = function
+        .blocks
+        .iter()
+        .map(|block| {
+            block
+                .instructions
+                .iter()
+                .map(|instruction| {
+                    !effects::removable_when_unused(&instruction.kind)
+                        || instruction
+                            .result
+                            .is_some_and(|result| live[result.0 as usize])
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    for ((block, keep), retained) in function
+        .blocks
+        .iter_mut()
+        .zip(&parameter_liveness)
+        .zip(&retained_instructions)
+    {
         let mut index = 0;
         block.parameters.retain(|_| {
             let retain = keep[index];
             index += 1;
             retain
         });
-        block.instructions.retain(|instruction| {
-            let retain = !effects::removable_when_unused(&instruction.kind)
-                || instruction
-                    .result
-                    .is_some_and(|result| live[result.0 as usize]);
-            changed |= !retain;
-            retain
+        let mut instruction_index = 0;
+        block.instructions.retain(|_| {
+            let keep = retained[instruction_index];
+            instruction_index += 1;
+            changed |= !keep;
+            keep
         });
     }
 
     if changed {
+        remap_promoted_local_update_positions(function, &retained_instructions)?;
         compact_values(function, &BTreeMap::new())?;
     }
     Ok(changed)

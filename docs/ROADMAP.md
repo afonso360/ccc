@@ -266,14 +266,14 @@ performed by Cranelift merely to improve a benchmark score.
 
 - Reconstruct nested lexical scopes rather than emitting one function-wide
   block.
-- Track optimized SSA/register values with sound location lists and describe
-  runtime-sized or dynamically realigned objects where the target DWARF model
-  permits it.
+- Extend the verifier-backed promoted-scalar location lists to optimized
+  constants and composite values, and describe runtime-sized or dynamically
+  realigned objects where the target DWARF model permits it.
 - Add independently verified TLS location expressions for AArch64 and RISC-V
   ELF.
-- Represent inlined calls, call sites, and abstract origins, and expand debugger
-  tests from breakpoint/backtrace smoke checks to stepping and value
-  inspection.
+- Represent inlined calls, call sites, and abstract origins, and expand
+  debugger tests beyond the current breakpoint, backtrace, and promoted-local
+  value checks to stepping and scope-sensitive inspection.
 
 ### Native stack and hardening
 

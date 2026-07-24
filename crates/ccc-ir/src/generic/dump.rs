@@ -157,6 +157,31 @@ pub fn dump_frontend_ir(module: &FullModule) -> String {
                 reasons,
             );
         }
+        for local in &function.promoted_locals {
+            let updates = local
+                .updates
+                .iter()
+                .map(|update| {
+                    format!(
+                        "b{}@{}={}",
+                        update.block.0,
+                        update.before_instruction,
+                        update.value.map_or_else(
+                            || "unavailable".to_owned(),
+                            |value| format!("v{}", value.0)
+                        )
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let _ = writeln!(
+                output,
+                "  promoted l{} %{}: {} [{updates}]",
+                local.local.0,
+                local.name,
+                module.types.display_qualified(local.ty),
+            );
+        }
         for block in &function.blocks {
             let parameters = block
                 .parameters

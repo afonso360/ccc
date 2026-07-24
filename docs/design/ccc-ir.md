@@ -9,6 +9,15 @@ separate immutable [module ABI plan](abi-and-varargs.md#module-abi-plan).
 
 - **Places vs values.** A place is an address expression plus type, qualifiers, and an optional bitfield descriptor. Every read is an explicit load and every write an explicit store; lvalue-to-rvalue conversion is never implicit. A transparent GNU statement expression may forward an eligible top-level-unqualified ordinary place or an eligible bit-field place whose ordinary expression type is top-level-unqualified. A forwarded aggregate retains nested member qualifications; a forwarded bit-field retains qualification declared on the field as descriptor access metadata and remains non-addressable. Top-level qualification on an ordinary final, including qualification inherited by a bit-field through its containing aggregate, instead causes an explicit value conversion and any required volatile read. A body that requires sequencing or scoped declarations likewise captures its result as a value before cleanup. `_Generic` independently forwards the selected association's place or value and does not use that materialization rule.
 - **Object identity and address-taking.** Address-taken, volatile, aggregate, atomic, and variably modified objects are materialized in memory. A pre-lowering scan classifies locals before any SSA value is emitted, so later `&local` cannot require retroactive materialization.
+- **Promoted source locals.** Automatic scalars promoted out of storage retain
+  source identity, type, declaration span, and an ordered state table. Every
+  block has an entry state; later boundaries are measured before retained
+  instructions, including the boundary immediately before a terminator. A
+  present value must type-match and dominate its boundary, while an absent
+  value is a deliberate debugger gap. Optimization remaps boundaries when it
+  removes instructions and preserves the last source state when boundaries
+  collapse. This metadata is provenance only: it never keeps an executable SSA
+  value or instruction live.
 - **Runtime-sized layout and automatic storage.** Runtime extents are explicit
   SSA values. `RuntimeSize` records the dynamic extents, constant dimension
   factor, and final element type; codegen rejects nonpositive extents and checks

@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ccc_pp::{PpItem, lex};
 use ccc_sema::generic::analyze_frontend;
@@ -2031,6 +2031,164 @@ fn debug_parameters_use_cranelift_value_location_ranges() {
 }
 
 #[test]
+fn promoted_locals_use_clipped_value_ranges_on_every_enabled_target() {
+    const SOURCE: &str = "
+        int inspect(int parameter, int branch) {
+            volatile int retained = 42;
+            int old = retained;
+            int observed = retained;
+            observed = old;
+            if (branch) {
+                observed = retained;
+            } else {
+                observed = parameter;
+            }
+            parameter = observed;
+            observed = old;
+            int maybe;
+            if (branch) maybe = retained;
+            return parameter + old + observed + (branch ? maybe : 0);
+        }
+    ";
+    for base_config in enabled_compilation_configs() {
+        let config = base_config.with_optimization_level(OptimizationLevel::O2);
+        let (module, sources) = lower_source_with_map(SOURCE, &config);
+        let output = emit(
+            &module,
+            &config,
+            Options {
+                emit_clif: true,
+                debug_info: Some(&sources),
+            },
+        )
+        .unwrap_or_else(|error| panic!("{}: {error}", config.target.triple));
+        assert!(
+            output.clif.contains("sequence_point"),
+            "{}",
+            config.target.triple
+        );
+        let object = object::File::parse(output.object.as_slice()).unwrap();
+        let section_name = |id: gimli::SectionId| {
+            if object.format() == object::BinaryFormat::MachO {
+                id.name().replacen('.', "__", 1)
+            } else {
+                id.name().to_owned()
+            }
+        };
+        let sections = gimli::DwarfSections::load(|id| {
+            Ok::<_, gimli::Error>(
+                object
+                    .section_by_name(&section_name(id))
+                    .and_then(|section| section.data().ok())
+                    .unwrap_or_default()
+                    .to_vec(),
+            )
+        })
+        .unwrap();
+        let dwarf =
+            sections.borrow(|section| gimli::EndianSlice::new(section, gimli::LittleEndian));
+        let mut units = dwarf.units();
+        let header = units.next().unwrap().expect("debug compilation unit");
+        let unit = dwarf.unit(header).unwrap();
+        let mut entries = unit.entries();
+        let mut ranges = BTreeMap::<String, Vec<gimli::Range>>::new();
+        let mut seen = BTreeSet::new();
+        let mut retained_is_frame_relative = false;
+        let mut function_begin = None;
+        while let Some(entry) = entries.next_dfs().unwrap() {
+            let name = entry
+                .attr(gimli::DW_AT_name)
+                .and_then(|attribute| dwarf.attr_string(&unit, attribute.value()).ok())
+                .map(|name| name.to_string_lossy().into_owned());
+            if entry.tag() == gimli::DW_TAG_subprogram && name.as_deref() == Some("inspect") {
+                function_begin = match entry.attr_value(gimli::DW_AT_low_pc).unwrap() {
+                    gimli::AttributeValue::Addr(address) => Some(address),
+                    _ => None,
+                };
+            }
+            if entry.tag() == gimli::DW_TAG_variable && name.as_deref() == Some("retained") {
+                retained_is_frame_relative = matches!(
+                    entry.attr_value(gimli::DW_AT_location).unwrap(),
+                    gimli::AttributeValue::Exprloc(_)
+                );
+            }
+            let is_promoted = matches!(
+                (entry.tag(), name.as_deref()),
+                (gimli::DW_TAG_formal_parameter, Some("parameter" | "branch"))
+                    | (gimli::DW_TAG_variable, Some("old" | "observed" | "maybe"))
+            );
+            if !is_promoted {
+                continue;
+            }
+            let Some(name) = name else { continue };
+            seen.insert(name.clone());
+            let Some(location) = entry.attr_value(gimli::DW_AT_location) else {
+                // A backend is allowed to discard a value completely. The
+                // source DIE remains, but it must not grow a fabricated
+                // whole-function location.
+                continue;
+            };
+            let gimli::AttributeValue::LocationListsRef(offset) = location else {
+                panic!(
+                    "{}: promoted `{name}` has a broad location",
+                    config.target.triple
+                );
+            };
+            let mut locations = dwarf.locations(&unit, offset).unwrap();
+            let mut variable_ranges = Vec::new();
+            while let Some(location) = locations.next().unwrap() {
+                assert!(
+                    location.range.begin < location.range.end,
+                    "{}: {name}",
+                    config.target.triple
+                );
+                variable_ranges.push(location.range);
+            }
+            assert!(
+                variable_ranges
+                    .windows(2)
+                    .all(|pair| pair[0].end <= pair[1].begin),
+                "{}: {name} has overlapping or unordered locations",
+                config.target.triple
+            );
+            assert!(
+                !variable_ranges.is_empty(),
+                "{}: {name}",
+                config.target.triple
+            );
+            ranges.insert(name, variable_ranges);
+        }
+        assert!(retained_is_frame_relative, "{}", config.target.triple);
+        for name in ["parameter", "branch", "old", "observed", "maybe"] {
+            assert!(seen.contains(name), "{}: {name}", config.target.triple);
+        }
+        for name in ["parameter", "branch", "old", "observed"] {
+            assert!(
+                ranges.contains_key(name),
+                "{}: {name}",
+                config.target.triple
+            );
+        }
+        let function_begin = function_begin.expect("inspect subprogram address");
+        for name in ["old", "observed", "maybe"] {
+            let Some(variable_ranges) = ranges.get(name) else {
+                continue;
+            };
+            assert!(
+                variable_ranges
+                    .iter()
+                    .map(|range| range.begin)
+                    .min()
+                    .unwrap()
+                    > function_begin,
+                "{}: promoted `{name}` was exposed before its first assignment",
+                config.target.triple
+            );
+        }
+    }
+}
+
+#[test]
 fn darwin_debug_code_addresses_are_text_section_relative() {
     let config = EffectiveCompilationConfig::aarch64_apple_darwin();
     let (module, sources) = lower_source_with_map(
@@ -2484,7 +2642,7 @@ fn complete_abi_plan_and_aggregate_clif_have_exact_snapshots() {
     assert!(dump.contains("packaging assembly-units=2"), "{dump}");
     assert_eq!(
         sha256(&dump),
-        "f966e45b3796025dbf49b0797ca6ae2c04ea251495ea7a4ce1699e48fab1881b"
+        "930fcbf0b73fc7bf0650484cdaf9e3cd5613af53eb980eb9f875e32bbc4d10be"
     );
 
     let output = emit(

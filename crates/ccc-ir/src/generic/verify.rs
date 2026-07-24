@@ -444,6 +444,7 @@ fn verify_function(module: &FullModule, function: &FullFunction) -> Result<(), I
     if function.entry.is_none() {
         if !function.blocks.is_empty()
             || !function.storage.is_empty()
+            || !function.promoted_locals.is_empty()
             || !function.value_types.is_empty()
             || function.instruction_count != 0
             || function
@@ -623,6 +624,105 @@ fn verify_function(module: &FullModule, function: &FullFunction) -> Result<(), I
         definitions: &definitions,
         dominators: &dominators,
     };
+    let retained_locals = function
+        .storage
+        .iter()
+        .map(|storage| storage.local)
+        .collect::<HashSet<_>>();
+    let mut promoted_ids = HashSet::new();
+    for local in &function.promoted_locals {
+        if !promoted_ids.insert(local.local) || retained_locals.contains(&local.local) {
+            return Err(IrError::verify(format!(
+                "function `{}` promoted local {} has a duplicate source identity",
+                function.name, local.local.0
+            )));
+        }
+        if let Some(parameter) = function
+            .parameters
+            .iter()
+            .find(|parameter| parameter.local == local.local)
+            && (parameter.ty != local.ty
+                || parameter.name != local.name
+                || parameter.span != local.span)
+        {
+            return Err(IrError::verify(format!(
+                "function `{}` promoted parameter `{}` has inconsistent source metadata",
+                function.name, local.name
+            )));
+        }
+        verify_type(&module.types, local.ty, "promoted local")?;
+        if !is_scalar(&module.types, local.ty.ty) {
+            return Err(IrError::verify(format!(
+                "function `{}` promoted local `{}` is not scalar",
+                function.name, local.name
+            )));
+        }
+        if local.ty.qualifiers.contains(TypeQualifiers::VOLATILE)
+            || local.ty.qualifiers.contains(TypeQualifiers::ATOMIC)
+        {
+            return Err(IrError::verify(format!(
+                "function `{}` promoted local `{}` requires ordered storage",
+                function.name, local.name
+            )));
+        }
+        let mut previous = None;
+        let mut block_starts = vec![false; function.blocks.len()];
+        for update in &local.updates {
+            let block = function
+                .blocks
+                .get(update.block.0 as usize)
+                .filter(|block| block.id == update.block)
+                .ok_or_else(|| {
+                    IrError::verify(format!(
+                        "function `{}` promoted local `{}` references unknown block {}",
+                        function.name, local.name, update.block.0
+                    ))
+                })?;
+            let boundary = usize::try_from(update.before_instruction).map_err(|_| {
+                IrError::verify("promoted-local boundary does not fit host address space")
+            })?;
+            if boundary > block.instructions.len() {
+                return Err(IrError::verify(format!(
+                    "function `{}` promoted local `{}` has an out-of-range boundary in block {}",
+                    function.name, local.name, block.id.0
+                )));
+            }
+            let key = (update.block, update.before_instruction);
+            if previous.is_some_and(|previous| previous >= key) {
+                return Err(IrError::verify(format!(
+                    "function `{}` promoted local `{}` updates are not in stable order",
+                    function.name, local.name
+                )));
+            }
+            previous = Some(key);
+            if boundary == 0 {
+                block_starts[block.id.0 as usize] = true;
+            }
+            if let Some(value) = update.value {
+                if value_type(function, value)?.ty != local.ty.ty {
+                    return Err(IrError::verify(format!(
+                        "function `{}` promoted local `{}` has a value of the wrong type",
+                        function.name, local.name
+                    )));
+                }
+                verifier.use_value(block.id, boundary, value)?;
+            }
+        }
+        if block_starts.iter().any(|present| !present) {
+            return Err(IrError::verify(format!(
+                "function `{}` promoted local `{}` is missing a block-entry state",
+                function.name, local.name
+            )));
+        }
+    }
+    for parameter in &function.parameters {
+        if parameter.storage.is_none() && !promoted_ids.contains(&parameter.local) {
+            return Err(IrError::verify(format!(
+                "function `{}` promoted parameter `{}` has no promoted-local metadata",
+                function.name, parameter.name
+            )));
+        }
+    }
     for block in &function.blocks {
         for (position, instruction) in block.instructions.iter().enumerate() {
             verifier.instruction(block.id, position, instruction)?;

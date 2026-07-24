@@ -801,7 +801,7 @@ else
         -o "breakpoint set --file debug_local.c --line 10" \
         -o run -o "frame variable left right" \
         -o continue -o "target variable ccc_debug_tls" \
-        -o "frame variable ccc_debug_local" > "$source_log" 2>&1 &
+        -o "frame variable ccc_debug_local observed" > "$source_log" 2>&1 &
     source_lldb_pid=$!
     (
         sleep 30
@@ -829,7 +829,8 @@ else
     grep -Eq 'left = 20' "$source_log"
     grep -Eq 'right = 22' "$source_log"
     grep -Eq 'ccc_debug_local = 42' "$source_log"
-    pass "one-step debug links preserve OSO inputs and publish lines, parameters, locals, and TLS metadata through dSYM"
+    grep -Eq 'observed[[:space:]]*=[[:space:]]*42' "$source_log"
+    pass "one-step debug links preserve OSO inputs and publish lines, parameters, stack and promoted locals, and TLS metadata through dSYM"
 fi
 pass "debugger stops in the variadic entry and generated call helper with caller frames"
 

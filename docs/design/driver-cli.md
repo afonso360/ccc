@@ -15,12 +15,15 @@ a single function-wide lexical block per subprogram, parameter DIEs, automatic
 storage DIEs, and compilation-unit-level DIEs for defined data objects. Nested
 source blocks and the original scope of block-static objects are not
 reconstructed. Fixed frame slots are described relative to the target frame
-pointer; values retained only in SSA/register form, runtime-sized objects, and
-dynamically realigned objects omit a location rather than publishing a false
-one. Defined x86-64 ELF TLS objects use a DTP-relative relocation followed by
+pointer. Automatic scalars promoted to SSA use version-specific Cranelift value
+labels and location lists clipped at verifier-backed source-state boundaries;
+an uninitialized, optimized-away, or otherwise unavailable version creates a
+gap rather than inheriting a stale location. Runtime-sized and dynamically
+realigned objects likewise omit a location rather than publishing a false one.
+Defined x86-64 ELF TLS objects use a DTP-relative relocation followed by
 `DW_OP_form_tls_address`; Darwin arm64 uses the corresponding TLV descriptor
-offset expression. Declaration-only objects have no DIE. The ordinary System V
-call-frame section is retained alongside source-level debug sections.
+offset expression. Declaration-only objects have no DIE. The ordinary System
+V call-frame section is retained alongside source-level debug sections.
 Unsupported debug dialects and levels are rejected instead of being treated as
 no-ops. For a Darwin executable or dynamic-library link, the driver resolves
 `dsymutil` through the selected compiler driver, publishes the linked binary,

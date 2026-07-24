@@ -26,11 +26,12 @@ use super::{
     AggregateOverlap, AggregateProjection, AtomicReadModifyWriteOperation, BinaryOperation,
     BitfieldDescriptor, BlockId, CallEffects, CodeLayoutHint, DataId, DataOrigin, FullBlock,
     FullEdge, FullFunction, FullGlobal, FullInstruction, FullInstructionKind, FullModule,
-    FullParameter, FullStorage, FullString, FullTerminator, InitializerEdge, InitializerGraph,
-    InitializerNode, InitializerNodeId, InitializerNodeKind, InitializerPath, InstructionId,
-    IntegerIntrinsicOperation, IrError, MemoryAccess, MemoryOrder, MemoryResidencyReason,
-    RelocationKind, RelocationTarget, ScalarConstant, ScalarConversion, StorageId, StorageLocation,
-    StringEncoding, SwitchEdge, UnaryOperation, ValueId,
+    FullParameter, FullPromotedLocal, FullPromotedLocalUpdate, FullStorage, FullString,
+    FullTerminator, InitializerEdge, InitializerGraph, InitializerNode, InitializerNodeId,
+    InitializerNodeKind, InitializerPath, InstructionId, IntegerIntrinsicOperation, IrError,
+    MemoryAccess, MemoryOrder, MemoryResidencyReason, RelocationKind, RelocationTarget,
+    ScalarConstant, ScalarConversion, StorageId, StorageLocation, StringEncoding, SwitchEdge,
+    UnaryOperation, ValueId,
 };
 
 const LOWERING_ERROR: &str = "CCC3101";
@@ -1663,6 +1664,7 @@ impl<'a> FunctionBuilder<'a> {
                 result_type: signature.result,
                 parameters,
                 storage,
+                promoted_locals: Vec::new(),
                 blocks: Vec::new(),
                 entry: None,
                 value_types: Vec::new(),
@@ -2037,6 +2039,16 @@ fn promote_scalar_locals(function: &mut FullFunction, types: &TypeStore) -> Resu
         .iter()
         .map(|(storage, _)| *storage)
         .collect::<BTreeSet<_>>();
+    let promoted_declarations = function
+        .storage
+        .iter()
+        .filter(|storage| eligible_ids.contains(&storage.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let promoted_debug_ids = promoted_declarations
+        .iter()
+        .map(|storage| storage.id)
+        .collect::<BTreeSet<_>>();
 
     // An indeterminate scalar may take any representable value. Giving it a
     // deterministic zero seed avoids inventing an address while keeping uses
@@ -2047,6 +2059,7 @@ fn promote_scalar_locals(function: &mut FullFunction, types: &TypeStore) -> Resu
         .filter_map(|parameter| Some((parameter.storage?, parameter.incoming?)))
         .filter(|(storage, _)| eligible_ids.contains(storage))
         .collect::<BTreeMap<_, _>>();
+    let parameter_storage = initial_values.keys().copied().collect::<BTreeSet<_>>();
     let mut zero_values = BTreeMap::new();
     let mut zero_instructions = Vec::with_capacity(eligible.len());
     for (storage, ty) in &eligible {
@@ -2084,9 +2097,13 @@ fn promote_scalar_locals(function: &mut FullFunction, types: &TypeStore) -> Resu
         }
         block_values.insert(block.id, values);
     }
+    let block_entry_values = block_values.clone();
 
     let mut address_storage = BTreeMap::<ValueId, StorageId>::new();
     let mut aliases = BTreeMap::<ValueId, ValueId>::new();
+    let mut assigned_in_block = BTreeSet::<(BlockId, StorageId)>::new();
+    let mut promoted_updates =
+        BTreeMap::<StorageId, BTreeMap<(BlockId, u32), Option<ValueId>>>::new();
     for block in &mut function.blocks {
         let mut current = block_values
             .remove(&block.id)
@@ -2141,7 +2158,22 @@ fn promote_scalar_locals(function: &mut FullFunction, types: &TypeStore) -> Resu
                             "ordered or type-changing access reached scalar SSA promotion",
                         ));
                     }
-                    current.insert(storage, resolve_alias(*value, &aliases)?);
+                    let value = resolve_alias(*value, &aliases)?;
+                    let changes_state = current.get(&storage).copied() != Some(value)
+                        || !parameter_storage.contains(&storage);
+                    current.insert(storage, value);
+                    if promoted_debug_ids.contains(&storage) && changes_state {
+                        let before_instruction = u32::try_from(retained.len()).map_err(|_| {
+                            IrError::verify(
+                                "promoted-local debug boundary exceeds the 32-bit IR space",
+                            )
+                        })?;
+                        promoted_updates
+                            .entry(storage)
+                            .or_default()
+                            .insert((block.id, before_instruction), Some(value));
+                        assigned_in_block.insert((block.id, storage));
+                    }
                 }
                 FullInstructionKind::ZeroInitialize {
                     destination,
@@ -2161,6 +2193,18 @@ fn promote_scalar_locals(function: &mut FullFunction, types: &TypeStore) -> Resu
                         IrError::verify("parameter storage received aggregate zero initialization")
                     })?;
                     current.insert(storage, zero);
+                    if promoted_debug_ids.contains(&storage) {
+                        let before_instruction = u32::try_from(retained.len()).map_err(|_| {
+                            IrError::verify(
+                                "promoted-local debug boundary exceeds the 32-bit IR space",
+                            )
+                        })?;
+                        promoted_updates
+                            .entry(storage)
+                            .or_default()
+                            .insert((block.id, before_instruction), Some(zero));
+                        assigned_in_block.insert((block.id, storage));
+                    }
                 }
                 _ => retained.push(instruction),
             }
@@ -2178,6 +2222,60 @@ fn promote_scalar_locals(function: &mut FullFunction, types: &TypeStore) -> Resu
                         .push(resolve_alias(current[storage], &aliases)?);
                 }
             }
+        }
+    }
+
+    let mut predecessors = vec![Vec::<BlockId>::new(); function.blocks.len()];
+    for block in &function.blocks {
+        let Some(terminator) = &block.terminator else {
+            continue;
+        };
+        for edge in terminator_edges(terminator) {
+            predecessors[edge.target.0 as usize].push(block.id);
+        }
+    }
+    for declaration in &promoted_declarations {
+        // Definite initialization is a forward must-property. Non-entry
+        // blocks begin at the lattice top so loop headers retain an incoming
+        // value when every entry and back edge supplies one.
+        let mut available_in = vec![true; function.blocks.len()];
+        available_in[entry.0 as usize] = function
+            .parameters
+            .iter()
+            .any(|parameter| parameter.storage == Some(declaration.id));
+        for block in &function.blocks {
+            if block.id != entry && predecessors[block.id.0 as usize].is_empty() {
+                available_in[block.id.0 as usize] = false;
+            }
+        }
+        loop {
+            let mut changed = false;
+            for block in &function.blocks {
+                if block.id == entry {
+                    continue;
+                }
+                let incoming = &predecessors[block.id.0 as usize];
+                let next = !incoming.is_empty()
+                    && incoming.iter().all(|predecessor| {
+                        available_in[predecessor.0 as usize]
+                            || assigned_in_block.contains(&(*predecessor, declaration.id))
+                    });
+                if available_in[block.id.0 as usize] != next {
+                    available_in[block.id.0 as usize] = next;
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        let updates = promoted_updates.entry(declaration.id).or_default();
+        for block in &function.blocks {
+            let value = available_in[block.id.0 as usize]
+                .then(|| block_entry_values[&block.id][&declaration.id]);
+            // An assignment before the first retained instruction supersedes
+            // the block-entry state at the same executable boundary.
+            updates.entry((block.id, 0)).or_insert(value);
         }
     }
 
@@ -2211,8 +2309,47 @@ fn promote_scalar_locals(function: &mut FullFunction, types: &TypeStore) -> Resu
             }
         }
     }
+    function.promoted_locals = promoted_declarations
+        .into_iter()
+        .map(|storage| FullPromotedLocal {
+            local: storage.local,
+            name: storage.name,
+            ty: storage.ty,
+            updates: promoted_updates
+                .remove(&storage.id)
+                .unwrap_or_default()
+                .into_iter()
+                .map(
+                    |((block, before_instruction), value)| FullPromotedLocalUpdate {
+                        block,
+                        before_instruction,
+                        value,
+                    },
+                )
+                .collect(),
+            span: storage.span,
+        })
+        .collect();
 
     compact_values(function, &aliases)
+}
+
+fn terminator_edges(terminator: &FullTerminator) -> Vec<&FullEdge> {
+    match terminator {
+        FullTerminator::Branch(edge) => vec![edge],
+        FullTerminator::Conditional {
+            then_edge,
+            else_edge,
+            ..
+        } => vec![then_edge, else_edge],
+        FullTerminator::Switch { cases, default, .. } => cases
+            .iter()
+            .map(|case| &case.edge)
+            .chain(std::iter::once(default))
+            .collect(),
+        FullTerminator::IndirectBranch { targets, .. } => targets.iter().collect(),
+        FullTerminator::Return(_) | FullTerminator::Unreachable => Vec::new(),
+    }
 }
 
 fn zero_scalar(types: &TypeStore, ty: TypeId) -> Result<ScalarConstant, IrError> {
@@ -2289,6 +2426,22 @@ pub(super) fn compact_values(
             remap_value(incoming, aliases, &remap)?;
         }
     }
+    for local in &mut function.promoted_locals {
+        for update in &mut local.updates {
+            let Some(value) = &mut update.value else {
+                continue;
+            };
+            let resolved = resolve_alias(*value, aliases)?;
+            if let Some(mapped) = remap.get(&resolved).copied() {
+                *value = mapped;
+            } else {
+                // Optimized-away source values are genuinely unavailable.
+                // Retain the boundary as a location-list gap so an earlier
+                // version cannot leak past this assignment.
+                update.value = None;
+            }
+        }
+    }
     let mut instruction_count = 0u32;
     for block in &mut function.blocks {
         for parameter in &mut block.parameters {
@@ -2310,6 +2463,53 @@ pub(super) fn compact_values(
     }
     function.value_types = value_types;
     function.instruction_count = instruction_count;
+    Ok(())
+}
+
+/// Repositions promoted-local boundaries after an optimization pass removes
+/// instructions. A boundary attached before a removed instruction advances
+/// to the next retained instruction (or the terminator), preserving the
+/// source-state transition without adding an IR instruction.
+pub(super) fn remap_promoted_local_update_positions(
+    function: &mut FullFunction,
+    retained_instructions: &[Vec<bool>],
+) -> Result<(), IrError> {
+    if retained_instructions.len() != function.blocks.len() {
+        return Err(IrError::verify(
+            "promoted-local instruction retention map has the wrong block count",
+        ));
+    }
+    for local in &mut function.promoted_locals {
+        for update in &mut local.updates {
+            let retained = retained_instructions
+                .get(update.block.0 as usize)
+                .ok_or_else(|| IrError::verify("promoted-local update references unknown block"))?;
+            let old = usize::try_from(update.before_instruction)
+                .map_err(|_| IrError::verify("promoted-local boundary does not fit host size"))?;
+            if old > retained.len() {
+                return Err(IrError::verify(
+                    "promoted-local boundary exceeds its block instruction count",
+                ));
+            }
+            update.before_instruction = u32::try_from(
+                retained[..old].iter().filter(|keep| **keep).count(),
+            )
+            .map_err(|_| IrError::verify("promoted-local boundary exceeds 32-bit IR space"))?;
+        }
+        local.updates.dedup_by(|later, earlier| {
+            if later.block == earlier.block
+                && later.before_instruction == earlier.before_instruction
+            {
+                // Updates retain source order. When removal collapses two
+                // boundaries onto one executable address, only the later
+                // source state is observable there.
+                *earlier = *later;
+                true
+            } else {
+                false
+            }
+        });
+    }
     Ok(())
 }
 

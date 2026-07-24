@@ -169,7 +169,10 @@ Debugger validation is the final part of each target-oracle command; there is
 no success mode that omits it. On native Linux it uses batch GDB. Cross-Linux
 starts QEMU's gdbstub and connects with `gdb-multiarch`; `CCC_GDB_PORT_BASE`
 can move the two reserved ports. Darwin uses batch LLDB and verifies the linked
-`.dSYM` with `dwarfdump` and `dsymutil`.
+`.dSYM` with `dwarfdump` and `dsymutil`. Its source probe stops after the
+assignment in `debug_local.c` and requires both the retained stack local and
+the SSA-promoted `observed` local to evaluate to `42`; a missing or stale
+promoted location fails the oracle.
 
 The host must allow the debugger to launch or attach to test processes. On
 macOS, install Xcode Command Line Tools and ensure LLDB/debugserver authorization

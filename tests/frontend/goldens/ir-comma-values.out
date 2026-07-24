@@ -1,6 +1,7 @@
 declare f0 @side : int () [linkage=External visibility=Default]
 declare f1 @take : int (struct Pair) [linkage=External visibility=Default]
 function f2 @scalar(v0 %value: int -> ssa) -> int [signature=int (int) linkage=External visibility=Default inline=false noreturn=false] {
+  promoted l0 %value: int [b0@0=v0]
   b0(v0: int):
     i0: v1: int = call.direct f0 () signature=int () variadic-boundary=0 [read=true write=true unwind=true noreturn=false]
     return v0
