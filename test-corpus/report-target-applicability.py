@@ -10,12 +10,6 @@ import sys
 from typing import Dict, List, Mapping, Sequence, Tuple
 
 
-EXPECTED_TARGETS = (
-    "x86_64-unknown-linux-gnu",
-    "aarch64-unknown-linux-gnu",
-    "riscv64-unknown-linux-gnu",
-    "aarch64-apple-darwin",
-)
 ALLOWED_STATUSES = {"applicable", "inapplicable"}
 ALLOWED_EVIDENCE_KINDS = {"execution", "parse-only"}
 TABLE_RE = re.compile(r'^\[target_applicability\."([^"]+)"\]$')
@@ -60,10 +54,6 @@ def parse_catalog(path: Path) -> Tuple[Sequence[str], Sequence[str]]:
         raise MatrixError(f"{path}: enabled_targets contains a duplicate")
     if len(corpora) != len(set(corpora)):
         raise MatrixError(f"{path}: corpora contains a duplicate")
-    if tuple(targets) != EXPECTED_TARGETS:
-        raise MatrixError(
-            f"{path}: enabled_targets must be exactly {list(EXPECTED_TARGETS)!r}, found {targets!r}"
-        )
     return targets, corpora
 
 

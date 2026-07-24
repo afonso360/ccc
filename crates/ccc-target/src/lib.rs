@@ -1645,6 +1645,33 @@ mod tests {
     }
 
     #[test]
+    fn corpus_applicability_catalogue_matches_enabled_targets() {
+        let catalogue = include_str!("../../../test-corpus/target-applicability.toml");
+        let assignment = catalogue
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("enabled_targets = "))
+            .expect("corpus catalogue must declare enabled_targets");
+        let targets = assignment
+            .strip_prefix('[')
+            .and_then(|value| value.strip_suffix(']'))
+            .expect("enabled_targets must be a single-line array")
+            .split(',')
+            .map(|value| {
+                value
+                    .trim()
+                    .strip_prefix('"')
+                    .and_then(|value| value.strip_suffix('"'))
+                    .expect("enabled target must be a quoted string")
+            })
+            .collect::<Vec<_>>();
+        let enabled = ENABLED_TARGET_SPECS
+            .iter()
+            .map(|profile| profile.triple.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(targets, enabled);
+    }
+
+    #[test]
     fn unsupported_hosts_do_not_fall_back_to_x86_64() {
         for spelling in [
             "wasm32-unknown-unknown",
