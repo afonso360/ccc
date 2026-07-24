@@ -335,8 +335,8 @@ performed by Cranelift merely to improve a benchmark score.
 - Finish moving driver integration tests onto the shared support module.
   Collision-safe RAII workspaces, retain-on-panic artifacts, command status
   diagnostics, target-driver discovery, and glibc identity are now shared;
-  diagnostics, link-input, and visibility tests use the common workspace.
-  Migrate the remaining object, execution, preprocessing, header, and ABI
+  diagnostics, link-input, visibility, object-emission, and execution tests use
+  the common workspace. Migrate the remaining preprocessing, header, and ABI
   suites, then factor repeated compiler invocation construction.
 - Unify temporary artifact ownership across the driver and linker. Replace the
   private `_debug_workspace` lifetime side effect in `PackagingReport` with an

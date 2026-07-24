@@ -1,7 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::process::Command;
 
 #[cfg(any(
     all(target_arch = "x86_64", target_os = "linux"),
@@ -18,19 +17,6 @@ use object::{
 
 mod support;
 
-static TEST_ID: AtomicU64 = AtomicU64::new(0);
-
-fn test_directory(name: &str) -> PathBuf {
-    let directory = std::env::temp_dir().join(format!(
-        "ccc-object-test-{}-{}-{name}",
-        std::process::id(),
-        TEST_ID.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = fs::remove_dir_all(&directory);
-    fs::create_dir_all(&directory).unwrap();
-    directory
-}
-
 fn compile_ccc(source: &Path, output: &Path) {
     compile_ccc_with_options(source, output, &[]);
 }
@@ -39,11 +25,7 @@ fn compile_ccc_with_options(source: &Path, output: &Path, options: &[&str]) {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ccc"));
     command.arg("-nostdinc").arg("-c").args(options);
     let result = command.arg(source).arg("-o").arg(output).output().unwrap();
-    assert!(
-        result.status.success(),
-        "CCC failed:\n{}",
-        render_output(&result)
-    );
+    support::assert_command_success("compile a native object with CCC", &result);
 }
 
 fn compile_x86_64_elf_with_options(source: &Path, output: &Path, options: &[&str]) {
@@ -57,11 +39,7 @@ fn compile_x86_64_elf_with_options(source: &Path, output: &Path, options: &[&str
         .arg(output)
         .output()
         .unwrap();
-    assert!(
-        result.status.success(),
-        "CCC failed:\n{}",
-        render_output(&result)
-    );
+    support::assert_command_success("compile an x86-64 ELF object with CCC", &result);
 }
 
 fn native_section_name(name: &str) -> String {
@@ -82,7 +60,8 @@ fn native_symbol_name(name: &str) -> String {
 
 #[test]
 fn debug_levels_emit_source_types_variables_and_relocations() {
-    let directory = test_directory("quality-options");
+    let directory =
+        support::TestWorkspace::new("object-emission", "quality-options").retain_on_failure();
     let source = directory.join("quality-options.c");
     let optimized = directory.join("optimized.o");
     let disabled = directory.join("disabled.o");
@@ -218,13 +197,12 @@ int inspect(int *parameter) {
         }
     }
     assert!(source_rows >= 3, "expected source-level line rows");
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
 fn optimization_profiles_emit_valid_objects_and_o0_preserves_default() {
-    let directory = test_directory("optimization-options");
+    let directory =
+        support::TestWorkspace::new("object-emission", "optimization-options").retain_on_failure();
     let source = directory.join("optimization-options.c");
     let baseline = directory.join("baseline.o");
     let unoptimized = directory.join("unoptimized.o");
@@ -255,8 +233,6 @@ fn optimization_profiles_emit_valid_objects_and_o0_preserves_default() {
             "{left} and {right} promise the same pass set"
         );
     }
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[cfg(any(
@@ -267,7 +243,8 @@ fn optimization_profiles_emit_valid_objects_and_o0_preserves_default() {
 ))]
 #[test]
 fn objects_built_at_different_optimization_levels_link_and_execute_together() {
-    let directory = test_directory("mixed-optimization-link");
+    let directory = support::TestWorkspace::new("object-emission", "mixed-optimization-link")
+        .retain_on_failure();
     let library_source = directory.join("optimized-library.c");
     let main_source = directory.join("unoptimized-main.c");
     let library_object = directory.join("optimized-library.o");
@@ -298,11 +275,7 @@ fn objects_built_at_different_optimization_levels_link_and_execute_together() {
             .arg(object)
             .output()
             .unwrap();
-        assert!(
-            compilation.status.success(),
-            "CCC failed:\n{}",
-            render_output(&compilation)
-        );
+        directory.assert_command_success("compile one mixed-profile object", &compilation);
     }
     let target_cc = std::env::var_os("CCC_CC").unwrap_or_else(|| "cc".into());
     let link = Command::new(target_cc)
@@ -312,25 +285,22 @@ fn objects_built_at_different_optimization_levels_link_and_execute_together() {
         .arg(&library_object)
         .output()
         .unwrap();
-    assert!(
-        link.status.success(),
-        "gcc failed:\n{}",
-        render_output(&link)
-    );
+    directory.assert_command_success("link mixed-profile objects", &link);
     let execution = Command::new(&executable).output().unwrap();
     assert_eq!(
         execution.status.code(),
         Some(0),
-        "mixed-profile executable failed:\n{}",
-        render_output(&execution)
+        "mixed-profile executable failed:\nstdout:\n{}\nstderr:\n{}\nworkspace: {}",
+        String::from_utf8_lossy(&execution.stdout),
+        String::from_utf8_lossy(&execution.stderr),
+        directory.path().display()
     );
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
 fn optimization_runs_before_ir_dump_and_abi_planning() {
-    let directory = test_directory("optimization-ir");
+    let directory =
+        support::TestWorkspace::new("object-emission", "optimization-ir").retain_on_failure();
     let source = directory.join("optimization-ir.c");
     fs::write(
         &source,
@@ -350,11 +320,7 @@ fn optimization_runs_before_ir_dump_and_abi_planning() {
             .arg(&source)
             .output()
             .unwrap();
-        assert!(
-            result.status.success(),
-            "CCC failed:\n{}",
-            render_output(&result)
-        );
+        directory.assert_command_success("dump optimized CCC IR", &result);
         String::from_utf8(result.stdout).unwrap()
     };
 
@@ -365,13 +331,12 @@ fn optimization_runs_before_ir_dump_and_abi_planning() {
     assert!(optimized.contains("runtime.allocate"), "{optimized}");
     assert!(optimized.contains("volatile=true"), "{optimized}");
     assert!(!dump("-O2", "--dump-abi").is_empty());
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
 fn debug_information_covers_data_only_translation_units() {
-    let directory = test_directory("debug-data-only");
+    let directory =
+        support::TestWorkspace::new("object-emission", "debug-data-only").retain_on_failure();
     let source = directory.join("debug-data-only.c");
     let output = directory.join("debug-data-only.o");
     fs::write(
@@ -393,13 +358,13 @@ fn debug_information_covers_data_only_translation_units() {
             >= if cfg!(target_os = "macos") { 1 } else { 2 },
         "the compilation unit and global address must be relocatable"
     );
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
 fn x86_64_elf_objects_use_position_independent_text_relocations() {
-    let directory = test_directory("position-independent-relocations");
+    let directory =
+        support::TestWorkspace::new("object-emission", "position-independent-relocations")
+            .retain_on_failure();
     let source = directory.join("position-independent-relocations.c");
     let output = directory.join("position-independent-relocations.o");
     fs::write(
@@ -470,8 +435,6 @@ int call_imported(void) {
         )),
         "position-independent text contains an absolute relocation: {relocations:?}"
     );
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
 // This pins the exact AMD64 relocation vocabulary. The target-oracle runner
@@ -479,7 +442,8 @@ int call_imported(void) {
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
 fn thread_local_objects_use_the_selected_elf_relocation_models() {
-    let directory = test_directory("thread-local-relocations");
+    let directory = support::TestWorkspace::new("object-emission", "thread-local-relocations")
+        .retain_on_failure();
     let source = directory.join("thread-local-relocations.c");
     let output = directory.join("thread-local-relocations.o");
     fs::write(
@@ -586,21 +550,11 @@ int read_tls_models(void) {
             .all(|symbol| symbol.is_local() && symbol.is_definition()),
         "packaged TLS accessors must be localized definitions"
     );
-    fs::remove_dir_all(directory).unwrap();
-}
-
-fn render_output(output: &Output) -> String {
-    format!(
-        "status: {}\nstdout:\n{}\nstderr:\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    )
 }
 
 #[test]
 fn x86_64_elf_object_has_expected_sections_bindings_and_relocations() {
-    let directory = test_directory("structure");
+    let directory = support::TestWorkspace::new("object-emission", "structure").retain_on_failure();
     let source = directory.join("structure.c");
     let output = directory.join("structure.o");
     fs::write(
@@ -705,13 +659,12 @@ int call_imported(void) {
         }),
         "direct external calls must use the linker's procedure linkage table"
     );
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
 fn incomplete_extern_arrays_emit_only_undefined_data_symbols() {
-    let directory = test_directory("incomplete-extern-arrays");
+    let directory = support::TestWorkspace::new("object-emission", "incomplete-extern-arrays")
+        .retain_on_failure();
     let source = directory.join("incomplete-extern-arrays.c");
     let output = directory.join("incomplete-extern-arrays.o");
     fs::write(
@@ -739,13 +692,12 @@ fn incomplete_extern_arrays_emit_only_undefined_data_symbols() {
         }
         assert_eq!(symbol.size(), 0, "{name}");
     }
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
 fn x86_64_elf_declaration_assembly_labels_control_defined_and_referenced_symbols() {
-    let directory = test_directory("declaration-assembly-labels");
+    let directory = support::TestWorkspace::new("object-emission", "declaration-assembly-labels")
+        .retain_on_failure();
     let source = directory.join("declaration-assembly-labels.c");
     let output = directory.join("declaration-assembly-labels.o");
     fs::write(
@@ -815,8 +767,6 @@ int exported_object asm("renamed_object") = 7;
             "missing relocation to `{name}`: {relocation_targets:?}"
         );
     }
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[cfg(any(
@@ -866,7 +816,7 @@ impl ReferenceCompiler {
             .arg("--version")
             .output()
             .unwrap_or_else(|error| panic!("required reference compiler is unavailable: {error}"));
-        assert!(output.status.success(), "{}", render_output(&output));
+        support::assert_command_success("query the reference compiler version", &output);
         String::from_utf8_lossy(&output.stdout)
             .lines()
             .find(|line| !line.trim().is_empty())
@@ -883,7 +833,7 @@ impl ReferenceCompiler {
             .arg(output)
             .output()
             .unwrap();
-        assert!(result.status.success(), "{}", render_output(&result));
+        support::assert_command_success("compile an object with the reference compiler", &result);
     }
 
     fn link<I, P>(&self, objects: I, output: &Path)
@@ -898,7 +848,7 @@ impl ReferenceCompiler {
             .arg(output)
             .output()
             .unwrap();
-        assert!(result.status.success(), "{}", render_output(&result));
+        support::assert_command_success("link objects with the reference compiler", &result);
     }
 }
 
@@ -922,7 +872,7 @@ fn write_source(directory: &Path, name: &str, contents: &str) -> PathBuf {
 ))]
 fn run_successfully(executable: &Path) {
     let result = Command::new(executable).output().unwrap();
-    assert!(result.status.success(), "{}", render_output(&result));
+    support::assert_command_success("run a cross-linked executable", &result);
 }
 
 #[cfg(any(
@@ -933,17 +883,18 @@ fn run_successfully(executable: &Path) {
 ))]
 #[test]
 fn objects_cross_link_in_both_directions_and_keep_static_names_local() {
-    let directory = test_directory("cross-link");
+    let directory =
+        support::TestWorkspace::new("object-emission", "cross-link").retain_on_failure();
     let reference = ReferenceCompiler::required();
     eprintln!("cross-link reference compiler: {}", reference.identity());
 
     let ccc_caller = write_source(
-        &directory,
+        directory.path(),
         "ccc-caller.c",
         "extern int reference_add(int); int main(void) { return reference_add(35) == 42 ? 0 : 1; }\n",
     );
     let reference_callee = write_source(
-        &directory,
+        directory.path(),
         "reference-callee.c",
         "int reference_add(int value) { return value + 7; }\n",
     );
@@ -959,12 +910,12 @@ fn objects_cross_link_in_both_directions_and_keep_static_names_local() {
     run_successfully(&caller_program);
 
     let ccc_callee = write_source(
-        &directory,
+        directory.path(),
         "ccc-callee.c",
         "int ccc_multiply(int left, int right) { return left * right; }\n",
     );
     let reference_caller = write_source(
-        &directory,
+        directory.path(),
         "reference-caller.c",
         "extern int ccc_multiply(int, int); int main(void) { return ccc_multiply(6, 7) == 42 ? 0 : 1; }\n",
     );
@@ -980,17 +931,17 @@ fn objects_cross_link_in_both_directions_and_keep_static_names_local() {
     run_successfully(&callee_program);
 
     let left = write_source(
-        &directory,
+        directory.path(),
         "left.c",
         "static int hidden = 19; int left(void) { return hidden; }\n",
     );
     let right = write_source(
-        &directory,
+        directory.path(),
         "right.c",
         "static int hidden = 23; int right(void) { return hidden; }\n",
     );
     let local_main = write_source(
-        &directory,
+        directory.path(),
         "local-main.c",
         "extern int left(void); extern int right(void); int main(void) { return left() + right() == 42 ? 0 : 1; }\n",
     );
@@ -1006,8 +957,6 @@ fn objects_cross_link_in_both_directions_and_keep_static_names_local() {
         &local_program,
     );
     run_successfully(&local_program);
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[cfg(any(
@@ -1018,18 +967,19 @@ fn objects_cross_link_in_both_directions_and_keep_static_names_local() {
 ))]
 #[test]
 fn thread_local_objects_cross_link_with_the_platform_compiler() {
-    let directory = test_directory("thread-local-cross-link");
+    let directory = support::TestWorkspace::new("object-emission", "thread-local-cross-link")
+        .retain_on_failure();
     let reference = ReferenceCompiler::required();
     eprintln!("TLS reference compiler: {}", reference.identity());
 
     let ccc_definition = write_source(
-        &directory,
+        directory.path(),
         "ccc-tls-definition.c",
         "_Thread_local int ccc_tls_value = 17;\n\
          int ccc_tls_read(void) { return ccc_tls_value; }\n",
     );
     let reference_consumer = write_source(
-        &directory,
+        directory.path(),
         "reference-tls-consumer.c",
         "extern _Thread_local int ccc_tls_value;\n\
          extern int ccc_tls_read(void);\n\
@@ -1047,13 +997,13 @@ fn thread_local_objects_cross_link_with_the_platform_compiler() {
     run_successfully(&ccc_definition_program);
 
     let ccc_reader = write_source(
-        &directory,
+        directory.path(),
         "ccc-tls-reader.c",
         "_Thread_local int reference_tls_value __attribute__((weak));\n\
          int reference_tls_read(void) { return reference_tls_value; }\n",
     );
     let reference_definition = write_source(
-        &directory,
+        directory.path(),
         "reference-tls-definition.c",
         "_Thread_local int reference_tls_value = 39;\n\
          extern int reference_tls_read(void);\n\
@@ -1069,8 +1019,6 @@ fn thread_local_objects_cross_link_with_the_platform_compiler() {
         &reference_definition_program,
     );
     run_successfully(&reference_definition_program);
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[cfg(any(
@@ -1081,12 +1029,13 @@ fn thread_local_objects_cross_link_with_the_platform_compiler() {
 ))]
 #[test]
 fn weak_definitions_link_as_fallbacks_for_strong_symbols() {
-    let directory = test_directory("weak-definition-interop");
+    let directory = support::TestWorkspace::new("object-emission", "weak-definition-interop")
+        .retain_on_failure();
     let reference = ReferenceCompiler::required();
     eprintln!("weak-symbol reference compiler: {}", reference.identity());
 
     let weak_source = write_source(
-        &directory,
+        directory.path(),
         "weak.c",
         "int selected(void) __attribute__((weak));\n\
          int selected(void) { return 1; }\n\
@@ -1094,13 +1043,13 @@ fn weak_definitions_link_as_fallbacks_for_strong_symbols() {
          int observe_selection(void) { return selected() + selected_value; }\n",
     );
     let fallback_main = write_source(
-        &directory,
+        directory.path(),
         "fallback-main.c",
         "extern int observe_selection(void);\n\
          int main(void) { return observe_selection() == 3 ? 0 : 1; }\n",
     );
     let strong_main = write_source(
-        &directory,
+        directory.path(),
         "strong-main.c",
         "int selected(void) { return 40; } int selected_value = 2;\n\
          extern int observe_selection(void);\n\
@@ -1120,8 +1069,6 @@ fn weak_definitions_link_as_fallbacks_for_strong_symbols() {
     let override_program = directory.join("strong-override");
     reference.link([&strong_main_object, &weak_object], &override_program);
     run_successfully(&override_program);
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[cfg(any(
@@ -1132,7 +1079,9 @@ fn weak_definitions_link_as_fallbacks_for_strong_symbols() {
 ))]
 #[test]
 fn declaration_assembly_labels_interoperate_in_both_directions() {
-    let directory = test_directory("declaration-assembly-label-interop");
+    let directory =
+        support::TestWorkspace::new("object-emission", "declaration-assembly-label-interop")
+            .retain_on_failure();
     let reference = ReferenceCompiler::required();
     eprintln!(
         "assembly-label reference compiler: {}",
@@ -1150,9 +1099,9 @@ int main(void) {{
 }}
 "#,
     );
-    let ccc_caller = write_source(&directory, "ccc-caller.c", &ccc_caller_source);
+    let ccc_caller = write_source(directory.path(), "ccc-caller.c", &ccc_caller_source);
     let reference_callee = write_source(
-        &directory,
+        directory.path(),
         "reference-callee.c",
         "int reference_add_impl(int value) { return value + 7; } int reference_value_impl = 7;\n",
     );
@@ -1176,9 +1125,9 @@ int internal_multiply(int left, int right) {{ return left * right; }}
 int internal_value asm("{ccc_value_symbol}") = 6;
 "#,
     );
-    let ccc_callee = write_source(&directory, "ccc-callee.c", &ccc_callee_source);
+    let ccc_callee = write_source(directory.path(), "ccc-callee.c", &ccc_callee_source);
     let reference_caller = write_source(
-        &directory,
+        directory.path(),
         "reference-caller.c",
         "extern int ccc_multiply_impl(int, int); extern int ccc_value_impl; int main(void) { return ccc_multiply_impl(6, 6) + ccc_value_impl == 42 ? 0 : 1; }\n",
     );
@@ -1192,8 +1141,6 @@ int internal_value asm("{ccc_value_symbol}") = 6;
         &callee_program,
     );
     run_successfully(&callee_program);
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[cfg(any(
@@ -1203,7 +1150,8 @@ int internal_value asm("{ccc_value_symbol}") = 6;
 ))]
 #[test]
 fn glibc_redirect_assembly_labels_form_elf_symbols_that_link() {
-    let directory = test_directory("glibc-redirect-labels");
+    let directory =
+        support::TestWorkspace::new("object-emission", "glibc-redirect-labels").retain_on_failure();
     let reference = ReferenceCompiler::required();
     let identity = support::installed_glibc_identity();
     eprintln!(
@@ -1211,7 +1159,7 @@ fn glibc_redirect_assembly_labels_form_elf_symbols_that_link() {
         reference.identity(),
     );
     let source = write_source(
-        &directory,
+        directory.path(),
         "glibc-redirect-labels.c",
         r#"
 #define _GNU_SOURCE 1
@@ -1242,11 +1190,7 @@ int main(void) {
         .arg(&object)
         .output()
         .unwrap();
-    assert!(
-        result.status.success(),
-        "CCC failed to compile installed glibc redirects:\n{}",
-        render_output(&result)
-    );
+    directory.assert_command_success("compile installed glibc redirects with CCC", &result);
 
     let bytes = fs::read(&object).unwrap();
     let file = object::File::parse(bytes.as_slice()).unwrap();
@@ -1278,6 +1222,4 @@ int main(void) {
     let executable = directory.join("glibc-redirect-labels");
     reference.link([&object], &executable);
     run_successfully(&executable);
-
-    fs::remove_dir_all(directory).unwrap();
 }

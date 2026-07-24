@@ -11,20 +11,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-static TEST_ID: AtomicU64 = AtomicU64::new(0);
-
-fn test_directory(name: &str) -> PathBuf {
-    let directory = std::env::temp_dir().join(format!(
-        "ccc-execution-test-{}-{}-{name}",
-        std::process::id(),
-        TEST_ID.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = fs::remove_dir_all(&directory);
-    fs::create_dir_all(&directory).unwrap();
-    directory
-}
+mod support;
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -38,16 +26,13 @@ fn macos_sdk_root() -> String {
         .args(["--sdk", "macosx", "--show-sdk-path"])
         .output()
         .expect("the Darwin execution gate requires xcrun");
-    assert!(
-        output.status.success(),
-        "xcrun could not locate the macOS SDK"
-    );
+    support::assert_command_success("locate the macOS SDK with xcrun", &output);
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 fn compile_and_run_darwin_header_program(name: &str, source_text: &str) {
-    let directory = test_directory(name);
+    let directory = support::TestWorkspace::new("execution", name).retain_on_failure();
     let source = directory.join(format!("{name}.c"));
     let executable = directory.join(name);
     fs::write(&source, source_text).unwrap();
@@ -60,11 +45,7 @@ fn compile_and_run_darwin_header_program(name: &str, source_text: &str) {
         .arg(&executable)
         .output()
         .unwrap();
-    assert!(
-        compilation.status.success(),
-        "ccc failed: {}",
-        String::from_utf8_lossy(&compilation.stderr)
-    );
+    directory.assert_command_success("compile a Darwin header program with CCC", &compilation);
     let execution = Command::new(&executable).output().unwrap();
     assert_eq!(
         execution.status.code(),
@@ -72,7 +53,6 @@ fn compile_and_run_darwin_header_program(name: &str, source_text: &str) {
         "program failed: {}",
         String::from_utf8_lossy(&execution.stderr)
     );
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[cfg(any(
@@ -85,7 +65,7 @@ fn compile_and_run_darwin_header_program(name: &str, source_text: &str) {
 fn host_default_emits_a_native_relocatable_object() {
     use object::{Architecture, Object as _, ObjectKind};
 
-    let directory = test_directory("empty-object");
+    let directory = support::TestWorkspace::new("execution", "empty-object").retain_on_failure();
     let output = directory.join("empty.o");
     let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
         .arg("-c")
@@ -94,11 +74,7 @@ fn host_default_emits_a_native_relocatable_object() {
         .arg(&output)
         .output()
         .unwrap();
-    assert!(
-        result.status.success(),
-        "ccc failed: {}",
-        String::from_utf8_lossy(&result.stderr)
-    );
+    directory.assert_command_success("compile an empty native object with CCC", &result);
     let bytes = fs::read(&output).unwrap();
     let object = object::File::parse(bytes.as_slice()).unwrap();
     let expected_architecture = if cfg!(target_arch = "x86_64") {
@@ -110,7 +86,6 @@ fn host_default_emits_a_native_relocatable_object() {
     };
     assert_eq!(object.architecture(), expected_architecture);
     assert_eq!(object.kind(), ObjectKind::Relocatable);
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[cfg(any(
@@ -121,7 +96,7 @@ fn host_default_emits_a_native_relocatable_object() {
 ))]
 #[test]
 fn float16_values_execute_with_exact_payloads_and_native_varargs() {
-    let directory = test_directory("float16-values");
+    let directory = support::TestWorkspace::new("execution", "float16-values").retain_on_failure();
     let executable = directory.join("float16-values");
     let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
         .arg(fixture("float16_values.c"))
@@ -129,14 +104,12 @@ fn float16_values_execute_with_exact_payloads_and_native_varargs() {
         .arg(&executable)
         .output()
         .unwrap();
-    assert!(
-        compilation.status.success(),
-        "ccc failed: {}",
-        String::from_utf8_lossy(&compilation.stderr)
+    directory.assert_command_success(
+        "compile the Float16 execution fixture with CCC",
+        &compilation,
     );
     let execution = Command::new(&executable).output().unwrap();
     assert_eq!(execution.status.code(), Some(0));
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[cfg(any(
@@ -147,7 +120,8 @@ fn float16_values_execute_with_exact_payloads_and_native_varargs() {
 ))]
 #[test]
 fn selected_c11_results_match_the_host_compiler() {
-    let directory = test_directory("selected-c11-differential");
+    let directory =
+        support::TestWorkspace::new("execution", "selected-c11-differential").retain_on_failure();
     let reference_driver = std::env::var_os("CCC_REFERENCE_CC")
         .or_else(|| std::env::var_os("CCC_CC"))
         .unwrap_or_else(|| "cc".into());
@@ -166,11 +140,8 @@ fn selected_c11_results_match_the_host_compiler() {
             .arg(&ccc_executable)
             .output()
             .unwrap();
-        assert!(
-            ccc_compilation.status.success(),
-            "CCC failed for {source_name}: {}",
-            String::from_utf8_lossy(&ccc_compilation.stderr)
-        );
+        directory
+            .assert_command_success(&format!("compile {source_name} with CCC"), &ccc_compilation);
         let reference_compilation = Command::new(&reference_driver)
             .args(["-std=c11", "-pedantic-errors"])
             .arg(&source)
@@ -178,10 +149,9 @@ fn selected_c11_results_match_the_host_compiler() {
             .arg(&reference_executable)
             .output()
             .unwrap();
-        assert!(
-            reference_compilation.status.success(),
-            "reference compiler failed for {source_name}: {}",
-            String::from_utf8_lossy(&reference_compilation.stderr)
+        directory.assert_command_success(
+            &format!("compile {source_name} with the reference compiler"),
+            &reference_compilation,
         );
 
         let ccc_result = Command::new(&ccc_executable).output().unwrap();
@@ -194,13 +164,13 @@ fn selected_c11_results_match_the_host_compiler() {
         assert_eq!(ccc_result.stdout, reference_result.stdout, "{source_name}");
         assert_eq!(ccc_result.stderr, reference_result.stderr, "{source_name}");
     }
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 #[test]
 fn darwin_linker_accepts_unwind_when_functions_reference_constant_data() {
-    let directory = test_directory("darwin-text-before-data-unwind");
+    let directory = support::TestWorkspace::new("execution", "darwin-text-before-data-unwind")
+        .retain_on_failure();
     let source = directory.join("darwin-text-before-data-unwind.c");
     let executable = directory.join("darwin-text-before-data-unwind");
     fs::write(
@@ -218,14 +188,9 @@ fn darwin_linker_accepts_unwind_when_functions_reference_constant_data() {
         .arg(&executable)
         .output()
         .unwrap();
-    assert!(
-        compilation.status.success(),
-        "ccc failed: {}",
-        String::from_utf8_lossy(&compilation.stderr)
-    );
+    directory.assert_command_success("compile the Darwin unwind fixture with CCC", &compilation);
     let execution = Command::new(&executable).output().unwrap();
     assert_eq!(execution.status.code(), Some(0));
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
@@ -249,7 +214,8 @@ fn apple_sdk_redirects_and_header_inline_fallback_link_and_execute() {
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 #[test]
 fn darwin_setjmp_and_longjmp_resume_materialized_automatic_objects() {
-    let directory = test_directory("darwin-returns-twice");
+    let directory =
+        support::TestWorkspace::new("execution", "darwin-returns-twice").retain_on_failure();
     for optimization in ["-O0", "-O2", "-Oz"] {
         let executable = directory.join(format!("returns-twice-{}", &optimization[1..]));
         let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
@@ -262,14 +228,12 @@ fn darwin_setjmp_and_longjmp_resume_materialized_automatic_objects() {
             .arg(&executable)
             .output()
             .unwrap();
-        assert!(
-            compilation.status.success(),
-            "ccc {optimization} failed: {}",
-            String::from_utf8_lossy(&compilation.stderr)
+        directory.assert_command_success(
+            &format!("compile the Darwin returns-twice fixture under {optimization}"),
+            &compilation,
         );
         assert_eq!(Command::new(&executable).status().unwrap().code(), Some(0));
     }
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[cfg(any(
@@ -279,7 +243,8 @@ fn darwin_setjmp_and_longjmp_resume_materialized_automatic_objects() {
 ))]
 #[test]
 fn linux_setjmp_and_longjmp_resume_materialized_automatic_objects() {
-    let directory = test_directory("linux-returns-twice");
+    let directory =
+        support::TestWorkspace::new("execution", "linux-returns-twice").retain_on_failure();
     for optimization in ["-O0", "-O2", "-Oz"] {
         let executable = directory.join(format!("returns-twice-{}", &optimization[1..]));
         let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
@@ -289,14 +254,12 @@ fn linux_setjmp_and_longjmp_resume_materialized_automatic_objects() {
             .arg(&executable)
             .output()
             .unwrap();
-        assert!(
-            compilation.status.success(),
-            "ccc {optimization} failed: {}",
-            String::from_utf8_lossy(&compilation.stderr)
+        directory.assert_command_success(
+            &format!("compile the Linux returns-twice fixture under {optimization}"),
+            &compilation,
         );
         assert_eq!(Command::new(&executable).status().unwrap().code(), Some(0));
     }
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
@@ -358,7 +321,7 @@ fn execution_programs_emit_native_objects() {
             continue;
         }
         let name = case.source;
-        let directory = test_directory(name);
+        let directory = support::TestWorkspace::new("execution-objects", name).retain_on_failure();
         for (optimization, artifact) in EXECUTION_OPTIMIZATION_PROFILES {
             let output = directory.join(format!("program-{artifact}.o"));
             let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
@@ -370,10 +333,9 @@ fn execution_programs_emit_native_objects() {
                 .arg(&output)
                 .output()
                 .unwrap();
-            assert!(
-                result.status.success(),
-                "ccc failed for {name} under {optimization}: {}",
-                String::from_utf8_lossy(&result.stderr)
+            directory.assert_command_success(
+                &format!("compile {name} to an object under {optimization}"),
+                &result,
             );
             let bytes = fs::read(&output).unwrap();
             let object = object::File::parse(bytes.as_slice()).unwrap();
@@ -389,7 +351,6 @@ fn execution_programs_emit_native_objects() {
                 "{name} under {optimization} has no main symbol"
             );
         }
-        fs::remove_dir_all(directory).unwrap();
     }
 }
 
@@ -406,7 +367,7 @@ fn execution_programs_produce_the_expected_exit_status() {
             continue;
         }
         let name = case.source;
-        let directory = test_directory(name);
+        let directory = support::TestWorkspace::new("execution-programs", name).retain_on_failure();
         for (optimization, artifact) in EXECUTION_OPTIMIZATION_PROFILES {
             let executable = directory.join(format!("program-{artifact}"));
             let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
@@ -417,10 +378,9 @@ fn execution_programs_produce_the_expected_exit_status() {
                 .arg(&executable)
                 .output()
                 .unwrap();
-            assert!(
-                compilation.status.success(),
-                "ccc failed for {name} under {optimization}: {}",
-                String::from_utf8_lossy(&compilation.stderr)
+            directory.assert_command_success(
+                &format!("compile and link {name} under {optimization}"),
+                &compilation,
             );
             let execution = Command::new(&executable)
                 .env("LC_ALL", "C")
@@ -445,7 +405,6 @@ fn execution_programs_produce_the_expected_exit_status() {
                 String::from_utf8_lossy(&execution.stderr)
             );
         }
-        fs::remove_dir_all(directory).unwrap();
     }
 }
 
@@ -459,7 +418,8 @@ fn execution_programs_produce_the_expected_exit_status() {
 fn default_link_produces_a_working_position_independent_executable() {
     use object::{FileFlags, Object as _, ObjectKind, ObjectSection as _};
 
-    let directory = test_directory("position-independent-executable");
+    let directory = support::TestWorkspace::new("execution", "position-independent-executable")
+        .retain_on_failure();
     let source = directory.join("position-independent-executable.c");
     let executable = directory.join("position-independent-executable");
     fs::write(
@@ -487,11 +447,7 @@ int main(void) {
         .arg(&executable)
         .output()
         .unwrap();
-    assert!(
-        compilation.status.success(),
-        "ccc failed: {}",
-        String::from_utf8_lossy(&compilation.stderr)
-    );
+    directory.assert_command_success("compile and link a native PIE with CCC", &compilation);
 
     let bytes = fs::read(&executable).unwrap();
     let file = object::File::parse(bytes.as_slice()).unwrap();
@@ -521,7 +477,6 @@ int main(void) {
         "PIE failed: {}",
         String::from_utf8_lossy(&execution.stderr)
     );
-    fs::remove_dir_all(directory).unwrap();
 }
 
 // GNU __int128 values and runtime-provider boundaries are currently enabled
@@ -529,7 +484,8 @@ int main(void) {
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
 fn wide_integer_runtime_helpers_resolve_through_the_ccc_link_path() {
-    let directory = test_directory("wide-runtime-provider");
+    let directory =
+        support::TestWorkspace::new("execution", "wide-runtime-provider").retain_on_failure();
     let source = directory.join("wide-runtime-provider.c");
     fs::write(
         &source,
@@ -564,19 +520,16 @@ int main(void) {
             .arg(&executable)
             .output()
             .unwrap();
-        assert!(
-            compilation.status.success(),
-            "CCC link through {compiler} failed: {}",
-            String::from_utf8_lossy(&compilation.stderr)
+        directory.assert_command_success(
+            &format!("compile and link the wide runtime fixture through {compiler}"),
+            &compilation,
         );
         let execution = Command::new(&executable).output().unwrap();
-        assert!(
-            execution.status.success(),
-            "program linked through {compiler} failed: {}",
-            String::from_utf8_lossy(&execution.stderr)
+        directory.assert_command_success(
+            &format!("run the wide runtime fixture linked through {compiler}"),
+            &execution,
         );
     }
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[cfg(any(
@@ -589,7 +542,8 @@ int main(void) {
 fn thread_local_objects_are_isolated_in_pthreads_and_pie() {
     use object::{Object as _, ObjectKind};
 
-    let directory = test_directory("thread-local-pthreads");
+    let directory =
+        support::TestWorkspace::new("execution", "thread-local-pthreads").retain_on_failure();
     let executable = directory.join("thread-local-pthreads");
     let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
         .arg(fixture("thread_local_pthreads.c"))
@@ -597,11 +551,7 @@ fn thread_local_objects_are_isolated_in_pthreads_and_pie() {
         .arg(&executable)
         .output()
         .unwrap();
-    assert!(
-        compilation.status.success(),
-        "ccc failed: {}",
-        String::from_utf8_lossy(&compilation.stderr)
-    );
+    directory.assert_command_success("compile and link the pthread TLS fixture", &compilation);
     let bytes = fs::read(&executable).unwrap();
     let file = object::File::parse(bytes.as_slice()).unwrap();
     if cfg!(target_os = "linux") {
@@ -625,7 +575,6 @@ fn thread_local_objects_are_isolated_in_pthreads_and_pie() {
         "pthread TLS fixture failed: {}",
         String::from_utf8_lossy(&execution.stderr)
     );
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[cfg(any(
@@ -638,7 +587,8 @@ fn thread_local_objects_are_isolated_in_pthreads_and_pie() {
 fn all_tls_models_link_and_execute_as_pie() {
     use object::{Object as _, ObjectKind};
 
-    let directory = test_directory("thread-local-models-pie");
+    let directory =
+        support::TestWorkspace::new("execution", "thread-local-models-pie").retain_on_failure();
     let source = directory.join("thread-local-models-pie.c");
     let executable = directory.join("thread-local-models-pie");
     fs::write(
@@ -666,11 +616,7 @@ int main(void) {
         .arg(&executable)
         .output()
         .unwrap();
-    assert!(
-        compilation.status.success(),
-        "ccc failed: {}",
-        String::from_utf8_lossy(&compilation.stderr)
-    );
+    directory.assert_command_success("compile and link the TLS-model PIE fixture", &compilation);
     let bytes = fs::read(&executable).unwrap();
     let file = object::File::parse(bytes.as_slice()).unwrap();
     if cfg!(target_os = "linux") {
@@ -687,12 +633,7 @@ int main(void) {
         );
     }
     let execution = Command::new(&executable).output().unwrap();
-    assert!(
-        execution.status.success(),
-        "TLS model PIE failed: {}",
-        String::from_utf8_lossy(&execution.stderr)
-    );
-    fs::remove_dir_all(directory).unwrap();
+    directory.assert_command_success("run the TLS-model PIE fixture", &execution);
 }
 
 #[cfg(any(
@@ -705,7 +646,8 @@ int main(void) {
 fn an_invalid_computed_goto_target_traps() {
     use std::os::unix::process::ExitStatusExt as _;
 
-    let directory = test_directory("computed-goto-null");
+    let directory =
+        support::TestWorkspace::new("execution", "computed-goto-null").retain_on_failure();
     let executable = directory.join("program");
     let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
         .arg(fixture("computed_goto_null.c"))
@@ -713,10 +655,9 @@ fn an_invalid_computed_goto_target_traps() {
         .arg(&executable)
         .output()
         .unwrap();
-    assert!(
-        compilation.status.success(),
-        "ccc failed: {}",
-        String::from_utf8_lossy(&compilation.stderr)
+    directory.assert_command_success(
+        "compile and link the invalid computed-goto fixture",
+        &compilation,
     );
     let execution = Command::new(&executable).output().unwrap();
     assert_eq!(execution.status.code(), None);
@@ -725,7 +666,6 @@ fn an_invalid_computed_goto_target_traps() {
         "expected SIGILL or SIGTRAP, got {:?}",
         execution.status.signal()
     );
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[cfg(any(
@@ -736,7 +676,8 @@ fn an_invalid_computed_goto_target_traps() {
 ))]
 #[test]
 fn runtime_sized_aggregate_return_is_materialized_before_cleanup() {
-    let directory = test_directory("runtime-sized-aggregate-return");
+    let directory = support::TestWorkspace::new("execution", "runtime-sized-aggregate-return")
+        .retain_on_failure();
     let executable = directory.join("program");
     let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
         .arg(fixture("runtime_sized_storage_reuse.c"))
@@ -744,10 +685,9 @@ fn runtime_sized_aggregate_return_is_materialized_before_cleanup() {
         .arg(&executable)
         .output()
         .unwrap();
-    assert!(
-        compilation.status.success(),
-        "ccc failed: {}",
-        String::from_utf8_lossy(&compilation.stderr)
+    directory.assert_command_success(
+        "compile and link the runtime-sized aggregate return fixture",
+        &compilation,
     );
     let execution = Command::new(&executable).output().unwrap();
     assert_eq!(
@@ -756,7 +696,6 @@ fn runtime_sized_aggregate_return_is_materialized_before_cleanup() {
         "runtime-sized aggregate return failed: {}",
         String::from_utf8_lossy(&execution.stderr)
     );
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[cfg(any(
@@ -778,7 +717,8 @@ fn invalid_runtime_sized_storage_extents_trap() {
         names.push("runtime_sized_storage_wide_overflow.c");
     }
     for name in names {
-        let directory = test_directory(name);
+        let directory = support::TestWorkspace::new("execution-invalid-runtime-sized", name)
+            .retain_on_failure();
         let executable = directory.join("program");
         let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
             .arg(fixture(name))
@@ -786,10 +726,9 @@ fn invalid_runtime_sized_storage_extents_trap() {
             .arg(&executable)
             .output()
             .unwrap();
-        assert!(
-            compilation.status.success(),
-            "ccc failed for {name}: {}",
-            String::from_utf8_lossy(&compilation.stderr)
+        directory.assert_command_success(
+            &format!("compile and link invalid runtime-sized fixture {name}"),
+            &compilation,
         );
         let execution = Command::new(&executable).output().unwrap();
         assert_eq!(execution.status.code(), None, "{name}");
@@ -798,7 +737,6 @@ fn invalid_runtime_sized_storage_extents_trap() {
             "{name}: expected SIGILL or SIGTRAP, got {:?}",
             execution.status.signal()
         );
-        fs::remove_dir_all(directory).unwrap();
     }
 }
 
@@ -807,7 +745,8 @@ fn invalid_runtime_sized_storage_extents_trap() {
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
 fn runtime_sized_storage_links_with_gcc_as_pie_and_has_no_leaks() {
-    let directory = test_directory("runtime-sized-storage-external-link");
+    let directory = support::TestWorkspace::new("execution", "runtime-sized-storage-external-link")
+        .retain_on_failure();
     let source = directory.join("runtime-sized-storage-external-link.c");
     let object = directory.join("runtime-sized-storage-external-link.o");
     let executable = directory.join("runtime-sized-storage-external-link");
@@ -837,11 +776,7 @@ int main(void) {
         .arg(&object)
         .output()
         .unwrap();
-    assert!(
-        compilation.status.success(),
-        "ccc failed: {}",
-        String::from_utf8_lossy(&compilation.stderr)
-    );
+    directory.assert_command_success("compile runtime-sized storage with CCC", &compilation);
     let link = Command::new("gcc")
         .arg("-fsanitize=address")
         .arg(&object)
@@ -849,11 +784,7 @@ int main(void) {
         .arg(&executable)
         .output()
         .unwrap();
-    assert!(
-        link.status.success(),
-        "gcc failed: {}",
-        String::from_utf8_lossy(&link.stderr)
-    );
+    directory.assert_command_success("link runtime-sized storage with GCC and ASan", &link);
     let execution = Command::new(&executable)
         .env("ASAN_OPTIONS", "detect_leaks=1:halt_on_error=1:exitcode=97")
         .output()
@@ -864,7 +795,6 @@ int main(void) {
         "sanitized PIE failed: {}",
         String::from_utf8_lossy(&execution.stderr)
     );
-    fs::remove_dir_all(directory).unwrap();
 }
 
 struct ExecutionExpectation {
