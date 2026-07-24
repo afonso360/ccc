@@ -116,6 +116,105 @@ assembly, variadics, ABI bridges, and returns-twice behavior. Exact CLIF
 goldens, object-symbol checks, deterministic rebuilds, all target oracles,
 Csmith, and the real-code corpora must agree at `-O0`, `-O2`, and `-Oz`.
 
+## Benchmarking and code-generation performance
+
+Optimization work needs reproducible measurements at the CCC-IR, CLIF,
+machine-code, and execution boundaries. Add a checked-in benchmark harness
+before changing inlining heuristics or making broad code-generation changes.
+It must build a release compiler, record the compiler/backend revision and
+complete target configuration, use deterministic inputs, perform warmups and
+repeated samples, and write machine-readable results that can be compared with
+a previous revision. Keep correctness checks enabled in every executable
+benchmark so faster wrong code can never appear as an improvement.
+
+### Benchmark set
+
+Keep the suite small enough for regular development while covering different
+sources of compiler and generated-code cost:
+
+- A minimal `int main(void) { return 0; }` translation establishes the fixed
+  frontend, ABI, CLIF, object, and link overhead.
+- Separate `puts("hello")` and `printf("hello\n")` programs expose direct
+  external calls, string data, relocations, and the generated variadic-call
+  protocol without mixing them together.
+- A declaration-heavy translation includes a large hosted header surface but
+  references only one function and one object. Its CLIF size must scale with
+  used declarations, not every declaration visible in the translation unit.
+- Focused, defined-behavior kernels cover direct calls, inlining, integer and
+  floating loops, branches and switches, loads and stores, aggregate copies,
+  TLS, atomics, and variadic calls. Each kernel validates its result and has a
+  fixed work count.
+- Generated scaling cases vary function count, declarations per function,
+  block count, SSA values, globals, and string literals independently. Use
+  them to detect accidental quadratic behavior and peak-memory growth.
+- Whole-program measurements use the existing bzip2, zlib, and zstd adapters
+  with fixed inputs. Record translation time, link time, aggregate object
+  size, executable text size, and execution throughput without weakening their
+  correctness contracts.
+
+Run IR and object-size measurements for every enabled target. Runtime
+comparisons are native-target evidence; QEMU runs remain correctness and rough
+trend evidence and must not be compared numerically with native execution.
+
+### Metrics and instrumentation
+
+- Report preprocessing, parsing, semantic analysis, CCC-IR lowering and
+  optimization, ABI planning, CLIF lowering, Cranelift compilation, object
+  packaging, and linking separately. Also record end-to-end wall time, CPU
+  time, and peak resident memory.
+- Count CCC-IR functions, blocks, values, operations, and dead operations
+  before and after CCC-owned optimization. Count CLIF blocks, instructions,
+  stack slots, signatures, external function references, global values, and
+  how many imported entities are never used.
+- Record emitted text, read-only data, writable data, debug-section, unwind,
+  relocation, and symbol-table sizes. Keep debug and non-debug measurements
+  separate.
+- Record runtime distributions rather than one timing. Use a pinned native
+  runner for regression decisions, retain raw samples, and reject comparisons
+  whose noise or confidence interval is larger than the claimed change.
+- Compare generated code with the previous CCC revision at all optimization
+  levels. Where GCC and Clang support the same source contract, also record
+  their `-O0`, `-O2`, and size-optimized results as directional references,
+  not as substitutes for CCC correctness.
+
+### Initial performance targets
+
+- Final CLIF must contain no unused `sig`, `fn`, or `gv` entities. Replace the
+  eager population in `declare_function_references` with deterministic lazy
+  interning when a CCC-IR operation actually needs a function, object, string,
+  TLS accessor, or support helper.
+- The minimal return program must lower to one block containing only the
+  constant and return, with no stack slot, load, store, external signature,
+  function reference, or global value. Lock this down as an exact CLIF
+  quality test on every target.
+- The two hello programs may contain only the data and external-call entities
+  they use. Adding unrelated declarations or hosted headers must not change
+  their per-function CLIF instruction or imported-entity counts.
+- Variadic-call setup must initialize only protocol fields and argument bytes
+  that a helper can read. It must not clear the complete maximum-size frame
+  byte by byte. Reduce the checked-in `printf` CLIF instruction baseline by at
+  least 90%, and require setup instruction and store counts to scale with live
+  arguments rather than frame capacity.
+- On the defined-behavior kernel suite, the `-O2` runtime geometric mean must
+  not regress against `-O0`, and `-Oz` text size must not exceed `-O2` in the
+  geometric mean. Record and justify individual exceptions rather than hiding
+  them in the aggregate.
+- After the first stable baseline, fail the dedicated benchmark job for a
+  greater than 5% regression in compiler-time or runtime geometric mean, a
+  greater than 10% increase in peak memory, or a greater than 5% increase in
+  text size. Require repeated confirmation before updating a baseline.
+- As an initial competitive code-quality goal, keep CCC `-O2` within 1.5 times
+  the faster of GCC and Clang for runtime and within 1.25 times the smaller
+  reference text size on the scalar integer, branch, call, and memory kernels.
+  Track vectorization-dependent cases separately until CCC has an explicit
+  vectorization strategy.
+
+Publish benchmark summaries for pull requests without making noisy shared
+runners authoritative. A scheduled run on pinned hardware owns regression
+decisions and retains historical results. Use profiles and flamegraphs to
+optimize the hottest CCC-owned stages; do not recreate transformations already
+performed by Cranelift merely to improve a benchmark score.
+
 ## Remaining compiler work
 
 ### Language, value, and ABI coverage
