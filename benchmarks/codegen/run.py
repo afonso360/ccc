@@ -51,6 +51,13 @@ REQUIRED_METRICS = (
     "primary_object.relocations",
     "primary_object.text_bytes",
 )
+DECLARATION_OBJECT_INVARIANTS = (
+    "primary_object.file_bytes",
+    "primary_object.symbols",
+    "primary_object.undefined_symbols",
+    "primary_object.relocations",
+    "primary_object.text_bytes",
+)
 TIMING_FIELDS = (
     "benchmark",
     "family",
@@ -512,6 +519,20 @@ def validate_invariants(
                 f"{record.case.expected_functions}"
             )
 
+    stats_by_case = {
+        (record.case.name, record.profile): record.stats for record in records
+    }
+    for invocation in invocations:
+        expected_bytes = stats_by_case[(invocation.case.name, invocation.profile)][
+            "primary_object.file_bytes"
+        ]
+        if invocation.timing["object_bytes"] != expected_bytes:
+            raise BenchmarkError(
+                f"{invocation.case.name} at -{invocation.profile} produced "
+                f"{invocation.timing['object_bytes']} timed object bytes but "
+                f"codegen-stats reported {expected_bytes}"
+            )
+
     sample_groups: dict[tuple[str, str], list[CompileInvocation]] = {}
     for invocation in invocations:
         if invocation.phase == "sample":
@@ -538,16 +559,19 @@ def validate_invariants(
             metric: value
             for metric, value in first.stats.items()
             if metric.startswith("post_inline_ir.")
+            or metric in DECLARATION_OBJECT_INVARIANTS
         }
         for record in group[1:]:
             current_ir = {
                 metric: value
                 for metric, value in record.stats.items()
                 if metric.startswith("post_inline_ir.")
+                or metric in DECLARATION_OBJECT_INVARIANTS
             }
             if current_ir != first_ir:
                 raise BenchmarkError(
-                    "unused declarations changed post-inline CLIF metrics at "
+                    "unused declarations changed post-inline CLIF or "
+                    "primary-object metrics at "
                     f"-{profile}: {first.case.scale} versus "
                     f"{record.case.scale} declarations"
                 )

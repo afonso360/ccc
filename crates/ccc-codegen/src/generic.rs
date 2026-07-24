@@ -407,6 +407,7 @@ fn emit_inner(
         &parsed_object,
         module,
         config,
+        &declarations,
         required_runtime_helpers.iter().copied(),
     )?;
     let (assemblies, manifest) = generated_bridge_artifacts(
@@ -444,6 +445,7 @@ fn validate_runtime_helper_symbols<'data, 'a>(
     object: &impl object::Object<'data>,
     module: &gir::FullModule,
     config: &EffectiveCompilationConfig,
+    declarations: &Declarations,
     selected: impl IntoIterator<Item = &'a str>,
 ) -> Result<(), CodegenError> {
     let selected = selected.into_iter().collect::<HashSet<_>>();
@@ -457,6 +459,7 @@ fn validate_runtime_helper_symbols<'data, 'a>(
     let source_symbols = module
         .functions
         .iter()
+        .filter(|function| declarations.functions.contains_key(&function.id.0))
         .map(|function| function.symbol_name.as_str())
         .collect::<HashSet<_>>();
     let undefined = object
@@ -885,11 +888,15 @@ fn declare_module(
     object_module: &mut ObjectModule,
 ) -> Result<Declarations, CodegenError> {
     let direct_calls = direct_call_signatures(module)?;
+    let required_functions = required_function_declarations(module);
     let mut functions = HashMap::with_capacity(module.functions.len());
     let mut definition_functions = HashMap::new();
     let mut definition_signatures = HashMap::new();
     let mut hidden_body_symbols = HashMap::new();
     for function in &module.functions {
+        if !required_functions.contains(&function.id.0) {
+            continue;
+        }
         let definition_plan = abi_plan.plan().definitions.get(&function.id);
         let definition_boundary = definition_plan.map(|plan| &plan.boundary);
         let call_use = direct_calls.get(&function.id.0);
@@ -1381,6 +1388,54 @@ fn module_uses_runtime_sized_storage(module: &gir::FullModule) -> bool {
             })
         })
     })
+}
+
+/// Source function definitions must always reach the object, while a
+/// declaration needs an ObjectModule identity only when retained IR can
+/// reference it. Per-function CLIF imports remain independently interned at
+/// first use by `FunctionReferences`.
+fn required_function_declarations(module: &gir::FullModule) -> HashSet<u32> {
+    let mut required = module
+        .functions
+        .iter()
+        .filter(|function| function.entry.is_some())
+        .map(|function| function.id.0)
+        .collect::<HashSet<_>>();
+
+    for instruction in module
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.instructions)
+    {
+        let referenced = match &instruction.kind {
+            gir::FullInstructionKind::DirectCall { function, .. }
+            | gir::FullInstructionKind::AddressOfFunction { function, .. } => Some(function.0),
+            gir::FullInstructionKind::AddressConstant {
+                target: gir::RelocationTarget::Function(function),
+                ..
+            } => Some(function.0),
+            _ => None,
+        };
+        required.extend(referenced);
+    }
+
+    for node in module
+        .globals
+        .iter()
+        .filter_map(|global| global.initializer.as_ref())
+        .flat_map(|initializer| &initializer.nodes)
+    {
+        if let gir::InitializerNodeKind::Relocation {
+            target: gir::RelocationTarget::Function(function),
+            ..
+        } = &node.kind
+        {
+            required.insert(function.0);
+        }
+    }
+
+    required
 }
 
 #[derive(Clone, Copy)]

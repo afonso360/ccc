@@ -136,18 +136,20 @@ sources of compiler and generated-code cost. The checked-in compiler-only
 runner now measures minimal return, separate `puts` and variadic `printf`
 calls, zero-to-1,024 unused declarations, and 8-to-128 live functions at each
 optimization level. It retains raw timing/RSS samples and the complete
-versioned codegen-stat stream, and fails when unused declarations change any
-post-inlining CLIF metric. Timed samples use ordinary object-only compilation;
-the structural-stat query is separate and untimed.
+versioned codegen-stat stream. ObjectModule function declarations are now
+materialized only for definitions and retained direct, address, or static
+initializer references; the runner fails if unused declarations change either
+post-inlining CLIF or primary-object structural metrics. Timed samples use
+ordinary object-only compilation; the structural-stat query is separate and
+untimed.
 
 The next benchmark targets are:
 
-- Make ObjectModule declarations lazy as well as CLIF references. The
-  declaration-scaling benchmark now proves that post-inlining CLIF and text
-  remain constant, but each unused `extern` still creates an undefined object
-  symbol and grows the relocatable file. Preserve visibility, weak binding,
-  assembly-label, bridge, and runtime-helper behavior while removing that
-  residual growth.
+- Extend demand-driven ObjectModule declarations from the implemented function
+  path to ordinary data and TLS declarations. Preserve TLS accessor planning,
+  visibility, weak binding, assembly labels, debug locations, and runtime
+  helpers while ensuring unused hosted-header declarations do not grow the
+  primary object or generated-support bundle.
 - Add a declaration-heavy hosted-header translation which references only one
   function and one object. Its CLIF size must match the equivalent minimal
   declarations even when preprocessing and semantic-analysis work grows.

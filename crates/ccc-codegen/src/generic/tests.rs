@@ -5,6 +5,7 @@ use ccc_sema::generic::analyze_frontend;
 use ccc_session::SourceMap;
 use ccc_syntax::frontend as syntax;
 use ccc_target::OptimizationLevel;
+use object::read::macho::Nlist as _;
 use object::{
     Object as _, ObjectSection as _, ObjectSymbol as _, RelocationEncoding, RelocationFlags,
     RelocationKind, RelocationTarget,
@@ -287,8 +288,177 @@ fn unused_float16_sdk_prototypes_do_not_require_value_transport() {
         emit_source_with_config(source, &EffectiveCompilationConfig::aarch64_apple_darwin());
     let object = object::File::parse(output.object.as_slice()).unwrap();
     assert!(object.symbol_by_name("_answer").is_some());
-    assert!(object.symbol_by_name("___fabsf16").unwrap().is_undefined());
-    assert!(object.symbol_by_name("___fmaf16").unwrap().is_undefined());
+    assert!(object.symbol_by_name("___fabsf16").is_none());
+    assert!(object.symbol_by_name("___fmaf16").is_none());
+}
+
+#[test]
+fn unused_function_declarations_do_not_reach_elf_or_macho_objects() {
+    const SOURCE: &str = "extern int unused_ordinary(int);\n\
+         extern int unused_weak(int) __attribute__((weak));\n\
+         extern int unused_hidden(int) __attribute__((visibility(\"hidden\")));\n\
+         extern int unused_protected(int) __attribute__((visibility(\"protected\")));\n\
+         extern int unused_internal_visibility(int) __attribute__((visibility(\"internal\")));\n\
+         extern int unused_exact(int) asm(\"unused_physical\");\n\
+         static int unused_internal_linkage(int);\n\
+         int retained_definition(void) { return 0; }";
+
+    for config in [
+        EffectiveCompilationConfig::default(),
+        EffectiveCompilationConfig::aarch64_apple_darwin(),
+    ] {
+        let output = emit_source_with_config(SOURCE, &config);
+        let object = object::File::parse(output.object.as_slice()).unwrap();
+        let ordinary_prefix = if object.format() == object::BinaryFormat::MachO {
+            "_"
+        } else {
+            ""
+        };
+        for name in [
+            "unused_ordinary",
+            "unused_weak",
+            "unused_hidden",
+            "unused_protected",
+            "unused_internal_visibility",
+            "unused_internal_linkage",
+        ] {
+            let name = format!("{ordinary_prefix}{name}");
+            assert!(
+                object.symbol_by_name(&name).is_none(),
+                "{} unexpectedly emitted `{name}`",
+                config.target.triple
+            );
+        }
+        for name in ["unused_exact", "unused_physical", "_unused_physical"] {
+            assert!(
+                object.symbol_by_name(name).is_none(),
+                "{} unexpectedly emitted `{name}`",
+                config.target.triple
+            );
+        }
+        let definition = format!("{ordinary_prefix}retained_definition");
+        assert!(
+            object
+                .symbol_by_name(&definition)
+                .is_some_and(|symbol| symbol.is_definition()),
+            "{} omitted `{definition}`",
+            config.target.triple
+        );
+    }
+}
+
+#[test]
+fn referenced_function_declarations_preserve_attributes_in_elf_and_macho_objects() {
+    const SOURCE: &str = "extern int called_hidden(int) __attribute__((visibility(\"hidden\")));\n\
+         extern int called_protected(int) __attribute__((visibility(\"protected\")));\n\
+         extern int addressed_weak(int) __attribute__((weak));\n\
+         extern int initialized_exact(int) asm(\"physical_initializer\");\n\
+         int (*saved_initializer)(int) = initialized_exact;\n\
+         int invoke_hidden(int value) { return called_hidden(value); }\n\
+         int invoke_protected(int value) { return called_protected(value); }\n\
+         int invoke_addressed(int value) {\n\
+             int (*callback)(int) = addressed_weak;\n\
+             return callback(value);\n\
+         }\n\
+         int invoke_initializer(int value) { return saved_initializer(value); }";
+
+    for config in [
+        EffectiveCompilationConfig::default(),
+        EffectiveCompilationConfig::aarch64_apple_darwin(),
+    ] {
+        let output = emit_source_with_config(SOURCE, &config);
+        let object = object::File::parse(output.object.as_slice()).unwrap();
+        let macho = object.format() == object::BinaryFormat::MachO;
+        let called_name = if macho {
+            "_called_hidden"
+        } else {
+            "called_hidden"
+        };
+        let addressed_name = if macho {
+            "_addressed_weak"
+        } else {
+            "addressed_weak"
+        };
+        let protected_name = if macho {
+            "_called_protected"
+        } else {
+            "called_protected"
+        };
+
+        let called = object
+            .symbol_by_name(called_name)
+            .unwrap_or_else(|| panic!("{} omitted `{called_name}`", config.target.triple));
+        assert!(called.is_undefined(), "{called_name}");
+        if macho {
+            let macho = object::read::macho::MachOFile64::<object::Endianness>::parse(
+                output.object.as_slice(),
+            )
+            .unwrap();
+            let called = macho.symbol_by_name(called_name).unwrap();
+            assert_ne!(
+                called.macho_symbol().n_type() & object::macho::N_PEXT,
+                0,
+                "{called_name}"
+            );
+        } else {
+            assert_eq!(
+                called.flags().elf_visibility(),
+                Some(object::elf::STV_HIDDEN)
+            );
+        }
+
+        let protected = object
+            .symbol_by_name(protected_name)
+            .unwrap_or_else(|| panic!("{} omitted `{protected_name}`", config.target.triple));
+        assert!(protected.is_undefined(), "{protected_name}");
+        if macho {
+            let macho = object::read::macho::MachOFile64::<object::Endianness>::parse(
+                output.object.as_slice(),
+            )
+            .unwrap();
+            let protected = macho.symbol_by_name(protected_name).unwrap();
+            assert_eq!(
+                protected.macho_symbol().n_type() & object::macho::N_PEXT,
+                0,
+                "{protected_name}"
+            );
+        } else {
+            assert_eq!(
+                protected.flags().elf_visibility(),
+                Some(object::elf::STV_PROTECTED)
+            );
+        }
+
+        let addressed = object
+            .symbol_by_name(addressed_name)
+            .unwrap_or_else(|| panic!("{} omitted `{addressed_name}`", config.target.triple));
+        assert!(addressed.is_undefined(), "{addressed_name}");
+        assert!(addressed.is_weak(), "{addressed_name}");
+
+        let initialized = object
+            .symbol_by_name("physical_initializer")
+            .unwrap_or_else(|| panic!("{} omitted exact initializer target", config.target.triple));
+        assert!(initialized.is_undefined());
+        if macho {
+            assert!(object.symbol_by_name("_physical_initializer").is_none());
+        }
+    }
+}
+
+#[test]
+fn unused_source_declaration_does_not_conflict_with_selected_runtime_helper() {
+    let output = emit_source(
+        "extern int __divti3(void);\n\
+         typedef __int128 i128;\n\
+         i128 divide(i128 left, i128 right) { return left / right; }",
+    );
+    let object = object::File::parse(output.object.as_slice()).unwrap();
+    let helpers = object
+        .symbols()
+        .filter(|symbol| symbol.name() == Ok("__divti3"))
+        .collect::<Vec<_>>();
+    assert_eq!(helpers.len(), 1);
+    assert!(helpers[0].is_undefined());
 }
 
 #[test]

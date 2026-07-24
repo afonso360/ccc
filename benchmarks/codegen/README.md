@@ -79,6 +79,7 @@ performance baseline.
 
 Every timed invocation has a unique explicit `.o` path. The objects are retained
 and hashed, and repeated samples must produce identical object bytes. The
+reported primary-object byte count must also match every timed object. The
 compiler executable SHA-256, successful `-dumpmachine` query, raw query output,
 effective target, and `--print-effective-config` output for every profile are
 archived with each result set.

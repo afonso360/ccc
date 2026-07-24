@@ -84,7 +84,7 @@ metrics = [
     ("post_inline_ir.global_values", 0),
     ("post_inline_ir.constants", 0),
     ("post_inline_ir.jump_tables", 0),
-    ("primary_object.file_bytes", 100 + functions * 10),
+    ("primary_object.file_bytes", 44),
     ("primary_object.sections", 3),
     ("primary_object.symbols", functions),
     ("primary_object.defined_symbols", functions),

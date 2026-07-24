@@ -94,17 +94,18 @@ impl InliningPlan {
                 .functions
                 .get(&function.id.0)
                 .copied()
-                .ok_or_else(|| {
-                    inline_error(
-                        format!(
-                            "function `{}` has no object declaration",
-                            function.symbol_name
-                        ),
-                        function.span,
-                    )
-                })?
-                .as_u32();
-            object_to_source.insert(object_id, function.id.0);
+                .map(cranelift_module::FuncId::as_u32);
+            if let Some(object_id) = object_id {
+                object_to_source.insert(object_id, function.id.0);
+            } else if function.entry.is_some() {
+                return Err(inline_error(
+                    format!(
+                        "function definition `{}` has no object declaration",
+                        function.symbol_name
+                    ),
+                    function.span,
+                ));
+            }
 
             let boundary = abi_plan
                 .plan()
@@ -115,7 +116,7 @@ impl InliningPlan {
             let bridge_definition = matches!(boundary, Some(ccc_abi::BoundaryPlan::Bridge(_)));
             let prepared_body = prepared
                 .get(&function.id.0)
-                .filter(|(definition_id, _)| *definition_id == object_id)
+                .filter(|(definition_id, _)| Some(*definition_id) == object_id)
                 .map(|(_, body)| *body);
             let has_body = prepared_body.is_some();
             let (leaf, instruction_count, block_count) =
