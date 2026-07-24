@@ -108,6 +108,49 @@ cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 ```
 
+### Inspecting compiler phase timings
+
+Use the opt-in timing sidecar for one C or preprocessed-C translation:
+
+```sh
+target/debug/ccc -nostdinc -c path/to/input.c -o input.o \
+  --write-phase-timings=input.timings.tsv
+```
+
+The sidecar is a versioned, fixed-order key/value TSV. Every value is an
+unsigned decimal count of wall-clock nanoseconds. Schema version 1 can contain
+`preprocessing`, `parsing`, `semantic_analysis`, `ccc_ir_lowering`,
+`ccc_ir_optimization`, `codegen.total`, `object_packaging`, and `pipeline`, in
+that order. A phase which the selected action did not execute is omitted rather
+than reported as zero. `pipeline` stops before the timing report is serialized
+or published, and `codegen.total` deliberately remains a coarse boundary until
+CCC has honest ABI, CLIF-lowering, and Cranelift-compilation boundaries.
+
+Timing is supported for a single C or preprocessed-C input with `-c`, `-E`,
+`-fsyntax-only`, or one of the existing dump/emit actions. It fails closed for
+link actions, `-###`, `-dumpmachine`/`-dumpversion`/`-print-*` configuration
+queries, dependency-only `-M`/`-MM`, multi-input `-c`, assembly, preprocessed
+assembly, and linker inputs. Help and `--version` retain their early driver
+override and produce no sidecar; no-input `-v` is rejected, while `-v` on a
+supported translation remains valid. The report path must be distinct from the
+source, object, dependency, and other driver outputs, including lexical and
+existing symlink aliases. After preprocessing and ordinary filesystem-output
+publication, CCC rechecks the paths the preprocessor actually read and asks
+the host filesystem to resolve the final names again. This catches case-folded
+and Unicode-normalized aliases on volumes which treat those names as
+equivalent. It does not claim equivalence for names which the host filesystem
+itself cannot resolve as aliases.
+
+The report is atomically replaced only after the selected translation and its
+ordinary filesystem-output publications succeed. A rejected mode or failed
+translation leaves an existing report untouched. Delivery of the returned
+standard-output and standard-error strings is caller-owned and outside this
+sidecar transaction, so a later pipe or stream failure does not retract an
+already published report. Without the option, the driver creates no timing
+recorder and performs no clock reads. This first instrumentation slice is
+intentionally not wired into the benchmark runners; use it for manual phase
+inspection while their sampling and noise policy is developed.
+
 ### Inspecting code-generation statistics
 
 Use the versioned TSV dump when comparing lowering or inlining changes:

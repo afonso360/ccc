@@ -194,10 +194,14 @@ trend evidence and must not be compared numerically with native execution.
   data-flow-graph entities. C-Ray archives that complete view and uses the CLIF
   subset in its summary; its independent final-object parser accounts for
   generated bridge packaging.
-- Report preprocessing, parsing, semantic analysis, CCC-IR lowering and
-  optimization, ABI planning, CLIF lowering, Cranelift compilation, object
-  packaging, and linking separately. Also record end-to-end wall time, CPU
-  time, and peak resident memory.
+- The opt-in phase-timing sidecar now reports preprocessing, parsing, semantic
+  analysis, CCC-IR lowering and optimization, coarse total code generation,
+  object packaging, and the successful end-to-end translation pipeline without
+  instrumenting ordinary builds. Split `codegen.total` into ABI planning, CLIF
+  lowering, Cranelift compilation, and primary-object emission next; add a
+  separate link boundary when link actions can publish the same atomic evidence
+  contract. Continue recording whole-process wall time, CPU time, and peak
+  resident memory externally rather than inventing per-phase CPU or RSS.
 - Count CCC-IR functions, blocks, values, operations, and dead operations
   before and after CCC-owned optimization. CLIF live blocks, values,
   instructions, stack slots, signatures, external function references, and

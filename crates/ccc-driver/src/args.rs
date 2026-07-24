@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use ccc_diag::DiagnosticFormat;
 use ccc_target::{LanguageMode, OptimizationLevel, RelocationModel, TrigraphPolicy};
 
+use crate::dependency::default_dependency_path;
 use crate::warnings::validate_warning_option;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -125,6 +126,7 @@ pub(crate) struct DriverOptions {
     pub link_items: Vec<LinkItem>,
     pub link_output_kind: LinkOutputKind,
     pub output: Option<PathBuf>,
+    pub phase_timings_output: Option<PathBuf>,
     pub language_mode: LanguageMode,
     pub relocation_model: RelocationModel,
     pub optimization: OptimizationLevel,
@@ -203,6 +205,7 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
     let mut syntax_only = false;
     let mut dump = None;
     let mut output = None;
+    let mut phase_timings_output = None;
     let mut inputs = Vec::new();
     let mut input_languages = Vec::new();
     let mut link_items = Vec::new();
@@ -480,6 +483,14 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
             _ if let Some(value) = argument.strip_prefix("--sysroot=") => {
                 sysroot = Some(PathBuf::from(value));
             }
+            _ if let Some(value) = argument.strip_prefix("--write-phase-timings=") => {
+                require_joined_value(value, "--write-phase-timings")?;
+                if phase_timings_output.replace(PathBuf::from(value)).is_some() {
+                    return Err(
+                        "ccc: `--write-phase-timings` may be specified only once".to_owned()
+                    );
+                }
+            }
             _ if let Some(value) = argument
                 .strip_prefix("--target=")
                 .or_else(|| argument.strip_prefix("-target=")) =>
@@ -646,6 +657,12 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
     }
 
     if let Some(query) = query {
+        if phase_timings_output.is_some() {
+            return Err(
+                "ccc: `--write-phase-timings` cannot be combined with build-system introspection"
+                    .to_owned(),
+            );
+        }
         if !inputs.is_empty() {
             return Err(
                 "ccc: build-system introspection options do not accept input files".to_owned(),
@@ -667,6 +684,12 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
                 optimization,
             }),
         ));
+    }
+    if inputs.is_empty() && phase_timings_output.is_some() {
+        return Err(
+            "ccc: `--write-phase-timings` requires exactly one C or preprocessed-C input"
+                .to_owned(),
+        );
     }
     if inputs.is_empty() && verbose {
         return Ok(ParsedCommand::VerboseVersion);
@@ -734,6 +757,19 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
         }
     };
 
+    if let Some(timings_output) = &phase_timings_output {
+        validate_phase_timing_action(
+            &action,
+            print_commands_only,
+            &inputs,
+            &input_languages,
+            &forced_inputs,
+            output.as_deref(),
+            &dependencies,
+            timings_output,
+        )?;
+    }
+
     if matches!(dependencies.mode, DependencyMode::Only { .. }) {
         suppress_warnings = true;
     }
@@ -746,6 +782,7 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
         link_items,
         link_output_kind,
         output,
+        phase_timings_output,
         language_mode,
         relocation_model,
         optimization,
@@ -940,6 +977,199 @@ fn parse_input_language(value: &str) -> Result<Option<DriverInputLanguage>, Stri
         "assembler-with-cpp" => Ok(Some(DriverInputLanguage::PreprocessedAssembly)),
         _ => Err(format!("ccc: unsupported input language `{value}`")),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_phase_timing_action(
+    action: &PrimaryAction,
+    print_commands_only: bool,
+    inputs: &[PathBuf],
+    input_languages: &[Option<DriverInputLanguage>],
+    forced_inputs: &[ForcedInputOption],
+    output: Option<&Path>,
+    dependencies: &DependencyOptions,
+    timings_output: &Path,
+) -> Result<(), String> {
+    if print_commands_only {
+        return Err("ccc: `--write-phase-timings` cannot be combined with `-###`".to_owned());
+    }
+    match action {
+        PrimaryAction::Compile { link: true } => {
+            return Err(
+                "ccc: `--write-phase-timings` does not support link actions; use `-c`".to_owned(),
+            );
+        }
+        PrimaryAction::Preprocess if matches!(dependencies.mode, DependencyMode::Only { .. }) => {
+            return Err(
+                "ccc: `--write-phase-timings` does not support dependency-only actions".to_owned(),
+            );
+        }
+        PrimaryAction::Preprocess => {}
+        PrimaryAction::Compile { link: false }
+        | PrimaryAction::SyntaxOnly
+        | PrimaryAction::Dump(_) => {}
+    }
+    if inputs.len() != 1 {
+        return Err(
+            "ccc: `--write-phase-timings` requires exactly one C or preprocessed-C input"
+                .to_owned(),
+        );
+    }
+    if !phase_timing_input_is_c(&inputs[0], input_languages[0]) {
+        return Err(
+            "ccc: `--write-phase-timings` supports only C and preprocessed-C inputs".to_owned(),
+        );
+    }
+    validate_phase_timing_output_paths(
+        action,
+        inputs,
+        forced_inputs,
+        output,
+        dependencies,
+        timings_output,
+    )
+}
+
+pub(crate) fn revalidate_phase_timing_output_paths(options: &DriverOptions) -> Result<(), String> {
+    let Some(timings_output) = options.phase_timings_output.as_deref() else {
+        return Ok(());
+    };
+    validate_phase_timing_output_paths(
+        &options.action,
+        &options.inputs,
+        &options.forced_inputs,
+        options.output.as_deref(),
+        &options.dependencies,
+        timings_output,
+    )
+}
+
+fn validate_phase_timing_output_paths(
+    action: &PrimaryAction,
+    inputs: &[PathBuf],
+    forced_inputs: &[ForcedInputOption],
+    output: Option<&Path>,
+    dependencies: &DependencyOptions,
+    timings_output: &Path,
+) -> Result<(), String> {
+    let Some(input) = inputs.first() else {
+        return Err(
+            "ccc: `--write-phase-timings` requires exactly one C or preprocessed-C input"
+                .to_owned(),
+        );
+    };
+    if timings_output == Path::new("-") {
+        return Err("ccc: `--write-phase-timings` requires a filesystem output path".to_owned());
+    }
+    for input in std::iter::once(input.as_path())
+        .chain(forced_inputs.iter().map(|forced| forced.path.as_path()))
+    {
+        if timing_paths_conflict(timings_output, input)? {
+            return Err(
+                "ccc: phase-timing output must be distinct from the compilation input".to_owned(),
+            );
+        }
+    }
+    if output
+        .map(|output| timing_paths_conflict(timings_output, output))
+        .transpose()?
+        .unwrap_or(false)
+    {
+        return Err(
+            "ccc: phase-timing output must be distinct from other driver outputs".to_owned(),
+        );
+    }
+    let dependency_output = match dependencies.mode {
+        DependencyMode::SideEffect { .. } => dependencies
+            .output
+            .clone()
+            .or_else(|| {
+                matches!(action, PrimaryAction::Preprocess)
+                    .then(|| output.map(Path::to_path_buf))
+                    .flatten()
+            })
+            .or_else(|| Some(default_dependency_path(input, output))),
+        DependencyMode::None | DependencyMode::Only { .. } => None,
+    };
+    if dependency_output
+        .as_deref()
+        .map(|output| timing_paths_conflict(timings_output, output))
+        .transpose()?
+        .unwrap_or(false)
+    {
+        return Err("ccc: phase-timing output must be distinct from dependency output".to_owned());
+    }
+    if matches!(action, PrimaryAction::Compile { link: false })
+        && output.is_none()
+        && timing_paths_conflict(
+            timings_output,
+            &input
+                .file_name()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| input.to_path_buf())
+                .with_extension("o"),
+        )?
+    {
+        return Err(
+            "ccc: phase-timing output must be distinct from the compilation output".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn timing_paths_conflict(left: &Path, right: &Path) -> Result<bool, String> {
+    Ok(comparable_timing_path(left)? == comparable_timing_path(right)?)
+}
+
+fn comparable_timing_path(path: &Path) -> Result<PathBuf, String> {
+    let absolute = std::path::absolute(path).map_err(|error| {
+        format!(
+            "ccc: cannot resolve output path {}: {error}",
+            path.display()
+        )
+    })?;
+    if let Ok(canonical) = fs::canonicalize(&absolute) {
+        return Ok(canonical);
+    }
+    if let (Some(parent), Some(file_name)) = (absolute.parent(), absolute.file_name())
+        && let Ok(parent) = fs::canonicalize(parent)
+    {
+        return Ok(parent.join(file_name));
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                let _ = normalized.pop();
+            }
+            std::path::Component::Prefix(_)
+            | std::path::Component::RootDir
+            | std::path::Component::Normal(_) => normalized.push(component.as_os_str()),
+        }
+    }
+    Ok(normalized)
+}
+
+fn phase_timing_input_is_c(input: &Path, language: Option<DriverInputLanguage>) -> bool {
+    if let Some(language) = language {
+        return matches!(
+            language,
+            DriverInputLanguage::C | DriverInputLanguage::PreprocessedC
+        );
+    }
+    if input
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.contains(".so."))
+    {
+        return false;
+    }
+    !matches!(
+        input.extension().and_then(|extension| extension.to_str()),
+        Some("s" | "S" | "o" | "lo" | "obj" | "a" | "so" | "dylib")
+    )
 }
 
 fn is_debug_level_option(argument: &str) -> bool {
@@ -1160,6 +1390,196 @@ mod tests {
             options(&["--emit=codegen-stats", "input.c"]).action,
             PrimaryAction::Dump(DumpKind::CodegenStats)
         );
+    }
+
+    #[test]
+    fn parses_phase_timing_output_for_supported_single_input_actions() {
+        let compile = options(&["--write-phase-timings=compile.tsv", "-c", "input.c"]);
+        assert_eq!(
+            compile.phase_timings_output,
+            Some(PathBuf::from("compile.tsv"))
+        );
+
+        let preprocessed = options(&[
+            "--write-phase-timings=preprocessed.tsv",
+            "-x",
+            "c-cpp-output",
+            "-c",
+            "input",
+        ]);
+        assert_eq!(
+            preprocessed.phase_timings_output,
+            Some(PathBuf::from("preprocessed.tsv"))
+        );
+
+        for action in ["-E", "-fsyntax-only", "--dump-ast", "--emit=clif"] {
+            assert!(
+                parse(["--write-phase-timings=phase.tsv", action, "input.c",].map(str::to_owned))
+                    .is_ok(),
+                "{action}"
+            );
+        }
+    }
+
+    #[test]
+    fn phase_timing_output_rejects_ambiguous_or_unsupported_actions() {
+        let rejected = [
+            vec!["--write-phase-timings=phase.tsv", "input.c"],
+            vec!["--write-phase-timings=phase.tsv", "-###", "-c", "input.c"],
+            vec!["--write-phase-timings=phase.tsv", "-v"],
+            vec!["--write-phase-timings=phase.tsv", "-dumpmachine"],
+            vec!["--write-phase-timings=phase.tsv", "-M", "input.c"],
+            vec!["--write-phase-timings=phase.tsv", "-c", "one.c", "two.c"],
+            vec!["--write-phase-timings=phase.tsv", "-c", "input.s"],
+            vec![
+                "--write-phase-timings=phase.tsv",
+                "-xassembler-with-cpp",
+                "-c",
+                "input",
+            ],
+            vec!["--write-phase-timings=-", "-c", "input.c"],
+            vec!["--write-phase-timings=input.c", "-c", "input.c"],
+            vec!["--write-phase-timings=./input.c", "-c", "input.c"],
+            vec!["--write-phase-timings=input.o", "-c", "input.c"],
+            vec!["--write-phase-timings=./input.o", "-c", "input.c"],
+            vec![
+                "--write-phase-timings=artifact.o",
+                "-c",
+                "input.c",
+                "-o",
+                "./artifact.o",
+            ],
+            vec![
+                "--write-phase-timings=deps.d",
+                "-c",
+                "-MD",
+                "-MF",
+                "deps.d",
+                "input.c",
+            ],
+            vec![
+                "--write-phase-timings=forced.h",
+                "-c",
+                "-include",
+                "./forced.h",
+                "input.c",
+            ],
+            vec!["--write-phase-timings=./input.d", "-c", "-MD", "input.c"],
+            vec![
+                "--write-phase-timings=build/artifact.d",
+                "-c",
+                "-MD",
+                "input.c",
+                "-o",
+                "./build/artifact.o",
+            ],
+        ];
+        for arguments in rejected {
+            assert!(
+                parse(arguments.iter().copied().map(str::to_owned)).is_err(),
+                "{arguments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn help_does_not_treat_post_double_dash_names_as_timing_options() {
+        assert!(matches!(
+            parse(["--help", "--", "--write-phase-timings=literal-input",].map(str::to_owned)),
+            Ok(ParsedCommand::Help)
+        ));
+    }
+
+    #[test]
+    fn phase_timing_output_requires_one_nonempty_joined_path() {
+        assert!(
+            parse(["--write-phase-timings=", "-c", "input.c",].map(str::to_owned))
+                .unwrap_err()
+                .contains("requires an argument")
+        );
+        assert!(
+            parse(
+                [
+                    "--write-phase-timings=first.tsv",
+                    "--write-phase-timings=second.tsv",
+                    "-c",
+                    "input.c",
+                ]
+                .map(str::to_owned)
+            )
+            .unwrap_err()
+            .contains("only once")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn phase_timing_output_rejects_an_existing_symlink_input_alias() {
+        use std::os::unix::fs::symlink;
+        use std::sync::atomic::Ordering;
+
+        let directory = std::env::temp_dir().join(format!(
+            "ccc-phase-path-alias-{}-{}",
+            std::process::id(),
+            crate::TEMPORARY_ID.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::create_dir(&directory).unwrap();
+        let source = directory.join("source.c");
+        let alias = directory.join("alias.c");
+        fs::write(&source, "int value;\n").unwrap();
+        symlink(&source, &alias).unwrap();
+
+        let error = parse([
+            format!("--write-phase-timings={}", source.display()),
+            "-c".to_owned(),
+            alias.display().to_string(),
+        ])
+        .unwrap_err();
+        assert!(error.contains("distinct from the compilation input"));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(any(target_os = "macos", windows))]
+    #[test]
+    fn post_execution_recheck_resolves_case_folded_output_aliases() {
+        use std::sync::atomic::Ordering;
+
+        let directory = std::env::temp_dir().join(format!(
+            "ccc-phase-case-alias-{}-{}",
+            std::process::id(),
+            crate::TEMPORARY_ID.fetch_add(1, Ordering::Relaxed),
+        ));
+        fs::create_dir(&directory).unwrap();
+        let probe = directory.join("case-probe");
+        fs::write(&probe, "probe").unwrap();
+        if !directory.join("CASE-PROBE").exists() {
+            fs::remove_dir_all(directory).unwrap();
+            return;
+        }
+
+        let source = directory.join("source.c");
+        let output = directory.join("Artifact.o");
+        let timing_output = directory.join("artifact.o");
+        fs::write(&source, "int value;\n").unwrap();
+        let command = parse([
+            "-c".to_owned(),
+            source.display().to_string(),
+            "-o".to_owned(),
+            output.display().to_string(),
+            format!("--write-phase-timings={}", timing_output.display()),
+        ])
+        .unwrap();
+        let ParsedCommand::Run(options) = command else {
+            panic!("expected runnable options");
+        };
+
+        fs::write(&output, "ordinary output").unwrap();
+        let error = revalidate_phase_timing_output_paths(&options).unwrap_err();
+        assert!(error.contains("distinct from other driver outputs"));
+        assert_eq!(fs::read_to_string(&output).unwrap(), "ordinary output");
+
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

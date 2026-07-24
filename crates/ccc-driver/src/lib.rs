@@ -5,6 +5,7 @@ mod atomic_output;
 mod dependency;
 mod diagnostics;
 mod empty_object;
+mod phase_timing;
 mod predefined;
 mod resource;
 mod warnings;
@@ -51,6 +52,7 @@ use dependency::{
     render_dependencies,
 };
 use diagnostics::PreprocessorDiagnostics;
+use phase_timing::{Phase, PhaseTimings};
 use resource::ResourceDirectory;
 use warnings::{WarningDisposition, WarningPolicy};
 
@@ -88,6 +90,7 @@ const HELP: &str = "Usage: ccc [options] <input>...\n\
                              Dump frontend representations\n\
   --emit=clif                Dump Cranelift IR\n\
   --emit=codegen-stats       Dump stable machine-readable codegen statistics\n\
+  --write-phase-timings=path Atomically write phase wall times after one successful translation\n\
   -###                       Print replayable phase commands without executing\n\
   -dumpmachine|-dumpversion  Print build-system compiler identity\n\
   -print-prog-name=name|-print-file-name=name|-print-search-dirs\n\
@@ -160,10 +163,54 @@ pub fn run(arguments: impl IntoIterator<Item = String>) -> Result<DriverOutput, 
             let verbose = options.verbose;
             let hardening_diagnostics = degraded_hardening_diagnostics(&options)?;
             let format = options.diagnostic_format;
+            let phase_timings_output = options.phase_timings_output.clone();
             let hardening_json = (format == DiagnosticFormat::Json
                 && !hardening_diagnostics.is_empty())
             .then(|| degraded_hardening_json_document(&options, false));
-            let mut output = match execute(*options) {
+            let execution = if let Some(destination) = phase_timings_output {
+                let mut timings = PhaseTimings::start_pipeline();
+                let timing_options = (*options).clone();
+                let output = execute(*options, Some(&mut timings));
+                match output {
+                    Ok(output) => {
+                        // The pipeline measurement deliberately stops before
+                        // rendering or publishing its own observability file.
+                        timings.finish_pipeline();
+                        let publication = args::revalidate_phase_timing_output_paths(
+                            &timing_options,
+                        )
+                        .map_err(DriverError::new)
+                        .and_then(|()| {
+                            for input in timings.protected_inputs() {
+                                if args::timing_paths_conflict(&destination, input)
+                                    .map_err(DriverError::new)?
+                                {
+                                    return Err(DriverError::new(
+                                        "ccc: phase-timing output must be distinct from every source file read during preprocessing",
+                                    ));
+                                }
+                            }
+                            Ok(())
+                        })
+                        .and_then(|()| {
+                            timings.publish(&destination).map_err(|error| {
+                                DriverError::new(format!(
+                                    "ccc: cannot write phase timings {}: {error}",
+                                    destination.display()
+                                ))
+                            })
+                        });
+                        match publication {
+                            Ok(()) => Ok(output),
+                            Err(error) => Err(with_prior_diagnostics(&output.stderr, error)),
+                        }
+                    }
+                    Err(error) => Err(error),
+                }
+            } else {
+                execute(*options, None)
+            };
+            let mut output = match execution {
                 Ok(output) => output,
                 Err(error) => {
                     let mut error = error_for_format(error, format);
@@ -474,7 +521,10 @@ fn verbose_version() -> String {
     )
 }
 
-fn execute(options: DriverOptions) -> Result<DriverOutput, DriverError> {
+fn execute(
+    options: DriverOptions,
+    mut timings: Option<&mut PhaseTimings>,
+) -> Result<DriverOutput, DriverError> {
     if options.print_commands_only {
         return print_command_plan(&options);
     }
@@ -507,7 +557,7 @@ fn execute(options: DriverOptions) -> Result<DriverOutput, DriverError> {
             &config,
         );
     }
-    let prepared = preprocess_source(&options)?;
+    let prepared = preprocess_source(&options, timings.as_deref_mut())?;
 
     if matches!(options.dependencies.mode, DriverDependencyMode::Only { .. }) {
         return dependency_only_output(&options, prepared);
@@ -515,9 +565,9 @@ fn execute(options: DriverOptions) -> Result<DriverOutput, DriverError> {
 
     match options.action {
         PrimaryAction::Preprocess => preprocess_output(&options, prepared),
-        PrimaryAction::SyntaxOnly => syntax_only_output(prepared),
-        PrimaryAction::Dump(kind) => dump_output(&options, prepared, kind),
-        PrimaryAction::Compile { link } => compile_output(&options, prepared, link),
+        PrimaryAction::SyntaxOnly => syntax_only_output(prepared, timings),
+        PrimaryAction::Dump(kind) => dump_output(&options, prepared, kind, timings),
+        PrimaryAction::Compile { link } => compile_output(&options, prepared, link, timings),
     }
 }
 
@@ -787,8 +837,11 @@ fn shell_quote(value: &str) -> String {
     }
 }
 
-fn syntax_only_output(prepared: PreparedSource) -> Result<DriverOutput, DriverError> {
-    let (parsed, _) = analyze_frontend_preprocessed(prepared)?;
+fn syntax_only_output(
+    prepared: PreparedSource,
+    timings: Option<&mut PhaseTimings>,
+) -> Result<DriverOutput, DriverError> {
+    let (parsed, _) = analyze_frontend_preprocessed(prepared, timings)?;
     Ok(DriverOutput {
         stdout: String::new(),
         stderr: parsed.stderr,
@@ -843,8 +896,8 @@ fn compile_multiple_outputs(options: DriverOptions) -> Result<DriverOutput, Driv
                 per_input.input_languages = vec![language];
                 per_input.link_items.clear();
                 per_input.output = Some(output);
-                preprocess_source(&per_input)
-                    .and_then(|prepared| compile_output(&per_input, prepared, false))
+                preprocess_source(&per_input, None)
+                    .and_then(|prepared| compile_output(&per_input, prepared, false, None))
             }
             InputKind::Assembly | InputKind::PreprocessedAssembly => {
                 let mut per_input = options.clone();
@@ -913,10 +966,10 @@ fn link_output(options: DriverOptions) -> Result<DriverOutput, DriverError> {
                     per_input.input_languages = vec![*language];
                     per_input.link_items.clear();
                     per_input.output = Some(temporary.path().to_path_buf());
-                    let prepared = preprocess_source(&per_input)
+                    let prepared = preprocess_source(&per_input, None)
                         .map_err(|error| with_prior_diagnostics(&stderr, error))?;
                     let (result, packaging) =
-                        compile_output_retaining_packaging(&per_input, prepared, false)
+                        compile_output_retaining_packaging(&per_input, prepared, false, None)
                             .map_err(|error| with_prior_diagnostics(&stderr, error))?;
                     retained_debug_inputs.extend(packaging.retained_debug_inputs);
                     stdout.push_str(&result.stdout);
@@ -1183,7 +1236,7 @@ fn assemble_input(
         per_input.inputs = vec![input.to_path_buf()];
         per_input.link_items.clear();
         per_input.output = None;
-        let prepared = preprocess_source(&per_input)?;
+        let prepared = preprocess_source(&per_input, None)?;
         prepared.reject_if_errors()?;
         append_diagnostic_output(&mut stderr, &prepared.stderr, options.diagnostic_format);
         let source = render_preprocessed(&prepared.output, false);
@@ -1287,7 +1340,11 @@ impl PreparedSource {
     }
 }
 
-fn preprocess_source(options: &DriverOptions) -> Result<PreparedSource, DriverError> {
+fn preprocess_source(
+    options: &DriverOptions,
+    mut timings: Option<&mut PhaseTimings>,
+) -> Result<PreparedSource, DriverError> {
+    let started = PhaseTimings::begin(timings.as_deref());
     let (config, resources) = effective_config(options)?;
     let provider = FsFileProvider;
     let loaded = provider.read(&options.input).map_err(|error| {
@@ -1370,13 +1427,24 @@ fn preprocess_source(options: &DriverOptions) -> Result<PreparedSource, DriverEr
         ));
     }
 
-    Ok(PreparedSource {
+    PhaseTimings::finish(timings.as_deref_mut(), Phase::Preprocessing, started);
+    if let Some(timings) = timings {
+        timings.protect_inputs(
+            output
+                .dependencies
+                .files
+                .iter()
+                .map(|dependency| dependency.path.as_path()),
+        );
+    }
+    let prepared = PreparedSource {
         session,
         output,
         diagnostics,
         diagnostic_format: options.diagnostic_format,
         stderr,
-    })
+    };
+    Ok(prepared)
 }
 
 fn effective_config(
@@ -1746,6 +1814,7 @@ fn dump_output(
     options: &DriverOptions,
     prepared: PreparedSource,
     kind: DumpKind,
+    mut timings: Option<&mut PhaseTimings>,
 ) -> Result<DriverOutput, DriverError> {
     let deferred_dependencies = defer_side_effect_dependencies(options, &prepared.output, None);
 
@@ -1782,20 +1851,20 @@ fn dump_output(
             )
         }
         DumpKind::Ast => {
-            let mut parsed = parse_frontend_preprocessed(prepared)?;
+            let mut parsed = parse_frontend_preprocessed(prepared, timings.as_deref_mut())?;
             parsed.reject_if_errors()?;
             (dump_frontend_ast(&parsed.ast), parsed.stderr)
         }
         DumpKind::TypedAst => {
-            let (parsed, typed) = analyze_frontend_preprocessed(prepared)?;
+            let (parsed, typed) = analyze_frontend_preprocessed(prepared, timings.as_deref_mut())?;
             (dump_frontend_typed_ast(&typed), parsed.stderr)
         }
         DumpKind::Ir => {
-            let (parsed, ir) = lower_frontend_preprocessed(prepared)?;
+            let (parsed, ir) = lower_frontend_preprocessed(prepared, timings.as_deref_mut())?;
             (ccc_ir::generic::dump_frontend_ir(&ir), parsed.stderr)
         }
         DumpKind::Abi => {
-            let (parsed, ir) = lower_frontend_preprocessed(prepared)?;
+            let (parsed, ir) = lower_frontend_preprocessed(prepared, timings.as_deref_mut())?;
             let plan = ccc_abi::plan_module(&ir, &parsed.session.config).map_err(|error| {
                 with_prior_diagnostics(
                     &parsed.stderr,
@@ -1813,7 +1882,7 @@ fn dump_output(
             (ccc_abi::dump_module_plan(verified), parsed.stderr)
         }
         DumpKind::Clif => {
-            let (parsed, ir) = lower_frontend_preprocessed(prepared)?;
+            let (parsed, ir) = lower_frontend_preprocessed(prepared, timings.as_deref_mut())?;
             let generated = codegen_frontend(
                 &ir,
                 &parsed.session.config,
@@ -1821,12 +1890,13 @@ fn dump_output(
                 true,
                 false,
                 false,
+                timings,
             )
             .map_err(|error| with_prior_diagnostics(&parsed.stderr, error))?;
             (generated.clif, parsed.stderr)
         }
         DumpKind::CodegenStats => {
-            let (parsed, ir) = lower_frontend_preprocessed(prepared)?;
+            let (parsed, ir) = lower_frontend_preprocessed(prepared, timings.as_deref_mut())?;
             let generated = codegen_frontend(
                 &ir,
                 &parsed.session.config,
@@ -1834,6 +1904,7 @@ fn dump_output(
                 false,
                 options.debug_info,
                 true,
+                timings,
             )
             .map_err(|error| with_prior_diagnostics(&parsed.stderr, error))?;
             (
@@ -1855,8 +1926,10 @@ fn compile_output(
     options: &DriverOptions,
     prepared: PreparedSource,
     link: bool,
+    timings: Option<&mut PhaseTimings>,
 ) -> Result<DriverOutput, DriverError> {
-    let (output, _packaging) = compile_output_retaining_packaging(options, prepared, link)?;
+    let (output, _packaging) =
+        compile_output_retaining_packaging(options, prepared, link, timings)?;
     Ok(output)
 }
 
@@ -1864,6 +1937,7 @@ fn compile_output_retaining_packaging(
     options: &DriverOptions,
     prepared: PreparedSource,
     link: bool,
+    mut timings: Option<&mut PhaseTimings>,
 ) -> Result<(DriverOutput, ccc_link::PackagingReport), DriverError> {
     let output = options.output.clone().unwrap_or_else(|| {
         if link {
@@ -1875,7 +1949,7 @@ fn compile_output_retaining_packaging(
     let deferred_dependencies =
         defer_side_effect_dependencies(options, &prepared.output, options.output.as_deref());
 
-    let (parsed, ir) = lower_frontend_preprocessed(prepared)?;
+    let (parsed, ir) = lower_frontend_preprocessed(prepared, timings.as_deref_mut())?;
     let generated = codegen_frontend(
         &ir,
         &parsed.session.config,
@@ -1883,6 +1957,7 @@ fn compile_output_retaining_packaging(
         false,
         options.debug_info,
         false,
+        timings.as_deref_mut(),
     )
     .map_err(|error| with_prior_diagnostics(&parsed.stderr, error))?;
     let artifact = generated.into_artifact_bundle();
@@ -1895,11 +1970,13 @@ fn compile_output_retaining_packaging(
             .prepare_external_write()
             .map_err(|error| with_prior_diagnostics(&parsed.stderr, error))?
             .to_path_buf();
+        let packaging_started = PhaseTimings::begin(timings.as_deref());
         packaging =
             ccc_link::package_artifact_bundle(artifact, &artifact_path, &parsed.session.config)
                 .map_err(|error| {
                     with_prior_diagnostics(&parsed.stderr, owner_error(error.code, error.message))
                 })?;
+        PhaseTimings::finish(timings, Phase::ObjectPackaging, packaging_started);
         let mut pending = atomic_output::PendingOutput::create(&output).map_err(|error| {
             with_prior_diagnostics(
                 &parsed.stderr,
@@ -1963,11 +2040,13 @@ fn compile_output_retaining_packaging(
                 )
             })?
             .to_path_buf();
+        let packaging_started = PhaseTimings::begin(timings.as_deref());
         packaging =
             ccc_link::package_artifact_bundle(artifact, &package_output, &parsed.session.config)
                 .map_err(|error| {
                     with_prior_diagnostics(&parsed.stderr, owner_error(error.code, error.message))
                 })?;
+        PhaseTimings::finish(timings, Phase::ObjectPackaging, packaging_started);
         dependency_stdout = publish_deferred_dependencies(deferred_dependencies)
             .map_err(|error| with_prior_diagnostics(&parsed.stderr, error))?;
         pending.commit(&output).map_err(|error| {
@@ -2121,7 +2200,9 @@ impl FrontendParsedSource {
 
 fn parse_frontend_preprocessed(
     prepared: PreparedSource,
+    timings: Option<&mut PhaseTimings>,
 ) -> Result<FrontendParsedSource, DriverError> {
+    let started = PhaseTimings::begin(timings.as_deref());
     let PreparedSource {
         session,
         output,
@@ -2169,20 +2250,24 @@ fn parse_frontend_preprocessed(
             break;
         }
     }
-    Ok(FrontendParsedSource {
+    let parsed = FrontendParsedSource {
         session,
         ast: recovered.ast,
         diagnostics,
         diagnostic_format,
         stderr,
         poisoned_bindings: recovered.poisoned_bindings,
-    })
+    };
+    PhaseTimings::finish(timings, Phase::Parsing, started);
+    Ok(parsed)
 }
 
 fn analyze_frontend_preprocessed(
     prepared: PreparedSource,
+    mut timings: Option<&mut PhaseTimings>,
 ) -> Result<(FrontendParsedSource, FullTypedTranslationUnit), DriverError> {
-    let mut parsed = parse_frontend_preprocessed(prepared)?;
+    let mut parsed = parse_frontend_preprocessed(prepared, timings.as_deref_mut())?;
+    let started = PhaseTimings::begin(timings.as_deref());
     let typed = if parsed.diagnostics.is_halted() {
         None
     } else {
@@ -2217,6 +2302,7 @@ fn analyze_frontend_preprocessed(
     };
     parsed.reject_if_errors()?;
     let typed = typed.expect("error-free semantic analysis returns a typed translation unit");
+    PhaseTimings::finish(timings, Phase::SemanticAnalysis, started);
     Ok((parsed, typed))
 }
 
@@ -2253,14 +2339,22 @@ fn diagnostic_depends_on_recovery(
 
 fn lower_frontend_preprocessed(
     prepared: PreparedSource,
+    mut timings: Option<&mut PhaseTimings>,
 ) -> Result<(FrontendParsedSource, FullModule), DriverError> {
-    let (parsed, typed) = analyze_frontend_preprocessed(prepared)?;
+    let (parsed, typed) = analyze_frontend_preprocessed(prepared, timings.as_deref_mut())?;
+    let lowering_started = PhaseTimings::begin(timings.as_deref());
     let mut ir = ccc_ir::generic::lower_frontend(&typed).map_err(|error| {
         with_prior_diagnostics(
             &parsed.stderr,
             frontend_ir_error(&parsed.session.sources, error),
         )
     })?;
+    PhaseTimings::finish(
+        timings.as_deref_mut(),
+        Phase::CccIrLowering,
+        lowering_started,
+    );
+    let optimization_started = PhaseTimings::begin(timings.as_deref());
     ccc_ir::generic::optimize_frontend_for_config(&mut ir, &parsed.session.config).map_err(
         |error| {
             with_prior_diagnostics(
@@ -2269,6 +2363,7 @@ fn lower_frontend_preprocessed(
             )
         },
     )?;
+    PhaseTimings::finish(timings, Phase::CccIrOptimization, optimization_started);
     Ok((parsed, ir))
 }
 
@@ -2295,7 +2390,9 @@ fn codegen_frontend(
     emit_clif: bool,
     debug_info: bool,
     emit_stats: bool,
+    timings: Option<&mut PhaseTimings>,
 ) -> Result<CodegenOutput, DriverError> {
+    let started = PhaseTimings::begin(timings.as_deref());
     let codegen_options = CodegenOptions {
         emit_clif,
         debug_info: debug_info.then_some(sources),
@@ -2305,13 +2402,15 @@ fn codegen_frontend(
     } else {
         ccc_codegen::generic::emit(ir, config, codegen_options)
     };
-    generated.map_err(|error| {
+    let generated = generated.map_err(|error| {
         let mut diagnostic = Diagnostic::error(error.code, error.message);
         if let Some(span) = error.span {
             diagnostic = diagnostic.with_primary(span, "while generating native code");
         }
         diagnostic_error(sources, diagnostic)
-    })
+    })?;
+    PhaseTimings::finish(timings, Phase::CodegenTotal, started);
+    Ok(generated)
 }
 
 fn dump_pp_tokens(sources: &SourceMap, tokens: &[PpToken]) -> String {

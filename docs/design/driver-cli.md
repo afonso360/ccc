@@ -145,3 +145,22 @@ from unstable entity numbering and absolute temporary paths.
 stable origin summaries. `--dump-tokens` shows the converted parser-token
 stream. `-dM -E` emits the final macro environment, including predefined
 macros, as `#define` directives.
+
+`--write-phase-timings=<path>` is an opt-in wall-clock sidecar for exactly one
+C or preprocessed-C translation. It supports single-input `-c`, `-E`,
+`-fsyntax-only`, and dump/emit actions. Link actions, command printing, driver
+configuration queries, dependency-only actions, multi-input compilation,
+assembly, and linker inputs are rejected rather than assigned misleading
+partial timings. Help and `--version` keep their early override behavior and
+produce no sidecar; no-input `-v` is rejected.
+The versioned numeric TSV uses a fixed phase order and omits unexecuted phases.
+Its initial honest boundaries are preprocessing, parsing, semantic analysis,
+CCC-IR lowering, CCC-IR optimization, coarse total code generation, object
+packaging, and the overall pipeline. The pipeline clock stops before rendering
+the report. The sidecar is published atomically only after ordinary filesystem
+outputs succeed. Before publication, the driver rechecks every source path
+observed by preprocessing and resolves final output names again; this catches
+case and Unicode-normalization aliases when the host filesystem exposes them
+as equivalent. Standard-stream delivery remains caller-owned and outside the
+sidecar transaction. Untimed invocations allocate no recorder and read no
+clocks.
