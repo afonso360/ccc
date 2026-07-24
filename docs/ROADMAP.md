@@ -168,8 +168,12 @@ The current executable slice and next benchmark targets are:
   declaration and live-function axes. The per-function family grows unused
   block-scope prototypes across a fixed live call graph while requiring every
   post-inlining CLIF and primary-object metric to stay identical. Each
-  structural family rejects dead fixtures and superlinear growth. Correlate
-  every axis with phase timing and peak-memory growth next.
+  structural family rejects dead fixtures and superlinear growth. Every
+  case/profile now adds a separate untimed phase-instrumented compilation,
+  accepts it only when its final object matches the first timed sample by size
+  and SHA-256, and retains the complete sidecar beside whole-process peak RSS.
+  Establish pinned-runner baselines before turning those noisy phase and memory
+  correlations into growth gates.
 - Whole-program measurements use the existing bzip2, zlib, and zstd adapters
   with fixed inputs. Record translation time, link time, aggregate object
   size, executable text size, and execution throughput without weakening their

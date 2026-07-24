@@ -5,6 +5,10 @@ CCC-IR, inlining, Cranelift, and object-emission costs without link or runtime
 noise. Every timed command is an ordinary object-only `ccc -c ... -o ...`
 compilation. One separate, untimed `ccc --emit=codegen-stats` invocation per
 case and profile records the structure of the generated IR and primary object.
+After the timed samples, one additional untimed object compilation records
+CCC's versioned phase wall times. Its final object must match the first timed
+sample in both byte count and SHA-256 before those phase measurements are
+accepted.
 
 The default set covers:
 
@@ -105,14 +109,16 @@ accidentally.
 
 ## Results
 
-The result directory uses format version 5 and is self-contained:
+The result directory uses format version 6 and is self-contained:
 
 | Path | Contents |
 | --- | --- |
 | `summary.tsv` | Timing, RSS, and selected codegen metrics per case/profile. |
 | `compile-times.tsv` | Per-run time, RSS, faults, context switches, and status. |
 | `codegen-stats.tsv` | One normalized structural-stats record per case/profile. |
-| `raw/` | Objects, compiler output, timing JSON, and untimed raw stats output. |
+| `phase-timings.tsv` | Complete normalized phase-timing schema per case/profile. |
+| `phase-timing-artifacts.tsv` | Canonical and instrumented object sizes, hashes, and match status. |
+| `raw/` | Objects, compiler output, timing JSON, raw stats, and raw phase sidecars. |
 | `sources/` | Exact static and generated C translation units that were measured. |
 | `manifest.tsv` | Source identities and any exact-equivalence baseline. |
 | `commands.jsonl` | Exact compiler argument vectors in execution order. |
@@ -130,8 +136,19 @@ and Cranelift's function-level semantic roots after inlining; the runner
 measures that residue without asking CCC to duplicate Cranelift cleanup.
 `primary_object.*` describes CCC's primary object and excludes generated bridge
 assembly. Compile timings cover only ordinary `-c` invocations. The structural
-stats query runs after the timed samples and is never included in timing
-summaries.
+stats query and phase-instrumented compilation run after the timed samples and
+are never included in `compile-times.tsv` or its distribution summaries.
+
+Phase-timing schema version 1 records nanoseconds in this exact order:
+`preprocessing`, `parsing`, `semantic_analysis`, `ccc_ir_lowering`,
+`ccc_ir_optimization`, `codegen.total`, `object_packaging`, and `pipeline`.
+The coarse `codegen.total` value does not claim separate ABI-planning, CLIF,
+Cranelift-compilation, or primary-object-emission measurements. `pipeline`
+stops before the compiler renders and publishes the timing sidecar. These are
+single internal wall-clock observations used to attribute the ordinary
+compile-time distribution; they are not per-phase CPU or peak-RSS
+measurements. The existing median peak RSS remains a whole-process metric from
+the ordinary timed samples.
 
 Use a release-built CCC for compiler-performance comparisons. A debug build is
 useful for exercising the harness and invariants, but its timings are not a
@@ -139,6 +156,10 @@ performance baseline.
 
 Every timed invocation has a unique explicit `.o` path. The objects are retained
 and hashed, and repeated samples must produce identical object bytes.
+The phase-instrumented invocation uses another explicit object path and must
+match the first timed sample's size and SHA-256. A mismatch fails the run
+instead of attaching phase measurements to code that differs from the measured
+artifact.
 `primary_object.file_bytes` describes Cranelift's primary relocatable object;
 the timed `.o` byte count can be larger when the driver packages generated ABI
 support alongside it. The runner requires the two sizes to match for cases

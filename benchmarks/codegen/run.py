@@ -23,8 +23,9 @@ import time
 from typing import Iterable
 
 
-FORMAT_VERSION = 5
+FORMAT_VERSION = 6
 CODEGEN_STATS_SCHEMA_VERSION = 3
+PHASE_TIMING_SCHEMA_VERSION = 1
 CODEGEN_STATS_METRICS = (
     "post_inline_ir.functions",
     "post_inline_ir.blocks",
@@ -58,6 +59,26 @@ CODEGEN_STATS_METRICS = (
     "primary_object.debug_bytes",
     "primary_object.metadata_bytes",
     "primary_object.other_section_bytes",
+)
+PHASE_TIMING_METRICS = (
+    "preprocessing",
+    "parsing",
+    "semantic_analysis",
+    "ccc_ir_lowering",
+    "ccc_ir_optimization",
+    "codegen.total",
+    "object_packaging",
+    "pipeline",
+)
+PHASE_TIMING_SUMMARY_FIELDS = (
+    ("compile_phase_preprocessing_nanoseconds", "preprocessing"),
+    ("compile_phase_parsing_nanoseconds", "parsing"),
+    ("compile_phase_semantic_analysis_nanoseconds", "semantic_analysis"),
+    ("compile_phase_ccc_ir_lowering_nanoseconds", "ccc_ir_lowering"),
+    ("compile_phase_ccc_ir_optimization_nanoseconds", "ccc_ir_optimization"),
+    ("compile_phase_codegen_total_nanoseconds", "codegen.total"),
+    ("compile_phase_object_packaging_nanoseconds", "object_packaging"),
+    ("compile_phase_pipeline_nanoseconds", "pipeline"),
 )
 DECLARATIONS_PER_FUNCTION_FUNCTIONS = 4
 PROFILE_FLAGS = {
@@ -136,6 +157,17 @@ NORMALIZED_STATS_FIELDS = (
     "metric",
     "value",
 )
+PHASE_TIMING_ARTIFACT_FIELDS = (
+    "benchmark",
+    "family",
+    "scale",
+    "profile",
+    "canonical_object_bytes",
+    "canonical_object_sha256",
+    "instrumented_object_bytes",
+    "instrumented_object_sha256",
+    "objects_match",
+)
 SUMMARY_FIELDS = (
     "benchmark",
     "family",
@@ -148,6 +180,7 @@ SUMMARY_FIELDS = (
     "median_user_seconds",
     "median_system_seconds",
     "median_peak_rss_bytes",
+    *(field for field, _metric in PHASE_TIMING_SUMMARY_FIELDS),
     "post_inline_ir.functions",
     "post_inline_ir.blocks",
     "post_inline_ir.values",
@@ -199,6 +232,14 @@ class StatsRecord:
     profile: str
     stats: dict[str, int]
     stats_order: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PhaseTimingRecord:
+    case: Case
+    profile: str
+    timings: dict[str, int]
+    timings_order: tuple[str, ...]
 
 
 def comma_separated(
@@ -824,6 +865,29 @@ def peak_rss_bytes(usage: resource.struct_rusage) -> int:
     return value * 1024
 
 
+def object_compile_command(
+    compiler: Path,
+    profile: str,
+    target: str,
+    source: Path,
+    output: Path,
+    *,
+    phase_timings: Path | None = None,
+) -> list[str]:
+    command = [
+        os.fspath(compiler),
+        "-c",
+        PROFILE_FLAGS[profile],
+        f"--target={target}",
+        os.fspath(source),
+        "-o",
+        os.fspath(output),
+    ]
+    if phase_timings is not None:
+        command.append(f"--write-phase-timings={phase_timings}")
+    return command
+
+
 def measured_run(
     command: list[str],
     standard_output: Path,
@@ -915,6 +979,62 @@ def parse_stats(path: Path) -> tuple[dict[str, int], tuple[str, ...]]:
     return stats, tuple(order)
 
 
+def parse_phase_timings(path: Path) -> tuple[dict[str, int], tuple[str, ...]]:
+    timings: dict[str, int] = {}
+    order: list[str] = []
+    try:
+        with path.open(encoding="utf-8", newline="") as source:
+            rows = list(csv.reader(source, delimiter="\t"))
+    except (OSError, UnicodeError) as error:
+        raise BenchmarkError(f"{path}: cannot read phase timings: {error}") from error
+    for line_number, row in enumerate(rows, 1):
+        if len(row) != 2:
+            raise BenchmarkError(
+                f"{path}:{line_number}: expected one tab-separated metric/value row"
+            )
+        metric, raw_value = row
+        if not re.fullmatch(r"[a-z][a-z0-9_.]*", metric):
+            raise BenchmarkError(
+                f"{path}:{line_number}: invalid phase-timing metric {metric!r}"
+            )
+        if metric in timings:
+            raise BenchmarkError(
+                f"{path}:{line_number}: duplicate phase-timing metric {metric!r}"
+            )
+        if re.fullmatch(r"(0|[1-9][0-9]*)", raw_value) is None:
+            raise BenchmarkError(
+                f"{path}:{line_number}: phase-timing metric {metric!r} "
+                "is not canonical unsigned decimal"
+            )
+        timings[metric] = int(raw_value)
+        order.append(metric)
+
+    expected_order = ("schema_version", *PHASE_TIMING_METRICS)
+    if not order or order[0] != "schema_version":
+        raise BenchmarkError(
+            f"{path}: first phase-timing metric must be schema_version"
+        )
+    if timings["schema_version"] != PHASE_TIMING_SCHEMA_VERSION:
+        raise BenchmarkError(
+            f"{path}: unsupported phase-timing schema "
+            f"{timings['schema_version']}"
+        )
+    if tuple(order) != expected_order:
+        missing = [metric for metric in expected_order if metric not in timings]
+        unexpected = [metric for metric in order if metric not in expected_order]
+        details = []
+        if missing:
+            details.append(f"missing {', '.join(missing)}")
+        if unexpected:
+            details.append(f"unexpected {', '.join(unexpected)}")
+        if not details:
+            details.append("metrics are out of schema order")
+        raise BenchmarkError(
+            f"{path}: invalid phase-timing schema: {'; '.join(details)}"
+        )
+    return timings, tuple(order)
+
+
 def write_json(path: Path, value: object) -> None:
     temporary = path.with_name(f"{path.name}.part.{os.getpid()}")
     temporary.write_text(
@@ -943,6 +1063,7 @@ def timing_row(invocation: CompileInvocation) -> dict[str, object]:
 def validate_invariants(
     invocations: list[CompileInvocation],
     records: list[StatsRecord],
+    phase_records: list[PhaseTimingRecord],
 ) -> None:
     stats_by_case = {
         (record.case.name, record.profile): record.stats for record in records
@@ -1026,6 +1147,30 @@ def validate_invariants(
                 raise BenchmarkError(
                     f"{case} at -{profile} produced nondeterministic object files"
                 )
+
+    seen_phase_keys = set()
+    duplicate_phase_keys = set()
+    for record in phase_records:
+        key = (record.case.name, record.profile)
+        if key in seen_phase_keys:
+            duplicate_phase_keys.add(key)
+        seen_phase_keys.add(key)
+    expected_phase_keys = set(sample_groups)
+    actual_phase_keys = seen_phase_keys
+    missing_phase_keys = sorted(expected_phase_keys - actual_phase_keys)
+    unexpected_phase_keys = sorted(actual_phase_keys - expected_phase_keys)
+    if duplicate_phase_keys or missing_phase_keys or unexpected_phase_keys:
+        details = []
+        if duplicate_phase_keys:
+            details.append(f"duplicate {sorted(duplicate_phase_keys)!r}")
+        if missing_phase_keys:
+            details.append(f"missing {missing_phase_keys!r}")
+        if unexpected_phase_keys:
+            details.append(f"unexpected {unexpected_phase_keys!r}")
+        raise BenchmarkError(
+            "phase-timing records do not match measured case/profile keys: "
+            + "; ".join(details)
+        )
 
     declaration_labels = {
         "declaration-heavy": "function declarations",
@@ -1180,6 +1325,7 @@ def format_seconds(value: float) -> str:
 def write_summary(
     invocations: list[CompileInvocation],
     records: list[StatsRecord],
+    phase_records: list[PhaseTimingRecord],
     output: Path,
 ) -> None:
     groups: dict[tuple[str, str], list[CompileInvocation]] = {}
@@ -1191,6 +1337,10 @@ def write_summary(
     stats_by_case = {
         (record.case.name, record.profile): record.stats for record in records
     }
+    phase_timings_by_case = {
+        (record.case.name, record.profile): record.timings
+        for record in phase_records
+    }
 
     with (output / "summary.tsv").open("w", encoding="utf-8", newline="") as file:
         writer = csv.DictWriter(
@@ -1200,6 +1350,7 @@ def write_summary(
         for key, group in groups.items():
             first = group[0]
             stats = stats_by_case[key]
+            phase_timings = phase_timings_by_case[key]
             wall = [float(item.timing["wall_seconds"]) for item in group]
             user = [float(item.timing["user_seconds"]) for item in group]
             system = [float(item.timing["system_seconds"]) for item in group]
@@ -1219,6 +1370,10 @@ def write_summary(
                         statistics.median(system)
                     ),
                     "median_peak_rss_bytes": round(statistics.median(rss)),
+                    **{
+                        field: phase_timings[metric]
+                        for field, metric in PHASE_TIMING_SUMMARY_FIELDS
+                    },
                     **{
                         metric: stats[metric]
                         for metric in REQUIRED_METRICS
@@ -1349,6 +1504,7 @@ def run(arguments: argparse.Namespace) -> Path:
     environment = {
         "format_version": FORMAT_VERSION,
         "codegen_stats_schema_version": CODEGEN_STATS_SCHEMA_VERSION,
+        "phase_timing_schema_version": PHASE_TIMING_SCHEMA_VERSION,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "compiler": os.fspath(compiler),
         "compiler_sha256": sha256(compiler),
@@ -1388,11 +1544,18 @@ def run(arguments: argparse.Namespace) -> Path:
     raw_directory.mkdir()
     invocations: list[CompileInvocation] = []
     stats_records: list[StatsRecord] = []
+    phase_records: list[PhaseTimingRecord] = []
     commands_file = (output / "commands.jsonl").open("w", encoding="utf-8")
     timings_file = (output / "compile-times.tsv").open(
         "w", encoding="utf-8", newline=""
     )
     stats_file = (output / "codegen-stats.tsv").open(
+        "w", encoding="utf-8", newline=""
+    )
+    phase_file = (output / "phase-timings.tsv").open(
+        "w", encoding="utf-8", newline=""
+    )
+    phase_artifacts_file = (output / "phase-timing-artifacts.tsv").open(
         "w", encoding="utf-8", newline=""
     )
     try:
@@ -1410,11 +1573,26 @@ def run(arguments: argparse.Namespace) -> Path:
             lineterminator="\n",
         )
         stats_writer.writeheader()
+        phase_writer = csv.DictWriter(
+            phase_file,
+            fieldnames=NORMALIZED_STATS_FIELDS,
+            delimiter="\t",
+            lineterminator="\n",
+        )
+        phase_writer.writeheader()
+        phase_artifacts_writer = csv.DictWriter(
+            phase_artifacts_file,
+            fieldnames=PHASE_TIMING_ARTIFACT_FIELDS,
+            delimiter="\t",
+            lineterminator="\n",
+        )
+        phase_artifacts_writer.writeheader()
 
         for case in cases:
             for profile in arguments.profiles:
                 invocation_directory = raw_directory / case.name / profile
                 invocation_directory.mkdir(parents=True, exist_ok=True)
+                profile_invocations: list[CompileInvocation] = []
                 for phase, count in (
                     ("warmup", arguments.warmups),
                     ("sample", arguments.samples),
@@ -1425,15 +1603,13 @@ def run(arguments: argparse.Namespace) -> Path:
                         raw_stderr = invocation_directory / f"{stem}.stderr.txt"
                         object_path = invocation_directory / f"{stem}.o"
                         timing_json = invocation_directory / f"{stem}.timing.json"
-                        command = [
-                            os.fspath(compiler),
-                            "-c",
-                            PROFILE_FLAGS[profile],
-                            f"--target={effective_target}",
-                            os.fspath(case.source),
-                            "-o",
-                            os.fspath(object_path),
-                        ]
+                        command = object_compile_command(
+                            compiler,
+                            profile,
+                            effective_target,
+                            case.source,
+                            object_path,
+                        )
                         commands_file.write(
                             json.dumps(
                                 {
@@ -1477,8 +1653,125 @@ def run(arguments: argparse.Namespace) -> Path:
                             object_path,
                         )
                         invocations.append(invocation)
+                        profile_invocations.append(invocation)
                         timing_writer.writerow(timing_row(invocation))
                         timings_file.flush()
+
+                canonical = next(
+                    invocation
+                    for invocation in profile_invocations
+                    if invocation.phase == "sample"
+                )
+                phase_stdout = invocation_directory / "phase-timings.stdout.txt"
+                phase_stderr = invocation_directory / "phase-timings.stderr.txt"
+                phase_object = invocation_directory / "phase-timings.o"
+                raw_phase_timings = invocation_directory / "phase-timings.tsv"
+                phase_result = invocation_directory / "phase-timings.result.json"
+                phase_command = object_compile_command(
+                    compiler,
+                    profile,
+                    effective_target,
+                    case.source,
+                    phase_object,
+                    phase_timings=raw_phase_timings,
+                )
+                commands_file.write(
+                    json.dumps(
+                        {
+                            "benchmark": case.name,
+                            "kind": "phase-timings",
+                            "profile": profile,
+                            "command": phase_command,
+                            "object": os.fspath(phase_object),
+                            "phase_timings": os.fspath(raw_phase_timings),
+                            "timed": False,
+                        },
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    + "\n"
+                )
+                commands_file.flush()
+                phase_status = capture_command(
+                    phase_command, phase_stdout, phase_stderr
+                )
+                phase_result_payload: dict[str, object] = {
+                    "format_version": FORMAT_VERSION,
+                    "command": phase_command,
+                    "exit_status": phase_status,
+                    "stdout": os.fspath(phase_stdout),
+                    "stderr": os.fspath(phase_stderr),
+                    "object": os.fspath(phase_object),
+                    "phase_timings": os.fspath(raw_phase_timings),
+                    "timed": False,
+                }
+                write_json(phase_result, phase_result_payload)
+                if phase_status != 0:
+                    raise BenchmarkError(
+                        f"{case.name} at -{profile} phase-timing compile failed "
+                        f"with status {phase_status}; see {phase_stderr}"
+                    )
+                if not phase_object.is_file():
+                    raise BenchmarkError(
+                        f"{case.name} at -{profile} phase-timing compile did "
+                        f"not create {phase_object}"
+                    )
+
+                canonical_bytes = int(canonical.timing["object_bytes"])
+                canonical_digest = str(canonical.timing["object_sha256"])
+                instrumented_bytes = phase_object.stat().st_size
+                instrumented_digest = sha256(phase_object)
+                objects_match = (
+                    instrumented_bytes == canonical_bytes
+                    and instrumented_digest == canonical_digest
+                )
+                artifact_row = {
+                    "benchmark": case.name,
+                    "family": case.family,
+                    "scale": case.scale,
+                    "profile": profile,
+                    "canonical_object_bytes": canonical_bytes,
+                    "canonical_object_sha256": canonical_digest,
+                    "instrumented_object_bytes": instrumented_bytes,
+                    "instrumented_object_sha256": instrumented_digest,
+                    "objects_match": int(objects_match),
+                }
+                phase_artifacts_writer.writerow(artifact_row)
+                phase_artifacts_file.flush()
+                phase_result_payload.update(artifact_row)
+                write_json(phase_result, phase_result_payload)
+                if not objects_match:
+                    raise BenchmarkError(
+                        f"{case.name} at -{profile} phase-timing "
+                        "instrumentation changed the final object: "
+                        f"canonical {canonical_bytes} bytes/{canonical_digest}, "
+                        f"instrumented {instrumented_bytes} bytes/"
+                        f"{instrumented_digest}"
+                    )
+                if not raw_phase_timings.is_file():
+                    raise BenchmarkError(
+                        f"{case.name} at -{profile} phase-timing compile did "
+                        f"not create {raw_phase_timings}"
+                    )
+                phase_timings, phase_order = parse_phase_timings(
+                    raw_phase_timings
+                )
+                phase_record = PhaseTimingRecord(
+                    case, profile, phase_timings, phase_order
+                )
+                phase_records.append(phase_record)
+                for metric in phase_order:
+                    phase_writer.writerow(
+                        {
+                            "benchmark": case.name,
+                            "family": case.family,
+                            "scale": case.scale,
+                            "profile": profile,
+                            "metric": metric,
+                            "value": phase_timings[metric],
+                        }
+                    )
+                phase_file.flush()
 
                 raw_stats = invocation_directory / "codegen-stats.stdout.tsv"
                 stats_stderr = invocation_directory / "codegen-stats.stderr.txt"
@@ -1543,9 +1836,11 @@ def run(arguments: argparse.Namespace) -> Path:
         commands_file.close()
         timings_file.close()
         stats_file.close()
+        phase_file.close()
+        phase_artifacts_file.close()
 
-    validate_invariants(invocations, stats_records)
-    write_summary(invocations, stats_records, output)
+    validate_invariants(invocations, stats_records, phase_records)
+    write_summary(invocations, stats_records, phase_records, output)
     return output
 
 

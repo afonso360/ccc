@@ -147,9 +147,10 @@ translation leaves an existing report untouched. Delivery of the returned
 standard-output and standard-error strings is caller-owned and outside this
 sidecar transaction, so a later pipe or stream failure does not retract an
 already published report. Without the option, the driver creates no timing
-recorder and performs no clock reads. This first instrumentation slice is
-intentionally not wired into the benchmark runners; use it for manual phase
-inspection while their sampling and noise policy is developed.
+recorder and performs no clock reads. The codegen structural-scaling runner
+uses this option only in a separate untimed compilation after its ordinary
+samples, and accepts the phase record only when that compilation's object size
+and SHA-256 match the first measured object.
 
 ### Inspecting code-generation statistics
 

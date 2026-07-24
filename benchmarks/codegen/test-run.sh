@@ -49,6 +49,14 @@ source_arguments = [argument for argument in sys.argv[1:] if argument.endswith("
 if len(source_arguments) != 1:
     print("unexpected fake compiler invocation", file=sys.stderr)
     sys.exit(2)
+phase_timing_arguments = [
+    argument.split("=", 1)[1]
+    for argument in sys.argv[1:]
+    if argument.startswith("--write-phase-timings=")
+]
+if len(phase_timing_arguments) > 1:
+    print("multiple phase-timing outputs", file=sys.stderr)
+    sys.exit(2)
 
 source = Path(source_arguments[0]).read_text(encoding="utf-8")
 family = re.search(r"ccc-benchmark-family: ([a-z-]+)", source).group(1)
@@ -75,7 +83,47 @@ if "--emit=codegen-stats" not in sys.argv:
         and os.environ.get("FAKE_CCC_LEAK_DATA_DECLS")
     ):
         payload += b"x" * scale
+    if phase_timing_arguments and os.environ.get(
+        "FAKE_CCC_PHASE_OBJECT_MISMATCH"
+    ):
+        payload += b"phase-instrumentation-changed-object"
     output.write_bytes(payload)
+    if phase_timing_arguments:
+        mode = os.environ.get("FAKE_CCC_PHASE_TIMING_MODE", "valid")
+        if mode == "missing":
+            sys.exit(0)
+        phase_rows = [
+            ("schema_version", "1"),
+            ("preprocessing", "11"),
+            ("parsing", "13"),
+            ("semantic_analysis", "17"),
+            ("ccc_ir_lowering", "19"),
+            ("ccc_ir_optimization", "23"),
+            ("codegen.total", "29"),
+            ("object_packaging", "31"),
+            ("pipeline", "149"),
+        ]
+        if mode == "malformed":
+            phase_rows[2] = ("parsing", "1.5")
+        elif mode == "noncanonical":
+            phase_rows[2] = ("parsing", "013")
+        elif mode == "missing-metric":
+            del phase_rows[7]
+        elif mode == "reordered":
+            phase_rows[4], phase_rows[5] = phase_rows[5], phase_rows[4]
+        elif mode == "duplicate":
+            phase_rows.insert(3, ("parsing", "13"))
+        elif mode == "unexpected":
+            phase_rows.insert(-1, ("frontend.unexpected", "37"))
+        elif mode == "wrong-version":
+            phase_rows[0] = ("schema_version", "2")
+        elif mode != "valid":
+            print(f"unknown phase timing mode: {mode}", file=sys.stderr)
+            sys.exit(2)
+        Path(phase_timing_arguments[0]).write_text(
+            "".join(f"{metric}\t{value}\n" for metric, value in phase_rows),
+            encoding="utf-8",
+        )
     sys.exit(0)
 
 scaling_families = {
@@ -244,8 +292,13 @@ grep -Fq $'live-globals-2\tlive-globals\t2\tO2\tpost_inline_ir.global_values\t2'
   "$results/codegen-stats.tsv"
 grep -Fq $'string-literals-2\tstring-literals\t2\tO2\tprimary_object.read_only_data_bytes\t36' \
   "$results/codegen-stats.tsv"
-grep -Fq '"format_version":5' "$results/environment.json"
+grep -Fq $'string-literals-2\tstring-literals\t2\tO2\tcodegen.total\t29' \
+  "$results/phase-timings.tsv"
+grep -Fq $'compile_phase_preprocessing_nanoseconds\tcompile_phase_parsing_nanoseconds\tcompile_phase_semantic_analysis_nanoseconds' \
+  "$results/summary.tsv"
+grep -Fq '"format_version":6' "$results/environment.json"
 grep -Fq '"codegen_stats_schema_version":3' "$results/environment.json"
+grep -Fq '"phase_timing_schema_version":1' "$results/environment.json"
 expected_compiler_sha=$(
   python3 -c \
     'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' \
@@ -263,7 +316,60 @@ grep -Fq '"effective_configs":{"O0":' "$results/environment.json"
 grep -Fq '"exit_status":0' "$results/environment.json"
 grep -Fq '"benchmark":"printf-variadic"' "$results/commands.jsonl"
 [[ "$(grep -c '"kind":"object-compile"' "$results/commands.jsonl")" == 138 ]]
+[[ "$(grep -c '"kind":"phase-timings"' "$results/commands.jsonl")" == 46 ]]
 [[ "$(grep -c '"kind":"codegen-stats"' "$results/commands.jsonl")" == 46 ]]
+python3 - "$results/commands.jsonl" <<'PYTHON'
+import json
+from pathlib import Path
+import sys
+
+records = [
+    json.loads(line)
+    for line in Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+]
+measured = [record for record in records if record["kind"] == "object-compile"]
+instrumented = [record for record in records if record["kind"] == "phase-timings"]
+assert len(measured) == 138
+assert len(instrumented) == 46
+assert all(record["timed"] is True for record in measured)
+assert all(
+    not any(
+        argument.startswith("--write-phase-timings=")
+        for argument in record["command"]
+    )
+    for record in measured
+)
+assert all(record["timed"] is False for record in instrumented)
+assert all(
+    sum(
+        argument.startswith("--write-phase-timings=")
+        for argument in record["command"]
+    )
+    == 1
+    for record in instrumented
+)
+PYTHON
+python3 - "$results/summary.tsv" <<'PYTHON'
+import csv
+from pathlib import Path
+import sys
+
+with Path(sys.argv[1]).open(encoding="utf-8", newline="") as source:
+    rows = list(csv.DictReader(source, delimiter="\t"))
+row = next(
+    row
+    for row in rows
+    if row["benchmark"] == "minimal-return" and row["profile"] == "O0"
+)
+assert row["compile_phase_preprocessing_nanoseconds"] == "11"
+assert row["compile_phase_parsing_nanoseconds"] == "13"
+assert row["compile_phase_semantic_analysis_nanoseconds"] == "17"
+assert row["compile_phase_ccc_ir_lowering_nanoseconds"] == "19"
+assert row["compile_phase_ccc_ir_optimization_nanoseconds"] == "23"
+assert row["compile_phase_codegen_total_nanoseconds"] == "29"
+assert row["compile_phase_object_packaging_nanoseconds"] == "31"
+assert row["compile_phase_pipeline_nanoseconds"] == "149"
+PYTHON
 [[ "$(grep -c '^extern long ccc_decl_' \
   "$results/sources/declaration-heavy-3.c")" == 3 ]]
 [[ "$(grep -c '^extern long ccc_data_decl_' \
@@ -294,14 +400,40 @@ grep -Fq 'extern int printf(const char *format, ...);' \
   "$results/sources/hosted-printf-minimal.c"
 [[ "$(find "$results/raw" -name 'codegen-stats.stdout.tsv' |
   wc -l | tr -d '[:space:]')" == 46 ]]
-[[ "$(find "$results/raw" -name '*.o' | wc -l | tr -d '[:space:]')" == 138 ]]
+[[ "$(find "$results/raw" -name 'phase-timings.tsv' |
+  wc -l | tr -d '[:space:]')" == 46 ]]
+[[ "$(find "$results/raw" -name '*.o' | wc -l | tr -d '[:space:]')" == 184 ]]
+[[ "$(wc -l <"$results/compile-times.tsv" | tr -d '[:space:]')" == 139 ]]
+[[ "$(wc -l <"$results/phase-timings.tsv" | tr -d '[:space:]')" == 415 ]]
 [[ -f "$results/raw/printf-variadic/O2/sample-002.timing.json" ]]
 [[ -s "$results/raw/printf-variadic/O2/sample-002.o" ]]
+[[ -s "$results/raw/printf-variadic/O2/phase-timings.o" ]]
 [[ "$(wc -c <"$results/raw/hosted-printf-minimal/O2/sample-002.o" |
   tr -d '[:space:]')" -gt 44 ]]
 [[ -f "$results/raw/printf-variadic/O2/sample-002.stdout.txt" ]]
 [[ -f "$results/raw/minimal-return/O0/warmup-001.stderr.txt" ]]
 [[ -f "$results/raw/minimal-return/O0/codegen-stats.result.json" ]]
+[[ -f "$results/raw/minimal-return/O0/phase-timings.stdout.txt" ]]
+[[ -f "$results/raw/minimal-return/O0/phase-timings.stderr.txt" ]]
+phase_result_payload=$(
+  cat "$results/raw/minimal-return/O0/phase-timings.result.json"
+)
+[[ "$phase_result_payload" == *'"objects_match":1'* ]]
+[[ "$phase_result_payload" == *'"timed":false'* ]]
+grep -Fqx $'schema_version\t1' \
+  "$results/raw/minimal-return/O0/phase-timings.tsv"
+grep -Fqx $'pipeline\t149' \
+  "$results/raw/minimal-return/O0/phase-timings.tsv"
+[[ "$(wc -l <"$results/phase-timing-artifacts.tsv" |
+  tr -d '[:space:]')" == 47 ]]
+awk -F '\t' '
+  NR == 1 {
+    if ($1 != "benchmark" || $9 != "objects_match") exit 1
+    next
+  }
+  $9 != "1" { exit 1 }
+  END { if (NR != 47) exit 1 }
+' "$results/phase-timing-artifacts.tsv"
 [[ -f "$results/compiler-dumpmachine.stdout.txt" ]]
 [[ -f "$results/effective-config/O0.stdout.txt" ]]
 grep -Fq 'compiler-driver=/usr/bin/fake-cc' \
@@ -522,6 +654,69 @@ missing_stats_status=$?
 set -e
 [[ "$missing_stats_status" == 1 ]]
 [[ "$missing_stats_output" == *"invalid codegen-stats schema: missing post_inline_ir.unused_global_values"* ]]
+
+expect_phase_schema_failure() {
+  mode=$1
+  expected=$2
+  phase_results="$temporary_directory/phase-$mode-results"
+  set +e
+  phase_output=$(
+    FAKE_CCC_PHASE_TIMING_MODE="$mode" "$script_directory/run.py" \
+      --ccc "$fake_ccc" \
+      --output "$phase_results" \
+      --cases minimal-return \
+      --profiles O0 \
+      --warmups 0 \
+      --samples 1 2>&1
+  )
+  phase_status=$?
+  set -e
+  [[ "$phase_status" == 1 ]]
+  [[ "$phase_output" == *"$expected"* ]]
+}
+
+expect_phase_schema_failure \
+  missing \
+  "phase-timing compile did not create"
+expect_phase_schema_failure \
+  malformed \
+  "phase-timing metric 'parsing' is not canonical unsigned decimal"
+expect_phase_schema_failure \
+  noncanonical \
+  "phase-timing metric 'parsing' is not canonical unsigned decimal"
+expect_phase_schema_failure \
+  missing-metric \
+  "invalid phase-timing schema: missing object_packaging"
+expect_phase_schema_failure \
+  reordered \
+  "invalid phase-timing schema: metrics are out of schema order"
+expect_phase_schema_failure \
+  duplicate \
+  "duplicate phase-timing metric 'parsing'"
+expect_phase_schema_failure \
+  unexpected \
+  "invalid phase-timing schema: unexpected frontend.unexpected"
+expect_phase_schema_failure \
+  wrong-version \
+  "unsupported phase-timing schema 2"
+
+phase_mismatch_results="$temporary_directory/phase-mismatch-results"
+set +e
+phase_mismatch_output=$(
+  FAKE_CCC_PHASE_OBJECT_MISMATCH=1 "$script_directory/run.py" \
+    --ccc "$fake_ccc" \
+    --output "$phase_mismatch_results" \
+    --cases minimal-return \
+    --profiles O0 \
+    --warmups 0 \
+    --samples 1 2>&1
+)
+phase_mismatch_status=$?
+set -e
+[[ "$phase_mismatch_status" == 1 ]]
+[[ "$phase_mismatch_output" == *"minimal-return at -O0 phase-timing instrumentation changed the final object"* ]]
+awk -F '\t' 'NR == 2 && $9 == "0" { found = 1 } END { exit !found }' \
+  "$phase_mismatch_results/phase-timing-artifacts.tsv"
 
 help_output=$("$script_directory/run.py" --help)
 [[ "$help_output" == *"--declaration-scales"* ]]
