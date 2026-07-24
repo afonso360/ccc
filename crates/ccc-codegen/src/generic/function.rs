@@ -451,7 +451,7 @@ pub(super) fn lower_function(
         })
         .collect();
     builder.seal_all_blocks();
-    builder.finalize();
+    builder.finalize(frontend_config);
     Ok(FunctionDebugLayout { storage_slots })
 }
 
@@ -536,26 +536,30 @@ impl FunctionState<'_> {
                 _ => unreachable!(),
             };
             self.f80_support_call(builder, opcode, slot, left, Some(right))?;
-            let ordering = builder.ins().load(ir::types::I32, MemFlags::new(), slot, 0);
+            let ordering = builder
+                .ins()
+                .load(ir::types::I32, MemFlagsData::new(), slot, 0);
             let boolean = match operator {
-                gir::BinaryOperation::Less => builder.ins().icmp_imm(IntCC::Equal, ordering, -1),
+                gir::BinaryOperation::Less => builder.ins().icmp_imm_s(IntCC::Equal, ordering, -1),
                 gir::BinaryOperation::LessEqual => {
                     builder
                         .ins()
-                        .icmp_imm(IntCC::SignedLessThanOrEqual, ordering, 0)
+                        .icmp_imm_s(IntCC::SignedLessThanOrEqual, ordering, 0)
                 }
-                gir::BinaryOperation::Greater => builder.ins().icmp_imm(IntCC::Equal, ordering, 1),
+                gir::BinaryOperation::Greater => {
+                    builder.ins().icmp_imm_s(IntCC::Equal, ordering, 1)
+                }
                 gir::BinaryOperation::GreaterEqual => {
                     let nonnegative =
                         builder
                             .ins()
-                            .icmp_imm(IntCC::SignedGreaterThanOrEqual, ordering, 0);
-                    let ordered = builder.ins().icmp_imm(IntCC::NotEqual, ordering, 2);
+                            .icmp_imm_s(IntCC::SignedGreaterThanOrEqual, ordering, 0);
+                    let ordered = builder.ins().icmp_imm_s(IntCC::NotEqual, ordering, 2);
                     builder.ins().band(nonnegative, ordered)
                 }
-                gir::BinaryOperation::Equal => builder.ins().icmp_imm(IntCC::Equal, ordering, 0),
+                gir::BinaryOperation::Equal => builder.ins().icmp_imm_s(IntCC::Equal, ordering, 0),
                 gir::BinaryOperation::NotEqual => {
-                    builder.ins().icmp_imm(IntCC::NotEqual, ordering, 0)
+                    builder.ins().icmp_imm_s(IntCC::NotEqual, ordering, 0)
                 }
                 _ => unreachable!(),
             };
@@ -606,8 +610,10 @@ impl FunctionState<'_> {
                 let slot = create_stack_backing(builder, 4, 4)?;
                 zero_memory(builder, slot, 4)?;
                 self.f80_support_call(builder, F80_OP_COMPARE_QUIET, slot, operand, Some(zero))?;
-                let ordering = builder.ins().load(ir::types::I32, MemFlags::new(), slot, 0);
-                let boolean = builder.ins().icmp_imm(IntCC::Equal, ordering, 0);
+                let ordering = builder
+                    .ins()
+                    .load(ir::types::I32, MemFlagsData::new(), slot, 0);
+                let boolean = builder.ins().icmp_imm_s(IntCC::Equal, ordering, 0);
                 let destination = scalar_type(&self.module.types, result_ty, self.config)?;
                 Ok(coerce_integer(
                     builder,
@@ -648,8 +654,10 @@ impl FunctionState<'_> {
             let slot = create_stack_backing(builder, 4, 4)?;
             zero_memory(builder, slot, 4)?;
             self.f80_support_call(builder, F80_OP_COMPARE_QUIET, slot, operand, Some(zero))?;
-            let ordering = builder.ins().load(ir::types::I32, MemFlags::new(), slot, 0);
-            let boolean = builder.ins().icmp_imm(IntCC::NotEqual, ordering, 0);
+            let ordering = builder
+                .ins()
+                .load(ir::types::I32, MemFlagsData::new(), slot, 0);
+            let boolean = builder.ins().icmp_imm_s(IntCC::NotEqual, ordering, 0);
             let destination = scalar_type(&self.module.types, to, self.config)?;
             return Ok(Some(coerce_integer(
                 builder,
@@ -708,7 +716,7 @@ impl FunctionState<'_> {
             )?;
             builder
                 .ins()
-                .store(MemFlags::new(), staged_value, source, 0);
+                .store(MemFlagsData::new(), staged_value, source, 0);
             let result = create_stack_backing(builder, 16, 16)?;
             zero_memory(builder, result, 16)?;
             self.f80_support_call(builder, opcode, result, source, None)?;
@@ -741,7 +749,9 @@ impl FunctionState<'_> {
             )?;
             zero_memory(builder, output, stored_size)?;
             self.f80_support_call(builder, opcode, output, operand, None)?;
-            let value = builder.ins().load(stored_ty, MemFlags::new(), output, 0);
+            let value = builder
+                .ins()
+                .load(stored_ty, MemFlagsData::new(), output, 0);
             let destination = scalar_type(&self.module.types, to, self.config)?;
             let value = if stored_ty.is_int() && stored_ty != destination {
                 coerce_integer(
@@ -770,8 +780,8 @@ impl FunctionState<'_> {
         slots.sort_unstable_by_key(|(storage, _)| **storage);
         for (_, slot) in slots {
             let state = builder.ins().stack_addr(ir::types::I64, *slot, 0);
-            builder.ins().store(MemFlags::new(), zero, state, 0);
-            builder.ins().store(MemFlags::new(), zero, state, 8);
+            builder.ins().store(MemFlagsData::new(), zero, state, 0);
+            builder.ins().store(MemFlagsData::new(), zero, state, 8);
         }
     }
 
@@ -905,9 +915,12 @@ impl FunctionState<'_> {
                         ccc_abi::NativePurpose::Normal => {
                             let destination =
                                 address_offset(builder, address, carrier.source_offset)?;
-                            builder
-                                .ins()
-                                .store(MemFlags::new(), incoming_value, destination, 0);
+                            builder.ins().store(
+                                MemFlagsData::new(),
+                                incoming_value,
+                                destination,
+                                0,
+                            );
                         }
                         ccc_abi::NativePurpose::StructReturn => {
                             return Err(error("source parameter unexpectedly uses sret purpose"));
@@ -944,11 +957,12 @@ impl FunctionState<'_> {
                 *frame,
                 bridge_frame_layout(plan.abi_identity).entry_indirect_result,
             )?;
-            self.sret = Some(
-                builder
-                    .ins()
-                    .load(ir::types::I64, MemFlags::new(), saved_sret, 0),
-            );
+            self.sret = Some(builder.ins().load(
+                ir::types::I64,
+                MemFlagsData::new(),
+                saved_sret,
+                0,
+            ));
         }
         if plan.parameters.len() != self.function.parameters.len() {
             return Err(error(
@@ -998,7 +1012,7 @@ impl FunctionState<'_> {
                         self.function.parameters[source_index].ty,
                         self.config,
                     )?,
-                    MemFlags::new(),
+                    MemFlagsData::new(),
                     source,
                     0,
                 )
@@ -1009,7 +1023,9 @@ impl FunctionState<'_> {
                 if let Some(piece) = pieces.iter().find(|piece| piece.indirect) {
                     let slot =
                         variadic_parameter_piece_address(builder, *frame, plan, piece.location)?;
-                    let source = builder.ins().load(ir::types::I64, MemFlags::new(), slot, 0);
+                    let source = builder
+                        .ins()
+                        .load(ir::types::I64, MemFlagsData::new(), slot, 0);
                     copy_memory(
                         builder,
                         result,
@@ -1101,7 +1117,7 @@ impl FunctionState<'_> {
                             .ok_or_else(|| {
                                 error(format!("reference to undeclared string {}", string.0))
                             })?;
-                    Ok(Some(builder.ins().global_value(ir::types::I64, reference)))
+                    Ok(Some(builder.ins().symbol_value(ir::types::I64, reference)))
                 }
                 I::AddressOfStorage { storage } => {
                     let storage = self.storage.get(&storage.0).copied().ok_or_else(|| {
@@ -1426,7 +1442,7 @@ impl FunctionState<'_> {
                             .ok_or_else(|| {
                                 error(format!("reference to undeclared string {}", string.0))
                             })?;
-                    let source = builder.ins().global_value(ir::types::I64, source);
+                    let source = builder.ins().symbol_value(ir::types::I64, source);
                     let string = self
                         .module
                         .strings
@@ -1672,7 +1688,7 @@ impl FunctionState<'_> {
                     let operand = self.value(*operand)?;
                     let old = builder.ins().atomic_rmw(
                         ty,
-                        MemFlags::new(),
+                        MemFlagsData::new(),
                         operation,
                         self.value(*address)?,
                         operand,
@@ -1704,7 +1720,7 @@ impl FunctionState<'_> {
                 } => {
                     let _ = atomic_scalar_type(&self.module.types, *object, self.config)?;
                     Ok(Some(builder.ins().atomic_cas(
-                        MemFlags::new(),
+                        MemFlagsData::new(),
                         self.value(*address)?,
                         self.value(*expected)?,
                         self.value(*replacement)?,
@@ -1867,7 +1883,7 @@ impl FunctionState<'_> {
         let value = reference
             .value
             .ok_or_else(|| error("non-TLS data reference has no global value"))?;
-        Ok(builder.ins().global_value(ir::types::I64, value))
+        Ok(builder.ins().symbol_value(ir::types::I64, value))
     }
 
     fn address_constant(
@@ -1894,7 +1910,7 @@ impl FunctionState<'_> {
                     .get(&id.0)
                     .copied()
                     .ok_or_else(|| error(format!("reference to undeclared string {}", id.0)))?;
-                builder.ins().global_value(ir::types::I64, reference)
+                builder.ins().symbol_value(ir::types::I64, reference)
             }
         };
         let addend = i64::try_from(addend)
@@ -1902,7 +1918,7 @@ impl FunctionState<'_> {
         Ok(if addend == 0 {
             address
         } else {
-            builder.ins().iadd_imm(address, addend)
+            builder.ins().iadd_imm_s(address, addend)
         })
     }
 
@@ -2007,7 +2023,7 @@ impl FunctionState<'_> {
                     let scaled = if stride == 1 {
                         index_value
                     } else {
-                        builder.ins().imul_imm(
+                        builder.ins().imul_imm_s(
                             index_value,
                             i64::try_from(stride)
                                 .map_err(|_| error("aggregate array stride is too large"))?,
@@ -2100,12 +2116,14 @@ impl FunctionState<'_> {
         }
         let gp_offset_address = list;
         let fp_offset_address = address_offset(builder, list, 4)?;
-        let gp_offset = builder
-            .ins()
-            .load(ir::types::I32, MemFlags::new(), gp_offset_address, 0);
-        let fp_offset = builder
-            .ins()
-            .load(ir::types::I32, MemFlags::new(), fp_offset_address, 0);
+        let gp_offset =
+            builder
+                .ins()
+                .load(ir::types::I32, MemFlagsData::new(), gp_offset_address, 0);
+        let fp_offset =
+            builder
+                .ins()
+                .load(ir::types::I32, MemFlagsData::new(), fp_offset_address, 0);
         let gp_limit = 48u32
             .checked_sub(u32::from(plan.gp_slots) * 8)
             .ok_or_else(|| error("va_arg GP slot requirement exceeds the save area"))?;
@@ -2115,7 +2133,7 @@ impl FunctionState<'_> {
         let gp_available = if plan.gp_slots == 0 {
             builder.ins().iconst(ir::types::I8, 1)
         } else {
-            builder.ins().icmp_imm(
+            builder.ins().icmp_imm_s(
                 IntCC::UnsignedLessThanOrEqual,
                 gp_offset,
                 i64::from(gp_limit),
@@ -2124,7 +2142,7 @@ impl FunctionState<'_> {
         let fp_available = if plan.sse_slots == 0 {
             builder.ins().iconst(ir::types::I8, 1)
         } else {
-            builder.ins().icmp_imm(
+            builder.ins().icmp_imm_s(
                 IntCC::UnsignedLessThanOrEqual,
                 fp_offset,
                 i64::from(fp_limit),
@@ -2144,21 +2162,22 @@ impl FunctionState<'_> {
 
         builder.switch_to_block(register_block);
         let save_area_address = address_offset(builder, list, 16)?;
-        let save_area = builder
-            .ins()
-            .load(ir::types::I64, MemFlags::new(), save_area_address, 0);
+        let save_area =
+            builder
+                .ins()
+                .load(ir::types::I64, MemFlagsData::new(), save_area_address, 0);
         let mut next_gp = gp_offset;
         let mut next_fp = fp_offset;
         for piece in &plan.classified.pieces {
             let source = match piece.class {
                 ccc_abi::AbiClass::Integer => {
                     let offset = builder.ins().uextend(ir::types::I64, next_gp);
-                    next_gp = builder.ins().iadd_imm(next_gp, 8);
+                    next_gp = builder.ins().iadd_imm_s(next_gp, 8);
                     builder.ins().iadd(save_area, offset)
                 }
                 ccc_abi::AbiClass::Sse | ccc_abi::AbiClass::SseUp => {
                     let offset = builder.ins().uextend(ir::types::I64, next_fp);
-                    next_fp = builder.ins().iadd_imm(next_fp, 16);
+                    next_fp = builder.ins().iadd_imm_s(next_fp, 16);
                     builder.ins().iadd(save_area, offset)
                 }
                 class => {
@@ -2182,12 +2201,12 @@ impl FunctionState<'_> {
         if plan.gp_slots != 0 {
             builder
                 .ins()
-                .store(MemFlags::new(), next_gp, gp_offset_address, 0);
+                .store(MemFlagsData::new(), next_gp, gp_offset_address, 0);
         }
         if plan.sse_slots != 0 {
             builder
                 .ins()
-                .store(MemFlags::new(), next_fp, fp_offset_address, 0);
+                .store(MemFlagsData::new(), next_fp, fp_offset_address, 0);
         }
         builder.ins().jump(merge_block, &[]);
 
@@ -2212,19 +2231,20 @@ impl FunctionState<'_> {
         let mut gr_offset =
             builder
                 .ins()
-                .load(ir::types::I32, MemFlags::new(), gr_offset_address, 0);
-        let vr_offset = builder
-            .ins()
-            .load(ir::types::I32, MemFlags::new(), vr_offset_address, 0);
+                .load(ir::types::I32, MemFlagsData::new(), gr_offset_address, 0);
+        let vr_offset =
+            builder
+                .ins()
+                .load(ir::types::I32, MemFlagsData::new(), vr_offset_address, 0);
         if !plan.indirect && plan.gp_slots != 0 && plan.sse_slots == 0 && plan.overflow_align >= 16
         {
-            let advanced = builder.ins().iadd_imm(gr_offset, 15);
-            gr_offset = builder.ins().band_imm(advanced, -16);
+            let advanced = builder.ins().iadd_imm_s(gr_offset, 15);
+            gr_offset = builder.ins().band_imm_u(advanced, -16);
         }
         let gr_available = if plan.gp_slots == 0 {
             builder.ins().iconst(ir::types::I8, 1)
         } else {
-            builder.ins().icmp_imm(
+            builder.ins().icmp_imm_s(
                 IntCC::SignedLessThanOrEqual,
                 gr_offset,
                 -i64::from(plan.gp_slots) * 8,
@@ -2233,7 +2253,7 @@ impl FunctionState<'_> {
         let vr_available = if plan.sse_slots == 0 {
             builder.ins().iconst(ir::types::I8, 1)
         } else {
-            builder.ins().icmp_imm(
+            builder.ins().icmp_imm_s(
                 IntCC::SignedLessThanOrEqual,
                 vr_offset,
                 -i64::from(plan.sse_slots) * 16,
@@ -2256,16 +2276,18 @@ impl FunctionState<'_> {
         let vr_top_address = address_offset(builder, list, 16)?;
         let gr_top = builder
             .ins()
-            .load(ir::types::I64, MemFlags::new(), gr_top_address, 0);
+            .load(ir::types::I64, MemFlagsData::new(), gr_top_address, 0);
         let vr_top = builder
             .ins()
-            .load(ir::types::I64, MemFlags::new(), vr_top_address, 0);
+            .load(ir::types::I64, MemFlagsData::new(), vr_top_address, 0);
         let mut next_gr = gr_offset;
         let mut next_vr = vr_offset;
         if plan.indirect {
             let offset = builder.ins().sextend(ir::types::I64, next_gr);
             let slot = builder.ins().iadd(gr_top, offset);
-            let source = builder.ins().load(ir::types::I64, MemFlags::new(), slot, 0);
+            let source = builder
+                .ins()
+                .load(ir::types::I64, MemFlagsData::new(), slot, 0);
             copy_memory(
                 builder,
                 result,
@@ -2274,18 +2296,18 @@ impl FunctionState<'_> {
                 gir::MemoryAccess::default(),
                 gir::MemoryAccess::default(),
             )?;
-            next_gr = builder.ins().iadd_imm(next_gr, 8);
+            next_gr = builder.ins().iadd_imm_s(next_gr, 8);
         } else {
             for piece in &plan.classified.pieces {
                 let source = match piece.class {
                     ccc_abi::AbiClass::Integer => {
                         let offset = builder.ins().sextend(ir::types::I64, next_gr);
-                        next_gr = builder.ins().iadd_imm(next_gr, 8);
+                        next_gr = builder.ins().iadd_imm_s(next_gr, 8);
                         builder.ins().iadd(gr_top, offset)
                     }
                     ccc_abi::AbiClass::Sse => {
                         let offset = builder.ins().sextend(ir::types::I64, next_vr);
-                        next_vr = builder.ins().iadd_imm(next_vr, 16);
+                        next_vr = builder.ins().iadd_imm_s(next_vr, 16);
                         builder.ins().iadd(vr_top, offset)
                     }
                     class => {
@@ -2308,12 +2330,12 @@ impl FunctionState<'_> {
         if plan.gp_slots != 0 {
             builder
                 .ins()
-                .store(MemFlags::new(), next_gr, gr_offset_address, 0);
+                .store(MemFlagsData::new(), next_gr, gr_offset_address, 0);
         }
         if plan.sse_slots != 0 {
             builder
                 .ins()
-                .store(MemFlags::new(), next_vr, vr_offset_address, 0);
+                .store(MemFlagsData::new(), next_vr, vr_offset_address, 0);
         }
         builder.ins().jump(merge_block, &[]);
 
@@ -2325,13 +2347,13 @@ impl FunctionState<'_> {
             let exhausted = builder.ins().iconst(ir::types::I32, 0);
             builder
                 .ins()
-                .store(MemFlags::new(), exhausted, gr_offset_address, 0);
+                .store(MemFlagsData::new(), exhausted, gr_offset_address, 0);
         }
         if plan.sse_slots != 0 {
             let exhausted = builder.ins().iconst(ir::types::I32, 0);
             builder
                 .ins()
-                .store(MemFlags::new(), exhausted, vr_offset_address, 0);
+                .store(MemFlagsData::new(), exhausted, vr_offset_address, 0);
         }
         self.va_arg_cursor(builder, list, result, plan)?;
         builder.ins().jump(merge_block, &[]);
@@ -2349,16 +2371,16 @@ impl FunctionState<'_> {
     ) -> Result<(), CodegenError> {
         let cursor = builder
             .ins()
-            .load(ir::types::I64, MemFlags::new(), cursor_address, 0);
+            .load(ir::types::I64, MemFlagsData::new(), cursor_address, 0);
         let aligned = if plan.overflow_align <= 1 {
             cursor
         } else {
-            let added = builder.ins().iadd_imm(
+            let added = builder.ins().iadd_imm_s(
                 cursor,
                 i64::try_from(plan.overflow_align - 1)
                     .map_err(|_| error("va_arg overflow alignment is too large"))?,
             );
-            builder.ins().band_imm(
+            builder.ins().band_imm_u(
                 added,
                 -i64::try_from(plan.overflow_align)
                     .map_err(|_| error("va_arg overflow alignment is too large"))?,
@@ -2367,7 +2389,7 @@ impl FunctionState<'_> {
         let source = if plan.indirect {
             builder
                 .ins()
-                .load(ir::types::I64, MemFlags::new(), aligned, 0)
+                .load(ir::types::I64, MemFlagsData::new(), aligned, 0)
         } else {
             aligned
         };
@@ -2379,14 +2401,14 @@ impl FunctionState<'_> {
             gir::MemoryAccess::default(),
             gir::MemoryAccess::default(),
         )?;
-        let next = builder.ins().iadd_imm(
+        let next = builder.ins().iadd_imm_s(
             aligned,
             i64::try_from(plan.overflow_size)
                 .map_err(|_| error("va_arg overflow size is too large"))?,
         );
         builder
             .ins()
-            .store(MemFlags::new(), next, cursor_address, 0);
+            .store(MemFlagsData::new(), next, cursor_address, 0);
         Ok(())
     }
 
@@ -2405,13 +2427,15 @@ impl FunctionState<'_> {
         if access.volatile {
             builder.ins().fence();
         }
-        let unit = builder.ins().load(storage_ty, MemFlags::new(), address, 0);
+        let unit = builder
+            .ins()
+            .load(storage_ty, MemFlagsData::new(), address, 0);
         let shifted = if descriptor.bit_offset == 0 {
             unit
         } else {
             builder
                 .ins()
-                .ushr_imm(unit, i64::from(descriptor.bit_offset))
+                .ushr_imm_u(unit, i64::from(descriptor.bit_offset))
         };
         let masked = integer_and_mask(
             builder,
@@ -2424,8 +2448,8 @@ impl FunctionState<'_> {
             if shift == 0 {
                 masked
             } else {
-                let shifted = builder.ins().ishl_imm(masked, i64::from(shift));
-                builder.ins().sshr_imm(shifted, i64::from(shift))
+                let shifted = builder.ins().ishl_imm_u(masked, i64::from(shift));
+                builder.ins().sshr_imm_u(shifted, i64::from(shift))
             }
         } else {
             masked
@@ -2458,7 +2482,9 @@ impl FunctionState<'_> {
         if access.volatile {
             builder.ins().fence();
         }
-        let old = builder.ins().load(storage_ty, MemFlags::new(), address, 0);
+        let old = builder
+            .ins()
+            .load(storage_ty, MemFlagsData::new(), address, 0);
         let value_ty = builder.func.dfg.value_type(value);
         let value = coerce_integer(builder, value, value_ty, storage_ty, descriptor.signed);
         let value_mask = low_mask_u128(descriptor.width);
@@ -2470,10 +2496,12 @@ impl FunctionState<'_> {
         } else {
             builder
                 .ins()
-                .ishl_imm(value, i64::from(descriptor.bit_offset))
+                .ishl_imm_u(value, i64::from(descriptor.bit_offset))
         };
         let combined = builder.ins().bor(retained, value);
-        builder.ins().store(MemFlags::new(), combined, address, 0);
+        builder
+            .ins()
+            .store(MemFlagsData::new(), combined, address, 0);
         if access.volatile {
             builder.ins().fence();
         }
@@ -2820,7 +2848,7 @@ impl FunctionState<'_> {
                             QualifiedType::unqualified(plan.result.ty),
                             self.config,
                         )?,
-                        MemFlags::new(),
+                        MemFlagsData::new(),
                         source,
                         0,
                     )))
@@ -2924,7 +2952,7 @@ impl FunctionState<'_> {
                     let address = address_offset(builder, stage, carrier.source_offset)?;
                     lowered.push(builder.ins().load(
                         native_carrier_type(carrier.carrier),
-                        MemFlags::new(),
+                        MemFlagsData::new(),
                         address,
                         0,
                     ));
@@ -2990,7 +3018,9 @@ impl FunctionState<'_> {
                 zero_memory(builder, address, padded)?;
                 for (carrier, value) in plan.clif_results.iter().zip(results) {
                     let destination = address_offset(builder, address, carrier.source_offset)?;
-                    builder.ins().store(MemFlags::new(), value, destination, 0);
+                    builder
+                        .ins()
+                        .store(MemFlagsData::new(), value, destination, 0);
                 }
                 Ok(Some(address))
             }
@@ -3054,10 +3084,10 @@ impl FunctionState<'_> {
         let state = builder.ins().stack_addr(ir::types::I64, slot, 0);
         let base = builder
             .ins()
-            .load(ir::types::I64, MemFlags::new(), state, 0);
+            .load(ir::types::I64, MemFlagsData::new(), state, 0);
         let capacity = builder
             .ins()
-            .load(ir::types::I64, MemFlags::new(), state, 8);
+            .load(ir::types::I64, MemFlagsData::new(), state, 8);
         let grow = builder.create_block();
         let ready = builder.create_block();
         builder.append_block_param(ready, ir::types::I64);
@@ -3076,8 +3106,10 @@ impl FunctionState<'_> {
             .first()
             .ok_or_else(|| error("realloc did not return a pointer"))?;
         builder.ins().trapz(allocated, trap);
-        builder.ins().store(MemFlags::new(), allocated, state, 0);
-        builder.ins().store(MemFlags::new(), required, state, 8);
+        builder
+            .ins()
+            .store(MemFlagsData::new(), allocated, state, 0);
+        builder.ins().store(MemFlagsData::new(), required, state, 8);
         builder.ins().jump(ready, &[allocated.into()]);
 
         builder.seal_block(ready);
@@ -3116,9 +3148,9 @@ impl FunctionState<'_> {
             let invalid = if signed {
                 builder
                     .ins()
-                    .icmp_imm(IntCC::SignedLessThanOrEqual, source, 0)
+                    .icmp_imm_s(IntCC::SignedLessThanOrEqual, source, 0)
             } else {
-                builder.ins().icmp_imm(IntCC::Equal, source, 0)
+                builder.ins().icmp_imm_s(IntCC::Equal, source, 0)
             };
             builder.ins().trapnz(invalid, trap);
             let value = if source_ty.bits() > ir::types::I64.bits() {
@@ -3156,7 +3188,7 @@ impl FunctionState<'_> {
             let state = builder.ins().stack_addr(ir::types::I64, *slot, 0);
             let base = builder
                 .ins()
-                .load(ir::types::I64, MemFlags::new(), state, 0);
+                .load(ir::types::I64, MemFlagsData::new(), state, 0);
             builder.ins().call(free, &[base]);
         }
         Ok(())
@@ -3205,7 +3237,7 @@ impl FunctionState<'_> {
                     let source = address_offset(builder, stage, carrier.source_offset)?;
                     results.push(builder.ins().load(
                         native_carrier_type(carrier.carrier),
-                        MemFlags::new(),
+                        MemFlagsData::new(),
                         source,
                         0,
                     ));
@@ -3271,7 +3303,7 @@ impl FunctionState<'_> {
                 } else {
                     builder
                         .ins()
-                        .store(MemFlags::new(), self.value(value)?, destination, 0);
+                        .store(MemFlagsData::new(), self.value(value)?, destination, 0);
                 }
             }
             (ccc_abi::PassingMode::Registers, Some(value)) => {
@@ -3373,11 +3405,11 @@ impl FunctionState<'_> {
                         "computed goto selector is not represented as an integer",
                     ));
                 }
-                let index = builder.ins().iadd_imm(selector, -1);
+                let index = builder.ins().iadd_imm_s(selector, -1);
                 let trap = builder.create_block();
                 if selector_ty.bits() > 32 {
                     let dispatch = builder.create_block();
-                    let out_of_range = builder.ins().icmp_imm(
+                    let out_of_range = builder.ins().icmp_imm_s(
                         IntCC::UnsignedGreaterThan,
                         index,
                         i64::from(u32::MAX),
@@ -3500,7 +3532,7 @@ fn coerce_carrier_value(
     if source.bits() == target.bits()
         && ((source.is_int() && target.is_float()) || (source.is_float() && target.is_int()))
     {
-        return Ok(builder.ins().bitcast(target, MemFlags::new(), value));
+        return Ok(builder.ins().bitcast(target, MemFlagsData::new(), value));
     }
     if source.is_int() && target.is_int() {
         return Ok(coerce_integer(builder, value, source, target, signed));
@@ -3595,15 +3627,16 @@ fn variadic_parameter_piece_address(
         ),
         ccc_abi::BridgeLocation::Stack { offset } => {
             let overflow_slot = address_offset(builder, frame, 16)?;
-            let overflow = builder
-                .ins()
-                .load(ir::types::I64, MemFlags::new(), overflow_slot, 0);
+            let overflow =
+                builder
+                    .ins()
+                    .load(ir::types::I64, MemFlagsData::new(), overflow_slot, 0);
             let fixed_stack_base = if plan.overflow_arg_offset == 0 {
                 overflow
             } else {
                 builder
                     .ins()
-                    .iadd_imm(overflow, -i64::from(plan.overflow_arg_offset))
+                    .iadd_imm_s(overflow, -i64::from(plan.overflow_arg_offset))
             };
             address_offset(builder, fixed_stack_base, u64::from(offset))
         }
@@ -3689,7 +3722,9 @@ fn store_value(
     value: ir::Value,
 ) -> Result<(), CodegenError> {
     let destination = address_offset(builder, base, offset)?;
-    builder.ins().store(MemFlags::new(), value, destination, 0);
+    builder
+        .ins()
+        .store(MemFlagsData::new(), value, destination, 0);
     Ok(())
 }
 
@@ -3757,7 +3792,7 @@ fn va_arg_result(
     } else {
         Ok(builder.ins().load(
             scalar_type(types, requested, config)?,
-            MemFlags::new(),
+            MemFlagsData::new(),
             address,
             0,
         ))
@@ -4003,7 +4038,7 @@ fn integer_and_mask(
         let mask = i128_constant(builder, mask);
         builder.ins().band(value, mask)
     } else {
-        builder.ins().band_imm(value, mask as u64 as i64)
+        builder.ins().band_imm_u(value, mask as u64 as i64)
     }
 }
 
@@ -4050,7 +4085,7 @@ fn lower_load(
     if access.volatile || access.atomic.is_some() {
         builder.ins().fence();
     }
-    let value = builder.ins().load(ty, MemFlags::new(), address, 0);
+    let value = builder.ins().load(ty, MemFlagsData::new(), address, 0);
     if access.volatile || access.atomic.is_some() {
         builder.ins().fence();
     }
@@ -4069,7 +4104,7 @@ fn lower_store(
     if access.volatile || access.atomic.is_some() {
         builder.ins().fence();
     }
-    builder.ins().store(MemFlags::new(), value, address, 0);
+    builder.ins().store(MemFlagsData::new(), value, address, 0);
     if access.volatile || access.atomic.is_some() {
         builder.ins().fence();
     }
@@ -4096,7 +4131,7 @@ fn address_offset(
     if offset == 0 {
         return Ok(address);
     }
-    Ok(builder.ins().iadd_imm(
+    Ok(builder.ins().iadd_imm_s(
         address,
         i64::try_from(offset).map_err(|_| error("object offset exceeds signed address range"))?,
     ))
@@ -4110,7 +4145,7 @@ fn zero_memory(
     let zero = builder.ins().iconst(ir::types::I8, 0);
     for offset in 0..size {
         let address = address_offset(builder, destination, offset)?;
-        builder.ins().store(MemFlags::new(), zero, address, 0);
+        builder.ins().store(MemFlagsData::new(), zero, address, 0);
     }
     Ok(())
 }
@@ -4302,8 +4337,8 @@ fn normalize_bool(
     let boolean = if is_float(types, from) {
         let source = builder.func.dfg.value_type(operand);
         if types.builtin_type(from.ty) == Some(BuiltinType::Float16) {
-            let magnitude = builder.ins().band_imm(operand, 0x7fff);
-            builder.ins().icmp_imm(IntCC::NotEqual, magnitude, 0)
+            let magnitude = builder.ins().band_imm_u(operand, 0x7fff);
+            builder.ins().icmp_imm_s(IntCC::NotEqual, magnitude, 0)
         } else {
             let zero = match source {
                 ir::types::F32 => builder.ins().f32const(Ieee32::with_bits(0)),
@@ -4313,7 +4348,7 @@ fn normalize_bool(
             builder.ins().fcmp(FloatCC::NotEqual, operand, zero)
         }
     } else {
-        builder.ins().icmp_imm(IntCC::NotEqual, operand, 0)
+        builder.ins().icmp_imm_s(IntCC::NotEqual, operand, 0)
     };
     let source = builder.func.dfg.value_type(boolean);
     Ok(coerce_integer(builder, boolean, source, destination, false))
@@ -4357,15 +4392,15 @@ fn coerce_integer(
 
 fn float16_to_f32(builder: &mut FunctionBuilder<'_>, value: ir::Value) -> ir::Value {
     let raw = builder.ins().uextend(ir::types::I32, value);
-    let sign = builder.ins().band_imm(raw, 0x8000);
-    let sign = builder.ins().ishl_imm(sign, 16);
-    let exponent = builder.ins().ushr_imm(raw, 10);
-    let exponent = builder.ins().band_imm(exponent, 0x1f);
-    let fraction = builder.ins().band_imm(raw, 0x03ff);
+    let sign = builder.ins().band_imm_u(raw, 0x8000);
+    let sign = builder.ins().ishl_imm_u(sign, 16);
+    let exponent = builder.ins().ushr_imm_u(raw, 10);
+    let exponent = builder.ins().band_imm_u(exponent, 0x1f);
+    let fraction = builder.ins().band_imm_u(raw, 0x03ff);
 
-    let normal_exponent = builder.ins().iadd_imm(exponent, 112);
-    let normal_exponent = builder.ins().ishl_imm(normal_exponent, 23);
-    let normal_fraction = builder.ins().ishl_imm(fraction, 13);
+    let normal_exponent = builder.ins().iadd_imm_s(exponent, 112);
+    let normal_exponent = builder.ins().ishl_imm_u(normal_exponent, 23);
+    let normal_fraction = builder.ins().ishl_imm_u(fraction, 13);
     let normal = builder.ins().bor(sign, normal_exponent);
     let normal = builder.ins().bor(normal, normal_fraction);
 
@@ -4380,55 +4415,59 @@ fn float16_to_f32(builder: &mut FunctionBuilder<'_>, value: ir::Value) -> ir::Va
     let subnormal = builder.ins().fmul(subnormal, scale);
     let subnormal = builder
         .ins()
-        .bitcast(ir::types::I32, MemFlags::new(), subnormal);
+        .bitcast(ir::types::I32, MemFlagsData::new(), subnormal);
     let subnormal = builder.ins().bor(subnormal, sign);
 
-    let is_zero_or_subnormal = builder.ins().icmp_imm(IntCC::Equal, exponent, 0);
-    let is_special = builder.ins().icmp_imm(IntCC::Equal, exponent, 0x1f);
+    let is_zero_or_subnormal = builder.ins().icmp_imm_s(IntCC::Equal, exponent, 0);
+    let is_special = builder.ins().icmp_imm_s(IntCC::Equal, exponent, 0x1f);
     let finite = builder
         .ins()
         .select(is_zero_or_subnormal, subnormal, normal);
     let bits = builder.ins().select(is_special, special, finite);
-    builder.ins().bitcast(ir::types::F32, MemFlags::new(), bits)
+    builder
+        .ins()
+        .bitcast(ir::types::F32, MemFlagsData::new(), bits)
 }
 
 fn f32_to_float16(builder: &mut FunctionBuilder<'_>, value: ir::Value) -> ir::Value {
     let raw = builder
         .ins()
-        .bitcast(ir::types::I32, MemFlags::new(), value);
-    let sign = builder.ins().ushr_imm(raw, 16);
-    let sign = builder.ins().band_imm(sign, 0x8000);
-    let magnitude = builder.ins().band_imm(raw, 0x7fff_ffff);
-    let exponent = builder.ins().ushr_imm(magnitude, 23);
-    let fraction = builder.ins().band_imm(magnitude, 0x007f_ffff);
+        .bitcast(ir::types::I32, MemFlagsData::new(), value);
+    let sign = builder.ins().ushr_imm_u(raw, 16);
+    let sign = builder.ins().band_imm_u(sign, 0x8000);
+    let magnitude = builder.ins().band_imm_u(raw, 0x7fff_ffff);
+    let exponent = builder.ins().ushr_imm_u(magnitude, 23);
+    let fraction = builder.ins().band_imm_u(magnitude, 0x007f_ffff);
 
-    let half_exponent = builder.ins().iadd_imm(exponent, -112);
-    let half_exponent = builder.ins().ishl_imm(half_exponent, 10);
-    let normal_fraction = builder.ins().ushr_imm(fraction, 13);
+    let half_exponent = builder.ins().iadd_imm_s(exponent, -112);
+    let half_exponent = builder.ins().ishl_imm_u(half_exponent, 10);
+    let normal_fraction = builder.ins().ushr_imm_u(fraction, 13);
     let normal_base = builder.ins().bor(half_exponent, normal_fraction);
-    let normal_remainder = builder.ins().band_imm(fraction, 0x1fff);
-    let normal_above = builder
-        .ins()
-        .icmp_imm(IntCC::UnsignedGreaterThan, normal_remainder, 0x1000);
+    let normal_remainder = builder.ins().band_imm_u(fraction, 0x1fff);
+    let normal_above =
+        builder
+            .ins()
+            .icmp_imm_s(IntCC::UnsignedGreaterThan, normal_remainder, 0x1000);
     let normal_tie = builder
         .ins()
-        .icmp_imm(IntCC::Equal, normal_remainder, 0x1000);
-    let normal_odd = builder.ins().band_imm(normal_base, 1);
-    let normal_odd = builder.ins().icmp_imm(IntCC::NotEqual, normal_odd, 0);
+        .icmp_imm_s(IntCC::Equal, normal_remainder, 0x1000);
+    let normal_odd = builder.ins().band_imm_u(normal_base, 1);
+    let normal_odd = builder.ins().icmp_imm_s(IntCC::NotEqual, normal_odd, 0);
     let normal_tie_odd = builder.ins().band(normal_tie, normal_odd);
     let normal_increment = builder.ins().bor(normal_above, normal_tie_odd);
     let normal_increment = builder.ins().uextend(ir::types::I32, normal_increment);
     let normal = builder.ins().iadd(normal_base, normal_increment);
 
-    let shift = builder.ins().irsub_imm(exponent, 126);
+    let subnormal_bias = builder.ins().iconst(ir::types::I32, 126);
+    let shift = builder.ins().isub(subnormal_bias, exponent);
     let in_subnormal_range =
         builder
             .ins()
-            .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, exponent, 102);
+            .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, exponent, 102);
     let maximum_subnormal_exponent =
         builder
             .ins()
-            .icmp_imm(IntCC::UnsignedLessThanOrEqual, exponent, 112);
+            .icmp_imm_s(IntCC::UnsignedLessThanOrEqual, exponent, 112);
     let safe_subnormal = builder
         .ins()
         .band(in_subnormal_range, maximum_subnormal_exponent);
@@ -4439,9 +4478,9 @@ fn f32_to_float16(builder: &mut FunctionBuilder<'_>, value: ir::Value) -> ir::Va
     let subnormal_base = builder.ins().ushr(significand, shift);
     let one = builder.ins().iconst(ir::types::I32, 1);
     let divisor = builder.ins().ishl(one, shift);
-    let mask = builder.ins().iadd_imm(divisor, -1);
+    let mask = builder.ins().iadd_imm_s(divisor, -1);
     let subnormal_remainder = builder.ins().band(significand, mask);
-    let half_shift = builder.ins().iadd_imm(shift, -1);
+    let half_shift = builder.ins().iadd_imm_s(shift, -1);
     let halfway = builder.ins().ishl(one, half_shift);
     let subnormal_above =
         builder
@@ -4450,29 +4489,29 @@ fn f32_to_float16(builder: &mut FunctionBuilder<'_>, value: ir::Value) -> ir::Va
     let subnormal_tie = builder
         .ins()
         .icmp(IntCC::Equal, subnormal_remainder, halfway);
-    let subnormal_odd = builder.ins().band_imm(subnormal_base, 1);
-    let subnormal_odd = builder.ins().icmp_imm(IntCC::NotEqual, subnormal_odd, 0);
+    let subnormal_odd = builder.ins().band_imm_u(subnormal_base, 1);
+    let subnormal_odd = builder.ins().icmp_imm_s(IntCC::NotEqual, subnormal_odd, 0);
     let subnormal_tie_odd = builder.ins().band(subnormal_tie, subnormal_odd);
     let subnormal_increment = builder.ins().bor(subnormal_above, subnormal_tie_odd);
     let subnormal_increment = builder.ins().uextend(ir::types::I32, subnormal_increment);
     let subnormal = builder.ins().iadd(subnormal_base, subnormal_increment);
 
-    let payload = builder.ins().ushr_imm(fraction, 13);
-    let has_payload = builder.ins().icmp_imm(IntCC::NotEqual, fraction, 0);
+    let payload = builder.ins().ushr_imm_u(fraction, 13);
+    let has_payload = builder.ins().icmp_imm_s(IntCC::NotEqual, fraction, 0);
     let has_payload = builder.ins().uextend(ir::types::I32, has_payload);
     let payload = builder.ins().bor(payload, has_payload);
     let infinity = builder.ins().iconst(ir::types::I32, 0x7c00);
     let special = builder.ins().bor(infinity, payload);
 
-    let is_special = builder.ins().icmp_imm(IntCC::Equal, exponent, 0xff);
+    let is_special = builder.ins().icmp_imm_s(IntCC::Equal, exponent, 0xff);
     let overflows =
         builder
             .ins()
-            .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, magnitude, 0x477f_f000);
+            .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, magnitude, 0x477f_f000);
     let is_normal =
         builder
             .ins()
-            .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, magnitude, 0x3880_0000);
+            .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, magnitude, 0x3880_0000);
     let zero = builder.ins().iconst(ir::types::I32, 0);
     let underflow = builder.ins().select(in_subnormal_range, subnormal, zero);
     let finite = builder.ins().select(is_normal, normal, underflow);
@@ -4485,41 +4524,42 @@ fn f32_to_float16(builder: &mut FunctionBuilder<'_>, value: ir::Value) -> ir::Va
 fn f64_to_float16(builder: &mut FunctionBuilder<'_>, value: ir::Value) -> ir::Value {
     let raw = builder
         .ins()
-        .bitcast(ir::types::I64, MemFlags::new(), value);
-    let sign = builder.ins().ushr_imm(raw, 48);
-    let sign = builder.ins().band_imm(sign, 0x8000);
-    let magnitude = builder.ins().band_imm(raw, 0x7fff_ffff_ffff_ffff);
-    let exponent = builder.ins().ushr_imm(magnitude, 52);
-    let fraction = builder.ins().band_imm(magnitude, 0x000f_ffff_ffff_ffff);
+        .bitcast(ir::types::I64, MemFlagsData::new(), value);
+    let sign = builder.ins().ushr_imm_u(raw, 48);
+    let sign = builder.ins().band_imm_u(sign, 0x8000);
+    let magnitude = builder.ins().band_imm_u(raw, 0x7fff_ffff_ffff_ffff);
+    let exponent = builder.ins().ushr_imm_u(magnitude, 52);
+    let fraction = builder.ins().band_imm_u(magnitude, 0x000f_ffff_ffff_ffff);
 
-    let half_exponent = builder.ins().iadd_imm(exponent, -1008);
-    let half_exponent = builder.ins().ishl_imm(half_exponent, 10);
-    let normal_fraction = builder.ins().ushr_imm(fraction, 42);
+    let half_exponent = builder.ins().iadd_imm_s(exponent, -1008);
+    let half_exponent = builder.ins().ishl_imm_u(half_exponent, 10);
+    let normal_fraction = builder.ins().ushr_imm_u(fraction, 42);
     let normal_base = builder.ins().bor(half_exponent, normal_fraction);
-    let normal_remainder = builder.ins().band_imm(fraction, (1i64 << 42) - 1);
+    let normal_remainder = builder.ins().band_imm_u(fraction, (1i64 << 42) - 1);
     let normal_above =
         builder
             .ins()
-            .icmp_imm(IntCC::UnsignedGreaterThan, normal_remainder, 1i64 << 41);
+            .icmp_imm_s(IntCC::UnsignedGreaterThan, normal_remainder, 1i64 << 41);
     let normal_tie = builder
         .ins()
-        .icmp_imm(IntCC::Equal, normal_remainder, 1i64 << 41);
-    let normal_odd = builder.ins().band_imm(normal_base, 1);
-    let normal_odd = builder.ins().icmp_imm(IntCC::NotEqual, normal_odd, 0);
+        .icmp_imm_s(IntCC::Equal, normal_remainder, 1i64 << 41);
+    let normal_odd = builder.ins().band_imm_u(normal_base, 1);
+    let normal_odd = builder.ins().icmp_imm_s(IntCC::NotEqual, normal_odd, 0);
     let normal_tie_odd = builder.ins().band(normal_tie, normal_odd);
     let normal_increment = builder.ins().bor(normal_above, normal_tie_odd);
     let normal_increment = builder.ins().uextend(ir::types::I64, normal_increment);
     let normal = builder.ins().iadd(normal_base, normal_increment);
 
-    let shift = builder.ins().irsub_imm(exponent, 1051);
+    let subnormal_bias = builder.ins().iconst(ir::types::I64, 1051);
+    let shift = builder.ins().isub(subnormal_bias, exponent);
     let in_subnormal_range =
         builder
             .ins()
-            .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, exponent, 998);
+            .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, exponent, 998);
     let maximum_subnormal_exponent =
         builder
             .ins()
-            .icmp_imm(IntCC::UnsignedLessThanOrEqual, exponent, 1008);
+            .icmp_imm_s(IntCC::UnsignedLessThanOrEqual, exponent, 1008);
     let safe_subnormal = builder
         .ins()
         .band(in_subnormal_range, maximum_subnormal_exponent);
@@ -4530,9 +4570,9 @@ fn f64_to_float16(builder: &mut FunctionBuilder<'_>, value: ir::Value) -> ir::Va
     let subnormal_base = builder.ins().ushr(significand, shift);
     let one = builder.ins().iconst(ir::types::I64, 1);
     let divisor = builder.ins().ishl(one, shift);
-    let mask = builder.ins().iadd_imm(divisor, -1);
+    let mask = builder.ins().iadd_imm_s(divisor, -1);
     let subnormal_remainder = builder.ins().band(significand, mask);
-    let half_shift = builder.ins().iadd_imm(shift, -1);
+    let half_shift = builder.ins().iadd_imm_s(shift, -1);
     let halfway = builder.ins().ishl(one, half_shift);
     let subnormal_above =
         builder
@@ -4541,26 +4581,26 @@ fn f64_to_float16(builder: &mut FunctionBuilder<'_>, value: ir::Value) -> ir::Va
     let subnormal_tie = builder
         .ins()
         .icmp(IntCC::Equal, subnormal_remainder, halfway);
-    let subnormal_odd = builder.ins().band_imm(subnormal_base, 1);
-    let subnormal_odd = builder.ins().icmp_imm(IntCC::NotEqual, subnormal_odd, 0);
+    let subnormal_odd = builder.ins().band_imm_u(subnormal_base, 1);
+    let subnormal_odd = builder.ins().icmp_imm_s(IntCC::NotEqual, subnormal_odd, 0);
     let subnormal_tie_odd = builder.ins().band(subnormal_tie, subnormal_odd);
     let subnormal_increment = builder.ins().bor(subnormal_above, subnormal_tie_odd);
     let subnormal_increment = builder.ins().uextend(ir::types::I64, subnormal_increment);
     let subnormal = builder.ins().iadd(subnormal_base, subnormal_increment);
 
-    let payload = builder.ins().ushr_imm(fraction, 42);
-    let has_payload = builder.ins().icmp_imm(IntCC::NotEqual, fraction, 0);
+    let payload = builder.ins().ushr_imm_u(fraction, 42);
+    let has_payload = builder.ins().icmp_imm_s(IntCC::NotEqual, fraction, 0);
     let has_payload = builder.ins().uextend(ir::types::I64, has_payload);
     let payload = builder.ins().bor(payload, has_payload);
     let infinity = builder.ins().iconst(ir::types::I64, 0x7c00);
     let special = builder.ins().bor(infinity, payload);
-    let is_special = builder.ins().icmp_imm(IntCC::Equal, exponent, 0x7ff);
-    let overflows = builder.ins().icmp_imm(
+    let is_special = builder.ins().icmp_imm_s(IntCC::Equal, exponent, 0x7ff);
+    let overflows = builder.ins().icmp_imm_s(
         IntCC::UnsignedGreaterThanOrEqual,
         magnitude,
         0x40ef_fe00_0000_0000,
     );
-    let is_normal = builder.ins().icmp_imm(
+    let is_normal = builder.ins().icmp_imm_s(
         IntCC::UnsignedGreaterThanOrEqual,
         magnitude,
         0x3f10_0000_0000_0000,
@@ -4577,44 +4617,46 @@ fn f64_to_float16(builder: &mut FunctionBuilder<'_>, value: ir::Value) -> ir::Va
 fn f80_to_float16(builder: &mut FunctionBuilder<'_>, address: ir::Value) -> ir::Value {
     let significand = builder
         .ins()
-        .load(ir::types::I64, MemFlags::new(), address, 0);
+        .load(ir::types::I64, MemFlagsData::new(), address, 0);
     let high = builder
         .ins()
-        .load(ir::types::I16, MemFlags::new(), address, 8);
+        .load(ir::types::I16, MemFlagsData::new(), address, 8);
     let high = builder.ins().uextend(ir::types::I64, high);
-    let sign = builder.ins().band_imm(high, 0x8000);
-    let exponent = builder.ins().band_imm(high, 0x7fff);
+    let sign = builder.ins().band_imm_u(high, 0x8000);
+    let exponent = builder.ins().band_imm_u(high, 0x7fff);
 
-    let half_exponent = builder.ins().iadd_imm(exponent, -16_368);
-    let half_exponent = builder.ins().ishl_imm(half_exponent, 10);
-    let normal_fraction = builder.ins().ushr_imm(significand, 53);
-    let normal_fraction = builder.ins().band_imm(normal_fraction, 0x03ff);
+    let half_exponent = builder.ins().iadd_imm_s(exponent, -16_368);
+    let half_exponent = builder.ins().ishl_imm_u(half_exponent, 10);
+    let normal_fraction = builder.ins().ushr_imm_u(significand, 53);
+    let normal_fraction = builder.ins().band_imm_u(normal_fraction, 0x03ff);
     let normal_base = builder.ins().bor(half_exponent, normal_fraction);
-    let normal_remainder = builder.ins().band_imm(significand, 0x001f_ffff_ffff_ffff);
-    let normal_above = builder.ins().icmp_imm(
+    let normal_remainder = builder.ins().band_imm_u(significand, 0x001f_ffff_ffff_ffff);
+    let normal_above = builder.ins().icmp_imm_s(
         IntCC::UnsignedGreaterThan,
         normal_remainder,
         0x0010_0000_0000_0000,
     );
-    let normal_tie = builder
-        .ins()
-        .icmp_imm(IntCC::Equal, normal_remainder, 0x0010_0000_0000_0000);
-    let normal_odd = builder.ins().band_imm(normal_base, 1);
-    let normal_odd = builder.ins().icmp_imm(IntCC::NotEqual, normal_odd, 0);
+    let normal_tie =
+        builder
+            .ins()
+            .icmp_imm_s(IntCC::Equal, normal_remainder, 0x0010_0000_0000_0000);
+    let normal_odd = builder.ins().band_imm_u(normal_base, 1);
+    let normal_odd = builder.ins().icmp_imm_s(IntCC::NotEqual, normal_odd, 0);
     let normal_tie_odd = builder.ins().band(normal_tie, normal_odd);
     let normal_increment = builder.ins().bor(normal_above, normal_tie_odd);
     let normal_increment = builder.ins().uextend(ir::types::I64, normal_increment);
     let normal = builder.ins().iadd(normal_base, normal_increment);
 
-    let shift = builder.ins().irsub_imm(exponent, 16_422);
+    let subnormal_bias = builder.ins().iconst(ir::types::I64, 16_422);
+    let shift = builder.ins().isub(subnormal_bias, exponent);
     let has_regular_subnormal_shift =
         builder
             .ins()
-            .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, exponent, 16_359);
+            .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, exponent, 16_359);
     let maximum_subnormal_exponent =
         builder
             .ins()
-            .icmp_imm(IntCC::UnsignedLessThanOrEqual, exponent, 16_368);
+            .icmp_imm_s(IntCC::UnsignedLessThanOrEqual, exponent, 16_368);
     let safe_subnormal = builder
         .ins()
         .band(has_regular_subnormal_shift, maximum_subnormal_exponent);
@@ -4623,9 +4665,9 @@ fn f80_to_float16(builder: &mut FunctionBuilder<'_>, address: ir::Value) -> ir::
     let subnormal_base = builder.ins().ushr(significand, shift);
     let one = builder.ins().iconst(ir::types::I64, 1);
     let divisor = builder.ins().ishl(one, shift);
-    let mask = builder.ins().iadd_imm(divisor, -1);
+    let mask = builder.ins().iadd_imm_s(divisor, -1);
     let subnormal_remainder = builder.ins().band(significand, mask);
-    let half_shift = builder.ins().iadd_imm(shift, -1);
+    let half_shift = builder.ins().iadd_imm_s(shift, -1);
     let halfway = builder.ins().ishl(one, half_shift);
     let subnormal_above =
         builder
@@ -4634,8 +4676,8 @@ fn f80_to_float16(builder: &mut FunctionBuilder<'_>, address: ir::Value) -> ir::
     let subnormal_tie = builder
         .ins()
         .icmp(IntCC::Equal, subnormal_remainder, halfway);
-    let subnormal_odd = builder.ins().band_imm(subnormal_base, 1);
-    let subnormal_odd = builder.ins().icmp_imm(IntCC::NotEqual, subnormal_odd, 0);
+    let subnormal_odd = builder.ins().band_imm_u(subnormal_base, 1);
+    let subnormal_odd = builder.ins().icmp_imm_s(IntCC::NotEqual, subnormal_odd, 0);
     let subnormal_tie_odd = builder.ins().band(subnormal_tie, subnormal_odd);
     let subnormal_increment = builder.ins().bor(subnormal_above, subnormal_tie_odd);
     let subnormal_increment = builder.ins().uextend(ir::types::I64, subnormal_increment);
@@ -4649,30 +4691,30 @@ fn f80_to_float16(builder: &mut FunctionBuilder<'_>, address: ir::Value) -> ir::
             .ins()
             .icmp(IntCC::UnsignedGreaterThan, significand, minimum_halfway);
     let minimum_subnormal = builder.ins().uextend(ir::types::I64, above_minimum_halfway);
-    let is_minimum_exponent = builder.ins().icmp_imm(IntCC::Equal, exponent, 16_358);
+    let is_minimum_exponent = builder.ins().icmp_imm_s(IntCC::Equal, exponent, 16_358);
     let subnormal = builder
         .ins()
         .select(is_minimum_exponent, minimum_subnormal, regular_subnormal);
 
-    let fraction = builder.ins().band_imm(significand, 0x7fff_ffff_ffff_ffff);
-    let payload = builder.ins().ushr_imm(fraction, 53);
-    let has_payload = builder.ins().icmp_imm(IntCC::NotEqual, fraction, 0);
+    let fraction = builder.ins().band_imm_u(significand, 0x7fff_ffff_ffff_ffff);
+    let payload = builder.ins().ushr_imm_u(fraction, 53);
+    let has_payload = builder.ins().icmp_imm_s(IntCC::NotEqual, fraction, 0);
     let has_payload = builder.ins().uextend(ir::types::I64, has_payload);
     let payload = builder.ins().bor(payload, has_payload);
     let infinity = builder.ins().iconst(ir::types::I64, 0x7c00);
     let special = builder.ins().bor(infinity, payload);
 
-    let is_special = builder.ins().icmp_imm(IntCC::Equal, exponent, 0x7fff);
+    let is_special = builder.ins().icmp_imm_s(IntCC::Equal, exponent, 0x7fff);
     let overflows = builder
         .ins()
-        .icmp_imm(IntCC::UnsignedGreaterThan, exponent, 16_398);
+        .icmp_imm_s(IntCC::UnsignedGreaterThan, exponent, 16_398);
     let is_normal = builder
         .ins()
-        .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, exponent, 16_369);
+        .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, exponent, 16_369);
     let in_subnormal_range =
         builder
             .ins()
-            .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, exponent, 16_358);
+            .icmp_imm_s(IntCC::UnsignedGreaterThanOrEqual, exponent, 16_358);
     let zero = builder.ins().iconst(ir::types::I64, 0);
     let underflow = builder.ins().select(in_subnormal_range, subnormal, zero);
     let finite = builder.ins().select(is_normal, normal, underflow);
@@ -4706,7 +4748,7 @@ fn lower_unary(
         gir::UnaryOperation::Negate
             if types.builtin_type(operand_ty.ty) == Some(BuiltinType::Float16) =>
         {
-            Ok(builder.ins().bxor_imm(operand, 0x8000))
+            Ok(builder.ins().bxor_imm_u(operand, 0x8000))
         }
         gir::UnaryOperation::Negate if is_float(types, operand_ty) => {
             Ok(builder.ins().fneg(operand))
@@ -4723,8 +4765,8 @@ fn lower_unary(
         gir::UnaryOperation::LogicalNot => {
             let boolean = if is_float(types, operand_ty) {
                 if types.builtin_type(operand_ty.ty) == Some(BuiltinType::Float16) {
-                    let magnitude = builder.ins().band_imm(operand, 0x7fff);
-                    builder.ins().icmp_imm(IntCC::Equal, magnitude, 0)
+                    let magnitude = builder.ins().band_imm_u(operand, 0x7fff);
+                    builder.ins().icmp_imm_s(IntCC::Equal, magnitude, 0)
                 } else {
                     let source = builder.func.dfg.value_type(operand);
                     let zero = match source {
@@ -4735,7 +4777,7 @@ fn lower_unary(
                     builder.ins().fcmp(FloatCC::Equal, operand, zero)
                 }
             } else {
-                builder.ins().icmp_imm(IntCC::Equal, operand, 0)
+                builder.ins().icmp_imm_s(IntCC::Equal, operand, 0)
             };
             let source = builder.func.dfg.value_type(boolean);
             Ok(coerce_integer(builder, boolean, source, result, false))

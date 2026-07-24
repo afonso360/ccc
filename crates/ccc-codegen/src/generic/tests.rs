@@ -1628,11 +1628,10 @@ fn computed_goto_uses_a_dense_br_table_and_nonrelocatable_label_tokens() {
 
     let invalid = function_clif(&output.clif, "invalid");
     assert!(invalid.contains("iconst.i32 0"), "{invalid}");
-    assert!(
-        invalid.contains("iadd_imm") && invalid.contains("-1"),
-        "{invalid}"
-    );
-    assert!(invalid.contains("icmp_imm ugt"), "{invalid}");
+    assert!(invalid.contains("iconst.i64 -1"), "{invalid}");
+    assert!(invalid.contains("iadd "), "{invalid}");
+    assert!(invalid.contains("iconst.i64 0xffff_ffff"), "{invalid}");
+    assert!(invalid.contains("icmp ugt"), "{invalid}");
     assert!(invalid.contains("br_table"), "{invalid}");
     assert!(invalid.contains("trap user1"), "{invalid}");
 
@@ -1689,7 +1688,7 @@ fn complete_abi_plan_and_aggregate_clif_have_exact_snapshots() {
     assert!(dump.contains("packaging assembly-units=2"), "{dump}");
     assert_eq!(
         sha256(&dump),
-        "e473b3371dd953205ecfc1e704bffbaebe63487d238f7c38febab5010a041441"
+        "4de89a9f44e8df6e1d5bd8d4a69ca27e9ccedc8bc1e2c8f42d298ae8800744cb"
     );
 
     let output = emit(
@@ -1703,12 +1702,12 @@ fn complete_abi_plan_and_aggregate_clif_have_exact_snapshots() {
     .unwrap();
     assert_eq!(
         sha256(&output.clif),
-        "66995b11436d037c292c8ea80138de4c73d2ee8ba8f9fdabc5a96daa41d4ebdd"
+        "1230dc2a71cb86d3c7598aa2cd7832e0e568a5fd9aeb510f2bda40e979eb753c"
     );
 }
 
 #[test]
-fn pinned_cranelift_accepts_rounded_struct_arguments_and_structure_returns() {
+fn backend_accepts_rounded_struct_arguments_and_structure_returns() {
     let mut config = EffectiveCompilationConfig::default();
     config.capabilities.insert(
         ccc_target::CapabilityKind::Attribute,
@@ -1807,7 +1806,8 @@ fn nonzero_offset_bitfields_use_their_projected_storage_once() {
         [0x44, 0x33, 0x22, 0x11, 0x07, 0x00, 0x00, 0x00]
     );
     let clif = function_clif(&output.clif, "update");
-    assert!(clif.contains("iadd_imm"), "{clif}");
+    assert!(clif.contains("iconst.i64 4"), "{clif}");
+    assert!(clif.contains("iadd "), "{clif}");
 }
 
 #[test]
@@ -1819,8 +1819,8 @@ fn aggregate_rvalue_bitfields_lower_through_their_projection_anchor() {
          int read(void) { return make().inner.value; }",
     );
     let clif = function_clif(&output.clif, "read");
-    assert!(clif.contains("band_imm"), "{clif}");
-    assert!(clif.contains("sshr_imm"), "{clif}");
+    assert!(clif.contains("band "), "{clif}");
+    assert!(clif.contains("sshr "), "{clif}");
 }
 
 #[test]
@@ -1861,7 +1861,7 @@ fn repeated_initializers_use_target_stride_and_preserve_relocations() {
 fn runtime_bool_conversion_normalizes_nonzero_values() {
     let output = emit_source("int normalize(int x) { _Bool truth = x; return truth; }");
     let clif = function_clif(&output.clif, "normalize");
-    assert!(clif.contains("icmp_imm ne"), "{clif}");
+    assert!(clif.contains("icmp ne"), "{clif}");
     assert!(!clif.contains("store"), "{clif}");
     assert!(!clif.contains("load.i8"), "{clif}");
 }
@@ -2686,7 +2686,8 @@ fn packed_and_bitfield_memory_paths_remain_unaligned_and_explicit() {
     );
     let output = output.unwrap();
     let clif = function_clif(&output.clif, "inspect");
-    assert!(clif.contains("iadd_imm"), "{clif}");
+    assert!(clif.contains("iconst.i64 1"), "{clif}");
+    assert!(clif.contains("iadd "), "{clif}");
     assert!(clif.contains("load.i32"), "{clif}");
     assert!(!clif.contains(" aligned"), "{clif}");
     assert!(clif.contains("ushr_imm") || clif.contains("ushr"), "{clif}");

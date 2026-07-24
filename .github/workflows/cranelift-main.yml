@@ -1,0 +1,85 @@
+name: Cranelift main compatibility
+
+on:
+  schedule:
+    - cron: "23 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  upstream-main:
+    name: Test current upstream head
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            binutils build-essential clang coreutils gdb libc-bin procps
+
+      - uses: dtolnay/rust-toolchain@1.96.0
+
+      - name: Refresh the candidate lockfile and provenance
+        run: |
+          cargo update -p cranelift-codegen
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          lockfile = Path("Cargo.lock").read_text()
+          revisions = set(
+              re.findall(
+                  r'source = "git\+https://github\.com/bytecodealliance/'
+                  r'wasmtime\.git\?branch=main#([0-9a-f]{40})"',
+                  lockfile,
+              )
+          )
+          if len(revisions) != 1:
+              raise SystemExit(
+                  f"expected one Wasmtime main revision, found {sorted(revisions)}"
+              )
+
+          revision = revisions.pop()
+          digest_path = Path("crates/ccc-abi/src/digest.rs")
+          digest = digest_path.read_text()
+          digest, replacements = re.subn(
+              r'const CRANELIFT_BACKEND_REVISION: &str = "[0-9a-f]{40}";',
+              f'const CRANELIFT_BACKEND_REVISION: &str = "{revision}";',
+              digest,
+          )
+          if replacements != 1:
+              raise SystemExit("could not update the backend provenance constant")
+          digest_path.write_text(digest)
+          PY
+          cargo fmt --all --check
+          git diff -- Cargo.lock crates/ccc-abi/src/digest.rs \
+            > "$RUNNER_TEMP/cranelift-main-candidate.patch"
+
+      - name: Verify the candidate dependency graph
+        run: cargo test -p ccc-abi cranelift_packages_use_the_audited_backend_revision
+
+      - name: Test the workspace
+        run: cargo test --workspace --all-targets
+
+      - name: Run the native target oracle
+        env:
+          CCC_BIN: ${{ github.workspace }}/target/debug/ccc
+          CCC_REQUIRE_TARGET_ORACLE: "1"
+          CCC_TARGET_ORACLE_ARTIFACTS: ${{ runner.temp }}/ccc-target-oracle-x86_64-linux
+        run: tests/target-oracle/run.sh x86_64-linux
+
+      - name: Upload the candidate and oracle evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cranelift-main-candidate
+          path: |
+            ${{ runner.temp }}/cranelift-main-candidate.patch
+            ${{ runner.temp }}/ccc-target-oracle-x86_64-linux
+          if-no-files-found: ignore

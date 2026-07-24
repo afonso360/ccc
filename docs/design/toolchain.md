@@ -2,9 +2,36 @@
 
 ## Rust and library dependencies
 
-The workspace uses exact, mutually compatible versions of `cranelift-codegen`, `cranelift-frontend`, `cranelift-object`, `object`, `target-lexicon`, and `gimli`. Workspace dependency declarations use exact constraints for the Cranelift family, and the committed `Cargo.lock` is the authoritative resolved-version record; documentation does not duplicate a version number that could drift.
+The workspace resolves `cranelift-codegen`, `cranelift-frontend`,
+`cranelift-module`, `cranelift-object`, and their internal Cranelift crates from
+the Wasmtime repository's `main` branch. The committed `Cargo.lock` is the
+authoritative exact-revision record: ordinary builds use `--locked` and never
+move with the branch implicitly. A lockfile test requires every package whose
+name starts with `cranelift-` to use the audited revision recorded by the ABI
+configuration key. Registry dependencies such as `object`, `target-lexicon`,
+and `gimli` retain exact workspace constraints.
 
-Cranelift upgrades occur in isolated changes. Each upgrade records capability changes for variadics, f16/f128, atomic operations, memory flags, runtime-sized automatic-storage lowering, native dynamic-stack support, TLS, object relocations, and debug information, then runs the ABI oracle, object inspection, CLIF verification, execution suite, and backend-specific regression corpus. A newly present API is not enabled until its emitted behavior passes those tests.
+Cranelift lock refreshes occur in isolated changes. Refresh with
+`cargo update -p cranelift-codegen`, copy the resulting Wasmtime commit from
+`Cargo.lock` into the single backend-revision constant in `ccc-abi`, and inspect
+the complete dependency diff before adapting APIs. Each refresh records
+capability changes for variadics, f16/f128, atomic operations, memory flags,
+runtime-sized automatic-storage lowering, native dynamic-stack support, TLS,
+object relocations, unwind information, and debug information, then runs the
+ABI oracle, object inspection, CLIF verification, execution suite, debugger
+checks, and backend-specific regression corpus. A newly present API is not
+enabled until its emitted behavior passes those tests.
+
+To bisect an upstream regression, set all four workspace Git dependencies to a
+candidate Wasmtime revision, refresh only the Cranelift family, update the
+backend-revision constant, and run the smallest failing gate with `--locked`.
+Repeat until the first bad commit is known, then restore the branch declarations
+and the last accepted lockfile. A temporary rollback changes the lockfile and
+backend provenance together; it must not mix packages from different commits.
+
+CCC currently keeps Cranelift's object-level unwind feature disabled and emits
+verified call-frame information itself. A backend update must not enable a
+second unwind emitter accidentally.
 
 ## Target toolchain resolution
 

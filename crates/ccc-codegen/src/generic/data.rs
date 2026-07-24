@@ -105,7 +105,7 @@ pub(super) fn define_globals(
             }
             description.set_align(align);
             if let Some(section) = &global.emission.section {
-                description.set_segment_section("", section, 0);
+                description.set_custom_section(section);
             }
             let declaration = declarations
                 .globals

@@ -11,8 +11,8 @@ use gimli::write::{
 use object::write::{Relocation as ObjectRelocation, StandardSection, SymbolId, SymbolSection};
 use object::{BinaryFormat, RelocationEncoding, RelocationFlags, RelocationKind};
 
-/// Collects the unwind description that `cranelift-object` 0.132 does not
-/// preserve when it copies compiled function bytes into its object writer.
+/// Collects unwind descriptions for CCC's object-format-owned call-frame
+/// emission. Cranelift's independent object unwind emitter stays disabled.
 pub(super) struct UnwindEmitter {
     cie: gimli::write::CommonInformationEntry,
     functions: Vec<(FuncId, cranelift_codegen::isa::unwind::systemv::UnwindInfo)>,

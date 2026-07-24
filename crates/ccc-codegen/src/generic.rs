@@ -24,7 +24,7 @@ use cranelift_codegen::Context;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::immediates::{Ieee16, Ieee32, Ieee64};
 use cranelift_codegen::ir::{
-    self, BlockArg, InstBuilder, MemFlags, StackSlot, StackSlotData, StackSlotKind, TrapCode,
+    self, BlockArg, InstBuilder, MemFlagsData, StackSlot, StackSlotData, StackSlotKind, TrapCode,
     UserFuncName,
 };
 use cranelift_codegen::isa;

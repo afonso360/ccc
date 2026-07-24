@@ -19,6 +19,17 @@ const RISCV_PSABI_SOURCE_SHA256: &str =
 const APPLE_ARM64_EVIDENCE_REVISION: &str = "retrieved-2026-07-18-clt-26.6";
 const APPLE_ARM64_SOURCE_SHA256: &str =
     "afe0badf53abe5510e610358ba81050080692af7df7715a44be55271904d3b3e";
+const CRANELIFT_BACKEND_REVISION: &str = "fb8c7616d641ae586b4f86fcd4311c6250f901fb";
+
+fn backend_profile(abi: AbiIdentity) -> String {
+    let abi_extensions = match abi {
+        AbiIdentity::SysvAmd64Lp64 => "llvm-abi-extensions",
+        AbiIdentity::Aapcs64Lp64 | AbiIdentity::RiscvLp64d | AbiIdentity::DarwinArm64 => {
+            "no-llvm-extensions"
+        }
+    };
+    format!("cranelift-main-{CRANELIFT_BACKEND_REVISION}-{abi_extensions}-no-implicit-sret")
+}
 
 pub fn abi_config_key(config: &EffectiveCompilationConfig) -> Result<AbiConfigKey, AbiError> {
     let calling_convention = config.target.calling_convention().ok_or_else(|| {
@@ -106,12 +117,7 @@ pub fn abi_config_key(config: &EffectiveCompilationConfig) -> Result<AbiConfigKe
         classifier_revision,
         specification_revision,
         specification_source_sha256: specification_digest,
-        backend_profile: match config.target.abi {
-            AbiIdentity::SysvAmd64Lp64 => "cranelift-0.132.0-llvm-abi-extensions-no-implicit-sret",
-            AbiIdentity::Aapcs64Lp64 | AbiIdentity::RiscvLp64d | AbiIdentity::DarwinArm64 => {
-                "cranelift-0.132.0-no-llvm-extensions-no-implicit-sret"
-            }
-        },
+        backend_profile: backend_profile(config.target.abi),
         normalized_target_arch: config.normalized_target_arch(),
         normalized_target_abi: config.normalized_target_abi(),
         normalized_target_cpu: config.normalized_target_cpu(),
@@ -151,7 +157,9 @@ pub fn sysv_amd64_v1_config_fingerprint(
     key.schema = "ccc-abi-config-v1";
     key.boundary_profile = "sysv-amd64-lp64-v1";
     key.classifier_revision = 1;
-    key.backend_profile = "cranelift-0.132.0-no-llvm-extensions-no-implicit-sret";
+    // The v1 fingerprint is a historical compatibility key, not a description
+    // of the backend compiling the current translation unit.
+    key.backend_profile = "cranelift-0.132.0-no-llvm-extensions-no-implicit-sret".to_owned();
     let mut encoder = Encoder { bytes: Vec::new() };
     encode_config_key_v1(&mut encoder, &key);
     Ok(Sha256::digest(encoder.finish()).into())
@@ -272,7 +280,7 @@ fn encode_config_key(encoder: &mut Encoder, key: &AbiConfigKey) {
     encoder.u32(key.classifier_revision);
     encoder.string(key.specification_revision);
     encoder.string(key.specification_source_sha256);
-    encoder.string(key.backend_profile);
+    encoder.string(&key.backend_profile);
     // Configuration-v2 fields are append-only. Stable tag assignments and the
     // v1 encoder below must not be renumbered when another profile is added.
     encoder.string(key.normalized_target_arch);
@@ -290,7 +298,7 @@ fn encode_config_key_v1(encoder: &mut Encoder, key: &AbiConfigKey) {
     encoder.u32(key.classifier_revision);
     encoder.string(key.specification_revision);
     encoder.string(key.specification_source_sha256);
-    encoder.string(key.backend_profile);
+    encoder.string(&key.backend_profile);
 }
 
 fn encode_calling_convention(encoder: &mut Encoder, calling_convention: CallingConvention) {
@@ -1242,14 +1250,7 @@ mod tests {
             assert_eq!(key.normalized_target_arch, architecture);
             assert_eq!(key.normalized_target_abi, abi);
             assert_eq!(key.normalized_target_cpu, "generic");
-            assert_eq!(
-                key.backend_profile,
-                if identity == AbiIdentity::SysvAmd64Lp64 {
-                    "cranelift-0.132.0-llvm-abi-extensions-no-implicit-sret"
-                } else {
-                    "cranelift-0.132.0-no-llvm-extensions-no-implicit-sret"
-                }
-            );
+            assert_eq!(key.backend_profile, backend_profile(identity));
             assert_eq!(
                 key.classifier_revision,
                 if identity == AbiIdentity::SysvAmd64Lp64 {
@@ -1303,11 +1304,11 @@ mod tests {
         let translation_unit = translation_unit_digest(&module, &key, ir);
         assert_eq!(
             crate::hex(&ir.0),
-            "d5edbc83204023579e6874355650a9b39158909baa4ee253b2b290e41b953dec"
+            "a296d8c7874287fc2a758f132a5339683cafd1ab6e3b61a18ef9702a8baa3a11"
         );
         assert_eq!(
             crate::hex(&translation_unit.0),
-            "3206def366107367d10225d3da354593553c76c043b060d0b31a79370dc923d4"
+            "0e2594e692905467ee524af210b495959fef0d20c96f7321b4675f3dd0a209ea"
         );
     }
 
@@ -1330,5 +1331,30 @@ mod tests {
 
         assert_eq!(first, repeated);
         assert_ne!(first, different_alignment);
+    }
+
+    #[test]
+    fn cranelift_packages_use_the_audited_backend_revision() {
+        let expected_source = format!(
+            "source = \"git+https://github.com/bytecodealliance/wasmtime.git?branch=main#{CRANELIFT_BACKEND_REVISION}\""
+        );
+        let mut cranelift_packages = 0;
+        for package in include_str!("../../../Cargo.lock").split("[[package]]") {
+            let is_cranelift = package
+                .lines()
+                .any(|line| line.starts_with("name = \"cranelift-"));
+            if !is_cranelift {
+                continue;
+            }
+            cranelift_packages += 1;
+            assert!(
+                package.lines().any(|line| line == expected_source),
+                "Cranelift package did not resolve from the audited main-branch revision:\n{package}"
+            );
+        }
+        assert!(
+            cranelift_packages >= 4,
+            "expected the complete Cranelift dependency family in Cargo.lock"
+        );
     }
 }

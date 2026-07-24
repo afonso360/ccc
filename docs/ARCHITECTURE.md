@@ -83,7 +83,7 @@ The significant, cross-cutting decisions live as ADRs in [`docs/adr/`](adr/):
 | [0005](adr/0005-preprocessor-owns-pp-token-lexing.md)            | Preprocessor owns pp-token lexing                                                                 |
 | [0006](adr/0006-link-via-target-driver.md)                       | Link via a resolved target compiler driver                                                        |
 | [0007](adr/0007-long-double-and-complex.md)                      | Preserve target `long double` ABI and reject unsupported operations or ABI-changing overrides     |
-| [0008](adr/0008-pin-cranelift.md)                                | Pin Cranelift; upgrade deliberately                                                               |
+| [0008](adr/0008-pin-cranelift.md)                                | Track Cranelift main with a reproducible lock                                                      |
 | [0009](adr/0009-shared-type-and-layout-crate.md)                 | Shared `ccc-types` crate: one canonical type representation and layout engine                     |
 | [0010](adr/0010-generate-abi-bridges-as-assembly.md)             | Generate ABI bridges as auditable target assembly                                                 |
 | [0011](adr/0011-arena-backed-runtime-sized-automatic-storage.md) | Back runtime-sized automatic objects with a scoped arena; keep native-stack builtins gated        |

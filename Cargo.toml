@@ -26,10 +26,10 @@ version = "0.1.0"
 unsafe_code = "forbid"
 
 [workspace.dependencies]
-cranelift-codegen = { version = "=0.132.0", default-features = false, features = ["std", "unwind", "x86", "arm64", "riscv64"] }
-cranelift-frontend = { version = "=0.132.0", default-features = false, features = ["std"] }
-cranelift-module = { version = "=0.132.0" }
-cranelift-object = { version = "=0.132.0" }
+cranelift-codegen = { git = "https://github.com/bytecodealliance/wasmtime.git", branch = "main", default-features = false, features = ["std", "unwind", "x86", "arm64", "riscv64"] }
+cranelift-frontend = { git = "https://github.com/bytecodealliance/wasmtime.git", branch = "main", default-features = false, features = ["std"] }
+cranelift-module = { git = "https://github.com/bytecodealliance/wasmtime.git", branch = "main" }
+cranelift-object = { git = "https://github.com/bytecodealliance/wasmtime.git", branch = "main", default-features = false }
 gimli = { version = "=0.33.0", default-features = false, features = ["read", "write"] }
 object = { version = "=0.39.0", default-features = false, features = ["read", "write"] }
 rustc_apfloat = { version = "=0.2.3", default-features = false }

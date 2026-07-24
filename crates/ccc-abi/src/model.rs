@@ -374,7 +374,7 @@ pub struct AbiConfigKey {
     pub classifier_revision: u32,
     pub specification_revision: &'static str,
     pub specification_source_sha256: &'static str,
-    pub backend_profile: &'static str,
+    pub backend_profile: String,
     pub normalized_target_arch: &'static str,
     pub normalized_target_abi: &'static str,
     pub normalized_target_cpu: &'static str,
