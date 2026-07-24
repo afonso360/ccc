@@ -55,7 +55,8 @@ family = re.search(r"ccc-benchmark-family: ([a-z-]+)", source).group(1)
 scale = int(re.search(r"ccc-benchmark-scale: ([0-9]+)", source).group(1))
 variant_match = re.search(r"ccc-benchmark-variant: ([a-z-]+)", source)
 variant = variant_match.group(1) if variant_match else None
-hosted_stdio = family == "hosted-header" and variant == "stdio"
+hosted_family = family in ("hosted-header", "hosted-printf")
+hosted_stdio = hosted_family and variant == "stdio"
 
 if "--emit=codegen-stats" not in sys.argv:
     if "-c" not in sys.argv or "-o" not in sys.argv:
@@ -65,6 +66,10 @@ if "--emit=codegen-stats" not in sys.argv:
     profile = next(argument for argument in sys.argv if argument.startswith("-O"))
     identity = hashlib.sha256(f"{profile}\n{source}".encode()).digest()
     payload = b"fake-object\0" + identity
+    if family == "hosted-printf":
+        # Model CCC's ABI-support packaging: codegen stats describe the primary
+        # Cranelift object, while an ordinary -c output can include bridge code.
+        payload += b"packaged-variadic-bridge"
     if (
         family == "data-declaration-heavy"
         and os.environ.get("FAKE_CCC_LEAK_DATA_DECLS")
@@ -79,7 +84,7 @@ if family == "declaration-heavy" and os.environ.get("FAKE_CCC_LEAK_DECLS"):
 calls = 1 if family in ("puts-call", "printf-variadic") else 0
 if family == "live-functions":
     calls = scale
-if family == "hosted-header":
+if hosted_family:
     calls = 1
 external_functions = calls
 if hosted_stdio and os.environ.get("FAKE_CCC_HOSTED_IR_LEAK"):
@@ -156,6 +161,8 @@ grep -Fq $'data-declaration-heavy-3\tdata-declaration-heavy\t3\tO2\tprimary_obje
   "$results/codegen-stats.tsv"
 grep -Fq $'hosted-header-stdio\thosted-header\t1\tO2\tpost_inline_ir.external_functions\t1' \
   "$results/codegen-stats.tsv"
+grep -Fq $'hosted-printf-stdio\thosted-printf\t1\tO2\tpost_inline_ir.external_functions\t1' \
+  "$results/codegen-stats.tsv"
 grep -Fq $'live-functions-4\tlive-functions\t4\tO2\t2\t' \
   "$results/summary.tsv"
 grep -Fq '"format_version":2' "$results/environment.json"
@@ -171,23 +178,31 @@ grep -Fq '"data_declaration_scales":[0,3]' "$results/environment.json"
 grep -Fq '"effective_configs":{"O0":' "$results/environment.json"
 grep -Fq '"exit_status":0' "$results/environment.json"
 grep -Fq '"benchmark":"printf-variadic"' "$results/commands.jsonl"
-[[ "$(grep -c '"kind":"object-compile"' "$results/commands.jsonl")" == 66 ]]
-[[ "$(grep -c '"kind":"codegen-stats"' "$results/commands.jsonl")" == 22 ]]
+[[ "$(grep -c '"kind":"object-compile"' "$results/commands.jsonl")" == 78 ]]
+[[ "$(grep -c '"kind":"codegen-stats"' "$results/commands.jsonl")" == 26 ]]
 [[ "$(grep -c '^extern long ccc_decl_' \
   "$results/sources/declaration-heavy-3.c")" == 3 ]]
 [[ "$(grep -c '^extern long ccc_data_decl_' \
   "$results/sources/data-declaration-heavy-3.c")" == 3 ]]
 grep -Fq $'hosted-header-stdio\thosted-header\t1\thosted-header-minimal\t' \
   "$results/manifest.tsv"
+grep -Fq $'hosted-printf-stdio\thosted-printf\t1\thosted-printf-minimal\t' \
+  "$results/manifest.tsv"
 grep -Fq '#include <stdio.h>' \
   "$results/sources/hosted-header-stdio.c"
 grep -Fq 'extern struct ccc_benchmark_file *stdout;' \
   "$results/sources/hosted-header-minimal.c"
+grep -Fq '#include <stdio.h>' \
+  "$results/sources/hosted-printf-stdio.c"
+grep -Fq 'extern int printf(const char *format, ...);' \
+  "$results/sources/hosted-printf-minimal.c"
 [[ "$(find "$results/raw" -name 'codegen-stats.stdout.tsv' |
-  wc -l | tr -d '[:space:]')" == 22 ]]
-[[ "$(find "$results/raw" -name '*.o' | wc -l | tr -d '[:space:]')" == 66 ]]
+  wc -l | tr -d '[:space:]')" == 26 ]]
+[[ "$(find "$results/raw" -name '*.o' | wc -l | tr -d '[:space:]')" == 78 ]]
 [[ -f "$results/raw/printf-variadic/O2/sample-002.timing.json" ]]
 [[ -s "$results/raw/printf-variadic/O2/sample-002.o" ]]
+[[ "$(wc -c <"$results/raw/hosted-printf-minimal/O2/sample-002.o" |
+  tr -d '[:space:]')" -gt 44 ]]
 [[ -f "$results/raw/printf-variadic/O2/sample-002.stdout.txt" ]]
 [[ -f "$results/raw/minimal-return/O0/warmup-001.stderr.txt" ]]
 [[ -f "$results/raw/minimal-return/O0/codegen-stats.result.json" ]]
@@ -274,6 +289,23 @@ set -e
 [[ "$negative_hosted_object_status" == 1 ]]
 [[ "$negative_hosted_object_output" == *"hosted-header-stdio changed primary-object structure relative to hosted-header-minimal at -O0"* ]]
 [[ "$negative_hosted_object_output" == *"primary_object.undefined_symbols=2 versus 3"* ]]
+
+negative_printf_results="$temporary_directory/negative-printf-results"
+set +e
+negative_printf_output=$(
+  FAKE_CCC_HOSTED_IR_LEAK=1 "$script_directory/run.py" \
+    --ccc "$fake_ccc" \
+    --output "$negative_printf_results" \
+    --cases hosted-printf \
+    --profiles O0 \
+    --warmups 0 \
+    --samples 1 2>&1
+)
+negative_printf_status=$?
+set -e
+[[ "$negative_printf_status" == 1 ]]
+[[ "$negative_printf_output" == *"hosted-printf-stdio changed post-inline CLIF relative to hosted-printf-minimal at -O0"* ]]
+[[ "$negative_printf_output" == *"post_inline_ir.external_functions=1 versus 2"* ]]
 
 help_output=$("$script_directory/run.py" --help)
 [[ "$help_output" == *"--declaration-scales"* ]]

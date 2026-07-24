@@ -202,11 +202,9 @@ trend evidence and must not be compared numerically with native execution.
 
 ### Initial performance targets
 
-- Keep the checked-in `fputs`/`stdout` hosted-header translation exactly equal
-  to its minimal-declaration baseline at the post-inlining CLIF and
-  primary-object boundaries. Add the same paired gate for the variadic
-  `printf` hello case before treating both common hosted-header paths as
-  covered.
+- Keep the checked-in `fputs`/`stdout` and variadic `printf` hosted-header
+  translations exactly equal to their minimal-declaration baselines at the
+  post-inlining CLIF and primary-object boundaries.
 - On the defined-behavior kernel suite, the `-O2` runtime geometric mean must
   not regress against `-O0`, and `-Oz` text size must not exceed `-O2` in the
   geometric mean. Record and justify individual exceptions rather than hiding

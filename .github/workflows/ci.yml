@@ -135,20 +135,20 @@ jobs:
       - name: Run Rust test suite
         run: cargo test --locked --workspace --all-targets
 
-      - name: Check hosted-header codegen equivalence
+      - name: Check hosted stdio codegen equivalence
         run: >-
           benchmarks/codegen/run.py
           --ccc "${{ github.workspace }}/${{ matrix.ccc_bin }}"
           --output
           "$RUNNER_TEMP/ccc-hosted-header-${{ matrix.oracle }}"
-          --cases hosted-header --profiles O0,O2,Oz
+          --cases hosted-header,hosted-printf --profiles O0,O2,Oz
           --warmups 0 --samples 1
 
-      - name: Upload hosted-header codegen evidence
+      - name: Upload hosted stdio codegen evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: hosted-header-codegen-${{ matrix.oracle }}
+          name: hosted-stdio-codegen-${{ matrix.oracle }}
           path: ${{ runner.temp }}/ccc-hosted-header-${{ matrix.oracle }}
           if-no-files-found: ignore
 

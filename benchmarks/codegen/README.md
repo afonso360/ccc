@@ -13,6 +13,8 @@ The default set covers:
 - one variadic `printf` call;
 - equivalent `fputs`/`stdout` programs using either minimal declarations or
   the target's complete hosted `<stdio.h>`;
+- equivalent variadic `printf` programs using either a minimal declaration or
+  the target's complete hosted `<stdio.h>`;
 - generated translation units with 0, 32, 256, and 1024 unused function
   declarations;
 - generated translation units with the same independent scale of unused data
@@ -27,15 +29,15 @@ old behavior where trivial programs accumulated unused CLIF references or
 object declarations. The live-function series provides a growing backend
 workload for codegen performance work.
 
-The hosted-header pair references exactly one function and one data object.
-For each optimization profile, the `<stdio.h>` case must match the
-minimal-declaration baseline in every `post_inline_ir.*` and
-`primary_object.*` metric. Preprocessing and semantic-analysis time may grow;
-CLIF and object structure may not. The two objects are not required to have the
-same hash because libc headers may give `fputs` or `stdout` target-specific
-physical symbol spellings. CI runs this structural check on every enabled
-target; only controlled native runs should use its timings as performance
-evidence.
+The `hosted-header` pair references exactly one function and one data object;
+the `hosted-printf` pair references exactly one variadic function. For each
+optimization profile, each `<stdio.h>` case must match its minimal-declaration
+baseline in every `post_inline_ir.*` and `primary_object.*` metric.
+Preprocessing and semantic-analysis time may grow; CLIF and object structure
+may not. The paired objects are not required to have the same hash because
+libc headers may give referenced declarations target-specific physical symbol
+spellings. CI runs both structural checks on every enabled target; only
+controlled native runs should use their timings as performance evidence.
 
 ## Running
 
@@ -64,11 +66,11 @@ benchmarks/codegen/run.py \
 ```
 
 Pass `--target=<triple>` to select an enabled target when its compiler driver
-and sysroot are configured. The `hosted-header` family additionally requires
-that target's `<stdio.h>`. Use `--cases` with a comma-separated subset to
-isolate one family; declaration-only scaling uses `declaration-heavy` and
-`data-declaration-heavy`. The output directory must be new or empty so
-evidence from separate runs cannot be mixed accidentally.
+and sysroot are configured. The `hosted-header` and `hosted-printf` families
+additionally require that target's `<stdio.h>`. Use `--cases` with a
+comma-separated subset to isolate one family; declaration-only scaling uses
+`declaration-heavy` and `data-declaration-heavy`. The output directory must be
+new or empty so evidence from separate runs cannot be mixed accidentally.
 
 ## Results
 
@@ -98,11 +100,15 @@ useful for exercising the harness and invariants, but its timings are not a
 performance baseline.
 
 Every timed invocation has a unique explicit `.o` path. The objects are retained
-and hashed, and repeated samples must produce identical object bytes. The
-reported primary-object byte count must also match every timed object. The
-compiler executable SHA-256, successful `-dumpmachine` query, raw query output,
-effective target, and `--print-effective-config` output for every profile are
-archived with each result set.
+and hashed, and repeated samples must produce identical object bytes.
+`primary_object.file_bytes` describes Cranelift's primary relocatable object;
+the timed `.o` byte count can be larger when the driver packages generated ABI
+support alongside it. The runner requires the two sizes to match for cases
+without generated support and retains both sizes for variadic cases where they
+are distinct compiler boundaries. The compiler executable SHA-256, successful
+`-dumpmachine` query, raw query output, effective target, and
+`--print-effective-config` output for every profile are archived with each
+result set.
 
 The runner uses `wait4` for per-process resource measurements and therefore
 targets the same Unix hosts as CCC (Linux and Darwin). Peak RSS follows the
@@ -111,8 +117,8 @@ platform convention internally and is normalized to bytes.
 ## Regression test
 
 The self-test uses a fake compiler, performs positive and negative
-declaration-liveness and hosted-header-equivalence checks, and does not require
-a CCC build:
+declaration-liveness and hosted-header-equivalence checks for both common
+stdio paths, and does not require a CCC build:
 
 ```sh
 benchmarks/codegen/test-run.sh

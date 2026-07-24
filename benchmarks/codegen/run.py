@@ -38,6 +38,7 @@ CASE_NAMES = (
     "puts-call",
     "printf-variadic",
     "hosted-header",
+    "hosted-printf",
     "declaration-heavy",
     "data-declaration-heavy",
     "live-functions",
@@ -123,6 +124,7 @@ class Case:
     source: Path
     expected_functions: int
     equivalent_to: str | None = None
+    primary_object_is_output: bool = True
 
 
 @dataclass(frozen=True)
@@ -362,7 +364,16 @@ def copy_and_generate_cases(
             continue
         source = source_directory / f"{name}.c"
         shutil.copyfile(benchmark_directory / "cases" / f"{name}.c", source)
-        cases.append(Case(name, name, 1, source, 1))
+        cases.append(
+            Case(
+                name,
+                name,
+                1,
+                source,
+                1,
+                primary_object_is_output=name != "printf-variadic",
+            )
+        )
 
     if "hosted-header" in selected:
         baseline = "hosted-header-minimal"
@@ -380,6 +391,26 @@ def copy_and_generate_cases(
                     source,
                     1,
                     equivalent_to,
+                )
+            )
+
+    if "hosted-printf" in selected:
+        baseline = "hosted-printf-minimal"
+        for name, equivalent_to in (
+            (baseline, None),
+            ("hosted-printf-stdio", baseline),
+        ):
+            source = source_directory / f"{name}.c"
+            shutil.copyfile(benchmark_directory / "cases" / f"{name}.c", source)
+            cases.append(
+                Case(
+                    name,
+                    "hosted-printf",
+                    1,
+                    source,
+                    1,
+                    equivalent_to,
+                    False,
                 )
             )
 
@@ -629,6 +660,8 @@ def validate_invariants(
             )
 
     for invocation in invocations:
+        if not invocation.case.primary_object_is_output:
+            continue
         expected_bytes = stats_by_case[(invocation.case.name, invocation.profile)][
             "primary_object.file_bytes"
         ]
