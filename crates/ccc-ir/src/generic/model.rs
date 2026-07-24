@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use ccc_sema::generic::{
@@ -39,10 +39,12 @@ pub struct FullModule {
 
 /// Source symbols that must receive object identities for this retained IR.
 ///
-/// Definitions are always required. Declaration-only symbols enter the set
-/// only through a direct call, address operation, or static initializer
-/// relocation. Ordered sets make the result stable for dumps and consumers
-/// without imposing an object-emission order.
+/// Externally observable and ordinary internal definitions are roots.
+/// Unreferenced internal C `inline` definitions are omitted, while a direct
+/// call, address operation, or static initializer relocation retains them and
+/// everything they reference. Declaration-only symbols enter the set through
+/// the same reachable references. Ordered sets make the result stable for
+/// dumps and consumers without imposing an object-emission order.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SourceSymbolRequirements {
     pub functions: BTreeSet<FullFunctionId>,
@@ -50,13 +52,22 @@ pub struct SourceSymbolRequirements {
 }
 
 impl SourceSymbolRequirements {
-    fn require_target(&mut self, target: RelocationTarget) {
+    fn require_target(
+        &mut self,
+        target: RelocationTarget,
+        pending_functions: &mut Vec<FullFunctionId>,
+        pending_objects: &mut Vec<DataId>,
+    ) {
         match target {
             RelocationTarget::Function(function) => {
-                self.functions.insert(function);
+                if self.functions.insert(function) {
+                    pending_functions.push(function);
+                }
             }
             RelocationTarget::Object(data) => {
-                self.objects.insert(data);
+                if self.objects.insert(data) {
+                    pending_objects.push(data);
+                }
             }
             RelocationTarget::String(_) => {}
         }
@@ -73,51 +84,82 @@ impl FullModule {
     /// Returns every source function or data object that retained IR can emit
     /// or reference.
     pub fn source_symbol_requirements(&self) -> SourceSymbolRequirements {
-        let mut requirements = SourceSymbolRequirements {
-            functions: self
-                .functions
-                .iter()
-                .filter(|function| function.entry.is_some())
-                .map(|function| function.id)
-                .collect(),
-            objects: self
-                .globals
-                .iter()
-                .filter(|global| global.emission.definition != ObjectDefinitionPolicy::Declaration)
-                .map(|global| global.id)
-                .collect(),
-        };
-
-        for instruction in self
+        let mut requirements = SourceSymbolRequirements::default();
+        let mut pending_functions = Vec::new();
+        let mut pending_objects = Vec::new();
+        let functions = self
             .functions
             .iter()
-            .flat_map(|function| &function.blocks)
-            .flat_map(|block| &block.instructions)
-        {
-            match &instruction.kind {
-                FullInstructionKind::DirectCall { function, .. }
-                | FullInstructionKind::AddressOfFunction { function, .. } => {
-                    requirements.functions.insert(*function);
-                }
-                FullInstructionKind::AddressOfGlobal { global } => {
-                    requirements.objects.insert(*global);
-                }
-                FullInstructionKind::AddressConstant { target, .. } => {
-                    requirements.require_target(*target);
-                }
-                _ => {}
-            }
-        }
+            .map(|function| (function.id, function))
+            .collect::<BTreeMap<_, _>>();
+        let objects = self
+            .globals
+            .iter()
+            .map(|global| (global.id, global))
+            .collect::<BTreeMap<_, _>>();
 
-        for node in self
+        for function in self.functions.iter().filter(|function| {
+            function.entry.is_some()
+                && !(function.linkage == Linkage::Internal && function.properties.inline)
+        }) {
+            requirements.functions.insert(function.id);
+            pending_functions.push(function.id);
+        }
+        for global in self
             .globals
             .iter()
             .filter(|global| global.emission.definition != ObjectDefinitionPolicy::Declaration)
-            .filter_map(|global| global.initializer.as_ref())
-            .flat_map(|initializer| &initializer.nodes)
         {
-            if let InitializerNodeKind::Relocation { target, .. } = &node.kind {
-                requirements.require_target(*target);
+            requirements.objects.insert(global.id);
+            pending_objects.push(global.id);
+        }
+
+        while !pending_functions.is_empty() || !pending_objects.is_empty() {
+            while let Some(function) = pending_functions.pop() {
+                let Some(function) = functions.get(&function) else {
+                    continue;
+                };
+                for instruction in function.blocks.iter().flat_map(|block| &block.instructions) {
+                    match &instruction.kind {
+                        FullInstructionKind::DirectCall { function, .. }
+                        | FullInstructionKind::AddressOfFunction { function, .. } => {
+                            if requirements.functions.insert(*function) {
+                                pending_functions.push(*function);
+                            }
+                        }
+                        FullInstructionKind::AddressOfGlobal { global } => {
+                            if requirements.objects.insert(*global) {
+                                pending_objects.push(*global);
+                            }
+                        }
+                        FullInstructionKind::AddressConstant { target, .. } => {
+                            requirements.require_target(
+                                *target,
+                                &mut pending_functions,
+                                &mut pending_objects,
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            while let Some(object) = pending_objects.pop() {
+                let Some(initializer) = objects
+                    .get(&object)
+                    .and_then(|global| global.initializer.as_ref())
+                else {
+                    continue;
+                };
+                for node in &initializer.nodes {
+                    if let InitializerNodeKind::Relocation { target, .. } = &node.kind {
+                        requirements.require_target(
+                            *target,
+                            &mut pending_functions,
+                            &mut pending_objects,
+                        );
+                    }
+                }
             }
         }
 
@@ -128,8 +170,13 @@ impl FullModule {
     /// inline-assembly operations. Packaging may use this without rediscovering
     /// source templates or constraints.
     pub fn required_native_inline_asm_helpers(&self) -> BTreeSet<NativeInlineAsmHelper> {
+        let requirements = self.source_symbol_requirements();
         let mut helpers = BTreeSet::new();
-        for function in &self.functions {
+        for function in self
+            .functions
+            .iter()
+            .filter(|function| requirements.functions.contains(&function.id))
+        {
             for block in &function.blocks {
                 for instruction in &block.instructions {
                     match &instruction.kind {

@@ -5,18 +5,25 @@ use ccc_sema::generic::{
 };
 use ccc_session::SourceMap;
 use ccc_syntax::frontend as syntax;
-use ccc_target::{EffectiveCompilationConfig, OptimizationLevel};
+use ccc_target::{EffectiveCompilationConfig, OptimizationLevel, enabled_compilation_configs};
 use ccc_types::{ArrayLength, ArrayType, QualifiedType, RecordKind, TypeId, TypeKind};
 
 use super::*;
 
 fn typed_source(source: &str) -> ccc_sema::generic::FullTypedTranslationUnit {
+    typed_source_with_config(source, &EffectiveCompilationConfig::default())
+}
+
+fn typed_source_with_config(
+    source: &str,
+    config: &EffectiveCompilationConfig,
+) -> ccc_sema::generic::FullTypedTranslationUnit {
     let mut sources = SourceMap::new();
     let file = sources.add_file("generic-ir-test.c", source);
     let tokens = lex(file, sources.source(file).unwrap()).unwrap();
     let items = syntax::convert_pp_items(tokens.into_iter().map(PpItem::Token)).unwrap();
     let parsed = syntax::parse(&items).unwrap();
-    analyze_frontend(&parsed, &EffectiveCompilationConfig::default()).unwrap()
+    analyze_frontend(&parsed, config).unwrap()
 }
 
 fn lower_source(source: &str) -> FullModule {
@@ -131,6 +138,118 @@ fn source_symbol_requirements_are_complete_minimal_and_deterministic() {
         );
     }
     assert!(!requirements.objects.contains(&object_ids["unused_object"]));
+}
+
+#[test]
+fn source_symbol_requirements_retain_only_reachable_static_inline_bodies_on_every_target() {
+    const SOURCE: &str = "extern int dead_import(int);\n\
+         extern int dead_variadic(int, ...);\n\
+         static inline int dead_leaf(int value) { return dead_import(value); }\n\
+         static inline int dead_bridge(int value) { return dead_variadic(value, 1); }\n\
+         static inline int dead_vla(int count) {\n\
+             int values[count];\n\
+             return values[0];\n\
+         }\n\
+         static inline int dead_left(int);\n\
+         static inline int dead_right(int value) {\n\
+             return value == 0 ? 0 : dead_left(value - 1);\n\
+         }\n\
+         static inline int dead_left(int value) {\n\
+             return value == 0 ? 0 : dead_right(value - 1);\n\
+         }\n\
+         static inline int live_leaf(int value) { return value + 1; }\n\
+         static inline int live_chain(int value) { return live_leaf(value); }\n\
+         static __attribute__((always_inline)) inline int live_forced(int value) {\n\
+             return value + 4;\n\
+         }\n\
+         static inline int live_left(int);\n\
+         static inline int live_right(int value) {\n\
+             return value == 0 ? 0 : live_left(value - 1);\n\
+         }\n\
+         static inline int live_left(int value) {\n\
+             return value == 0 ? 0 : live_right(value - 1);\n\
+         }\n\
+         static inline int addressed(int value) { return value + 2; }\n\
+         static inline int initialized(int value) { return value + 3; }\n\
+         int (*saved_callback)(int) = initialized;\n\
+         static int ordinary_internal(void) { return 17; }\n\
+         int externally_observable(void) { return 19; }\n\
+         int force_entry(int value) { return live_forced(value); }\n\
+         int entry(int value) {\n\
+             int (*callback)(int) = addressed;\n\
+             return live_chain(value) + live_left(value)\n\
+                 + callback(value) + saved_callback(value);\n\
+         }";
+
+    for config in enabled_compilation_configs() {
+        let module = lower_frontend(&typed_source_with_config(SOURCE, &config)).unwrap();
+        verify_frontend(&module).unwrap();
+        let ids = module
+            .functions
+            .iter()
+            .map(|function| (function.name.as_str(), function.id))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let requirements = module.source_symbol_requirements();
+
+        for name in [
+            "live_leaf",
+            "live_chain",
+            "live_forced",
+            "live_left",
+            "live_right",
+            "addressed",
+            "initialized",
+            "ordinary_internal",
+            "externally_observable",
+            "force_entry",
+            "entry",
+        ] {
+            assert!(
+                requirements.functions.contains(&ids[name]),
+                "{} omitted reachable definition `{name}`",
+                config.target.triple
+            );
+        }
+        for name in [
+            "dead_import",
+            "dead_variadic",
+            "dead_leaf",
+            "dead_bridge",
+            "dead_vla",
+            "dead_left",
+            "dead_right",
+        ] {
+            assert!(
+                !requirements.functions.contains(&ids[name]),
+                "{} retained unreachable function `{name}`",
+                config.target.triple
+            );
+        }
+    }
+}
+
+#[test]
+fn source_symbol_requirement_worklist_handles_a_long_static_inline_chain() {
+    const CHAIN_LENGTH: usize = 1_024;
+    let mut source = String::from("static inline int chain_0(int value) { return value; }\n");
+    for index in 1..CHAIN_LENGTH {
+        source.push_str(&format!(
+            "static inline int chain_{index}(int value) {{ return chain_{}(value); }}\n",
+            index - 1
+        ));
+    }
+    source.push_str(&format!(
+        "int entry(int value) {{ return chain_{}(value); }}\n",
+        CHAIN_LENGTH - 1
+    ));
+
+    let module = lower_source(&source);
+    verify_frontend(&module).unwrap();
+    let requirements = module.source_symbol_requirements();
+    assert_eq!(requirements.functions.len(), CHAIN_LENGTH + 1);
+    assert!(module.functions.iter().all(|function| {
+        function.entry.is_none() || requirements.functions.contains(&function.id)
+    }));
 }
 
 #[test]

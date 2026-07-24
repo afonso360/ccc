@@ -43,6 +43,9 @@ pub fn plan_module(
     let mut va_args = std::collections::BTreeMap::new();
 
     for function in &module.functions {
+        if !required_symbols.functions.contains(&function.id) {
+            continue;
+        }
         if function.entry.is_some() {
             let boundary = plan_boundary_type(&module.types, function.signature, config)
                 .map_err(|error| error.with_span_if_none(function.span))?;
@@ -312,11 +315,15 @@ fn plan_artifacts(
             }),
     });
     let f80_support = (abi_identity == ccc_target::AbiIdentity::SysvAmd64Lp64
-        && module.functions.iter().any(|function| {
-            function.value_types.iter().any(|ty| {
-                module.types.builtin_type(*ty) == Some(ccc_types::BuiltinType::LongDouble)
-            })
-        }))
+        && module
+            .functions
+            .iter()
+            .filter(|function| required_symbols.functions.contains(&function.id))
+            .any(|function| {
+                function.value_types.iter().any(|ty| {
+                    module.types.builtin_type(*ty) == Some(ccc_types::BuiltinType::LongDouble)
+                })
+            }))
     .then(|| F80SupportArtifactPlan {
         helper_symbol: generated_symbol_for(
             translation_unit_digest,

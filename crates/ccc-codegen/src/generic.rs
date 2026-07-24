@@ -157,8 +157,8 @@ fn emit_inner(
     // locals are already forced to stack storage by IR lowering; retain the
     // frame pointer as the matching machine-code side of that contract. Debug
     // builds retain it so source-level stack inspection has the same anchor.
-    let preserve_frame_pointers =
-        module_contains_returns_twice_call(module) || options.debug_info.is_some();
+    let preserve_frame_pointers = module_contains_returns_twice_call(module, &required_symbols)
+        || options.debug_info.is_some();
     let mut object_module = backend::object_module(config, preserve_frame_pointers)?;
     let mut unwind = unwind::UnwindEmitter::new(object_module.isa()).map_err(error)?;
 
@@ -185,6 +185,9 @@ fn emit_inner(
     // Cranelift optimization and machine lowering.
     let mut prepared_functions = Vec::new();
     for (function_index, function) in module.functions.iter().enumerate() {
+        if !required_symbols.functions.contains(&function.id) {
+            continue;
+        }
         let Some(_) = function.entry else {
             continue;
         };
@@ -410,7 +413,8 @@ fn emit_inner(
     if let Some(stats) = stats.as_mut() {
         stats.primary_object = PrimaryObjectStats::from_object(&parsed_object, object.len());
     }
-    let required_runtime_helpers = required_runtime_helper_symbols(module, config);
+    let required_runtime_helpers =
+        required_runtime_helper_symbols(module, config, &required_symbols);
     validate_runtime_helper_symbols(
         &parsed_object,
         module,
@@ -424,6 +428,7 @@ fn emit_inner(
         abi_plan,
         &declarations.hidden_body_symbols,
         declarations.call_helper_symbol.as_deref(),
+        &required_symbols,
     )?;
     Ok(Output {
         object,
@@ -434,19 +439,26 @@ fn emit_inner(
     })
 }
 
-fn module_contains_returns_twice_call(module: &gir::FullModule) -> bool {
-    module.functions.iter().any(|function| {
-        function.blocks.iter().any(|block| {
-            block.instructions.iter().any(|instruction| {
-                matches!(
-                    &instruction.kind,
-                    gir::FullInstructionKind::DirectCall { effects, .. }
-                        | gir::FullInstructionKind::IndirectCall { effects, .. }
-                        if effects.returns_twice
-                )
+fn module_contains_returns_twice_call(
+    module: &gir::FullModule,
+    required_symbols: &gir::SourceSymbolRequirements,
+) -> bool {
+    module
+        .functions
+        .iter()
+        .filter(|function| required_symbols.functions.contains(&function.id))
+        .any(|function| {
+            function.blocks.iter().any(|block| {
+                block.instructions.iter().any(|instruction| {
+                    matches!(
+                        &instruction.kind,
+                        gir::FullInstructionKind::DirectCall { effects, .. }
+                            | gir::FullInstructionKind::IndirectCall { effects, .. }
+                            if effects.returns_twice
+                    )
+                })
             })
         })
-    })
 }
 
 fn validate_runtime_helper_symbols<'data, 'a>(
@@ -560,6 +572,7 @@ fn generated_bridge_artifacts(
     abi_plan: ccc_abi::VerifiedModuleAbiPlan<'_>,
     hidden_body_symbols: &HashMap<u32, String>,
     call_helper_symbol: Option<&str>,
+    required_symbols: &gir::SourceSymbolRequirements,
 ) -> Result<
     (
         Vec<ccc_link::bridge::GeneratedAssembly>,
@@ -588,7 +601,7 @@ fn generated_bridge_artifacts(
         assemblies.push(assembly);
     }
     if let Some(support) = &abi_plan.plan().artifacts.f80_support {
-        let required = required_runtime_helper_symbols(module, config);
+        let required = required_runtime_helper_symbols(module, config, required_symbols);
         let assembly = render_f80_support(
             &support.helper_symbol,
             F80RuntimeHelperPlan {
@@ -896,7 +909,7 @@ fn declare_module(
     required_symbols: &gir::SourceSymbolRequirements,
     object_module: &mut ObjectModule,
 ) -> Result<Declarations, CodegenError> {
-    let direct_calls = direct_call_signatures(module)?;
+    let direct_calls = direct_call_signatures(module, required_symbols)?;
     let mut functions = HashMap::with_capacity(required_symbols.functions.len());
     let mut definition_functions = HashMap::new();
     let mut definition_signatures = HashMap::new();
@@ -1007,34 +1020,36 @@ fn declare_module(
             (None, None)
         };
 
-    let (runtime_realloc, runtime_free) = if module_uses_runtime_sized_storage(module) {
-        let mut realloc_signature = object_module.make_signature();
-        realloc_signature
-            .params
-            .push(ir::AbiParam::new(ir::types::I64));
-        realloc_signature
-            .params
-            .push(ir::AbiParam::new(ir::types::I64));
-        realloc_signature
-            .returns
-            .push(ir::AbiParam::new(ir::types::I64));
-        let realloc = object_module
-            .declare_function("realloc", Linkage::Import, &realloc_signature)
-            .map_err(module_error)?;
+    let (runtime_realloc, runtime_free) =
+        if module_uses_runtime_sized_storage(module, required_symbols) {
+            let mut realloc_signature = object_module.make_signature();
+            realloc_signature
+                .params
+                .push(ir::AbiParam::new(ir::types::I64));
+            realloc_signature
+                .params
+                .push(ir::AbiParam::new(ir::types::I64));
+            realloc_signature
+                .returns
+                .push(ir::AbiParam::new(ir::types::I64));
+            let realloc = object_module
+                .declare_function("realloc", Linkage::Import, &realloc_signature)
+                .map_err(module_error)?;
 
-        let mut free_signature = object_module.make_signature();
-        free_signature
-            .params
-            .push(ir::AbiParam::new(ir::types::I64));
-        let free = object_module
-            .declare_function("free", Linkage::Import, &free_signature)
-            .map_err(module_error)?;
-        (Some(realloc), Some(free))
-    } else {
-        (None, None)
-    };
+            let mut free_signature = object_module.make_signature();
+            free_signature
+                .params
+                .push(ir::AbiParam::new(ir::types::I64));
+            let free = object_module
+                .declare_function("free", Linkage::Import, &free_signature)
+                .map_err(module_error)?;
+            (Some(realloc), Some(free))
+        } else {
+            (None, None)
+        };
 
-    let required_runtime_helpers = required_runtime_helper_symbols(module, config);
+    let required_runtime_helpers =
+        required_runtime_helper_symbols(module, config, required_symbols);
     let mut runtime_helpers = HashMap::new();
     for contract in config
         .target
@@ -1262,9 +1277,14 @@ fn runtime_helper_uses_f80(contract: &RuntimeHelperContract) -> bool {
 fn required_runtime_helper_symbols(
     module: &gir::FullModule,
     config: &EffectiveCompilationConfig,
+    required_symbols: &gir::SourceSymbolRequirements,
 ) -> HashSet<&'static str> {
     let mut required = HashSet::new();
-    for function in &module.functions {
+    for function in module
+        .functions
+        .iter()
+        .filter(|function| required_symbols.functions.contains(&function.id))
+    {
         for instruction in function.blocks.iter().flat_map(|block| &block.instructions) {
             match instruction.kind {
                 gir::FullInstructionKind::Binary { operator, left, .. }
@@ -1388,17 +1408,24 @@ fn required_runtime_helper_symbols(
     required
 }
 
-fn module_uses_runtime_sized_storage(module: &gir::FullModule) -> bool {
-    module.functions.iter().any(|function| {
-        function.blocks.iter().any(|block| {
-            block.instructions.iter().any(|instruction| {
-                matches!(
-                    instruction.kind,
-                    gir::FullInstructionKind::RuntimeSizedAllocate { .. }
-                )
+fn module_uses_runtime_sized_storage(
+    module: &gir::FullModule,
+    required_symbols: &gir::SourceSymbolRequirements,
+) -> bool {
+    module
+        .functions
+        .iter()
+        .filter(|function| required_symbols.functions.contains(&function.id))
+        .any(|function| {
+            function.blocks.iter().any(|block| {
+                block.instructions.iter().any(|instruction| {
+                    matches!(
+                        instruction.kind,
+                        gir::FullInstructionKind::RuntimeSizedAllocate { .. }
+                    )
+                })
             })
         })
-    })
 }
 
 #[derive(Clone, Copy)]
@@ -1410,9 +1437,14 @@ struct DirectCallUse {
 
 fn direct_call_signatures(
     module: &gir::FullModule,
+    required_symbols: &gir::SourceSymbolRequirements,
 ) -> Result<HashMap<u32, DirectCallUse>, CodegenError> {
     let mut signatures = HashMap::new();
-    for caller in &module.functions {
+    for caller in module
+        .functions
+        .iter()
+        .filter(|function| required_symbols.functions.contains(&function.id))
+    {
         for instruction in caller.blocks.iter().flat_map(|block| &block.instructions) {
             let gir::FullInstructionKind::DirectCall {
                 function: callee,

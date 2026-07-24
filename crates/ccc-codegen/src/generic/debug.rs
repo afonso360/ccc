@@ -279,7 +279,8 @@ impl<'a> DebugEmitter<'a> {
             }
             line_program.end_sequence(record.code_size);
         }
-        for function in &self.module.functions {
+        for record in &self.functions {
+            let function = &self.module.functions[record.function_index];
             ensure_span_file(
                 &mut line_program,
                 &mut file_ids,

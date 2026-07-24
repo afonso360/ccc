@@ -98,13 +98,10 @@ impl InliningPlan {
             if let Some(object_id) = object_id {
                 object_to_source.insert(object_id, function.id.0);
             } else if function.entry.is_some() {
-                return Err(inline_error(
-                    format!(
-                        "function definition `{}` has no object declaration",
-                        function.symbol_name
-                    ),
-                    function.span,
-                ));
+                // Source-symbol reachability intentionally leaves an
+                // unreferenced internal C `inline` definition without an
+                // object declaration or prepared body.
+                continue;
             }
 
             let boundary = abi_plan

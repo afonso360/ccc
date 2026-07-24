@@ -4,7 +4,7 @@ use ccc_pp::{PpItem, lex};
 use ccc_sema::generic::analyze_frontend;
 use ccc_session::SourceMap;
 use ccc_syntax::frontend as syntax;
-use ccc_target::{ENABLED_TARGET_SPECS, OptimizationLevel};
+use ccc_target::{OptimizationLevel, enabled_compilation_configs};
 use object::read::macho::Nlist as _;
 use object::{
     Object as _, ObjectSection as _, ObjectSymbol as _, RelocationEncoding, RelocationFlags,
@@ -50,13 +50,6 @@ fn lower_source_with_map(
 
 fn lower_source(source: &str) -> gir::FullModule {
     lower_source_with_config(source, &EffectiveCompilationConfig::default())
-}
-
-fn enabled_configs() -> impl Iterator<Item = EffectiveCompilationConfig> {
-    ENABLED_TARGET_SPECS.iter().map(|profile| {
-        EffectiveCompilationConfig::for_target(profile.triple.clone())
-            .expect("catalogued target has an effective configuration")
-    })
 }
 
 #[test]
@@ -355,6 +348,129 @@ fn unused_function_declarations_do_not_reach_elf_or_macho_objects() {
 }
 
 #[test]
+fn unreachable_static_inline_bodies_do_not_reach_clif_or_objects_on_enabled_targets() {
+    const SOURCE: &str = "extern int dead_import(int);\n\
+         extern int dead_variadic(int, ...);\n\
+         static inline int dead_leaf(int value) { return dead_import(value); }\n\
+         static inline int dead_bridge(int value) { return dead_variadic(value, 1); }\n\
+         static inline int dead_vla(int count) {\n\
+             int values[count];\n\
+             return values[0];\n\
+         }\n\
+         static inline int dead_left(int);\n\
+         static inline int dead_right(int value) {\n\
+             return value == 0 ? 0 : dead_left(value - 1);\n\
+         }\n\
+         static inline int dead_left(int value) {\n\
+             return value == 0 ? 0 : dead_right(value - 1);\n\
+         }\n\
+         static inline int live_leaf(int value) { return value + 1; }\n\
+         static inline int live_chain(int value) { return live_leaf(value); }\n\
+         static __attribute__((always_inline)) inline int live_forced(int value) {\n\
+             return value + 4;\n\
+         }\n\
+         static inline int live_left(int);\n\
+         static inline int live_right(int value) {\n\
+             return value == 0 ? 0 : live_left(value - 1);\n\
+         }\n\
+         static inline int live_left(int value) {\n\
+             return value == 0 ? 0 : live_right(value - 1);\n\
+         }\n\
+         static inline int addressed(int value) { return value + 2; }\n\
+         static inline int initialized(int value) { return value + 3; }\n\
+         int (*saved_callback)(int) = initialized;\n\
+         static int ordinary_internal(void) { return 17; }\n\
+         int externally_observable(void) { return 19; }\n\
+         int force_entry(int value) { return live_forced(value); }\n\
+         int entry(int value) {\n\
+             int (*callback)(int) = addressed;\n\
+             return live_chain(value) + live_left(value)\n\
+                 + callback(value) + saved_callback(value);\n\
+         }";
+
+    for base_config in enabled_compilation_configs() {
+        for optimization in [
+            OptimizationLevel::O0,
+            OptimizationLevel::O2,
+            OptimizationLevel::SizeMin,
+        ] {
+            let config = base_config.clone().with_optimization_level(optimization);
+            let output = emit_source_with_config(SOURCE, &config);
+            let object = object::File::parse(output.object.as_slice()).unwrap();
+            let prefix = if object.format() == object::BinaryFormat::MachO {
+                "_"
+            } else {
+                ""
+            };
+            assert!(
+                output.assemblies.is_empty(),
+                "{} {} packaged a helper needed only by unreachable inline code",
+                config.target.triple,
+                optimization.flag()
+            );
+
+            for name in [
+                "live_leaf",
+                "live_chain",
+                "live_forced",
+                "live_left",
+                "live_right",
+                "addressed",
+                "initialized",
+                "ordinary_internal",
+                "externally_observable",
+                "force_entry",
+                "entry",
+            ] {
+                assert!(
+                    output.clif.contains(&format!("; function {name}\n")),
+                    "{} {} omitted `{name}` from CLIF:\n{}",
+                    config.target.triple,
+                    optimization.flag(),
+                    output.clif
+                );
+                let symbol = format!("{prefix}{name}");
+                assert!(
+                    object
+                        .symbol_by_name(&symbol)
+                        .is_some_and(|symbol| symbol.is_definition()),
+                    "{} {} omitted object definition `{symbol}`",
+                    config.target.triple,
+                    optimization.flag()
+                );
+            }
+
+            for name in [
+                "dead_import",
+                "dead_variadic",
+                "dead_leaf",
+                "dead_bridge",
+                "dead_vla",
+                "dead_left",
+                "dead_right",
+                "realloc",
+                "free",
+            ] {
+                assert!(
+                    !output.clif.contains(&format!("; function {name}\n")),
+                    "{} {} retained `{name}` in CLIF:\n{}",
+                    config.target.triple,
+                    optimization.flag(),
+                    output.clif
+                );
+                let symbol = format!("{prefix}{name}");
+                assert!(
+                    object.symbol_by_name(&symbol).is_none(),
+                    "{} {} retained object symbol `{symbol}`",
+                    config.target.triple,
+                    optimization.flag()
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn referenced_function_declarations_preserve_attributes_in_elf_and_macho_objects() {
     const SOURCE: &str = "extern int called_hidden(int) __attribute__((visibility(\"hidden\")));\n\
          extern int called_protected(int) __attribute__((visibility(\"protected\")));\n\
@@ -479,7 +595,7 @@ fn unused_data_and_tls_declarations_emit_nothing_on_enabled_targets() {
          extern _Thread_local int unused_exact_tls asm(\"unused_physical_tls\");\n\
          int retained_definition(void) { return 0; }";
 
-    for config in enabled_configs() {
+    for config in enabled_compilation_configs() {
         let module = lower_source_with_config(SOURCE, &config);
         let plan = ccc_abi::plan_module(&module, &config).unwrap();
         assert!(
@@ -552,7 +668,7 @@ fn referenced_data_and_tls_declarations_preserve_source_contracts_on_enabled_tar
              return hidden_object + weak_object + *saved_object + imported_tls;\n\
          }";
 
-    for config in enabled_configs() {
+    for config in enabled_compilation_configs() {
         let module = lower_source_with_config(SOURCE, &config);
         let plan = ccc_abi::plan_module(&module, &config).unwrap();
         let tls = module
@@ -646,7 +762,7 @@ fn unreferenced_data_and_tls_definitions_remain_materialized_on_enabled_targets(
          _Thread_local int tls_definition = 3;\n\
          int entry(void) { return 0; }";
 
-    for config in enabled_configs() {
+    for config in enabled_compilation_configs() {
         let module = lower_source_with_config(SOURCE, &config);
         let plan = ccc_abi::plan_module(&module, &config).unwrap();
         let tls = module
@@ -702,12 +818,7 @@ fn unreferenced_data_and_tls_definitions_remain_materialized_on_enabled_targets(
 
 #[test]
 fn float16_values_lower_across_enabled_targets() {
-    for config in [
-        EffectiveCompilationConfig::default(),
-        EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
-        EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
-        EffectiveCompilationConfig::aarch64_apple_darwin(),
-    ] {
+    for config in enabled_compilation_configs() {
         for source in [
             "_Float16 initialized = 1.0;",
             "_Float16 defined(_Float16 value) { return value; }",
@@ -814,12 +925,7 @@ fn generic_and_file_compound_literals_emit_for_every_enabled_target() {
              _Generic(*value, int: *value, default: *value) = pair->left;
              return _Generic(pair->right, int: *value, default: 0);
          }";
-    for config in [
-        EffectiveCompilationConfig::default(),
-        EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
-        EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
-        EffectiveCompilationConfig::aarch64_apple_darwin(),
-    ] {
+    for config in enabled_compilation_configs() {
         let output = emit_source_with_config(source, &config);
         let object = object::File::parse(output.object.as_slice()).unwrap();
         assert!(
@@ -843,7 +949,10 @@ fn indirect_calls_select_the_conservative_returns_twice_codegen_profile() {
              return callback(value) + retained;\n\
          }",
     );
-    assert!(module_contains_returns_twice_call(&indirect));
+    assert!(module_contains_returns_twice_call(
+        &indirect,
+        &indirect.source_symbol_requirements()
+    ));
     assert!(indirect.functions[0].storage.iter().any(|storage| {
         storage
             .required_by
@@ -864,7 +973,10 @@ fn indirect_calls_select_the_conservative_returns_twice_codegen_profile() {
         "int ordinary(int value) { return value + 1; }\n\
          int invoke(int value) { return ordinary(value); }",
     );
-    assert!(!module_contains_returns_twice_call(&direct));
+    assert!(!module_contains_returns_twice_call(
+        &direct,
+        &direct.source_symbol_requirements()
+    ));
 }
 
 #[test]
@@ -1753,6 +1865,7 @@ fn debug_information_distinguishes_prototypes_and_locates_tls_definitions() {
     let (module, sources) = lower_source_with_map(
         "extern int unused_debug_object;\n\
          extern _Thread_local int unused_debug_tls;\n\
+         static inline int unused_debug_inline(void) { return 8; }\n\
          int debug_regular = 5;\n\
          _Thread_local int debug_tls = 7;\n\
          int (*unspecified_function_pointer)();\n\
@@ -1771,6 +1884,7 @@ fn debug_information_distinguishes_prototypes_and_locates_tls_definitions() {
     let object = object::File::parse(output.object.as_slice()).unwrap();
     assert!(object.symbol_by_name("unused_debug_object").is_none());
     assert!(object.symbol_by_name("unused_debug_tls").is_none());
+    assert!(object.symbol_by_name("unused_debug_inline").is_none());
 
     let debug_info = object.section_by_name(".debug_info").unwrap();
     assert!(debug_info.relocations().any(|(_, relocation)| {
@@ -1805,6 +1919,7 @@ fn debug_information_distinguishes_prototypes_and_locates_tls_definitions() {
     let unit = dwarf.unit(header).unwrap();
     let mut entries = unit.entries();
     let mut prototyped_subprogram = false;
+    let mut unused_inline_subprogram = false;
     let mut prototyped_subroutine_type = false;
     let mut unspecified_subroutine_type = false;
     let mut regular_location = false;
@@ -1821,6 +1936,10 @@ fn debug_information_distinguishes_prototypes_and_locates_tls_definitions() {
             .map(|name| name.to_string_lossy().into_owned());
         if entry.tag() == gimli::DW_TAG_subprogram && name.as_deref() == Some("prototyped") {
             prototyped_subprogram = has_prototype;
+        }
+        if entry.tag() == gimli::DW_TAG_subprogram && name.as_deref() == Some("unused_debug_inline")
+        {
+            unused_inline_subprogram = true;
         }
         if entry.tag() == gimli::DW_TAG_variable && name.as_deref() == Some("debug_regular") {
             regular_location = entry.has_attr(gimli::DW_AT_location);
@@ -1845,6 +1964,7 @@ fn debug_information_distinguishes_prototypes_and_locates_tls_definitions() {
         }
     }
     assert!(prototyped_subprogram);
+    assert!(!unused_inline_subprogram);
     assert!(prototyped_subroutine_type);
     assert!(unspecified_subroutine_type);
     assert!(regular_location);
@@ -2257,12 +2377,7 @@ fn tiny_functions_intern_only_referenced_clif_entities_on_every_target() {
                   int minimal(void) { return 0; }\n\
                   int call_puts(void) { return puts(\"hello\"); }\n\
                   int call_printf(void) { return printf(\"%d\", 7); }";
-    for config in [
-        EffectiveCompilationConfig::default(),
-        EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
-        EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
-        EffectiveCompilationConfig::aarch64_apple_darwin(),
-    ] {
+    for config in enabled_compilation_configs() {
         let output = emit_source_with_config(source, &config);
         let minimal = function_clif(&output.clif, "minimal");
         assert!(clif_entities(minimal, "sig").is_empty(), "{minimal}");
