@@ -4,7 +4,7 @@ use ccc_pp::{PpItem, lex};
 use ccc_sema::generic::analyze_frontend;
 use ccc_session::SourceMap;
 use ccc_syntax::frontend as syntax;
-use ccc_target::{EffectiveCompilationConfig, OptimizationLevel};
+use ccc_target::{ENABLED_TARGET_SPECS, EffectiveCompilationConfig, OptimizationLevel};
 use object::{Object as _, ObjectSymbol as _};
 
 const SMALL_LEAF: &str = "
@@ -12,13 +12,11 @@ const SMALL_LEAF: &str = "
     int caller(int value) { return leaf(value) * 3; }
 ";
 
-fn enabled_targets() -> [EffectiveCompilationConfig; 4] {
-    [
-        EffectiveCompilationConfig::x86_64_unknown_linux_gnu(),
-        EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
-        EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
-        EffectiveCompilationConfig::aarch64_apple_darwin(),
-    ]
+fn enabled_targets() -> impl Iterator<Item = EffectiveCompilationConfig> {
+    ENABLED_TARGET_SPECS.iter().map(|profile| {
+        EffectiveCompilationConfig::for_target(profile.triple.clone())
+            .expect("catalogued target has an effective configuration")
+    })
 }
 
 fn lower(source: &str, config: &EffectiveCompilationConfig) -> (SourceMap, FullModule) {
@@ -371,6 +369,53 @@ fn per_caller_site_budget_has_an_exact_deterministic_boundary() {
         assert_eq!(
             direct_call_count(function_clif(&first, "nine")),
             1,
+            "{}:\n{}",
+            config.target.triple,
+            first.clif
+        );
+    }
+}
+
+#[test]
+fn translation_unit_budget_has_an_exact_boundary_and_required_calls_override_it() {
+    let mut source = String::from(
+        "
+        static int leaf(int value) { return value + 1; }
+        static __attribute__((always_inline)) int forced(int value) {
+            return value + 2;
+        }
+        ",
+    );
+    for caller in 0..65 {
+        source.push_str(&format!(
+            "int caller_{caller}(int value) {{ return leaf(value); }}\n"
+        ));
+    }
+    source.push_str("int forced_caller(int value) { return forced(value); }\n");
+
+    for target in enabled_targets() {
+        let config = target.with_optimization_level(OptimizationLevel::O2);
+        let first = compile(&source, &config, false).unwrap();
+        let second = compile(&source, &config, false).unwrap();
+        assert_eq!(first.clif, second.clif, "{}", config.target.triple);
+        assert_eq!(first.object, second.object, "{}", config.target.triple);
+        assert_eq!(
+            direct_call_count(function_clif(&first, "caller_63")),
+            0,
+            "{}:\n{}",
+            config.target.triple,
+            first.clif
+        );
+        assert_eq!(
+            direct_call_count(function_clif(&first, "caller_64")),
+            1,
+            "{}:\n{}",
+            config.target.triple,
+            first.clif
+        );
+        assert_eq!(
+            direct_call_count(function_clif(&first, "forced_caller")),
+            0,
             "{}:\n{}",
             config.target.triple,
             first.clif

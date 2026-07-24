@@ -5,6 +5,7 @@
 //! intentionally leaves to its embedding compiler.
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use ccc_ir::generic as gir;
@@ -23,12 +24,29 @@ const MAX_HEURISTIC_CALLEE_BLOCKS: usize = 4;
 const MAX_HEURISTIC_SITES_PER_CALLER: usize = 8;
 const MAX_HEURISTIC_INSTRUCTION_GROWTH_PER_CALLER: usize = 96;
 const MAX_HEURISTIC_BLOCK_GROWTH_PER_CALLER: usize = 16;
+// Permit at most eight fully budgeted callers before a translation unit stops
+// selecting optional sites. This is a safety ceiling, not profile tuning.
+const MAX_HEURISTIC_SITES_PER_TRANSLATION_UNIT: usize = 64;
+const MAX_HEURISTIC_INSTRUCTION_GROWTH_PER_TRANSLATION_UNIT: usize = 768;
+const MAX_HEURISTIC_BLOCK_GROWTH_PER_TRANSLATION_UNIT: usize = 128;
+
+const CALLER_LIMITS: GrowthLimits = GrowthLimits {
+    sites: MAX_HEURISTIC_SITES_PER_CALLER,
+    instructions: MAX_HEURISTIC_INSTRUCTION_GROWTH_PER_CALLER,
+    blocks: MAX_HEURISTIC_BLOCK_GROWTH_PER_CALLER,
+};
+const TRANSLATION_UNIT_LIMITS: GrowthLimits = GrowthLimits {
+    sites: MAX_HEURISTIC_SITES_PER_TRANSLATION_UNIT,
+    instructions: MAX_HEURISTIC_INSTRUCTION_GROWTH_PER_TRANSLATION_UNIT,
+    blocks: MAX_HEURISTIC_BLOCK_GROWTH_PER_TRANSLATION_UNIT,
+};
 
 pub(super) struct InliningPlan {
     functions: BTreeMap<u32, FunctionInfo>,
     object_to_source: BTreeMap<u32, u32>,
     heuristic_enabled: bool,
     debug_enabled: bool,
+    translation_unit_growth: Cell<GrowthBudget>,
 }
 
 struct FunctionInfo {
@@ -150,6 +168,7 @@ impl InliningPlan {
             object_to_source,
             heuristic_enabled,
             debug_enabled,
+            translation_unit_growth: Cell::new(GrowthBudget::default()),
         };
         plan.validate_required_calls(module)?;
         Ok(plan)
@@ -159,7 +178,7 @@ impl InliningPlan {
         InliningPolicy {
             plan: self,
             caller,
-            budget: CallerBudget::default(),
+            caller_growth: GrowthBudget::default(),
         }
     }
 
@@ -237,7 +256,7 @@ impl InliningPlan {
 pub(super) struct InliningPolicy<'a> {
     plan: &'a InliningPlan,
     caller: u32,
-    budget: CallerBudget,
+    caller_growth: GrowthBudget,
 }
 
 impl InliningPolicy<'_> {
@@ -282,51 +301,68 @@ impl InliningPolicy<'_> {
     }
 
     fn heuristic_budget_allows(&self, target: &FunctionInfo) -> bool {
-        self.budget.allows(
+        callee_size_allows(
             target.instruction_count,
             target.block_count,
             target.inline_hint,
-        )
+        ) && self
+            .caller_growth
+            .allows(target.instruction_count, target.block_count, CALLER_LIMITS)
+            && self.plan.translation_unit_growth.get().allows(
+                target.instruction_count,
+                target.block_count,
+                TRANSLATION_UNIT_LIMITS,
+            )
     }
 
     fn record_inline(&mut self, target: &FunctionInfo) {
-        self.budget
+        self.caller_growth
             .record(target.instruction_count, target.block_count);
+        let mut translation_unit = self.plan.translation_unit_growth.get();
+        translation_unit.record(target.instruction_count, target.block_count);
+        self.plan.translation_unit_growth.set(translation_unit);
     }
 }
 
+fn callee_size_allows(instructions: usize, blocks: usize, inline_hint: bool) -> bool {
+    let instruction_limit = if inline_hint {
+        MAX_INLINE_HINT_CALLEE_INSTRUCTIONS
+    } else {
+        MAX_HEURISTIC_CALLEE_INSTRUCTIONS
+    };
+    instructions <= instruction_limit && blocks <= MAX_HEURISTIC_CALLEE_BLOCKS
+}
+
 #[derive(Clone, Copy, Default)]
-struct CallerBudget {
+struct GrowthBudget {
     sites: usize,
     instruction_growth: usize,
     block_growth: usize,
 }
 
-impl CallerBudget {
-    fn allows(self, instructions: usize, blocks: usize, inline_hint: bool) -> bool {
-        let instruction_limit = if inline_hint {
-            MAX_INLINE_HINT_CALLEE_INSTRUCTIONS
-        } else {
-            MAX_HEURISTIC_CALLEE_INSTRUCTIONS
-        };
+#[derive(Clone, Copy)]
+struct GrowthLimits {
+    sites: usize,
+    instructions: usize,
+    blocks: usize,
+}
+
+impl GrowthBudget {
+    fn allows(self, instructions: usize, blocks: usize, limits: GrowthLimits) -> bool {
         // Cranelift replaces the original call with a jump, clones every
         // callee instruction and block, and normally splits out a continuation
         // block. Charge that full structural growth rather than assuming that
         // the call or callee return disappears during this transformation.
-        let instruction_growth = instructions;
         let block_growth = blocks.saturating_add(1);
-        instructions <= instruction_limit
-            && blocks <= MAX_HEURISTIC_CALLEE_BLOCKS
-            && self.sites < MAX_HEURISTIC_SITES_PER_CALLER
-            && self.instruction_growth + instruction_growth
-                <= MAX_HEURISTIC_INSTRUCTION_GROWTH_PER_CALLER
-            && self.block_growth + block_growth <= MAX_HEURISTIC_BLOCK_GROWTH_PER_CALLER
+        self.sites < limits.sites
+            && self.instruction_growth.saturating_add(instructions) <= limits.instructions
+            && self.block_growth.saturating_add(block_growth) <= limits.blocks
     }
 
     fn record(&mut self, instructions: usize, blocks: usize) {
-        self.sites += 1;
-        self.instruction_growth += instructions;
-        self.block_growth += blocks.saturating_add(1);
+        self.sites = self.sites.saturating_add(1);
+        self.instruction_growth = self.instruction_growth.saturating_add(instructions);
+        self.block_growth = self.block_growth.saturating_add(blocks.saturating_add(1));
     }
 }
 
@@ -575,46 +611,77 @@ mod tests {
 
     #[test]
     fn exact_heuristic_budget_boundaries_are_inclusive() {
-        let empty = CallerBudget::default();
-        assert!(empty.allows(MAX_HEURISTIC_CALLEE_INSTRUCTIONS, 1, false));
-        assert!(!empty.allows(MAX_HEURISTIC_CALLEE_INSTRUCTIONS + 1, 1, false));
-        assert!(empty.allows(MAX_INLINE_HINT_CALLEE_INSTRUCTIONS, 1, true));
-        assert!(!empty.allows(MAX_INLINE_HINT_CALLEE_INSTRUCTIONS + 1, 1, true));
-        assert!(empty.allows(1, MAX_HEURISTIC_CALLEE_BLOCKS, false));
-        assert!(!empty.allows(1, MAX_HEURISTIC_CALLEE_BLOCKS + 1, false));
+        assert!(callee_size_allows(
+            MAX_HEURISTIC_CALLEE_INSTRUCTIONS,
+            1,
+            false
+        ));
+        assert!(!callee_size_allows(
+            MAX_HEURISTIC_CALLEE_INSTRUCTIONS + 1,
+            1,
+            false
+        ));
+        assert!(callee_size_allows(
+            MAX_INLINE_HINT_CALLEE_INSTRUCTIONS,
+            1,
+            true
+        ));
+        assert!(!callee_size_allows(
+            MAX_INLINE_HINT_CALLEE_INSTRUCTIONS + 1,
+            1,
+            true
+        ));
+        assert!(callee_size_allows(1, MAX_HEURISTIC_CALLEE_BLOCKS, false));
+        assert!(!callee_size_allows(
+            1,
+            MAX_HEURISTIC_CALLEE_BLOCKS + 1,
+            false
+        ));
 
-        let last_site = CallerBudget {
+        let last_site = GrowthBudget {
             sites: MAX_HEURISTIC_SITES_PER_CALLER - 1,
-            ..CallerBudget::default()
+            ..GrowthBudget::default()
         };
-        assert!(last_site.allows(1, 1, false));
-        let no_sites = CallerBudget {
+        assert!(last_site.allows(1, 1, CALLER_LIMITS));
+        let no_sites = GrowthBudget {
             sites: MAX_HEURISTIC_SITES_PER_CALLER,
-            ..CallerBudget::default()
+            ..GrowthBudget::default()
         };
-        assert!(!no_sites.allows(1, 1, false));
+        assert!(!no_sites.allows(1, 1, CALLER_LIMITS));
 
-        let instruction_edge = CallerBudget {
+        let instruction_edge = GrowthBudget {
             instruction_growth: MAX_HEURISTIC_INSTRUCTION_GROWTH_PER_CALLER
                 - MAX_HEURISTIC_CALLEE_INSTRUCTIONS,
-            ..CallerBudget::default()
+            ..GrowthBudget::default()
         };
-        assert!(instruction_edge.allows(MAX_HEURISTIC_CALLEE_INSTRUCTIONS, 1, false));
-        let instruction_over = CallerBudget {
+        assert!(instruction_edge.allows(MAX_HEURISTIC_CALLEE_INSTRUCTIONS, 1, CALLER_LIMITS));
+        let instruction_over = GrowthBudget {
             instruction_growth: instruction_edge.instruction_growth + 1,
-            ..CallerBudget::default()
+            ..GrowthBudget::default()
         };
-        assert!(!instruction_over.allows(MAX_HEURISTIC_CALLEE_INSTRUCTIONS, 1, false));
+        assert!(!instruction_over.allows(MAX_HEURISTIC_CALLEE_INSTRUCTIONS, 1, CALLER_LIMITS));
 
-        let block_edge = CallerBudget {
+        let block_edge = GrowthBudget {
             block_growth: MAX_HEURISTIC_BLOCK_GROWTH_PER_CALLER - (MAX_HEURISTIC_CALLEE_BLOCKS + 1),
-            ..CallerBudget::default()
+            ..GrowthBudget::default()
         };
-        assert!(block_edge.allows(1, MAX_HEURISTIC_CALLEE_BLOCKS, false));
-        let block_over = CallerBudget {
+        assert!(block_edge.allows(1, MAX_HEURISTIC_CALLEE_BLOCKS, CALLER_LIMITS));
+        let block_over = GrowthBudget {
             block_growth: block_edge.block_growth + 1,
-            ..CallerBudget::default()
+            ..GrowthBudget::default()
         };
-        assert!(!block_over.allows(1, MAX_HEURISTIC_CALLEE_BLOCKS, false));
+        assert!(!block_over.allows(1, MAX_HEURISTIC_CALLEE_BLOCKS, CALLER_LIMITS));
+
+        let translation_unit_edge = GrowthBudget {
+            sites: MAX_HEURISTIC_SITES_PER_TRANSLATION_UNIT - 1,
+            instruction_growth: MAX_HEURISTIC_INSTRUCTION_GROWTH_PER_TRANSLATION_UNIT - 1,
+            block_growth: MAX_HEURISTIC_BLOCK_GROWTH_PER_TRANSLATION_UNIT - 2,
+        };
+        assert!(translation_unit_edge.allows(1, 1, TRANSLATION_UNIT_LIMITS));
+        let translation_unit_full = GrowthBudget {
+            sites: MAX_HEURISTIC_SITES_PER_TRANSLATION_UNIT,
+            ..GrowthBudget::default()
+        };
+        assert!(!translation_unit_full.allows(1, 1, TRANSLATION_UNIT_LIMITS));
     }
 }

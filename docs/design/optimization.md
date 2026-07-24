@@ -78,16 +78,19 @@ their function-local user-name references, so CCC keeps those candidates out
 instead of adding a duplicate backend remapper. The raw-CLIF limits are 24
 instructions (32 when the C `inline` specifier supplies a hint), four blocks,
 eight sites per caller, 96 estimated instructions of caller growth, and 16
-estimated blocks of caller growth. Traversal is depth one
-(`visit_callee=false`), and every original definition is still emitted as an
-out-of-line symbol.
+estimated blocks of caller growth. Across the translation unit, optional sites
+stop after 64 calls, 768 estimated instructions, or 128 estimated blocks of
+growth—eight fully budgeted callers. Source-function and CLIF layout order make
+that boundary deterministic. Traversal is depth one (`visit_callee=false`),
+and every original definition is still emitted as an out-of-line symbol.
 
 A safe internal leaf marked `always_inline` is required at every optimization
-level and ignores the heuristic size and growth limits. If its direct call
-cannot satisfy the initial safety contract, code generation reports `CCC4012`
-instead of silently retaining the call. Exact `noinline` always wins; semantic
-analysis rejects a declaration that combines the two attributes before code
-generation.
+level and overrides the heuristic size and growth limits, while its actual
+growth is still charged before considering later optional calls. If its direct
+call cannot satisfy the initial safety contract, code generation reports
+`CCC4012` instead of silently retaining the call. Exact `noinline` always wins;
+semantic analysis rejects a declaration that combines the two attributes
+before code generation.
 
 Heuristic inlining is disabled when source debug information is requested
 because CCC does not yet emit inlined-subroutine DIEs and abstract origins. A

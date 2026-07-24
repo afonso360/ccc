@@ -67,10 +67,12 @@ definitions remain emitted.
 - Keep user-named symbolic global values out until Cranelift remaps their
   function-local user-name references while cloning global values. Track that
   upstream rather than maintaining a second CCC-side entity remapper.
-- Add a translation-unit growth budget and benchmark-derived, separately tuned
-  `-O2` and `-O3` instruction/block/site limits. The current deterministic
-  depth-one policy has exact per-callee and per-caller limits but deliberately
-  has no profile-specific tuning.
+- Replace the initial translation-unit ceiling—eight fully budgeted callers,
+  bounded by 64 optional sites, 768 estimated instructions, and 128 estimated
+  blocks—with benchmark-derived, separately tuned `-O2` and `-O3` limits. The
+  deterministic depth-one policy now has exact per-callee, per-caller, and
+  whole-translation-unit bounds but deliberately has no profile-specific
+  tuning.
 - Decide whether `-Os`/`-Oz` may inline only after measuring a net encoded-size
   reduction rather than assuming raw CLIF counts predict machine-code size.
 - Broaden the set of safely honor-able `always_inline` definitions. Continue
