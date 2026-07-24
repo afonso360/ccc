@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod support;
+
 static TEST_ID: AtomicU64 = AtomicU64::new(0);
 const ENABLED_TARGETS: [&str; 4] = [
     "x86_64-unknown-linux-gnu",
@@ -27,10 +29,6 @@ impl TestDirectory {
         Self { path }
     }
 
-    #[cfg(any(
-        all(target_arch = "x86_64", target_os = "linux"),
-        all(target_arch = "aarch64", target_os = "macos")
-    ))]
     fn write(&self, relative: &str, contents: &str) -> PathBuf {
         let path = self.path.join(relative);
         if let Some(parent) = path.parent() {
@@ -40,9 +38,13 @@ impl TestDirectory {
         path
     }
 
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    #[cfg(any(
+        all(target_arch = "x86_64", target_os = "linux"),
+        all(target_arch = "aarch64", target_os = "linux"),
+        all(target_arch = "riscv64", target_os = "linux")
+    ))]
     fn command(&self) -> Command {
-        self.command_for_target("x86_64-unknown-linux-gnu")
+        self.command_for_target(support::native_linux_target_triple())
     }
 
     fn command_for_target(&self, target: &str) -> Command {
@@ -171,46 +173,14 @@ fn apple_math_private_classification_helpers_reach_the_ast_without_public_replac
     );
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-fn installed_environment_identity() -> String {
-    let features = fs::read_to_string("/usr/include/features.h")
-        .expect("the installed-header parser gate requires /usr/include/features.h");
-    assert!(
-        features.contains("__GLIBC__"),
-        "features.h is not from glibc"
-    );
-
-    let compiler = Command::new("cc")
-        .arg("--version")
-        .output()
-        .expect("the installed-header parser gate requires cc");
-    assert!(compiler.status.success(), "cc --version failed");
-    let target = Command::new("cc")
-        .arg("-dumpmachine")
-        .output()
-        .expect("the installed-header parser gate requires cc -dumpmachine");
-    assert!(target.status.success(), "cc -dumpmachine failed");
-    let libc = Command::new("getconf")
-        .arg("GNU_LIBC_VERSION")
-        .output()
-        .expect("the installed-header parser gate requires getconf");
-    assert!(libc.status.success(), "getconf GNU_LIBC_VERSION failed");
-
-    format!(
-        "compiler={}; target={}; libc={}",
-        String::from_utf8_lossy(&compiler.stdout)
-            .lines()
-            .next()
-            .unwrap_or("unknown compiler"),
-        String::from_utf8_lossy(&target.stdout).trim(),
-        String::from_utf8_lossy(&libc.stdout).trim()
-    )
-}
-
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "riscv64", target_os = "linux")
+))]
 #[test]
 fn installed_target_glibc_declarations_reach_the_ast_intact() {
-    let identity = installed_environment_identity();
+    let identity = support::installed_glibc_identity();
     eprintln!("installed-header parser gate: {identity}");
     let directory = TestDirectory::new("installed-glibc");
     let source = directory.write(
@@ -266,10 +236,14 @@ fn installed_target_glibc_declarations_reach_the_ast_intact() {
     );
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "riscv64", target_os = "linux")
+))]
 #[test]
 fn installed_target_glibc_declarations_compile_link_and_execute() {
-    let identity = installed_environment_identity();
+    let identity = support::installed_glibc_identity();
     eprintln!("installed-header code-generation gate: {identity}");
     let directory = TestDirectory::new("installed-glibc-codegen");
     let source = directory.write(

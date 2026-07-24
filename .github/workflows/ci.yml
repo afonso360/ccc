@@ -63,6 +63,7 @@ jobs:
             qemu: false
             oracle: x86_64-linux
             ccc_bin: target/debug/ccc
+            target_cc: gcc
           - name: Linux AArch64
             runner: ubuntu-24.04-arm
             packages: >-
@@ -72,6 +73,7 @@ jobs:
             qemu: false
             oracle: aarch64-linux
             ccc_bin: target/debug/ccc
+            target_cc: gcc
           - name: Linux RISC-V64 under QEMU
             runner: ubuntu-24.04
             packages: >-
@@ -82,6 +84,7 @@ jobs:
             qemu: true
             oracle: riscv64-linux
             ccc_bin: target/riscv64gc-unknown-linux-gnu/debug/ccc
+            target_cc: riscv64-linux-gnu-gcc
           - name: macOS AArch64
             runner: macos-26
             packages: ""
@@ -89,6 +92,9 @@ jobs:
             qemu: false
             oracle: darwin-arm64
             ccc_bin: target/debug/ccc
+            target_cc: /usr/bin/cc
+    env:
+      CCC_CC: ${{ matrix.target_cc }}
 
     steps:
       - uses: actions/checkout@v6
@@ -112,7 +118,6 @@ jobs:
           echo 'CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_LINKER=riscv64-linux-gnu-gcc' >> "$GITHUB_ENV"
           echo 'CARGO_TARGET_RISCV64GC_UNKNOWN_LINUX_GNU_RUNNER=qemu-riscv64 -L /usr/riscv64-linux-gnu' >> "$GITHUB_ENV"
           echo 'CARGO_PROFILE_DEV_OPT_LEVEL=2' >> "$GITHUB_ENV"
-          echo 'CCC_CC=riscv64-linux-gnu-gcc' >> "$GITHUB_ENV"
           echo 'QEMU_LD_PREFIX=/usr/riscv64-linux-gnu' >> "$GITHUB_ENV"
 
       - name: Verify RISC-V QEMU

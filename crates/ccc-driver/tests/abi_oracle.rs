@@ -1,5 +1,9 @@
 #![cfg(all(target_arch = "x86_64", target_os = "linux"))]
 
+// This oracle compares the System V AMD64 classifier and x86-64 ELF layout
+// with two independent compilers. Target-neutral and per-psABI evidence lives
+// in the workspace tests and tests/target-oracle/run.sh.
+
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};

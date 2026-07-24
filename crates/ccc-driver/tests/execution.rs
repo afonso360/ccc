@@ -524,6 +524,8 @@ int main(void) {
     fs::remove_dir_all(directory).unwrap();
 }
 
+// GNU __int128 values and runtime-provider boundaries are currently enabled
+// only for the System V AMD64 profile. The other execution suites still run.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
 fn wide_integer_runtime_helpers_resolve_through_the_ccc_link_path() {
@@ -800,6 +802,8 @@ fn invalid_runtime_sized_storage_extents_trap() {
     }
 }
 
+// This is the independently provisioned GCC ASan/LSan provider gate, not a
+// restriction on the portable runtime-sized-storage execution cases above.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
 fn runtime_sized_storage_links_with_gcc_as_pie_and_has_no_leaks() {

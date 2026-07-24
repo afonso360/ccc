@@ -16,6 +16,8 @@ use object::{
     SectionKind, SymbolKind,
 };
 
+mod support;
+
 static TEST_ID: AtomicU64 = AtomicU64::new(0);
 
 fn test_directory(name: &str) -> PathBuf {
@@ -472,6 +474,8 @@ int call_imported(void) {
     fs::remove_dir_all(directory).unwrap();
 }
 
+// This pins the exact AMD64 relocation vocabulary. The target-oracle runner
+// checks the corresponding AArch64 and RISC-V ELF relocation families.
 #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
 #[test]
 fn thread_local_objects_use_the_selected_elf_relocation_models() {
@@ -1192,14 +1196,19 @@ int internal_value asm("{ccc_value_symbol}") = 6;
     fs::remove_dir_all(directory).unwrap();
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "riscv64", target_os = "linux")
+))]
 #[test]
 fn glibc_redirect_assembly_labels_form_elf_symbols_that_link() {
     let directory = test_directory("glibc-redirect-labels");
     let reference = ReferenceCompiler::required();
+    let identity = support::installed_glibc_identity();
     eprintln!(
-        "glibc redirect reference compiler: {}",
-        reference.identity()
+        "glibc redirect target environment: {identity}; link driver={}",
+        reference.identity(),
     );
     let source = write_source(
         &directory,

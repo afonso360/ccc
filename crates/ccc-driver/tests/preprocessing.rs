@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use object::{Object as _, ObjectSymbol as _};
 
+mod support;
+
 static TEST_ID: AtomicU64 = AtomicU64::new(0);
 const ENABLED_TARGETS: [&str; 4] = [
     "x86_64-unknown-linux-gnu",
@@ -251,55 +253,6 @@ fn normalize_fixture_snapshot(text: &str) -> String {
         .join("\n");
     normalized.push('\n');
     normalized
-}
-
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-fn installed_glibc_identity() -> (String, String, String) {
-    let installed_header = Path::new("/usr/include/features.h");
-    let installed_contents = fs::read_to_string(installed_header)
-        .expect("the Linux hosted-header gate requires /usr/include/features.h");
-    assert!(
-        installed_contents.contains("__GLIBC__"),
-        "the installed features.h is not a glibc header"
-    );
-
-    let compiler = Command::new("cc")
-        .arg("--version")
-        .output()
-        .expect("the Linux hosted-header gate requires cc");
-    assert!(compiler.status.success(), "cc --version failed");
-    let compiler_target = Command::new("cc")
-        .arg("-dumpmachine")
-        .output()
-        .expect("the Linux hosted-header gate requires cc -dumpmachine");
-    assert!(
-        compiler_target.status.success(),
-        "cc -dumpmachine failed with {}",
-        compiler_target.status
-    );
-    let libc = Command::new("getconf")
-        .arg("GNU_LIBC_VERSION")
-        .output()
-        .expect("the Linux hosted-header gate requires getconf");
-    assert!(
-        libc.status.success(),
-        "getconf GNU_LIBC_VERSION failed with {}",
-        libc.status
-    );
-
-    let compiler_identity = String::from_utf8_lossy(&compiler.stdout)
-        .lines()
-        .next()
-        .unwrap_or("unknown compiler")
-        .to_owned();
-    let compiler_target = String::from_utf8_lossy(&compiler_target.stdout)
-        .trim()
-        .to_owned();
-    let libc_identity = String::from_utf8_lossy(&libc.stdout).trim().to_owned();
-    eprintln!(
-        "hosted-header gate: compiler={compiler_identity}; target={compiler_target}; libc={libc_identity}"
-    );
-    (compiler_identity, compiler_target, libc_identity)
 }
 
 #[test]
@@ -1422,10 +1375,15 @@ fn parses_the_curated_hosted_header_tree_as_system_headers() {
     }
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "riscv64", target_os = "linux")
+))]
 #[test]
 fn preprocesses_installed_target_glibc_headers() {
-    let (compiler_identity, compiler_target, libc_identity) = installed_glibc_identity();
+    let identity = support::installed_glibc_identity();
+    eprintln!("hosted-header gate: {identity}");
 
     let directory = TestDirectory::new("installed-glibc-header");
     let source = directory.write(
@@ -1449,12 +1407,12 @@ fn preprocesses_installed_target_glibc_headers() {
         ),
     );
 
-    let mut command = directory.command();
+    let mut command = directory.command_for_target(support::native_linux_target_triple());
     command.args(["-E", "-P"]).arg(source);
     let result = run(command);
     assert!(
         result.status.success(),
-        "hosted-header gate failed for {compiler_identity}; {compiler_target}; {libc_identity}\nstdout:\n{}\nstderr:\n{}",
+        "hosted-header gate failed for {identity}\nstdout:\n{}\nstderr:\n{}",
         result.stdout,
         result.stderr
     );
@@ -1483,10 +1441,15 @@ fn preprocesses_installed_target_glibc_headers() {
     }
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "riscv64", target_os = "linux")
+))]
 #[test]
 fn parses_installed_target_glibc_headers() {
-    let (compiler_identity, compiler_target, libc_identity) = installed_glibc_identity();
+    let identity = support::installed_glibc_identity();
+    eprintln!("hosted-header gate: {identity}");
     let directory = TestDirectory::new("installed-glibc-header-parse");
     let source = directory.write(
         "installed-parse.c",
@@ -1510,12 +1473,12 @@ fn parses_installed_target_glibc_headers() {
         ),
     );
 
-    let mut command = directory.command();
+    let mut command = directory.command_for_target(support::native_linux_target_triple());
     command.arg("--dump-ast").arg(source);
     let result = run(command);
     assert!(
         result.status.success(),
-        "hosted-header parse gate failed for {compiler_identity}; {compiler_target}; {libc_identity}\nstdout:\n{}\nstderr:\n{}",
+        "hosted-header parse gate failed for {identity}\nstdout:\n{}\nstderr:\n{}",
         result.stdout,
         result.stderr
     );

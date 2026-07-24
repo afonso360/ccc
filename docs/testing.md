@@ -57,6 +57,14 @@ Clang. `CCC_ABI_GCC` and `CCC_ABI_CLANG` may name target-qualified driver
 commands. Native execution tests require the enabled host's assembler, linker,
 runtime libraries, and object tools.
 
+Set `CCC_CC` to the compiler driver for the Rust test profile. CI sets it
+job-wide to native GCC on x86-64 and AArch64 Linux, the RISC-V cross GCC under
+QEMU, and Apple Clang on Darwin. The installed-header preprocessing, parsing,
+linking, and glibc assembly-label tests reject a driver whose `-dumpmachine`
+architecture does not match the Rust test target. The RISC-V profile relies on
+the configured binfmt/QEMU runner when those tests execute child binaries;
+those executions are correctness evidence, not native timing evidence.
+
 Run the workspace command on each supported host profile. The RISC-V CI profile
 uses these exact settings:
 
