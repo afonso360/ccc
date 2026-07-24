@@ -2,7 +2,7 @@ use ccc_pp::{PpItem, lex};
 use ccc_sema::generic::analyze_frontend;
 use ccc_session::SourceMap;
 use ccc_syntax::frontend as syntax;
-use ccc_target::{EffectiveCompilationConfig, OptimizationLevel};
+use ccc_target::{EffectiveCompilationConfig, OptimizationLevel, enabled_compilation_configs};
 
 use super::super::super::{
     BinaryOperation, FullInstructionKind, FullModule, dump_frontend_ir, lower_frontend,
@@ -119,12 +119,7 @@ fn every_enabled_profile_reaches_a_stable_verified_form() {
                       if (1) return duplicate + (x + 1);
                       return 0;
                   }";
-    for base in [
-        EffectiveCompilationConfig::x86_64_unknown_linux_gnu(),
-        EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
-        EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
-        EffectiveCompilationConfig::aarch64_apple_darwin(),
-    ] {
+    for base in enabled_compilation_configs() {
         for level in [
             OptimizationLevel::O1,
             OptimizationLevel::O2,
@@ -196,12 +191,7 @@ fn negative_switch_constants_match_at_the_selector_width_on_every_target() {
                           default: return 2;
                       }
                   }";
-    for base in [
-        EffectiveCompilationConfig::x86_64_unknown_linux_gnu(),
-        EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
-        EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
-        EffectiveCompilationConfig::aarch64_apple_darwin(),
-    ] {
+    for base in enabled_compilation_configs() {
         for level in [
             OptimizationLevel::O1,
             OptimizationLevel::O2,

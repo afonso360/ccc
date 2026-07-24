@@ -4,7 +4,7 @@ use ccc_pp::{PpItem, lex};
 use ccc_sema::generic::analyze_frontend;
 use ccc_session::SourceMap;
 use ccc_syntax::frontend as syntax;
-use ccc_target::EffectiveCompilationConfig;
+use ccc_target::{EffectiveCompilationConfig, enabled_compilation_configs};
 use object::{Object as _, ObjectSymbol as _};
 
 fn lower(source: &str, config: &EffectiveCompilationConfig) -> gir::FullModule {
@@ -20,15 +20,6 @@ fn lower(source: &str, config: &EffectiveCompilationConfig) -> gir::FullModule {
     module
 }
 
-fn enabled_targets() -> [EffectiveCompilationConfig; 4] {
-    [
-        EffectiveCompilationConfig::default(),
-        EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
-        EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
-        EffectiveCompilationConfig::aarch64_apple_darwin(),
-    ]
-}
-
 #[test]
 fn runtime_layout_and_storage_emit_for_every_target() {
     let source = "
@@ -40,7 +31,7 @@ fn runtime_layout_and_storage_emit_for_every_target() {
             return sizeof(matrix) + sizeof(Row) + cast_size + matrix[rows - 1][columns - 2];
         }
     ";
-    for config in enabled_targets() {
+    for config in enabled_compilation_configs() {
         let output = emit(
             &lower(source, &config),
             &config,
@@ -105,7 +96,7 @@ fn runtime_sizeof_without_storage_needs_no_allocator_provider() {
             return sizeof(Vector) + extent;
         }
     ";
-    for config in enabled_targets() {
+    for config in enabled_compilation_configs() {
         let output = emit(
             &lower(source, &config),
             &config,

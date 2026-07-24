@@ -4,7 +4,10 @@ use ccc_pp::{
 };
 use ccc_session::{Session, SourceMap};
 use ccc_syntax::frontend::{self as syntax, ExternalItem};
-use ccc_target::{CapabilityKind, CapabilityState, EffectiveCompilationConfig, LanguageMode};
+use ccc_target::{
+    CapabilityKind, CapabilityState, EffectiveCompilationConfig, LanguageMode,
+    enabled_compilation_configs,
+};
 use ccc_types::{ArrayLength, TypeId, TypeKind, TypeQualifiers};
 
 use super::*;
@@ -3879,12 +3882,7 @@ fn enabled_target_tls_and_variadic_alignment_contracts_are_exact() {
         "int read(void) { static _Thread_local int block_value; return block_value; }",
         "int read(void) { extern _Thread_local int block_value; return block_value; }",
     ];
-    for config in [
-        EffectiveCompilationConfig::default(),
-        EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
-        EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
-        EffectiveCompilationConfig::aarch64_apple_darwin(),
-    ] {
+    for config in enabled_compilation_configs() {
         for source in tls_sources {
             analyze_source_with_config(source, &config).unwrap_or_else(|diagnostics| {
                 panic!(
@@ -3900,12 +3898,7 @@ fn enabled_target_tls_and_variadic_alignment_contracts_are_exact() {
          struct Pair read(int count, ...) { va_list list;\n\
            __builtin_va_start(list, count);\n\
            return __builtin_va_arg(list, struct Pair); }";
-    for config in [
-        EffectiveCompilationConfig::default(),
-        EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
-        EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
-        EffectiveCompilationConfig::aarch64_apple_darwin(),
-    ] {
+    for config in enabled_compilation_configs() {
         analyze_source_with_config(aligned_va_arg, &config).unwrap_or_else(|diagnostics| {
             panic!(
                 "{} rejected a supported 16-byte aligned va_arg: {diagnostics:#?}",
@@ -4085,12 +4078,7 @@ fn compiler_128_bit_integers_have_target_gated_value_transport() {
              (void)first;\n\
          }\n\
          __int128 declaration_only(__uint128_t);";
-    for config in [
-        EffectiveCompilationConfig::default(),
-        EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
-        EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
-        EffectiveCompilationConfig::aarch64_apple_darwin(),
-    ] {
+    for config in enabled_compilation_configs() {
         analyze_source_with_config(storage_source, &config).unwrap_or_else(|diagnostics| {
             panic!(
                 "{} rejected layout-only 128-bit storage: {diagnostics:#?}",
@@ -4121,12 +4109,7 @@ fn compiler_128_bit_integers_have_target_gated_value_transport() {
     )
     .unwrap();
 
-    for config in [
-        EffectiveCompilationConfig::default(),
-        EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
-        EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
-        EffectiveCompilationConfig::aarch64_apple_darwin(),
-    ] {
+    for config in enabled_compilation_configs() {
         for source in [
             "_Atomic(__int128) value;",
             "_Atomic unsigned __int128 value;",

@@ -363,7 +363,7 @@ pub(crate) fn validate_target(config: &EffectiveCompilationConfig) -> Result<(),
 
 #[cfg(test)]
 mod bridge_high_water_tests {
-    use ccc_target::{AbiIdentity, EffectiveCompilationConfig};
+    use ccc_target::{AbiIdentity, enabled_compilation_configs};
     use ccc_types::{FunctionType, QualifiedType, TypeId, TypeStore};
 
     use super::{plan_variadic_call, validate_bridge_register_high_water};
@@ -375,12 +375,7 @@ mod bridge_high_water_tests {
             QualifiedType::unqualified(TypeId::INT),
             vec![QualifiedType::unqualified(TypeId::INT)],
         ));
-        for config in [
-            EffectiveCompilationConfig::default(),
-            EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
-            EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
-            EffectiveCompilationConfig::aarch64_apple_darwin(),
-        ] {
+        for config in enabled_compilation_configs() {
             let plan = plan_variadic_call(&types, signature, &[TypeId::INT], 1, &config).unwrap();
             let gp_capacity = if config.target.abi == AbiIdentity::SysvAmd64Lp64 {
                 6
@@ -473,19 +468,14 @@ mod int128_tests {
 
 #[cfg(test)]
 mod float16_tests {
-    use ccc_target::EffectiveCompilationConfig;
+    use ccc_target::enabled_compilation_configs;
     use ccc_types::{Field, FunctionType, QualifiedType, RecordKind, TypeId, TypeStore};
 
     use super::{AbiCarrier, AbiClass, PassingMode, plan_function_type, plan_va_arg};
 
     #[test]
     fn scalar_and_aggregate_float16_boundaries_are_classified_per_target() {
-        for config in [
-            EffectiveCompilationConfig::default(),
-            EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
-            EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
-            EffectiveCompilationConfig::aarch64_apple_darwin(),
-        ] {
+        for config in enabled_compilation_configs() {
             let mut types = TypeStore::default();
             let (record, wrapper) = types.declare_record(RecordKind::Struct, None);
             types
@@ -517,7 +507,7 @@ mod float16_tests {
 
 #[cfg(test)]
 mod alignment_adjusted_tests {
-    use ccc_target::{AbiIdentity, EffectiveCompilationConfig};
+    use ccc_target::{AbiIdentity, EffectiveCompilationConfig, enabled_compilation_configs};
     use ccc_types::{
         Field, FunctionParameters, FunctionType, QualifiedType, RecordKind, TypeId, TypeStore,
     };
@@ -542,12 +532,7 @@ mod alignment_adjusted_tests {
             )
             .unwrap();
 
-        for config in [
-            EffectiveCompilationConfig::default(),
-            EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
-            EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
-            EffectiveCompilationConfig::aarch64_apple_darwin(),
-        ] {
+        for config in enabled_compilation_configs() {
             let scalar = classify_type(&types, adjusted, &config).unwrap();
             assert_eq!(
                 (scalar.size, scalar.align),

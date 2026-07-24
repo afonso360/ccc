@@ -4,7 +4,7 @@ use ccc_pp::{PpItem, lex};
 use ccc_sema::generic::analyze_frontend;
 use ccc_session::SourceMap;
 use ccc_syntax::frontend as syntax;
-use ccc_target::EffectiveCompilationConfig;
+use ccc_target::{EffectiveCompilationConfig, enabled_compilation_configs};
 use object::{Object as _, ObjectSection as _, ObjectSymbol as _};
 
 fn lower(source: &str, config: &EffectiveCompilationConfig) -> gir::FullModule {
@@ -44,12 +44,7 @@ fn values_arithmetic_conversions_calls_and_varargs_emit_for_every_target() {
         }
         int call_read_half(void) { return read_half(1, (_Float16)1.5); }
     ";
-    for config in [
-        EffectiveCompilationConfig::default(),
-        EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
-        EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
-        EffectiveCompilationConfig::aarch64_apple_darwin(),
-    ] {
+    for config in enabled_compilation_configs() {
         emit(
             &lower(source, &config),
             &config,
@@ -71,12 +66,7 @@ fn static_initializers_use_exact_binary16_payloads() {
         _Float16 tie_up = 1.00146484375;
         _Float16 minimum_subnormal = 0x1p-24;
     ";
-    for config in [
-        EffectiveCompilationConfig::default(),
-        EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
-        EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
-        EffectiveCompilationConfig::aarch64_apple_darwin(),
-    ] {
+    for config in enabled_compilation_configs() {
         let output = emit(
             &lower(source, &config),
             &config,

@@ -4,20 +4,13 @@ use ccc_pp::{PpItem, lex};
 use ccc_sema::generic::analyze_frontend;
 use ccc_session::SourceMap;
 use ccc_syntax::frontend as syntax;
-use ccc_target::{ENABLED_TARGET_SPECS, EffectiveCompilationConfig, OptimizationLevel};
+use ccc_target::{EffectiveCompilationConfig, OptimizationLevel, enabled_compilation_configs};
 use object::{Object as _, ObjectSymbol as _};
 
 const SMALL_LEAF: &str = "
     static int leaf(int value) { return value + 7; }
     int caller(int value) { return leaf(value) * 3; }
 ";
-
-fn enabled_targets() -> impl Iterator<Item = EffectiveCompilationConfig> {
-    ENABLED_TARGET_SPECS.iter().map(|profile| {
-        EffectiveCompilationConfig::for_target(profile.triple.clone())
-            .expect("catalogued target has an effective configuration")
-    })
-}
 
 fn lower(source: &str, config: &EffectiveCompilationConfig) -> (SourceMap, FullModule) {
     let mut sources = SourceMap::new();
@@ -66,7 +59,7 @@ fn direct_call_count(clif: &str) -> usize {
 
 #[test]
 fn small_internal_leaf_is_heuristic_only_at_o2_and_o3_on_every_target() {
-    for target in enabled_targets() {
+    for target in enabled_compilation_configs() {
         for (level, expected_calls) in [
             (OptimizationLevel::O0, 1),
             (OptimizationLevel::O1, 1),
@@ -101,7 +94,7 @@ fn always_inline_and_noinline_are_exact_and_out_of_line_symbols_remain() {
         int (*forced_address)(int) = forced;
         int caller(int value) { return forced(value) + retained(value); }
     ";
-    for target in enabled_targets() {
+    for target in enabled_compilation_configs() {
         for level in [OptimizationLevel::O0, OptimizationLevel::O2] {
             let config = target.clone().with_optimization_level(level);
             let output = compile(source, &config, false).unwrap();
@@ -155,7 +148,7 @@ fn interposable_weak_recursive_returns_twice_and_indirect_calls_stay_out() {
             return function(value);
         }
     ";
-    for target in enabled_targets() {
+    for target in enabled_compilation_configs() {
         let config = target.with_optimization_level(OptimizationLevel::O2);
         let output = compile(source, &config, false)
             .unwrap_or_else(|error| panic!("{}: {error}", config.target.triple));
@@ -198,7 +191,7 @@ fn user_named_global_values_keep_calls_out_on_every_target() {
             return first * 10 + second;
         }
     ";
-    for target in enabled_targets() {
+    for target in enabled_compilation_configs() {
         let config = target.with_optimization_level(OptimizationLevel::O2);
         let output = compile(source, &config, false)
             .unwrap_or_else(|error| panic!("{}: {error}", config.target.triple));
@@ -222,7 +215,7 @@ fn user_named_global_values_reject_required_inlining() {
         }
         int caller(void) { return next(); }
     ";
-    for target in enabled_targets() {
+    for target in enabled_compilation_configs() {
         let config = target.with_optimization_level(OptimizationLevel::O2);
         let error = compile(source, &config, false).unwrap_err();
         assert_eq!(error.code, "CCC4012");
@@ -235,7 +228,7 @@ fn user_named_global_values_reject_required_inlining() {
 
 #[test]
 fn debug_builds_keep_heuristic_calls_and_reject_required_inlining() {
-    for target in enabled_targets() {
+    for target in enabled_compilation_configs() {
         let config = target.with_optimization_level(OptimizationLevel::O2);
         let output = compile(SMALL_LEAF, &config, true)
             .unwrap_or_else(|error| panic!("{}: {error}", config.target.triple));
@@ -269,7 +262,7 @@ fn unsafe_always_inline_has_a_stable_diagnostic() {
         }
         int caller(int value) { return exported(value); }
     ";
-    for target in enabled_targets() {
+    for target in enabled_compilation_configs() {
         let config = target.with_optimization_level(OptimizationLevel::O2);
         let error = compile(source, &config, false).unwrap_err();
         assert_eq!(error.code, "CCC4012");
@@ -298,7 +291,7 @@ fn always_inline_overrides_the_heuristic_size_budget() {
         }
         int caller(int value) { return large(value); }
     ";
-    for target in enabled_targets() {
+    for target in enabled_compilation_configs() {
         let config = target.with_optimization_level(OptimizationLevel::O0);
         let output = compile(source, &config, false).unwrap();
         assert!(
@@ -319,7 +312,7 @@ fn always_inline_overrides_the_heuristic_size_budget() {
 
 #[test]
 fn bridge_callers_are_not_rewritten() {
-    for target in enabled_targets() {
+    for target in enabled_compilation_configs() {
         let config = target.with_optimization_level(OptimizationLevel::O2);
         let output = compile(
             "
@@ -353,7 +346,7 @@ fn per_caller_site_budget_has_an_exact_deterministic_boundary() {
                 + leaf(value);
         }
     ";
-    for target in enabled_targets() {
+    for target in enabled_compilation_configs() {
         let config = target.with_optimization_level(OptimizationLevel::O2);
         let first = compile(source, &config, false).unwrap();
         let second = compile(source, &config, false).unwrap();
@@ -393,7 +386,7 @@ fn translation_unit_budget_has_an_exact_boundary_and_required_calls_override_it(
     }
     source.push_str("int forced_caller(int value) { return forced(value); }\n");
 
-    for target in enabled_targets() {
+    for target in enabled_compilation_configs() {
         let config = target.with_optimization_level(OptimizationLevel::O2);
         let first = compile(&source, &config, false).unwrap();
         let second = compile(&source, &config, false).unwrap();

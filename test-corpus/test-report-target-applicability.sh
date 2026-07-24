@@ -9,44 +9,51 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cat >"$temporary_directory/target-applicability.toml" <<'EOF'
-format_version = 1
-enabled_targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "riscv64-unknown-linux-gnu", "aarch64-apple-darwin"]
-corpora = ["fixture"]
-EOF
+enabled_targets=()
+while IFS= read -r target; do
+  [[ -n "$target" ]] && enabled_targets+=("$target")
+done < <("$script_directory/report-target-applicability.py" --list-enabled-targets)
+((${#enabled_targets[@]} > 1))
+
+{
+  printf 'format_version = 1\n'
+  printf 'enabled_targets = ['
+  separator=
+  for target in "${enabled_targets[@]}"; do
+    printf '%s"%s"' "$separator" "$target"
+    separator=', '
+  done
+  printf ']\ncorpora = ["fixture"]\n'
+} >"$temporary_directory/target-applicability.toml"
 mkdir "$temporary_directory/fixture"
 printf '#!/usr/bin/env bash\nexit 0\n' >"$temporary_directory/fixture/run.sh"
 chmod +x "$temporary_directory/fixture/run.sh"
 : >"$temporary_directory/fixture/probe.c"
 
-cat >"$temporary_directory/fixture/manifest.toml" <<'EOF'
-format_version = 1
-execution_status = "blocked-test-capability"
+write_manifest() {
+  local execution_status=$1
+  local evidence_mode=$2
+  local index target
+  {
+    printf 'format_version = 1\n'
+    printf 'execution_status = "%s"\n' "$execution_status"
+    for ((index = 0; index < ${#enabled_targets[@]}; index++)); do
+      target=${enabled_targets[index]}
+      printf '\n[target_applicability."%s"]\n' "$target"
+      printf 'status = "applicable"\n'
+      if [[ "$evidence_mode" == all-execution || "$index" == 0 ]]; then
+        printf 'evidence_kind = "execution"\n'
+        printf 'runner = "run.sh"\n'
+      else
+        printf 'evidence_kind = "parse-only"\n'
+        printf 'entrypoint = "probe.c"\n'
+      fi
+      printf 'reason = "fixture"\n'
+    done
+  } >"$temporary_directory/fixture/manifest.toml"
+}
 
-[target_applicability."x86_64-unknown-linux-gnu"]
-status = "applicable"
-evidence_kind = "execution"
-runner = "run.sh"
-reason = "fixture"
-
-[target_applicability."aarch64-unknown-linux-gnu"]
-status = "applicable"
-evidence_kind = "execution"
-runner = "run.sh"
-reason = "fixture"
-
-[target_applicability."riscv64-unknown-linux-gnu"]
-status = "applicable"
-evidence_kind = "execution"
-runner = "run.sh"
-reason = "fixture"
-
-[target_applicability."aarch64-apple-darwin"]
-status = "applicable"
-evidence_kind = "execution"
-runner = "run.sh"
-reason = "fixture"
-EOF
+write_manifest blocked-test-capability all-execution
 
 set +e
 blocked_output=$("$script_directory/report-target-applicability.py" \
@@ -56,34 +63,7 @@ set -e
 [[ "$blocked_status" == 1 ]]
 [[ "$blocked_output" == *"execution_status 'blocked-test-capability' cannot claim execution evidence"* ]]
 
-cat >"$temporary_directory/fixture/manifest.toml" <<'EOF'
-format_version = 1
-execution_status = "ready"
-
-[target_applicability."x86_64-unknown-linux-gnu"]
-status = "applicable"
-evidence_kind = "execution"
-runner = "run.sh"
-reason = "fixture"
-
-[target_applicability."aarch64-unknown-linux-gnu"]
-status = "applicable"
-evidence_kind = "parse-only"
-entrypoint = "probe.c"
-reason = "fixture"
-
-[target_applicability."riscv64-unknown-linux-gnu"]
-status = "applicable"
-evidence_kind = "parse-only"
-entrypoint = "probe.c"
-reason = "fixture"
-
-[target_applicability."aarch64-apple-darwin"]
-status = "applicable"
-evidence_kind = "parse-only"
-entrypoint = "probe.c"
-reason = "fixture"
-EOF
+write_manifest ready first-execution
 
 set +e
 coverage_output=$("$script_directory/report-target-applicability.py" \

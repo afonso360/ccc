@@ -127,7 +127,7 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ccc_target::LanguageMode;
+    use ccc_target::{LanguageMode, enabled_compilation_configs};
 
     #[test]
     fn derives_standard_and_target_macros_from_the_configuration() {
@@ -262,12 +262,7 @@ mod tests {
 
     #[test]
     fn enabled_targets_do_not_define_the_vla_denial_macro() {
-        for config in [
-            EffectiveCompilationConfig::default(),
-            EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
-            EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
-            EffectiveCompilationConfig::aarch64_apple_darwin(),
-        ] {
+        for config in enabled_compilation_configs() {
             assert!(
                 !additional_predefined_macros(&config).contains_key("__STDC_NO_VLA__"),
                 "{}",

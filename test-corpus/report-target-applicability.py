@@ -228,16 +228,38 @@ def render_table(rows: Sequence[Tuple[str, str, str, str, str, str]]) -> None:
         print("  ".join(value.ljust(widths[index]) for index, value in enumerate(row)))
 
 
+def parse_arguments(arguments: Sequence[str]) -> Tuple[Path, bool]:
+    root = Path(__file__).resolve().parent
+    list_enabled_targets = False
+    root_seen = False
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        if argument == "--root" and not root_seen:
+            if index + 1 >= len(arguments):
+                raise MatrixError("--root requires a directory")
+            root = Path(arguments[index + 1]).resolve()
+            root_seen = True
+            index += 2
+            continue
+        if argument == "--list-enabled-targets" and not list_enabled_targets:
+            list_enabled_targets = True
+            index += 1
+            continue
+        raise MatrixError(
+            "usage: report-target-applicability.py "
+            "[--root DIRECTORY] [--list-enabled-targets]"
+        )
+    return root, list_enabled_targets
+
+
 def main() -> int:
-    arguments = sys.argv[1:]
-    if not arguments:
-        root = Path(__file__).resolve().parent
-    elif len(arguments) == 2 and arguments[0] == "--root":
-        root = Path(arguments[1]).resolve()
-    else:
-        raise MatrixError("usage: report-target-applicability.py [--root DIRECTORY]")
+    root, list_enabled_targets = parse_arguments(sys.argv[1:])
     catalog_path = root / "target-applicability.toml"
     targets, corpora = parse_catalog(catalog_path)
+    if list_enabled_targets:
+        print("\n".join(targets))
+        return 0
 
     discovered = sorted(
         path.parent.name for path in root.glob("*/manifest.toml") if path.is_file()

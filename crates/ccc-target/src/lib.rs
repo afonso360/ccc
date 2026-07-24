@@ -1485,6 +1485,17 @@ pub const ENABLED_TARGET_SPECS: &[TargetSpec] = &[
     AARCH64_APPLE_DARWIN,
 ];
 
+/// Builds the default effective configuration for every enabled target.
+///
+/// Target-neutral tests and tools should use this iterator instead of
+/// maintaining a parallel array of target constructors.
+pub fn enabled_compilation_configs() -> impl ExactSizeIterator<Item = EffectiveCompilationConfig> {
+    ENABLED_TARGET_SPECS
+        .iter()
+        .cloned()
+        .map(EffectiveCompilationConfig::for_spec)
+}
+
 const LINUX_LP64_BINARY128_LAYOUT: TargetDataLayout = TargetDataLayout {
     byte_order: ByteOrder::Little,
     char_is_signed: true,
@@ -1642,6 +1653,13 @@ mod tests {
             let selected = TargetSpec::enabled(reparsed).unwrap();
             assert_eq!(&selected, profile);
         }
+
+        assert_eq!(
+            enabled_compilation_configs()
+                .map(|config| config.target)
+                .collect::<Vec<_>>(),
+            ENABLED_TARGET_SPECS
+        );
     }
 
     #[test]
@@ -2005,12 +2023,7 @@ mod tests {
 
     #[test]
     fn float16_value_capabilities_are_advertised_on_enabled_targets() {
-        for config in [
-            EffectiveCompilationConfig::default(),
-            EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
-            EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
-            EffectiveCompilationConfig::aarch64_apple_darwin(),
-        ] {
+        for config in enabled_compilation_configs() {
             assert_eq!(config.target_macros.get("__SIZEOF_FLOAT16__"), Some("2"));
             assert_eq!(config.target_macros.get("__FLT16_MANT_DIG__"), Some("11"));
             assert_eq!(
@@ -2027,12 +2040,7 @@ mod tests {
 
     #[test]
     fn variable_length_arrays_are_advertised_on_enabled_targets() {
-        for config in [
-            EffectiveCompilationConfig::default(),
-            EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
-            EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
-            EffectiveCompilationConfig::aarch64_apple_darwin(),
-        ] {
+        for config in enabled_compilation_configs() {
             assert_eq!(
                 config
                     .capabilities

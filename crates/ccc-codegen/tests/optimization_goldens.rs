@@ -4,7 +4,7 @@ use ccc_pp::{PpItem, lex};
 use ccc_sema::generic::analyze_frontend;
 use ccc_session::SourceMap;
 use ccc_syntax::frontend as syntax;
-use ccc_target::{EffectiveCompilationConfig, OptimizationLevel};
+use ccc_target::{EffectiveCompilationConfig, OptimizationLevel, enabled_compilation_configs};
 
 const SOURCE: &str = "int optimized(int value) {
     int first = value + 3;
@@ -54,12 +54,7 @@ fn optimized_ir_and_clif_match_committed_goldens() {
 #[test]
 fn optimized_dominance_ssa_lowers_in_cfg_order_on_every_target() {
     let source = include_str!("../../../tests/execution/cases/full_control_flow.c");
-    for config in [
-        EffectiveCompilationConfig::default(),
-        EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
-        EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
-        EffectiveCompilationConfig::aarch64_apple_darwin(),
-    ] {
+    for config in enabled_compilation_configs() {
         for level in [OptimizationLevel::O1, OptimizationLevel::O2] {
             let config = config.clone().with_optimization_level(level);
             let module = optimized_module(source, &config);

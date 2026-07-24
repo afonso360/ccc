@@ -1,4 +1,4 @@
-use ccc_target::{EffectiveCompilationConfig, PackingPolicy};
+use ccc_target::{EffectiveCompilationConfig, PackingPolicy, enabled_compilation_configs};
 use ccc_types::{
     ArrayLength, ArrayType, BitfieldLayout, BuiltinType, Enumerator, Field, FunctionType,
     LayoutError, LayoutShape, QualifiedType, RecordKind, TypeId, TypeLayout, TypeQualifiers,
@@ -90,12 +90,7 @@ fn x86_64_builtin_and_pointer_layouts_are_explicit() {
 
 #[test]
 fn compiler_128_bit_integer_layout_is_stable_for_every_enabled_target() {
-    for config in [
-        EffectiveCompilationConfig::default(),
-        EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
-        EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
-        EffectiveCompilationConfig::aarch64_apple_darwin(),
-    ] {
+    for config in enabled_compilation_configs() {
         let types = TypeStore::default();
         for builtin in [BuiltinType::Int128, BuiltinType::UnsignedInt128] {
             let layout = types.layout_of(types.builtin(builtin), &config).unwrap();
