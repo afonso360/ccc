@@ -27,7 +27,15 @@ generated TLS accessor, requires
 the executable and staged `.dSYM` UUIDs to match, then uses LLDB to stop on a C
 source line, recover both a fixed-frame local and the promoted scalar
 `observed = 42`, and confirm the TLS definition's certified location
-expression. A command/cleanup fixture
+expression. A host-independent object oracle complements that gate by
+packaging a debug-enabled AArch64 Mach-O primary with a generated Darwin TLS
+accessor through an in-process model of relocatable linking and exact symbol
+localization. It inspects the raw `N_OSO` debug-map entry, verifies that its
+primary object and the sibling generated assembly/object remain available
+while the packaging guard is alive, and verifies their removal when the guard
+is dropped. This oracle covers the packaging and lifetime contract on every
+Rust test host; it does not replace native Apple assembler, linker, `nmedit`,
+`dsymutil`, UUID, or LLDB coverage. A command/cleanup fixture
 separately proves that `dsymutil` runs before registered link objects are
 released and that incomplete bundle trees never replace an existing bundle.
 

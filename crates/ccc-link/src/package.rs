@@ -954,6 +954,7 @@ impl ArtifactWorkspace {
 mod tests {
     use std::cell::{Cell, RefCell};
 
+    use object::read::macho::{MachOFile64, Nlist as _};
     use object::write::{Object, Relocation, StandardSection, Symbol, SymbolSection};
     use object::{
         Architecture, BinaryFormat, Endianness, RelocationFlags, SectionKind, SymbolFlags,
@@ -962,7 +963,10 @@ mod tests {
 
     use crate::ProbeOutput;
     use crate::artifact::{BridgeManifestV2, GeneratedSymbol, GeneratedSymbolOwner};
-    use crate::bridge::{GeneratedSymbolKind, render_generic_call_helper};
+    use crate::bridge::{
+        GeneratedSymbolKind, TlsAccessModel, TlsAccessorPlan, TlsSymbolVisibility,
+        render_generic_call_helper, render_target_tls_accessor,
+    };
 
     use super::*;
 
@@ -1054,6 +1058,115 @@ mod tests {
             });
         }
         object.write().unwrap()
+    }
+
+    fn make_macho_object(
+        symbols: &[(String, bool, SymbolScope, SymbolKind)],
+        debug: bool,
+        unwind: bool,
+        oso_names: &[Vec<u8>],
+    ) -> Vec<u8> {
+        let mut object = Object::new(
+            BinaryFormat::MachO,
+            Architecture::Aarch64,
+            Endianness::Little,
+        );
+        object.set_mangling(object::write::Mangling::None);
+        let text = object.section_id(StandardSection::Text);
+        object.append_section_data(text, &[0xc0, 0x03, 0x5f, 0xd6], 4);
+        let data = object.section_id(StandardSection::Data);
+        object.append_section_data(data, &[0; 8], 8);
+        let tls = object.section_id(StandardSection::Tls);
+        object.append_section_data(tls, &[1, 0, 0, 0], 4);
+        if unwind {
+            let eh_frame = object.add_section(
+                b"__TEXT".to_vec(),
+                b"__eh_frame".to_vec(),
+                SectionKind::ReadOnlyData,
+            );
+            object.append_section_data(eh_frame, &[0], 1);
+        }
+        if debug {
+            let debug_info = object.add_section(
+                b"__DWARF".to_vec(),
+                b"__debug_info".to_vec(),
+                SectionKind::Debug,
+            );
+            object.append_section_data(debug_info, &[1], 1);
+        }
+        for (name, defined, scope, kind) in symbols {
+            let section = match kind {
+                SymbolKind::Tls => tls,
+                SymbolKind::Data => data,
+                _ => text,
+            };
+            object.add_symbol(Symbol {
+                name: name.as_bytes().to_vec(),
+                value: 0,
+                size: u64::from(*defined) * 4,
+                kind: *kind,
+                scope: *scope,
+                weak: false,
+                section: if *defined {
+                    SymbolSection::Section(section)
+                } else {
+                    SymbolSection::Undefined
+                },
+                flags: SymbolFlags::None,
+            });
+        }
+        for name in oso_names {
+            object.add_symbol(Symbol {
+                name: name.clone(),
+                value: 0,
+                size: 0,
+                kind: SymbolKind::Unknown,
+                scope: SymbolScope::Compilation,
+                weak: false,
+                section: SymbolSection::Absolute,
+                flags: SymbolFlags::None,
+            });
+        }
+        let bytes = object.write().unwrap();
+        patch_macho_oso_symbols(bytes, oso_names)
+    }
+
+    fn patch_macho_oso_symbols(mut bytes: Vec<u8>, oso_names: &[Vec<u8>]) -> Vec<u8> {
+        let offsets = {
+            let macho = MachOFile64::<Endianness>::parse(bytes.as_slice()).unwrap();
+            let symbols = macho.macho_symbol_table();
+            let expected = oso_names.iter().map(Vec::as_slice).collect::<BTreeSet<_>>();
+            symbols
+                .iter()
+                .filter_map(|symbol| {
+                    let name = symbol.name(macho.endian(), symbols.strings()).ok()?;
+                    expected.contains(name).then_some(
+                        (symbol as *const object::macho::Nlist64<Endianness> as usize)
+                            - (bytes.as_ptr() as usize),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(offsets.len(), oso_names.len());
+        for offset in offsets {
+            // n_strx is the first four bytes of nlist_64; n_type follows it.
+            bytes[offset + 4] = object::macho::N_OSO;
+            bytes[offset + 5] = 0;
+        }
+        bytes
+    }
+
+    fn macho_oso_names(bytes: &[u8]) -> Vec<Vec<u8>> {
+        let macho = MachOFile64::<Endianness>::parse(bytes).unwrap();
+        let symbols = macho.macho_symbol_table();
+        symbols
+            .iter()
+            .filter(|symbol| symbol.n_type() == object::macho::N_OSO)
+            .map(|symbol| {
+                let name = symbol.name(macho.endian(), symbols.strings()).unwrap();
+                name.to_vec()
+            })
+            .collect()
     }
 
     fn make_object_with_call_and_address_references(symbol: &str, hidden_body: &str) -> Vec<u8> {
@@ -1149,6 +1262,32 @@ mod tests {
                 });
             }
             emulate_tool(request)?;
+            Ok(ProbeOutput {
+                success: true,
+                status: "exit status: 0".to_owned(),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeMachoRunner {
+        requests: RefCell<Vec<ProbeRequest>>,
+    }
+
+    impl ProbeRunner for FakeMachoRunner {
+        fn run(&self, request: &ProbeRequest) -> io::Result<ProbeOutput> {
+            self.requests.borrow_mut().push(request.clone());
+            if request.arguments == [OsString::from("--version")] {
+                return Ok(ProbeOutput {
+                    success: true,
+                    status: "exit status: 0".to_owned(),
+                    stdout: b"fake Apple object tools 1\n".to_vec(),
+                    stderr: Vec::new(),
+                });
+            }
+            emulate_macho_tool(request)?;
             Ok(ProbeOutput {
                 success: true,
                 status: "exit status: 0".to_owned(),
@@ -1276,6 +1415,116 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             return fs::write(output, make_object_with_visibility(&borrowed));
+        }
+        Ok(())
+    }
+
+    fn emulate_macho_tool(request: &ProbeRequest) -> io::Result<()> {
+        let arguments = &request.arguments;
+        if let Some(position) = arguments.iter().position(|argument| argument == "-c") {
+            let source = PathBuf::from(&arguments[position + 1]);
+            let output = output_path(arguments).unwrap();
+            let text = fs::read_to_string(source)?;
+            let unwind = text
+                .lines()
+                .any(|line| line.trim_start().starts_with(".cfi_"));
+            let symbols = text
+                .lines()
+                .filter_map(|line| line.strip_prefix(".globl "))
+                .map(|name| {
+                    (
+                        name.to_owned(),
+                        true,
+                        SymbolScope::Dynamic,
+                        SymbolKind::Text,
+                    )
+                })
+                .collect::<Vec<_>>();
+            return fs::write(output, make_macho_object(&symbols, false, unwind, &[]));
+        }
+        if arguments.iter().any(|argument| argument == "-r") {
+            let output = output_path(arguments).unwrap();
+            let inputs = arguments
+                .iter()
+                .filter(|argument| Path::new(argument).extension() == Some(OsStr::new("o")))
+                .map(PathBuf::from)
+                .filter(|path| path != &output)
+                .collect::<Vec<_>>();
+            let mut by_name = BTreeMap::<String, (bool, SymbolScope, SymbolKind)>::new();
+            let mut oso_names = Vec::new();
+            let mut unwind = false;
+            for path in inputs {
+                let bytes = fs::read(&path)?;
+                let object = object::File::parse(bytes.as_slice()).unwrap();
+                unwind |= object.section_by_name("__eh_frame").is_some();
+                if object
+                    .sections()
+                    .filter_map(|section| section.name().ok())
+                    .any(|name| name.starts_with("__debug_"))
+                {
+                    oso_names.push(path.as_os_str().as_encoded_bytes().to_vec());
+                }
+                for symbol in object.symbols() {
+                    let Ok(name) = symbol.name() else {
+                        continue;
+                    };
+                    if name.is_empty() {
+                        continue;
+                    }
+                    let incoming = (!symbol.is_undefined(), symbol.scope(), symbol.kind());
+                    by_name
+                        .entry(name.to_owned())
+                        .and_modify(|current| {
+                            if !current.0 && incoming.0 {
+                                *current = incoming;
+                            }
+                        })
+                        .or_insert(incoming);
+                }
+            }
+            let symbols = by_name
+                .into_iter()
+                .map(|(name, (defined, scope, kind))| (name, defined, scope, kind))
+                .collect::<Vec<_>>();
+            return fs::write(
+                output,
+                make_macho_object(&symbols, false, unwind, &oso_names),
+            );
+        }
+        if arguments.first() == Some(&OsString::from("-R")) {
+            let localization = PathBuf::from(&arguments[1]);
+            let output = PathBuf::from(&arguments[3]);
+            let input = PathBuf::from(&arguments[4]);
+            let localize = fs::read_to_string(localization)?
+                .lines()
+                .map(str::to_owned)
+                .collect::<BTreeSet<_>>();
+            let bytes = fs::read(input)?;
+            let object = object::File::parse(bytes.as_slice()).unwrap();
+            let unwind = object.section_by_name("__eh_frame").is_some();
+            let symbols = object
+                .symbols()
+                .filter_map(|symbol| {
+                    let name = symbol.name().ok()?;
+                    (!name.is_empty()).then(|| {
+                        (
+                            name.to_owned(),
+                            !symbol.is_undefined(),
+                            if localize.contains(name) {
+                                SymbolScope::Compilation
+                            } else {
+                                symbol.scope()
+                            },
+                            symbol.kind(),
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            let oso_names = macho_oso_names(&bytes);
+            return fs::write(
+                output,
+                make_macho_object(&symbols, false, unwind, &oso_names),
+            );
         }
         Ok(())
     }
@@ -1473,6 +1722,139 @@ mod tests {
                 input.as_os_str().to_owned(),
             ]
         );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn macho_tls_bridge_debug_map_retains_oso_inputs_without_native_linking() {
+        let directory = test_directory("macho-tls-bridge-debug-map");
+        let output = directory.join("result.o");
+        let helper = "__ccc_tls_accessor_debug_map_oracle";
+        let tls_object = "debug_tls";
+        let assembly = render_target_tls_accessor(&TlsAccessorPlan {
+            abi: ccc_target::AbiIdentity::DarwinArm64,
+            helper_symbol: helper.to_owned(),
+            object_symbol: tls_object.to_owned(),
+            object_symbol_is_exact: false,
+            model: TlsAccessModel::GeneralDynamic,
+            object_visibility: TlsSymbolVisibility::Default,
+            logical_line: 1,
+        })
+        .unwrap();
+        assert!(assembly.source().contains("_debug_tls@TLVPPAGE"));
+        assert!(assembly.source().contains("blr x8"));
+        assert!(assembly.source().contains(".cfi_startproc"));
+        let assembly_stem = assembly.stem().to_owned();
+        let primary = make_macho_object(
+            &[
+                (
+                    format!("_{helper}"),
+                    false,
+                    SymbolScope::Unknown,
+                    SymbolKind::Text,
+                ),
+                (
+                    "_debug_tls".to_owned(),
+                    true,
+                    SymbolScope::Dynamic,
+                    SymbolKind::Tls,
+                ),
+                (
+                    "_read_debug_tls".to_owned(),
+                    true,
+                    SymbolScope::Dynamic,
+                    SymbolKind::Text,
+                ),
+            ],
+            true,
+            false,
+            &[],
+        );
+        let primary_object = object::File::parse(primary.as_slice()).unwrap();
+        assert_eq!(primary_object.format(), object::BinaryFormat::MachO);
+        assert_eq!(primary_object.architecture(), object::Architecture::Aarch64);
+        assert!(primary_object.section_by_name("__debug_info").is_some());
+        assert_eq!(
+            primary_object.symbol_by_name("_debug_tls").unwrap().kind(),
+            SymbolKind::Tls
+        );
+        assert!(primary_object.section_by_name("__eh_frame").is_none());
+        let bundle = ArtifactBundle::new(
+            primary,
+            vec![assembly],
+            BridgeManifestV2::new(
+                [8; 32],
+                vec![GeneratedSymbol::internal(
+                    helper,
+                    GeneratedSymbolKind::TlsAccessor,
+                    GeneratedSymbolOwner::AssemblyUnit(assembly_stem.clone()),
+                )],
+            ),
+        );
+        let config = EffectiveCompilationConfig::aarch64_apple_darwin();
+        let toolchain = ToolchainSpec {
+            compiler_driver: Some(ToolCommandSpec::new("fake-apple-cc")),
+            ..ToolchainSpec::default()
+        };
+        let runner = FakeMachoRunner::default();
+
+        let mut report =
+            package_artifact_bundle_with_runner(bundle, &output, &config, &toolchain, &runner)
+                .unwrap();
+
+        assert!(report.used_generated_assembly);
+        assert!(report.symbol_localizer.is_some());
+        let retained = report
+            .retained_debug_inputs
+            .take()
+            .expect("debug-enabled Mach-O bridge packaging must retain OSO inputs");
+        let packaged_bytes = fs::read(&output).unwrap();
+        let packaged = object::File::parse(packaged_bytes.as_slice()).unwrap();
+        assert_eq!(packaged.format(), object::BinaryFormat::MachO);
+        assert_eq!(packaged.architecture(), object::Architecture::Aarch64);
+        assert!(packaged.section_by_name("__eh_frame").is_some());
+        assert!(packaged.section_by_name("__debug_info").is_none());
+        let helper = packaged.symbol_by_name(&format!("_{helper}")).unwrap();
+        assert!(helper.is_definition());
+        assert_eq!(helper.scope(), SymbolScope::Compilation);
+        assert_eq!(
+            packaged.symbol_by_name("_debug_tls").unwrap().kind(),
+            SymbolKind::Tls
+        );
+
+        let workspace = retained.workspace.path().to_path_buf();
+        let primary_path = workspace.join("primary.o");
+        let oso_names = macho_oso_names(&packaged_bytes);
+        assert_eq!(
+            oso_names,
+            [primary_path.as_os_str().as_encoded_bytes().to_vec()]
+        );
+        assert!(primary_path.is_file());
+        let bridge_source = workspace.join(format!("{assembly_stem}.s"));
+        let bridge_object = workspace.join(format!("{assembly_stem}.o"));
+        assert!(bridge_source.is_file());
+        assert!(bridge_object.is_file());
+        let bridge_bytes = fs::read(&bridge_object).unwrap();
+        let bridge = object::File::parse(bridge_bytes.as_slice()).unwrap();
+        assert_eq!(bridge.format(), object::BinaryFormat::MachO);
+        assert!(bridge.section_by_name("__eh_frame").is_some());
+        assert!(bridge.section_by_name("__debug_info").is_none());
+        assert!(
+            fs::read_to_string(&bridge_source)
+                .unwrap()
+                .contains("_debug_tls@TLVPPAGE")
+        );
+        assert!(runner.requests.borrow().iter().all(|request| {
+            !request
+                .command
+                .program
+                .to_string_lossy()
+                .contains("dsymutil")
+        }));
+
+        drop(retained);
+        assert!(!workspace.exists());
+        assert!(output.is_file());
         fs::remove_dir_all(directory).unwrap();
     }
 

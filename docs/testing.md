@@ -85,6 +85,22 @@ AArch64 Linux needs an AArch64 GCC-compatible driver and binutils. Darwin arm64
 needs Xcode Command Line Tools, an installed macOS SDK, and the platform
 `nmedit` and `dsymutil` tools.
 
+The object-only Mach-O debug-map oracle is intentionally runnable on any Rust
+test host and needs none of those Apple tools:
+
+```sh
+cargo test --locked -p ccc-link \
+  macho_tls_bridge_debug_map_retains_oso_inputs_without_native_linking
+```
+
+It packages an AArch64 Mach-O primary carrying `__debug_info` together with a
+generated Darwin TLS accessor, inspects the published object's raw `N_OSO`
+entry and localized helper, and checks that the referenced primary plus the
+generated assembly/object share the packaging guard's lifetime. Its in-process
+tool model does not validate Apple assembly or relocation encodings, native
+linker/`nmedit` behavior, `.dSYM` UUIDs, `dsymutil`, or LLDB; the `darwin-arm64`
+target oracle supplies that evidence.
+
 Formatting and lint validation are separate from the test suite:
 
 ```sh

@@ -357,9 +357,12 @@ performed by Cranelift merely to improve a benchmark score.
 - Mach-O debug-map inputs now have explicit ownership:
   `PackagingReport` exposes a must-use `RetainedDebugInputs` guard which the
   driver holds through final linking and `dsymutil`. Success, publication
-  failure, and process-isolated signal cleanup are tested. Add an object-only
-  Mach-O bridge-debug oracle before extending OSO-bearing artifact lifetimes
-  beyond one driver invocation.
+  failure, and process-isolated signal cleanup are tested. A cross-host
+  object-only Mach-O oracle now packages a debug primary with a generated TLS
+  bridge, inspects raw OSO ownership and localized unwind-bearing helper state,
+  and proves guard-controlled cleanup. Keep the native Darwin assembler,
+  linker, `nmedit`, `dsymutil`, UUID, and LLDB oracle authoritative before
+  extending OSO-bearing artifact lifetimes beyond one driver invocation.
 - Create a typed diagnostic-code registry and generate uniqueness, ownership,
   range, and documentation checks while keeping serialized `CCCxxxx` strings
   stable.
