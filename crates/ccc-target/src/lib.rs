@@ -395,15 +395,11 @@ pub struct TargetSpec {
 impl TargetSpec {
     /// Selects one of the complete target profiles enabled by CCC.
     pub fn enabled(triple: Triple) -> Result<Self, String> {
-        [
-            X86_64_UNKNOWN_LINUX_GNU,
-            AARCH64_UNKNOWN_LINUX_GNU,
-            RISCV64_UNKNOWN_LINUX_GNU,
-            AARCH64_APPLE_DARWIN,
-        ]
-        .into_iter()
-        .find(|profile| profile.triple == triple)
-        .ok_or_else(|| format!("target `{triple}` is not an enabled CCC target profile"))
+        ENABLED_TARGET_SPECS
+            .iter()
+            .find(|profile| profile.triple.eq(&triple))
+            .cloned()
+            .ok_or_else(|| format!("target `{triple}` is not an enabled CCC target profile"))
     }
 
     pub fn pointer_width(&self) -> Option<u8> {
@@ -1478,6 +1474,17 @@ pub const AARCH64_APPLE_DARWIN: TargetSpec = TargetSpec {
     },
 };
 
+/// The canonical catalogue of complete target profiles enabled by CCC.
+///
+/// Target-neutral consumers should iterate this slice instead of maintaining
+/// their own list of target triples.
+pub const ENABLED_TARGET_SPECS: &[TargetSpec] = &[
+    X86_64_UNKNOWN_LINUX_GNU,
+    AARCH64_UNKNOWN_LINUX_GNU,
+    RISCV64_UNKNOWN_LINUX_GNU,
+    AARCH64_APPLE_DARWIN,
+];
+
 const LINUX_LP64_BINARY128_LAYOUT: TargetDataLayout = TargetDataLayout {
     byte_order: ByteOrder::Little,
     char_is_signed: true,
@@ -1616,6 +1623,24 @@ mod tests {
                 config.target.data_layout.long_double_format,
                 long_double_format
             );
+        }
+    }
+
+    #[test]
+    fn enabled_target_catalogue_is_unique_and_round_trips() {
+        let mut canonical_triples = std::collections::BTreeSet::new();
+
+        for profile in ENABLED_TARGET_SPECS {
+            let canonical = profile.triple.to_string();
+            assert!(
+                canonical_triples.insert(canonical.clone()),
+                "duplicate enabled target `{canonical}`"
+            );
+
+            let reparsed = canonical.parse().unwrap();
+            assert_eq!(&reparsed, &profile.triple);
+            let selected = TargetSpec::enabled(reparsed).unwrap();
+            assert_eq!(&selected, profile);
         }
     }
 

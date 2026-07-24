@@ -3,17 +3,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use ccc_target::ENABLED_TARGET_SPECS;
 use object::{Object as _, ObjectSymbol as _};
 
 mod support;
 
 static TEST_ID: AtomicU64 = AtomicU64::new(0);
-const ENABLED_TARGETS: [&str; 4] = [
-    "x86_64-unknown-linux-gnu",
-    "aarch64-unknown-linux-gnu",
-    "riscv64-unknown-linux-gnu",
-    "aarch64-apple-darwin",
-];
 
 struct TestDirectory {
     path: PathBuf,
@@ -1301,8 +1296,9 @@ fn preprocesses_the_curated_hosted_header_tree_as_system_headers() {
     let source = include_directory.join("probe.c");
     let directory = TestDirectory::new("curated-hosted-headers");
 
-    for target in ENABLED_TARGETS {
-        let mut command = directory.command_for_target(target);
+    for profile in ENABLED_TARGET_SPECS {
+        let target = profile.triple.to_string();
+        let mut command = directory.command_for_target(&target);
         command
             .args(["-E", "-P", "-nostdinc", "-isystem"])
             .arg(&include_directory)
@@ -1345,8 +1341,9 @@ fn parses_the_curated_hosted_header_tree_as_system_headers() {
     let source = include_directory.join("probe.c");
     let directory = TestDirectory::new("curated-hosted-header-parse");
 
-    for target in ENABLED_TARGETS {
-        let mut command = directory.command_for_target(target);
+    for profile in ENABLED_TARGET_SPECS {
+        let target = profile.triple.to_string();
+        let mut command = directory.command_for_target(&target);
         command
             .args(["--dump-ast", "-nostdinc", "-isystem"])
             .arg(&include_directory)

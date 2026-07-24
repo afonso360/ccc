@@ -3,15 +3,11 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use ccc_target::ENABLED_TARGET_SPECS;
+
 mod support;
 
 static TEST_ID: AtomicU64 = AtomicU64::new(0);
-const ENABLED_TARGETS: [&str; 4] = [
-    "x86_64-unknown-linux-gnu",
-    "aarch64-unknown-linux-gnu",
-    "riscv64-unknown-linux-gnu",
-    "aarch64-apple-darwin",
-];
 
 struct TestDirectory {
     path: PathBuf,
@@ -114,9 +110,10 @@ fn curated_hosted_declarations_reach_the_ast_intact() {
     let include = repository("test-corpus/libc-headers/glibc-like");
     let source = include.join("probe.c");
     let directory = TestDirectory::new("curated");
-    for target in ENABLED_TARGETS {
+    for profile in ENABLED_TARGET_SPECS {
+        let target = profile.triple.to_string();
         let output = directory
-            .command_for_target(target)
+            .command_for_target(&target)
             .args(["--dump-ast", "-nostdinc", "-isystem"])
             .arg(&include)
             .arg(&source)
