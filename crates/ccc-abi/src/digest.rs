@@ -1392,27 +1392,28 @@ mod tests {
     }
 
     #[test]
-    fn cranelift_packages_use_the_audited_backend_revision() {
+    fn wasmtime_repository_packages_use_the_audited_backend_revision() {
         let expected_source = format!(
             "source = \"git+https://github.com/bytecodealliance/wasmtime.git?branch=main#{CRANELIFT_BACKEND_REVISION}\""
         );
-        let mut cranelift_packages = 0;
+        let mut backend_packages = 0;
         for package in include_str!("../../../Cargo.lock").split("[[package]]") {
-            let is_cranelift = package
-                .lines()
-                .any(|line| line.starts_with("name = \"cranelift-"));
-            if !is_cranelift {
+            let is_wasmtime_repository_package = package.lines().any(|line| {
+                line.starts_with("name = \"cranelift-")
+                    || line.starts_with("name = \"wasmtime-internal-")
+            });
+            if !is_wasmtime_repository_package {
                 continue;
             }
-            cranelift_packages += 1;
+            backend_packages += 1;
             assert!(
                 package.lines().any(|line| line == expected_source),
-                "Cranelift package did not resolve from the audited main-branch revision:\n{package}"
+                "Wasmtime repository package did not resolve from the audited main-branch revision:\n{package}"
             );
         }
         assert!(
-            cranelift_packages >= 4,
-            "expected the complete Cranelift dependency family in Cargo.lock"
+            backend_packages >= 5,
+            "expected the complete Cranelift and Wasmtime-internal dependency family in Cargo.lock"
         );
     }
 }

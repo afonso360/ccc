@@ -6,10 +6,10 @@ The workspace resolves `cranelift-codegen`, `cranelift-frontend`,
 `cranelift-module`, `cranelift-object`, and their internal Cranelift crates from
 the Wasmtime repository's `main` branch. The committed `Cargo.lock` is the
 authoritative exact-revision record: ordinary builds use `--locked` and never
-move with the branch implicitly. A lockfile test requires every package whose
-name starts with `cranelift-` to use the audited revision recorded by the ABI
-configuration key. Registry dependencies such as `object`, `target-lexicon`,
-and `gimli` retain exact workspace constraints.
+move with the branch implicitly. A lockfile test requires every `cranelift-*`
+and `wasmtime-internal-*` package to use the audited revision recorded by the
+ABI configuration key. Registry dependencies such as `object`,
+`target-lexicon`, and `gimli` retain exact workspace constraints.
 
 Cranelift lock refreshes occur in isolated changes. Refresh with
 `cargo update -p cranelift-codegen`, copy the resulting Wasmtime commit from

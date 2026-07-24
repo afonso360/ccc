@@ -17,10 +17,10 @@ Declare the complete Cranelift family as Git dependencies on the Wasmtime
 repository's `main` branch. The committed `Cargo.lock` pins one exact commit,
 so normal and release builds never follow a moving branch implicitly.
 
-Every Cranelift package must resolve from that same commit. The current ABI
-configuration key records the audited commit as backend provenance, and a test
-rejects a mixed registry/Git or mixed-revision lockfile. Lockfile refreshes are
-isolated changes gated by the
+Every Cranelift and Wasmtime-internal package must resolve from that same
+commit. The current ABI configuration key records the audited commit as
+backend provenance, and a test rejects a mixed registry/Git or mixed-revision
+lockfile. Lockfile refreshes are isolated changes gated by the
 [ABI oracle](../design/testing.md#abi-oracle), backend-capability tests, object
 inspection, debugger checks, and the execution suite.
 
