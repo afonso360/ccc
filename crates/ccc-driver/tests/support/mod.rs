@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{ExitStatus, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_WORKSPACE: AtomicU64 = AtomicU64::new(0);
@@ -54,10 +54,31 @@ impl TestWorkspace {
         self.path.join(path)
     }
 
+    pub fn write(&self, path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> PathBuf {
+        let path = self.join(path);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap_or_else(|error| {
+                panic!(
+                    "failed to create test workspace directory `{}`: {error}",
+                    parent.display()
+                )
+            });
+        }
+        fs::write(&path, contents).unwrap_or_else(|error| {
+            panic!(
+                "failed to write test workspace file `{}`: {error}",
+                path.display()
+            )
+        });
+        path
+    }
+
+    #[track_caller]
     pub fn assert_command_success(&self, context: &str, output: &Output) {
         assert_command_status(context, output, true, Some(self.path()));
     }
 
+    #[track_caller]
     pub fn assert_command_failure(&self, context: &str, output: &Output) {
         assert_command_status(context, output, false, Some(self.path()));
     }
@@ -89,32 +110,90 @@ impl Drop for TestWorkspace {
     }
 }
 
+#[track_caller]
 pub fn assert_command_success(context: &str, output: &Output) {
     assert_command_status(context, output, true, None);
 }
 
+#[track_caller]
 pub fn assert_command_failure(context: &str, output: &Output) {
     assert_command_status(context, output, false, None);
 }
 
+#[track_caller]
+pub fn assert_command_text_success(
+    context: &str,
+    status: &ExitStatus,
+    stdout: &str,
+    stderr: &str,
+    workspace: Option<&Path>,
+) {
+    assert_command_status_parts(
+        context,
+        status,
+        stdout.as_bytes(),
+        stderr.as_bytes(),
+        true,
+        workspace,
+    );
+}
+
+#[track_caller]
+pub fn assert_command_text_failure(
+    context: &str,
+    status: &ExitStatus,
+    stdout: &str,
+    stderr: &str,
+    workspace: Option<&Path>,
+) {
+    assert_command_status_parts(
+        context,
+        status,
+        stdout.as_bytes(),
+        stderr.as_bytes(),
+        false,
+        workspace,
+    );
+}
+
+#[track_caller]
 fn assert_command_status(
     context: &str,
     output: &Output,
     expected_success: bool,
     workspace: Option<&Path>,
 ) {
+    assert_command_status_parts(
+        context,
+        &output.status,
+        &output.stdout,
+        &output.stderr,
+        expected_success,
+        workspace,
+    );
+}
+
+#[track_caller]
+fn assert_command_status_parts(
+    context: &str,
+    status: &ExitStatus,
+    stdout: &[u8],
+    stderr: &[u8],
+    expected_success: bool,
+    workspace: Option<&Path>,
+) {
     let expectation = if expected_success { "succeed" } else { "fail" };
     assert!(
-        output.status.success() == expected_success,
+        status.success() == expected_success,
         "{context} was expected to {expectation}, but exited with {}{}\
          \nstdout:\n{}\
          \nstderr:\n{}",
-        output.status,
+        status,
         workspace
             .map(|path| format!("\nworkspace: {}", path.display()))
             .unwrap_or_default(),
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(stdout),
+        String::from_utf8_lossy(stderr)
     );
 }
 

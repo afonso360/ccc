@@ -342,8 +342,9 @@ performed by Cranelift merely to improve a benchmark score.
   Collision-safe RAII workspaces, retain-on-panic artifacts, command status
   diagnostics, target-driver discovery, and glibc identity are now shared;
   diagnostics, link-input, visibility, object-emission, and execution tests use
-  the common workspace. Migrate the remaining preprocessing, header, and ABI
-  suites, then factor repeated compiler invocation construction.
+  the common workspace. Preprocessing, hosted-header parsing, and the compact
+  ABI oracle now use it as well. Migrate the remaining System V AMD64 interop
+  suite, then factor repeated compiler invocation construction.
 - Unify temporary artifact ownership across the driver and linker. Replace the
   private `_debug_workspace` lifetime side effect in `PackagingReport` with an
   explicit retained-debug-input guard whose cleanup is tested on success,

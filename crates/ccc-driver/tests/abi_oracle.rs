@@ -7,13 +7,12 @@
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::process::Command;
 
 use ccc_target::{EffectiveCompilationConfig, Triple};
 use object::{Architecture, Object as _, ObjectSection as _, ObjectSymbol as _};
 
-static TEST_ID: AtomicU64 = AtomicU64::new(0);
+mod support;
 
 #[derive(Clone, Copy, Debug)]
 enum CompilerFamily {
@@ -75,11 +74,12 @@ impl ReferenceCompiler {
                     self.display()
                 )
             });
-        assert!(
-            output.status.success(),
-            "reference compiler identity query failed for `{}`: {}",
-            self.display(),
-            render_output(&output)
+        support::assert_command_success(
+            &format!(
+                "query the reference compiler identity for `{}`",
+                self.display()
+            ),
+            &output,
         );
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -118,10 +118,9 @@ impl ReferenceCompiler {
             .arg(query)
             .output()
             .unwrap_or_else(|error| panic!("failed to query target for `{identity}`: {error}"));
-        assert!(
-            output.status.success(),
-            "target query failed for `{identity}`: {}",
-            render_output(&output)
+        support::assert_command_success(
+            &format!("query the reference compiler target for `{identity}`"),
+            &output,
         );
         let text = String::from_utf8(output.stdout)
             .unwrap_or_else(|error| panic!("target query for `{identity}` was not UTF-8: {error}"));
@@ -321,10 +320,10 @@ fn x86_64_layout_objects_match_gcc_and_clang() {
         "the ABI oracle must follow CCC's enabled target"
     );
 
-    let directory = test_directory("layout-objects");
+    let directory = support::TestWorkspace::new("abi-oracle", "layout-objects").retain_on_failure();
     let source = oracle_fixture("layout_objects.c");
     let ccc_object = directory.join("ccc.o");
-    compile_ccc(&source, &ccc_object);
+    compile_ccc(&directory, &source, &ccc_object);
     let ccc_bytes = fs::read(&ccc_object).unwrap();
     let ccc_file = parse_x86_64_elf(&ccc_bytes, "CCC");
 
@@ -342,16 +341,20 @@ fn x86_64_layout_objects_match_gcc_and_clang() {
             CompilerFamily::Clang => "clang",
         };
         let reference_object = directory.join(format!("{family}.o"));
-        compile_reference(&reference, &identity, &source, &reference_object);
+        compile_reference(
+            &directory,
+            &reference,
+            &identity,
+            &source,
+            &reference_object,
+        );
         let reference_bytes = fs::read(&reference_object).unwrap();
         let reference_file = parse_x86_64_elf(&reference_bytes, &identity);
         compare_oracle(&ccc_file, &reference_file, &identity);
     }
-
-    fs::remove_dir_all(directory).unwrap();
 }
 
-fn compile_ccc(source: &Path, output: &Path) {
+fn compile_ccc(directory: &support::TestWorkspace, source: &Path, output: &Path) {
     let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
         .arg("-nostdinc")
         .arg("-c")
@@ -360,14 +363,16 @@ fn compile_ccc(source: &Path, output: &Path) {
         .arg(output)
         .output()
         .expect("failed to run CCC for the ABI layout oracle");
-    assert!(
-        result.status.success(),
-        "CCC failed in the ABI layout oracle: {}",
-        render_output(&result)
-    );
+    directory.assert_command_success("compile the ABI layout oracle with CCC", &result);
 }
 
-fn compile_reference(compiler: &ReferenceCompiler, identity: &str, source: &Path, output: &Path) {
+fn compile_reference(
+    directory: &support::TestWorkspace,
+    compiler: &ReferenceCompiler,
+    identity: &str,
+    source: &Path,
+    output: &Path,
+) {
     let result = compiler
         .command()
         .args([
@@ -384,10 +389,9 @@ fn compile_reference(compiler: &ReferenceCompiler, identity: &str, source: &Path
         .arg(output)
         .output()
         .unwrap_or_else(|error| panic!("failed to run `{identity}`: {error}"));
-    assert!(
-        result.status.success(),
-        "reference compiler `{identity}` failed: {}",
-        render_output(&result)
+    directory.assert_command_success(
+        &format!("compile the ABI layout oracle with `{identity}`"),
+        &result,
     );
 }
 
@@ -516,31 +520,4 @@ fn oracle_fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/abi-oracle")
         .join(name)
-}
-
-fn test_directory(name: &str) -> PathBuf {
-    let directory = std::env::temp_dir().join(format!(
-        "ccc-abi-oracle-{}-{}-{name}",
-        std::process::id(),
-        TEST_ID.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = fs::remove_dir_all(&directory);
-    fs::create_dir_all(&directory).unwrap();
-    directory
-}
-
-fn render_output(output: &Output) -> String {
-    format!(
-        "status {}; stdout: {}; stderr: {}",
-        output.status,
-        escaped(&output.stdout),
-        escaped(&output.stderr)
-    )
-}
-
-fn escaped(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes)
-        .trim()
-        .escape_debug()
-        .to_string()
 }

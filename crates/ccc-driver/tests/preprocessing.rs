@@ -1,44 +1,19 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use ccc_target::ENABLED_TARGET_SPECS;
 use object::{Object as _, ObjectSymbol as _};
 
 mod support;
 
-static TEST_ID: AtomicU64 = AtomicU64::new(0);
-
-struct TestDirectory {
-    path: PathBuf,
+trait PreprocessingWorkspaceExt {
+    fn command(&self) -> Command;
+    fn command_for_target(&self, target: &str) -> Command;
+    fn host_command(&self) -> Command;
 }
 
-impl TestDirectory {
-    fn new(name: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "ccc-preprocessing-test-{}-{}-{name}",
-            std::process::id(),
-            TEST_ID.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path).unwrap();
-        Self { path }
-    }
-
-    fn path(&self, relative: impl AsRef<Path>) -> PathBuf {
-        self.path.join(relative)
-    }
-
-    fn write(&self, relative: impl AsRef<Path>, contents: &str) -> PathBuf {
-        let path = self.path(relative);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).unwrap();
-        }
-        fs::write(&path, contents).unwrap();
-        path
-    }
-
+impl PreprocessingWorkspaceExt for support::TestWorkspace {
     fn command(&self) -> Command {
         self.command_for_target("x86_64-unknown-linux-gnu")
     }
@@ -46,7 +21,7 @@ impl TestDirectory {
     fn command_for_target(&self, target: &str) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_ccc"));
         command
-            .current_dir(&self.path)
+            .current_dir(self.path())
             .arg(format!("--target={target}"))
             .env("LC_ALL", "C")
             .env("LANG", "C")
@@ -57,7 +32,7 @@ impl TestDirectory {
     fn host_command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_ccc"));
         command
-            .current_dir(&self.path)
+            .current_dir(self.path())
             .env("LC_ALL", "C")
             .env("LANG", "C")
             .env_remove("SOURCE_DATE_EPOCH");
@@ -65,53 +40,54 @@ impl TestDirectory {
     }
 }
 
-impl Drop for TestDirectory {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-    }
-}
-
 struct RunResult {
     status: ExitStatus,
     stdout: String,
     stderr: String,
+    workspace: Option<PathBuf>,
 }
 
 impl RunResult {
     #[track_caller]
     fn assert_success(&self) {
-        assert!(
-            self.status.success(),
-            "ccc failed with {}\nstdout:\n{}\nstderr:\n{}",
-            self.status,
-            self.stdout,
-            self.stderr
+        support::assert_command_text_success(
+            "CCC invocation",
+            &self.status,
+            &self.stdout,
+            &self.stderr,
+            self.workspace.as_deref(),
         );
     }
 
     #[track_caller]
     fn assert_failure(&self) {
-        assert!(
-            !self.status.success(),
-            "ccc unexpectedly succeeded\nstdout:\n{}\nstderr:\n{}",
-            self.stdout,
-            self.stderr
+        support::assert_command_text_failure(
+            "CCC invocation",
+            &self.status,
+            &self.stdout,
+            &self.stderr,
+            self.workspace.as_deref(),
         );
     }
 }
 
 fn run(mut command: Command) -> RunResult {
+    let workspace = command.get_current_dir().map(Path::to_path_buf);
     let output = command.output().unwrap();
     RunResult {
         status: output.status,
         stdout: String::from_utf8(output.stdout).unwrap(),
         stderr: String::from_utf8(output.stderr).unwrap(),
+        workspace,
     }
 }
 
-fn run_reference_preprocessor(directory: &TestDirectory, source: &Path) -> Option<RunResult> {
+fn run_reference_preprocessor(
+    directory: &support::TestWorkspace,
+    source: &Path,
+) -> Option<RunResult> {
     let output = Command::new("cc")
-        .current_dir(&directory.path)
+        .current_dir(directory.path())
         .env("LC_ALL", "C")
         .env("LANG", "C")
         .env_remove("SOURCE_DATE_EPOCH")
@@ -123,6 +99,7 @@ fn run_reference_preprocessor(directory: &TestDirectory, source: &Path) -> Optio
         status: output.status,
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        workspace: Some(directory.path().to_owned()),
     })
 }
 
@@ -151,17 +128,15 @@ fn macos_sdk_root() -> String {
         .args(["--sdk", "macosx", "--show-sdk-path"])
         .output()
         .expect("the Darwin hosted-header gate requires xcrun");
-    assert!(
-        output.status.success(),
-        "xcrun could not locate the macOS SDK"
-    );
+    support::assert_command_success("locate the macOS SDK with xcrun", &output);
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 #[test]
 fn apple_math_private_builtin_adaptation_is_scoped_and_predicate_neutral() {
-    let directory = TestDirectory::new("apple-math-private-builtins");
+    let directory = support::TestWorkspace::new("preprocessing", "apple-math-private-builtins")
+        .retain_on_failure();
     let source = directory.write(
         "apple-math.c",
         concat!(
@@ -352,7 +327,8 @@ fn committed_warning_fixture_matches_its_diagnostic_golden() {
 
 #[test]
 fn preprocess_output_tracks_file_entry_return_and_marker_suppression() {
-    let directory = TestDirectory::new("line-markers");
+    let directory =
+        support::TestWorkspace::new("preprocessing", "line-markers").retain_on_failure();
     let source = directory.write(
         "source/main.c",
         "#include \"value.h\"\nint from_main = FROM_HEADER;\n",
@@ -411,7 +387,8 @@ fn preprocess_output_tracks_file_entry_return_and_marker_suppression() {
 
 #[test]
 fn expands_object_function_stringize_paste_and_variadic_macros() {
-    let directory = TestDirectory::new("macro-expansion");
+    let directory =
+        support::TestWorkspace::new("preprocessing", "macro-expansion").retain_on_failure();
     let source = directory.write(
         "macros.c",
         concat!(
@@ -460,7 +437,8 @@ fn expands_object_function_stringize_paste_and_variadic_macros() {
 
 #[test]
 fn resolves_nested_computed_and_ordered_include_paths() {
-    let directory = TestDirectory::new("include-search");
+    let directory =
+        support::TestWorkspace::new("preprocessing", "include-search").retain_on_failure();
     let source = directory.write(
         "source/main.c",
         concat!(
@@ -478,16 +456,16 @@ fn resolves_nested_computed_and_ordered_include_paths() {
         "#define LOCAL 1\n#include \"detail/deep.h\"\n",
     );
     directory.write("source/detail/deep.h", "#define DEEP 2\n");
-    let quote = directory.path("quote");
+    let quote = directory.join("quote");
     directory.write("quote/quote_only.h", "#define QUOTED 3\n");
-    let first_user = directory.path("user-first");
+    let first_user = directory.join("user-first");
     directory.write("user-first/pick.h", "#define PICKED 4\n");
     directory.write("user-first/computed.h", "#define COMPUTED 5\n");
-    let second_user = directory.path("user-second");
+    let second_user = directory.join("user-second");
     directory.write("user-second/pick.h", "#define PICKED 40\n");
-    let system = directory.path("system");
+    let system = directory.join("system");
     directory.write("system/tier.h", "#define TIER 6\n");
-    let after = directory.path("after");
+    let after = directory.join("after");
     directory.write("after/tier.h", "#define TIER 60\n");
 
     let mut command = directory.command();
@@ -514,7 +492,8 @@ fn resolves_nested_computed_and_ordered_include_paths() {
 
 #[test]
 fn evaluates_conditional_expressions_and_feature_predicates() {
-    let directory = TestDirectory::new("conditionals");
+    let directory =
+        support::TestWorkspace::new("preprocessing", "conditionals").retain_on_failure();
     let source = directory.write(
         "conditional.c",
         concat!(
@@ -546,7 +525,8 @@ fn evaluates_conditional_expressions_and_feature_predicates() {
 
 #[test]
 fn inactive_groups_tolerate_unterminated_literals() {
-    let directory = TestDirectory::new("inactive-token-validation");
+    let directory = support::TestWorkspace::new("preprocessing", "inactive-token-validation")
+        .retain_on_failure();
     let source = directory.write(
         "invalid.c",
         "#if 0\nconst char *text = \"unterminated;\nthis isn't C @ all\n#endif\nint live_value;\n",
@@ -566,7 +546,8 @@ fn inactive_groups_tolerate_unterminated_literals() {
 
 #[test]
 fn emits_predefined_dynamic_and_reproducible_macros() {
-    let directory = TestDirectory::new("predefined-macros");
+    let directory =
+        support::TestWorkspace::new("preprocessing", "predefined-macros").retain_on_failure();
     let source = directory.write(
         "predefined.c",
         concat!(
@@ -741,7 +722,8 @@ fn emits_predefined_dynamic_and_reproducible_macros() {
 
 #[test]
 fn optimization_profiles_control_the_predefined_macro_contract() {
-    let directory = TestDirectory::new("optimization-macros");
+    let directory =
+        support::TestWorkspace::new("preprocessing", "optimization-macros").retain_on_failure();
     let source = directory.write("empty.c", "\n");
 
     for (optimization, optimize, size) in [
@@ -770,7 +752,8 @@ fn optimization_profiles_control_the_predefined_macro_contract() {
 
 #[test]
 fn expands_computed_line_operands_and_logical_locations() {
-    let directory = TestDirectory::new("line-directive");
+    let directory =
+        support::TestWorkspace::new("preprocessing", "line-directive").retain_on_failure();
     let source = directory.write(
         "line.c",
         concat!(
@@ -804,7 +787,8 @@ fn expands_computed_line_operands_and_logical_locations() {
 
 #[test]
 fn warning_controls_promote_and_suppress_preprocessor_warnings() {
-    let directory = TestDirectory::new("warning-controls");
+    let directory =
+        support::TestWorkspace::new("preprocessing", "warning-controls").retain_on_failure();
     let source = directory.write(
         "warning.c",
         "#warning this is an intentional warning\nint warning_sentinel;\n",
@@ -891,7 +875,8 @@ fn warning_controls_promote_and_suppress_preprocessor_warnings() {
 
 #[test]
 fn macro_redefinition_reports_the_previous_source_location() {
-    let directory = TestDirectory::new("macro-redefinition-location");
+    let directory = support::TestWorkspace::new("preprocessing", "macro-redefinition-location")
+        .retain_on_failure();
     let source = directory.write(
         "redefine.c",
         concat!(
@@ -926,7 +911,8 @@ fn macro_redefinition_reports_the_previous_source_location() {
 
 #[test]
 fn warning_directives_remain_visible_in_system_header_regions() {
-    let directory = TestDirectory::new("system-warning-directive");
+    let directory = support::TestWorkspace::new("preprocessing", "system-warning-directive")
+        .retain_on_failure();
     let source = directory.write(
         "warning.i",
         concat!(
@@ -972,7 +958,7 @@ fn warning_directives_remain_visible_in_system_header_regions() {
 
 #[test]
 fn pragma_once_system_headers_and_diagnostic_state_are_observable() {
-    let directory = TestDirectory::new("pragmas");
+    let directory = support::TestWorkspace::new("preprocessing", "pragmas").retain_on_failure();
     let source = directory.write(
         "main.c",
         concat!(
@@ -986,7 +972,7 @@ fn pragma_once_system_headers_and_diagnostic_state_are_observable() {
             "int pragma_sentinel;\n",
         ),
     );
-    let system_directory = directory.path("system");
+    let system_directory = directory.join("system");
     directory.write(
         "system/system.h",
         concat!(
@@ -1045,12 +1031,13 @@ fn pragma_once_system_headers_and_diagnostic_state_are_observable() {
 
 #[test]
 fn pragma_once_uses_physical_identity_across_hard_links() {
-    let directory = TestDirectory::new("pragma-once-hard-link");
+    let directory =
+        support::TestWorkspace::new("preprocessing", "pragma-once-hard-link").retain_on_failure();
     let header = directory.write(
         "include/original.h",
         "#pragma once\nint physical_header_sentinel;\n",
     );
-    let alias = directory.path("include/alias.h");
+    let alias = directory.join("include/alias.h");
     fs::hard_link(&header, &alias).unwrap();
     let source = directory.write(
         "main.c",
@@ -1060,7 +1047,7 @@ fn pragma_once_uses_physical_identity_across_hard_links() {
     let mut command = directory.command();
     command
         .args(["-E", "-P", "-nostdinc", "-I"])
-        .arg(directory.path("include"))
+        .arg(directory.join("include"))
         .arg(source);
     let result = run(command);
     result.assert_success();
@@ -1076,7 +1063,8 @@ fn pragma_once_uses_physical_identity_across_hard_links() {
 
 #[test]
 fn dependency_filtering_observes_a_system_header_pragma() {
-    let directory = TestDirectory::new("pragma-system-dependency");
+    let directory = support::TestWorkspace::new("preprocessing", "pragma-system-dependency")
+        .retain_on_failure();
     let header = directory.write(
         "include/reclassified.h",
         "#pragma GCC system_header\n#define RECLASSIFIED 42\n",
@@ -1089,7 +1077,7 @@ fn dependency_filtering_observes_a_system_header_pragma() {
     let mut command = directory.command();
     command
         .args(["-MM", "-nostdinc", "-I"])
-        .arg(directory.path("include"))
+        .arg(directory.join("include"))
         .arg(&source);
     let user_dependencies = run(command);
     user_dependencies.assert_success();
@@ -1102,7 +1090,7 @@ fn dependency_filtering_observes_a_system_header_pragma() {
     let mut command = directory.command();
     command
         .args(["-M", "-nostdinc", "-I"])
-        .arg(directory.path("include"))
+        .arg(directory.join("include"))
         .arg(source);
     let all_dependencies = run(command);
     all_dependencies.assert_success();
@@ -1115,7 +1103,8 @@ fn dependency_filtering_observes_a_system_header_pragma() {
 
 #[test]
 fn dependency_modes_filter_quote_targets_and_emit_phony_rules() {
-    let directory = TestDirectory::new("dependency-modes");
+    let directory =
+        support::TestWorkspace::new("preprocessing", "dependency-modes").retain_on_failure();
     let source = directory.write(
         "source dir/main.c",
         concat!(
@@ -1125,9 +1114,9 @@ fn dependency_modes_filter_quote_targets_and_emit_phony_rules() {
             "int dependency_sentinel = USER_VALUE + SYSTEM_VALUE;\n",
         ),
     );
-    let user = directory.path("user dir");
+    let user = directory.join("user dir");
     let user_header = directory.write("user dir/user header.h", "#define USER_VALUE 1\n");
-    let system = directory.path("system dir");
+    let system = directory.join("system dir");
     let system_header = directory.write("system dir/system_header.h", "#define SYSTEM_VALUE 2\n");
 
     let mut command = directory.command();
@@ -1191,7 +1180,7 @@ fn dependency_modes_filter_quote_targets_and_emit_phony_rules() {
     assert!(user_only.stdout.contains(&make_quote_path(&user_header)));
     assert!(!user_only.stdout.contains(&make_quote_path(&system_header)));
 
-    let all_file = directory.path("all.d");
+    let all_file = directory.join("all.d");
     let mut command = directory.command();
     command
         .args(["-E", "-P", "-MD", "-MF"])
@@ -1207,7 +1196,7 @@ fn dependency_modes_filter_quote_targets_and_emit_phony_rules() {
     let all_dependencies = fs::read_to_string(all_file).unwrap();
     assert!(all_dependencies.contains(&make_quote_path(&system_header)));
 
-    let user_file = directory.path("user.d");
+    let user_file = directory.join("user.d");
     let mut command = directory.command();
     command
         .args(["-E", "-P", "-MMD", "-MF"])
@@ -1226,7 +1215,8 @@ fn dependency_modes_filter_quote_targets_and_emit_phony_rules() {
 
 #[test]
 fn failed_preprocessing_preserves_an_existing_dependency_file() {
-    let directory = TestDirectory::new("dependency-failure");
+    let directory =
+        support::TestWorkspace::new("preprocessing", "dependency-failure").retain_on_failure();
     let source = directory.write("broken.c", "#include \"missing.h\"\n");
     let dependencies = directory.write("broken.d", "existing dependency contents\n");
 
@@ -1242,7 +1232,7 @@ fn failed_preprocessing_preserves_an_existing_dependency_file() {
         fs::read_to_string(&dependencies).unwrap(),
         "existing dependency contents\n"
     );
-    let pending_outputs = fs::read_dir(&directory.path)
+    let pending_outputs = fs::read_dir(directory.path())
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
         .filter(|name| name.contains(".ccc-") && name.ends_with(".tmp"))
@@ -1255,7 +1245,8 @@ fn failed_preprocessing_preserves_an_existing_dependency_file() {
 
 #[test]
 fn forced_macro_files_precede_forced_includes_and_do_not_emit_text() {
-    let directory = TestDirectory::new("forced-inputs");
+    let directory =
+        support::TestWorkspace::new("preprocessing", "forced-inputs").retain_on_failure();
     let first_macros = directory.write(
         "first-macros.h",
         "#define ORDER 1\nint imacros_text_must_not_be_emitted;\n",
@@ -1294,7 +1285,8 @@ fn forced_macro_files_precede_forced_includes_and_do_not_emit_text() {
 fn preprocesses_the_curated_hosted_header_tree_as_system_headers() {
     let include_directory = repository_fixture("test-corpus/libc-headers/glibc-like");
     let source = include_directory.join("probe.c");
-    let directory = TestDirectory::new("curated-hosted-headers");
+    let directory =
+        support::TestWorkspace::new("preprocessing", "curated-hosted-headers").retain_on_failure();
 
     for profile in ENABLED_TARGET_SPECS {
         let target = profile.triple.to_string();
@@ -1339,7 +1331,8 @@ fn preprocesses_the_curated_hosted_header_tree_as_system_headers() {
 fn parses_the_curated_hosted_header_tree_as_system_headers() {
     let include_directory = repository_fixture("test-corpus/libc-headers/glibc-like");
     let source = include_directory.join("probe.c");
-    let directory = TestDirectory::new("curated-hosted-header-parse");
+    let directory = support::TestWorkspace::new("preprocessing", "curated-hosted-header-parse")
+        .retain_on_failure();
 
     for profile in ENABLED_TARGET_SPECS {
         let target = profile.triple.to_string();
@@ -1382,7 +1375,8 @@ fn preprocesses_installed_target_glibc_headers() {
     let identity = support::installed_glibc_identity();
     eprintln!("hosted-header gate: {identity}");
 
-    let directory = TestDirectory::new("installed-glibc-header");
+    let directory =
+        support::TestWorkspace::new("preprocessing", "installed-glibc-header").retain_on_failure();
     let source = directory.write(
         "installed.c",
         concat!(
@@ -1407,11 +1401,12 @@ fn preprocesses_installed_target_glibc_headers() {
     let mut command = directory.command_for_target(support::native_linux_target_triple());
     command.args(["-E", "-P"]).arg(source);
     let result = run(command);
-    assert!(
-        result.status.success(),
-        "hosted-header gate failed for {identity}\nstdout:\n{}\nstderr:\n{}",
-        result.stdout,
-        result.stderr
+    support::assert_command_text_success(
+        &format!("preprocess the installed hosted-header gate for {identity}"),
+        &result.status,
+        &result.stdout,
+        &result.stderr,
+        result.workspace.as_deref(),
     );
     let output = squash_whitespace(&result.stdout);
     assert!(
@@ -1447,7 +1442,8 @@ fn preprocesses_installed_target_glibc_headers() {
 fn parses_installed_target_glibc_headers() {
     let identity = support::installed_glibc_identity();
     eprintln!("hosted-header gate: {identity}");
-    let directory = TestDirectory::new("installed-glibc-header-parse");
+    let directory = support::TestWorkspace::new("preprocessing", "installed-glibc-header-parse")
+        .retain_on_failure();
     let source = directory.write(
         "installed-parse.c",
         concat!(
@@ -1473,11 +1469,12 @@ fn parses_installed_target_glibc_headers() {
     let mut command = directory.command_for_target(support::native_linux_target_triple());
     command.arg("--dump-ast").arg(source);
     let result = run(command);
-    assert!(
-        result.status.success(),
-        "hosted-header parse gate failed for {identity}\nstdout:\n{}\nstderr:\n{}",
-        result.stdout,
-        result.stderr
+    support::assert_command_text_success(
+        &format!("parse the installed hosted-header gate for {identity}"),
+        &result.status,
+        &result.stdout,
+        &result.stderr,
+        result.workspace.as_deref(),
     );
     assert!(result.stderr.trim().is_empty(), "{}", result.stderr);
 
@@ -1517,13 +1514,14 @@ fn parses_installed_target_glibc_headers() {
 
 #[test]
 fn recompiles_saved_preprocessor_output_with_numeric_linemarkers() {
-    let directory = TestDirectory::new("saved-preprocessor-output");
+    let directory = support::TestWorkspace::new("preprocessing", "saved-preprocessor-output")
+        .retain_on_failure();
     let source = directory.write(
         "source/main.c",
         "#include \"value.h\"\nint saved_value(void) { return HEADER_VALUE; }\n",
     );
     directory.write("source/value.h", "#define HEADER_VALUE 42\n");
-    let preprocessed = directory.path("build/main.i");
+    let preprocessed = directory.join("build/main.i");
     fs::create_dir_all(preprocessed.parent().unwrap()).unwrap();
 
     let mut command = directory.command();
@@ -1544,7 +1542,7 @@ fn recompiles_saved_preprocessor_output_with_numeric_linemarkers() {
         "{saved}"
     );
 
-    let object = directory.path("build/main.o");
+    let object = directory.join("build/main.o");
     let mut command = directory.command();
     command
         .args(["-c", "-nostdinc", "-o"])
@@ -1560,13 +1558,14 @@ fn recompiles_saved_preprocessor_output_with_numeric_linemarkers() {
 
 #[test]
 fn preprocessed_c_inputs_are_not_macro_expanded_again() {
-    let directory = TestDirectory::new("preprocessed-c-language");
+    let directory =
+        support::TestWorkspace::new("preprocessing", "preprocessed-c-language").retain_on_failure();
     for (name, language) in [
         ("implicit.i", None),
         ("extensionless", Some("c-cpp-output")),
     ] {
         let source = directory.write(name, "int SELECTED(void) { return 42; }\n");
-        let object_path = directory.path(format!("{name}.o"));
+        let object_path = directory.join(format!("{name}.o"));
         let mut command = directory.command();
         command.args(["-c", "-nostdinc", "-DSELECTED=reexpanded"]);
         if let Some(language) = language {
@@ -1589,7 +1588,8 @@ fn preprocessed_c_inputs_are_not_macro_expanded_again() {
 
 #[test]
 fn stringization_preserves_one_separator_between_argument_tokens() {
-    let directory = TestDirectory::new("exact-stringization");
+    let directory =
+        support::TestWorkspace::new("preprocessing", "exact-stringization").retain_on_failure();
     let source = directory.write(
         "stringize.c",
         concat!(
@@ -1627,7 +1627,8 @@ fn stringization_preserves_one_separator_between_argument_tokens() {
 
 #[test]
 fn expands_function_macros_with_multiline_invocations_and_arguments() {
-    let directory = TestDirectory::new("multiline-macro-invocation");
+    let directory = support::TestWorkspace::new("preprocessing", "multiline-macro-invocation")
+        .retain_on_failure();
     let source = directory.write(
         "multiline.c",
         concat!(
@@ -1656,7 +1657,8 @@ fn expands_function_macros_with_multiline_invocations_and_arguments() {
 
 #[test]
 fn token_pasting_treats_empty_operands_as_placemarkers() {
-    let directory = TestDirectory::new("empty-paste-operands");
+    let directory =
+        support::TestWorkspace::new("preprocessing", "empty-paste-operands").retain_on_failure();
     let source = directory.write(
         "paste.c",
         concat!(
@@ -1679,7 +1681,8 @@ fn token_pasting_treats_empty_operands_as_placemarkers() {
 
 #[test]
 fn expands_computed_includes_but_not_direct_angle_header_names() {
-    let directory = TestDirectory::new("direct-and-computed-includes");
+    let directory = support::TestWorkspace::new("preprocessing", "direct-and-computed-includes")
+        .retain_on_failure();
     let source = directory.write(
         "main.c",
         concat!(
@@ -1690,7 +1693,7 @@ fn expands_computed_includes_but_not_direct_angle_header_names() {
             "int include_value = DIRECT_VALUE + COMPUTED_VALUE;\n",
         ),
     );
-    let include = directory.path("include");
+    let include = directory.join("include");
     directory.write("include/direct.h", "#define DIRECT_VALUE 1\n");
     directory.write("include/redirected.h", "#define DIRECT_VALUE 99\n");
     directory.write("include/computed.h", "#define COMPUTED_VALUE 2\n");
@@ -1711,12 +1714,13 @@ fn expands_computed_includes_but_not_direct_angle_header_names() {
 
 #[test]
 fn include_next_resumes_after_the_directory_that_found_the_current_header() {
-    let directory = TestDirectory::new("include-next");
+    let directory =
+        support::TestWorkspace::new("preprocessing", "include-next").retain_on_failure();
     let source = directory.write(
         "main.c",
         "#include <chain.h>\nint chained_value = FIRST_VALUE + SECOND_VALUE;\n",
     );
-    let first = directory.path("first");
+    let first = directory.join("first");
     directory.write(
         "first/chain.h",
         concat!(
@@ -1727,9 +1731,9 @@ fn include_next_resumes_after_the_directory_that_found_the_current_header() {
             "#endif\n",
         ),
     );
-    let unrelated = directory.path("unrelated");
+    let unrelated = directory.join("unrelated");
     fs::create_dir_all(&unrelated).unwrap();
-    let second = directory.path("second");
+    let second = directory.join("second");
     directory.write("second/chain.h", "#define SECOND_VALUE 2\n");
 
     let mut command = directory.command();
@@ -1754,13 +1758,13 @@ fn include_next_resumes_after_the_directory_that_found_the_current_header() {
     let mut command = directory.command();
     command
         .args(["-E", "-P", "-std=c11", "-nostdinc", "-I"])
-        .arg(directory.path("first"))
+        .arg(directory.join("first"))
         .arg("-I")
-        .arg(directory.path("unrelated"))
+        .arg(directory.join("unrelated"))
         .arg("-I")
-        .arg(directory.path("first"))
+        .arg(directory.join("first"))
         .arg("-I")
-        .arg(directory.path("second"))
+        .arg(directory.join("second"))
         .arg(source);
     let strict = run(command);
     strict.assert_success();
@@ -1773,7 +1777,8 @@ fn include_next_resumes_after_the_directory_that_found_the_current_header() {
 
 #[test]
 fn forced_include_names_are_resolved_through_user_include_paths() {
-    let directory = TestDirectory::new("forced-include-search");
+    let directory =
+        support::TestWorkspace::new("preprocessing", "forced-include-search").retain_on_failure();
     directory.write("headers/forced.h", "#define FORCED_SEARCH_VALUE 42\n");
     directory.write("source/forced.h", "#define FORCED_SEARCH_VALUE 1\n");
     directory.write(
@@ -1803,7 +1808,8 @@ fn forced_include_names_are_resolved_through_user_include_paths() {
 
 #[test]
 fn preprocessing_token_dump_has_stable_macro_origin_summaries() {
-    let directory = TestDirectory::new("pp-token-origins");
+    let directory =
+        support::TestWorkspace::new("preprocessing", "pp-token-origins").retain_on_failure();
     let source = directory.write(
         "origins.c",
         concat!(
@@ -1852,7 +1858,8 @@ fn preprocessing_token_dump_has_stable_macro_origin_summaries() {
 
 #[test]
 fn normalizes_bom_crlf_splices_and_valid_universal_character_names() {
-    let directory = TestDirectory::new("source-normalization");
+    let directory =
+        support::TestWorkspace::new("preprocessing", "source-normalization").retain_on_failure();
     let source = directory.write(
         "normalized.c",
         concat!(
@@ -1876,7 +1883,8 @@ fn normalizes_bom_crlf_splices_and_valid_universal_character_names() {
 
 #[test]
 fn language_mode_controls_default_trigraph_conversion() {
-    let directory = TestDirectory::new("language-trigraph-defaults");
+    let directory = support::TestWorkspace::new("preprocessing", "language-trigraph-defaults")
+        .retain_on_failure();
     let source = directory.write(
         "trigraph.c",
         "??=define TRIGRAPH_VALUE 42\nint trigraph_value = TRIGRAPH_VALUE;\n",
@@ -1909,7 +1917,8 @@ fn language_mode_controls_default_trigraph_conversion() {
 
 #[test]
 fn c99_build_profile_aliases_retain_the_c11_macro_identity() {
-    let directory = TestDirectory::new("c99-alias-macro-identity");
+    let directory = support::TestWorkspace::new("preprocessing", "c99-alias-macro-identity")
+        .retain_on_failure();
     let source = directory.write("identity.c", "int identity;\n");
 
     for (mode, strict) in [("-std=gnu99", false), ("-std=c99", true)] {
@@ -1939,7 +1948,8 @@ fn c99_build_profile_aliases_retain_the_c11_macro_identity() {
 
 #[test]
 fn discovers_and_preprocesses_compiler_resource_headers() {
-    let directory = TestDirectory::new("compiler-resource-headers");
+    let directory = support::TestWorkspace::new("preprocessing", "compiler-resource-headers")
+        .retain_on_failure();
     let source = directory.write(
         "resources.c",
         concat!(
@@ -1976,7 +1986,8 @@ fn discovers_and_preprocesses_compiler_resource_headers() {
 
 #[test]
 fn float_resource_header_exposes_binary16_limits_on_request() {
-    let directory = TestDirectory::new("float16-resource-header");
+    let directory =
+        support::TestWorkspace::new("preprocessing", "float16-resource-header").retain_on_failure();
     let source = directory.write(
         "float16.c",
         concat!(
@@ -2007,7 +2018,8 @@ fn float_resource_header_exposes_binary16_limits_on_request() {
 
 #[test]
 fn stdatomic_resource_header_exposes_native_scalar_operations_without_overclaiming() {
-    let directory = TestDirectory::new("stdatomic-resource-header");
+    let directory = support::TestWorkspace::new("preprocessing", "stdatomic-resource-header")
+        .retain_on_failure();
     let source = directory.write(
         "stdatomic.c",
         concat!(
@@ -2046,7 +2058,8 @@ fn stdatomic_resource_header_exposes_native_scalar_operations_without_overclaimi
 
 #[test]
 fn stdarg_resource_header_supports_repeated_and_partial_inclusion() {
-    let directory = TestDirectory::new("stdarg-resource-header");
+    let directory =
+        support::TestWorkspace::new("preprocessing", "stdarg-resource-header").retain_on_failure();
     let source = directory.write(
         "stdarg.c",
         concat!(
@@ -2107,7 +2120,8 @@ fn stdarg_resource_header_supports_repeated_and_partial_inclusion() {
 
 #[test]
 fn nobuiltininc_removes_the_stdarg_resource_header() {
-    let directory = TestDirectory::new("stdarg-nobuiltininc");
+    let directory =
+        support::TestWorkspace::new("preprocessing", "stdarg-nobuiltininc").retain_on_failure();
     let source = directory.write("stdarg.c", "#include <stdarg.h>\n");
     let resources = repository_fixture("resource-dir");
 
@@ -2123,7 +2137,8 @@ fn nobuiltininc_removes_the_stdarg_resource_header() {
 
 #[test]
 fn dependency_rules_preserve_default_and_explicit_relative_spellings() {
-    let directory = TestDirectory::new("relative-dependency-spelling");
+    let directory = support::TestWorkspace::new("preprocessing", "relative-dependency-spelling")
+        .retain_on_failure();
     directory.write(
         "src/main.c",
         "#include <value.h>\nint dependency_value = VALUE;\n",
@@ -2139,7 +2154,7 @@ fn dependency_rules_preserve_default_and_explicit_relative_spellings() {
         "default dependency spelling changed"
     );
 
-    fs::create_dir_all(directory.path("deps")).unwrap();
+    fs::create_dir_all(directory.join("deps")).unwrap();
     let mut command = directory.command();
     command.args([
         "-M",
@@ -2156,7 +2171,7 @@ fn dependency_rules_preserve_default_and_explicit_relative_spellings() {
     explicit.assert_success();
     assert!(explicit.stdout.is_empty(), "{}", explicit.stdout);
     assert_eq!(
-        fs::read_to_string(directory.path("deps/custom.d")).unwrap(),
+        fs::read_to_string(directory.join("deps/custom.d")).unwrap(),
         "objects/custom.o: src/main.c headers/value.h\n",
         "explicit dependency spelling changed"
     );
@@ -2164,7 +2179,8 @@ fn dependency_rules_preserve_default_and_explicit_relative_spellings() {
 
 #[test]
 fn inactive_token_validation_matches_an_available_reference_preprocessor() {
-    let directory = TestDirectory::new("reference-inactive-tokens");
+    let directory = support::TestWorkspace::new("preprocessing", "reference-inactive-tokens")
+        .retain_on_failure();
     let probe = directory.write("probe.c", "int reference_probe;\n");
     let Some(probe_result) = run_reference_preprocessor(&directory, &probe) else {
         return;
