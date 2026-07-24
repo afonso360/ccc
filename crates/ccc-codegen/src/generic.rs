@@ -4,6 +4,7 @@ mod backend;
 mod data;
 mod debug;
 mod function;
+mod inlining;
 #[cfg(test)]
 mod tests;
 mod unwind;
@@ -37,6 +38,14 @@ use crate::{CodegenError, Options, Output};
 
 const BACKEND_ERROR: &str = "CCC4002";
 const ATOMIC_ERROR: &str = "CCC4011";
+const INLINE_ERROR: &str = "CCC4012";
+
+struct PreparedFunction {
+    function_index: usize,
+    id: FuncId,
+    context: cranelift_codegen::Context,
+    debug_layout: function::FunctionDebugLayout,
+}
 
 fn f64_to_f16_bits(value: f64) -> u16 {
     let raw = value.to_bits();
@@ -142,7 +151,11 @@ fn emit_inner(
         .debug_info
         .map(|sources| debug::DebugEmitter::new(module, config, sources));
 
-    let mut clif = String::new();
+    // Inlining needs verified, frontend-finalized bodies from the same target
+    // invocation. Prepare every definition before compiling any one of them;
+    // the normal ObjectModule definition path below remains the sole owner of
+    // Cranelift optimization and machine lowering.
+    let mut prepared_functions = Vec::new();
     for (function_index, function) in module.functions.iter().enumerate() {
         let Some(_) = function.entry else {
             continue;
@@ -177,12 +190,6 @@ fn emit_inner(
         )
         .map_err(|error| error.with_span_if_none(function.span))?;
         drop(references);
-        if options.emit_clif {
-            clif.push_str(&format!(
-                "; function {}\n{}\n",
-                function.symbol_name, context.func
-            ));
-        }
         let id = declarations
             .definition_functions
             .get(&function.id.0)
@@ -197,20 +204,63 @@ fn emit_inner(
                 function.symbol_name
             )));
         }
+        prepared_functions.push(PreparedFunction {
+            function_index,
+            id,
+            context,
+            debug_layout,
+        });
+    }
+
+    let inlining = inlining::InliningPlan::new(
+        module,
+        abi_plan,
+        &declarations,
+        &prepared_functions,
+        config.optimization,
+        options.debug_info.is_some(),
+    )?;
+
+    let mut clif = String::new();
+    for mut prepared in prepared_functions {
+        let function = &module.functions[prepared.function_index];
+        let mut policy = inlining.policy(function.id.0);
+        let rewritten = backend::inline_function(&mut prepared.context, &mut policy)?;
+        policy.verify_required_calls_were_inlined(&prepared.context.func, function)?;
+        if rewritten
+            && let Err(errors) =
+                cranelift_codegen::verify_function(&prepared.context.func, object_module.isa())
+        {
+            let details = cranelift_codegen::print_errors::pretty_verifier_error(
+                &prepared.context.func,
+                None,
+                errors,
+            );
+            return Err(error(format!(
+                "Cranelift verifier rejected `{}` after inlining:\n{details}",
+                function.symbol_name
+            )));
+        }
+        if options.emit_clif {
+            clif.push_str(&format!(
+                "; function {}\n{}\n",
+                function.symbol_name, prepared.context.func
+            ));
+        }
         object_module
-            .define_function(id, &mut context)
+            .define_function(prepared.id, &mut prepared.context)
             .map_err(module_error)?;
         if let Some(debug) = debug.as_mut() {
             debug.record_function(
-                function_index,
-                id,
-                &context,
-                &debug_layout,
+                prepared.function_index,
+                prepared.id,
+                &prepared.context,
+                &prepared.debug_layout,
                 object_module.isa(),
             )?;
         }
         unwind
-            .record_function(id, &context, object_module.isa())
+            .record_function(prepared.id, &prepared.context, object_module.isa())
             .map_err(error)?;
     }
 

@@ -38,77 +38,81 @@ remain direct. The remaining integration work is to:
 - Keep `cargo tree` evidence with each accepted refresh and make the smallest
   failing target/corpus command available for upstream regression bisection.
 
-## Second: enable Cranelift inlining
+## Second: broaden and measure Cranelift inlining
 
-Use Cranelift's
+CCC now uses Cranelift's
 [`Context::inline`](https://github.com/bytecodealliance/wasmtime/blob/main/cranelift/codegen/src/context.rs)
 and
 [`Inline` policy interface](https://github.com/bytecodealliance/wasmtime/blob/main/cranelift/codegen/src/inline.rs).
 Cranelift provides the transformation but deliberately leaves call-graph
 knowledge and heuristics to its user, so CCC must supply the policy and the
-proof that each selected call is safe.
+proof that each selected call is safe. The first slice prepares and verifies
+all raw CLIF definitions before compilation, resolves exact namespace-zero
+`FuncRef` signatures within one target invocation, and admits bounded strong
+internal native leaf definitions at `-O2`/`-O3`. Exact `noinline` is enforced;
+safe `always_inline` leaves are required at every optimization tier and unsafe
+uses receive `CCC4012`. Rewritten callers still enter the ordinary Cranelift
+definition/optimization pipeline exactly once, and original out-of-line
+definitions remain emitted.
 
-### Code-generation integration
+### Remaining code-generation policy
 
-- Lower all function definitions to CLIF before compiling any one function.
-  Build a deterministic map from a caller's direct `FuncRef` to its
-  translation-unit-local definition.
-- Finalize raw frontend-built CLIF and verify caller and candidates before
-  invoking `Context::inline`; verify the rewritten caller again, then pass it
-  through the normal module definition and Cranelift optimization pipeline.
-  Do not invent a legalization or candidate pre-optimization pass: current
-  Cranelift removed the public legalizer and its own inliner tests exercise this
-  order. Require exactly the signature referenced by each call site. The
-  inliner remaps global values, memory flags, and alias regions, so do not add a
-  blanket rejection for those entities. Keep prepared bodies local to one
-  target/configuration invocation; never reuse them across ISA or codegen
-  settings.
-- Run inlining before the caller's normal Cranelift optimization and machine
-  lowering, then let Cranelift simplify the resulting CFG and values.
-- Keep generated ABI bridges, imported functions, indirect calls, patchable
-  calls, weak definitions, interposable external definitions, and incompatible
-  lowered signatures out of the initial candidate set.
-- Preserve the original out-of-line definition whenever its symbol or address
-  remains observable.
+- Extend the candidate proof beyond leaves only after focused evidence for
+  non-leaf bodies, hidden/final external definitions, global values, stack
+  slots, alias regions, TLS, volatile and atomic effects, computed goto,
+  runtime-sized storage, and supported inline assembly. Imports, weak or
+  interposable definitions, generated ABI bridges, incompatible signatures,
+  indirect calls, and patchable calls must remain out unless their distinct
+  semantics acquire an explicit contract.
+- Keep user-named symbolic global values out until Cranelift remaps their
+  function-local user-name references while cloning global values. Track that
+  upstream rather than maintaining a second CCC-side entity remapper.
+- Add a translation-unit growth budget and benchmark-derived, separately tuned
+  `-O2` and `-O3` instruction/block/site limits. The current deterministic
+  depth-one policy has exact per-callee and per-caller limits but deliberately
+  has no profile-specific tuning.
+- Decide whether `-Os`/`-Oz` may inline only after measuring a net encoded-size
+  reduction rather than assuming raw CLIF counts predict machine-code size.
+- Broaden the set of safely honor-able `always_inline` definitions. Continue
+  diagnosing every referenced required body outside that set instead of
+  silently weakening the attribute.
 
 ### Policy and language semantics
 
-- Start heuristic inlining at `-O2` and `-O3`. Use deterministic instruction,
-  block, depth, and translation-unit growth budgets; prevent direct and mutual
-  recursion from exhausting the compiler. Admit `-Os` and `-Oz` candidates
-  only when the measured result is smaller.
-- Enforce the recorded exact `always_inline` and `noinline` properties in the
-  inlining policy, and diagnose an `always_inline` call that cannot be honored.
-  Treat the separate C `inline` specifier as a hint, not as permission to
-  ignore its C11 definition and linkage rules.
-- Exclude returns-twice paths, generated bridge bodies, and other exceptional
-  frame contracts until focused tests prove that cloning them is safe.
 - Record every rejection reason in an optional optimization remark so
   `-Winline` can report a useful source location without making ordinary builds
   noisy.
-- Benchmark compile time, code size, and runtime before assigning distinct
-  budgets to `-O2` and `-O3`.
+- Complete ISO and GNU inline-definition/linkage semantics independently of
+  optimizer choice. The C `inline` specifier is currently only a size-budget
+  hint and must never become permission to change an externally observable
+  definition.
+- Keep returns-twice callers and callees, recursive SCCs, generated bridge
+  bodies, and other exceptional frame contracts out until focused ABI,
+  unwind, and execution tests prove that cloning them is safe.
 
 CCC-IR must continue to own only transformations that require C type/effect
 knowledge or canonical verified IR. Global value numbering, loop transforms,
 machine instruction combining, register allocation, scheduling, and
-target-specific peepholes remain Cranelift work; enabling inlining must not
+target-specific peepholes remain Cranelift work; broadening inlining must not
 create second implementations of those passes.
 
 ### Debug information and evidence
 
-Inlining must not publish misleading source information. Until CCC emits
-correct abstract origins, call-site ranges, and `DW_TAG_inlined_subroutine`
-entries, keep heuristic inlining disabled for `-g` builds. Then add GDB and
-LLDB checks that can step from caller to inlined callee, inspect surviving
-arguments and locals, and produce a source-level backtrace.
+Heuristic inlining is disabled for `-g`, and a required `always_inline` call is
+diagnosed, so the first slice cannot publish misleading source information.
+Emit correct abstract origins, call-site ranges, and
+`DW_TAG_inlined_subroutine` entries before lifting that restriction. Then add
+GDB and LLDB checks that can step from caller to inlined callee, inspect
+surviving arguments and locals, and produce a source-level backtrace.
 
-The functional matrix must cover calls that are retained and removed,
-attributes, recursion, address-taken functions, static and external linkage,
-TLS, volatile and atomic effects, runtime-sized storage, computed goto, inline
-assembly, variadics, ABI bridges, and returns-twice behavior. Exact CLIF
-goldens, object-symbol checks, deterministic rebuilds, all target oracles,
-Csmith, and the real-code corpora must agree at `-O0`, `-O2`, and `-Oz`.
+The initial all-target matrix covers calls that are retained and removed,
+attribute requirements, recursion, address-preserving out-of-line symbols,
+static and external linkage, weak definitions, indirect calls, generated
+bridges, returns-twice callers, debug builds, deterministic rebuilds, and exact
+budget boundaries. Extend it to TLS, volatile and atomic effects,
+runtime-sized storage, computed goto, inline assembly, deeper variadic cases,
+exact CLIF goldens, target-oracle execution, Csmith, and the real-code corpora
+at `-O0`, `-O2`, and `-Oz`.
 
 ## Benchmarking and code-generation performance
 

@@ -7,6 +7,7 @@
 
 use ccc_target::{EffectiveCompilationConfig, OptimizationLevel, RelocationModel};
 use cranelift_codegen::Context;
+use cranelift_codegen::inline::Inline;
 use cranelift_codegen::ir::{self, InstBuilder, MemFlagsData, UserFuncName};
 use cranelift_codegen::isa;
 use cranelift_codegen::settings::{self, Configurable as _};
@@ -79,6 +80,15 @@ pub(super) fn function_context(function: u32, signature: ir::Signature) -> Conte
     let mut context = Context::new();
     context.func = ir::Function::with_name_signature(UserFuncName::user(0, function), signature);
     context
+}
+
+/// Invoke Cranelift's library inliner without exposing its evolving entry
+/// point throughout CCC's policy and lowering code.
+pub(super) fn inline_function(
+    context: &mut Context,
+    inliner: impl Inline,
+) -> Result<bool, CodegenError> {
+    context.inline(inliner).map_err(module_error)
 }
 
 pub(super) fn frontend_config(module: &ObjectModule) -> FrontendConfig {

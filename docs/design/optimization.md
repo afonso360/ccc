@@ -57,6 +57,44 @@ target-specific peepholes remain Cranelift responsibilities. Reimplementing
 those operations in CCC-IR would add a second machine optimizer without adding
 C-language correctness information.
 
+## Backend inlining
+
+Code generation prepares and verifies every frontend-finalized CLIF definition
+before compiling any one function. A target-invocation-local map resolves
+namespace-zero Cranelift `FuncRef`s to exact-signature bodies, and
+`Context::inline` performs the transformation before the ordinary
+`ObjectModule::define_function` path. Candidates are not legalized or
+pre-optimized separately, and CCC does not add CFG cleanup, GVN, peepholes, or
+other substitutes for Cranelift's normal passes. `--emit-clif` consequently
+shows the post-inlining function that enters that pipeline.
+
+The first policy is deliberately narrow. At `-O2` and `-O3`, it considers
+strong internal, native-boundary, non-recursive leaf definitions only. It
+rejects bridge bodies, imports, weak or externally linked definitions,
+returns-twice callers and callees, indirect or patchable call sites, signature
+mismatches, user-named global storage, and exact `noinline` definitions.
+Current Cranelift copies symbolic global values while inlining without remapping
+their function-local user-name references, so CCC keeps those candidates out
+instead of adding a duplicate backend remapper. The raw-CLIF limits are 24
+instructions (32 when the C `inline` specifier supplies a hint), four blocks,
+eight sites per caller, 96 estimated instructions of caller growth, and 16
+estimated blocks of caller growth. Traversal is depth one
+(`visit_callee=false`), and every original definition is still emitted as an
+out-of-line symbol.
+
+A safe internal leaf marked `always_inline` is required at every optimization
+level and ignores the heuristic size and growth limits. If its direct call
+cannot satisfy the initial safety contract, code generation reports `CCC4012`
+instead of silently retaining the call. Exact `noinline` always wins; semantic
+analysis rejects a declaration that combines the two attributes before code
+generation.
+
+Heuristic inlining is disabled when source debug information is requested
+because CCC does not yet emit inlined-subroutine DIEs and abstract origins. A
+required `always_inline` call in that mode receives `CCC4012` for the same
+reason, so emitted DWARF never pretends that a transformed call is still an
+ordinary out-of-line frame.
+
 ## Validation
 
 Pass-local tests cover target-width wrapping and undefined or

@@ -298,10 +298,19 @@ GNU `always_inline` and `noinline` are canonical function properties, including
 across redeclarations, while the original attribute spelling remains available
 in the typed tree. They are distinct from the C `inline` specifier: recording
 `always_inline` does not create a C inline definition, and `inline noinline`
-retains both the language-specifier and optimization-policy facts. The
-Cranelift inliner is not enabled yet, so the shipped Apple header wrapper
-continues to select its static-inline fallback until the recorded policy is
-enforced during code generation.
+retains both the language-specifier and optimization-policy facts. Code
+generation now enforces `noinline` and the first conservative `always_inline`
+contract while using the separate C specifier only as a heuristic size hint.
+Safe strong internal native leaf definitions marked `always_inline` are
+required at every optimization level; an unsafe referenced definition receives
+`CCC4012` rather than being silently ignored. Ordinary heuristic inlining is
+limited to `-O2`/`-O3` and is disabled with `-g`; see
+[Optimization](optimization.md#backend-inlining).
+
+The shipped Apple header wrapper continues to select the SDK's static-inline
+fallback. The initial policy is intentionally narrower than the SDK's complete
+external-inline and debug-information contract, so enabling the first
+translation-unit-local leaf cases is not evidence for changing that wrapper.
 
 On builtin integer typedefs, `aligned` records the exact requested object
 alignment while preserving the underlying integer's size, compatibility,
