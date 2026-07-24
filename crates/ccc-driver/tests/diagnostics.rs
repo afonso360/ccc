@@ -1,9 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 
-static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+mod support;
 
 struct Case {
     name: &'static str,
@@ -12,17 +11,6 @@ struct Case {
 
 fn repository() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
-fn temporary_directory(name: &str) -> PathBuf {
-    let serial = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-    let directory = std::env::temp_dir().join(format!(
-        "ccc-diagnostics-{}-{serial}-{name}",
-        std::process::id()
-    ));
-    let _ = fs::remove_dir_all(&directory);
-    fs::create_dir_all(&directory).unwrap();
-    directory
 }
 
 #[test]
@@ -110,7 +98,7 @@ fn rejected_translations_match_diagnostic_goldens_and_emit_no_object() {
     let repository = repository();
 
     for case in cases {
-        let directory = temporary_directory(case.name);
+        let directory = support::TestWorkspace::new("diagnostics", case.name).retain_on_failure();
         let output = directory.join(format!("{}.o", case.name));
         let input = format!("tests/diagnostics/cases/{}.c", case.name);
         let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
@@ -128,11 +116,7 @@ fn rejected_translations_match_diagnostic_goldens_and_emit_no_object() {
             .output()
             .unwrap();
 
-        assert!(
-            !result.status.success(),
-            "{} unexpectedly compiled successfully",
-            case.name
-        );
+        directory.assert_command_failure(case.name, &result);
         assert!(
             result.stdout.is_empty(),
             "{} wrote stdout:\n{}",
@@ -150,7 +134,6 @@ fn rejected_translations_match_diagnostic_goldens_and_emit_no_object() {
             "{} emitted an object despite its diagnostic",
             case.name
         );
-        fs::remove_dir_all(directory).unwrap();
     }
 }
 
@@ -173,7 +156,7 @@ fn binary128_long_double_rejections_match_diagnostic_goldens() {
     let repository = repository();
 
     for case in cases {
-        let directory = temporary_directory(case.name);
+        let directory = support::TestWorkspace::new("diagnostics", case.name).retain_on_failure();
         let output = directory.join(format!("{}.o", case.name));
         let input = format!("tests/diagnostics/cases/{}.c", case.name);
         let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
@@ -191,11 +174,7 @@ fn binary128_long_double_rejections_match_diagnostic_goldens() {
             .output()
             .unwrap();
 
-        assert!(
-            !result.status.success(),
-            "{} unexpectedly compiled successfully",
-            case.name
-        );
+        directory.assert_command_failure(case.name, &result);
         assert!(
             result.stdout.is_empty(),
             "{} wrote stdout:\n{}",
@@ -213,7 +192,6 @@ fn binary128_long_double_rejections_match_diagnostic_goldens() {
             "{} emitted an object despite its diagnostic",
             case.name
         );
-        fs::remove_dir_all(directory).unwrap();
     }
 }
 
@@ -248,7 +226,7 @@ fn inline_assembly_near_misses_fail_closed_before_object_emission() {
     ];
 
     for (name, text) in cases {
-        let directory = temporary_directory(name);
+        let directory = support::TestWorkspace::new("diagnostics", name).retain_on_failure();
         let source = directory.join(format!("{name}.c"));
         let object = directory.join(format!("{name}.o"));
         fs::write(&source, text).unwrap();
@@ -260,17 +238,17 @@ fn inline_assembly_near_misses_fail_closed_before_object_emission() {
             .output()
             .unwrap();
         let stderr = String::from_utf8_lossy(&result.stderr);
-        assert!(!result.status.success(), "{name} unexpectedly compiled");
+        directory.assert_command_failure(name, &result);
         assert!(stderr.contains("CCC2454"), "{name}: {stderr}");
         assert!(!object.exists(), "{name} emitted an object after rejection");
-        fs::remove_dir_all(directory).unwrap();
     }
 }
 
 #[test]
 fn parser_recovery_reports_independent_errors_and_preserves_publications() {
     let repository = repository();
-    let directory = temporary_directory("parser-recovery");
+    let directory =
+        support::TestWorkspace::new("diagnostics", "parser-recovery").retain_on_failure();
     let object = directory.join("recovered.o");
     let dependencies = directory.join("recovered.d");
     fs::write(&object, b"existing object").unwrap();
@@ -287,7 +265,7 @@ fn parser_recovery_reports_independent_errors_and_preserves_publications() {
         .output()
         .unwrap();
 
-    assert!(!result.status.success());
+    directory.assert_command_failure("parser recovery", &result);
     assert!(result.stdout.is_empty());
     assert_eq!(
         String::from_utf8(result.stderr).unwrap(),
@@ -295,7 +273,6 @@ fn parser_recovery_reports_independent_errors_and_preserves_publications() {
     );
     assert_eq!(fs::read(&object).unwrap(), b"existing object");
     assert_eq!(fs::read(&dependencies).unwrap(), b"existing dependencies");
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -415,7 +392,8 @@ fn json_mode_formats_command_line_parse_errors() {
 
 #[test]
 fn recovery_poison_suppresses_only_dependent_semantic_errors() {
-    let directory = temporary_directory("recovery-poison");
+    let directory =
+        support::TestWorkspace::new("diagnostics", "recovery-poison").retain_on_failure();
     let source = directory.join("recovery-poison.c");
     fs::write(
         &source,
@@ -429,9 +407,9 @@ fn recovery_poison_suppresses_only_dependent_semantic_errors() {
         .arg(&source)
         .output()
         .unwrap();
+    directory.assert_command_failure("recovery poison", &result);
     let stderr = String::from_utf8(result.stderr).unwrap();
 
-    assert!(!result.status.success());
     assert_eq!(stderr.matches("error[CCC1020]").count(), 2, "{stderr}");
     assert!(
         stderr.contains("undeclared identifier `independent`"),
@@ -445,7 +423,6 @@ fn recovery_poison_suppresses_only_dependent_semantic_errors() {
         !stderr.contains("undeclared identifier `poisoned`"),
         "{stderr}"
     );
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -482,7 +459,8 @@ fn json_mode_composes_driver_and_frontend_diagnostics_once() {
 #[test]
 fn json_mode_composes_publication_failures_with_prior_warnings() {
     let repository = repository();
-    let directory = temporary_directory("json-publication");
+    let directory =
+        support::TestWorkspace::new("diagnostics", "json-publication").retain_on_failure();
     let missing = directory.join("missing").join("output.d");
     let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
         .current_dir(&repository)
@@ -493,9 +471,9 @@ fn json_mode_composes_publication_failures_with_prior_warnings() {
         .arg("tests/preprocessing/diagnostics/warning.c")
         .output()
         .unwrap();
+    directory.assert_command_failure("JSON publication", &result);
     let stderr = String::from_utf8(result.stderr).unwrap();
 
-    assert!(!result.status.success());
     assert_eq!(
         stderr.matches("\"schema_version\":1").count(),
         1,
@@ -505,12 +483,12 @@ fn json_mode_composes_publication_failures_with_prior_warnings() {
     assert!(stderr.contains("\"code\":\"CCC1315\""), "{stderr}");
     assert!(stderr.contains("\"code\":\"CCC6000\""), "{stderr}");
     assert!(!stderr.contains("\nccc:"), "{stderr}");
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
 fn json_mode_composes_diagnostics_across_multiple_inputs() {
-    let directory = temporary_directory("json-multiple-inputs");
+    let directory =
+        support::TestWorkspace::new("diagnostics", "json-multiple-inputs").retain_on_failure();
     fs::write(
         directory.join("first.c"),
         "#warning first input\nint first;\n",
@@ -523,7 +501,7 @@ fn json_mode_composes_diagnostics_across_multiple_inputs() {
     .unwrap();
 
     let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
-        .current_dir(&directory)
+        .current_dir(directory.path())
         .env("LC_ALL", "C")
         .env("LANG", "C")
         .args([
@@ -535,9 +513,9 @@ fn json_mode_composes_diagnostics_across_multiple_inputs() {
         ])
         .output()
         .unwrap();
+    directory.assert_command_failure("multiple JSON diagnostic inputs", &result);
     let stderr = String::from_utf8(result.stderr).unwrap();
 
-    assert!(!result.status.success());
     assert_eq!(
         stderr.matches("\"schema_version\":1").count(),
         1,
@@ -551,12 +529,12 @@ fn json_mode_composes_diagnostics_across_multiple_inputs() {
     assert!(stderr.contains("\"code\":\"CCC1020\""), "{stderr}");
     assert!(stderr.ends_with("]}\n"), "{stderr}");
     assert!(!stderr.contains("\nccc:"), "{stderr}");
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
 fn preprocessing_stops_when_the_shared_error_budget_is_exhausted() {
-    let directory = temporary_directory("preprocessor-error-budget");
+    let directory =
+        support::TestWorkspace::new("diagnostics", "preprocessor-error-budget").retain_on_failure();
     let source = directory.join("budget.c");
     fs::write(
         &source,
@@ -568,19 +546,19 @@ fn preprocessing_stops_when_the_shared_error_budget_is_exhausted() {
         .arg(&source)
         .output()
         .unwrap();
+    directory.assert_command_failure("preprocessor error budget", &result);
     let stderr = String::from_utf8(result.stderr).unwrap();
 
-    assert!(!result.status.success());
     assert_eq!(stderr.matches("error[CCC1314]").count(), 1, "{stderr}");
     assert_eq!(stderr.matches("error[CCC0000]").count(), 1, "{stderr}");
     assert!(!stderr.contains("must-not-be-opened"), "{stderr}");
     assert!(!stderr.contains("CCC1020"), "{stderr}");
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
 fn failed_assembly_preserves_an_existing_object() {
-    let directory = temporary_directory("assembly-publication");
+    let directory =
+        support::TestWorkspace::new("diagnostics", "assembly-publication").retain_on_failure();
     let source = directory.join("invalid.s");
     let object = directory.join("invalid.o");
     fs::write(&source, ".definitely_not_a_real_directive\n").unwrap();
@@ -594,9 +572,8 @@ fn failed_assembly_preserves_an_existing_object() {
         .output()
         .unwrap();
 
-    assert!(!result.status.success());
+    directory.assert_command_failure("assembly publication", &result);
     assert_eq!(fs::read(&object).unwrap(), b"existing object");
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[cfg(any(
@@ -626,7 +603,7 @@ fn float16_value_paths_publish_objects() {
             "typedef __builtin_va_list va_list; int read(int count, ...) { va_list list; __builtin_va_start(list, count); return __builtin_va_arg(list, _Float16) != 0; }\n",
         ),
     ] {
-        let directory = temporary_directory(name);
+        let directory = support::TestWorkspace::new("diagnostics", name).retain_on_failure();
         let input = directory.join(format!("float16-{name}.c"));
         let output = directory.join(format!("float16-{name}.o"));
         fs::write(&input, source).unwrap();
@@ -640,14 +617,9 @@ fn float16_value_paths_publish_objects() {
             .output()
             .unwrap();
 
-        assert!(
-            result.status.success(),
-            "{name} did not compile: {}",
-            String::from_utf8_lossy(&result.stderr)
-        );
+        directory.assert_command_success(name, &result);
         assert!(result.stdout.is_empty(), "{name} wrote stdout");
         assert!(result.stderr.is_empty(), "{name} wrote stderr");
         assert!(output.exists(), "{name} did not emit an object");
-        fs::remove_dir_all(directory).unwrap();
     }
 }

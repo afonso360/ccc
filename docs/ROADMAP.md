@@ -332,10 +332,12 @@ performed by Cranelift merely to improve a benchmark score.
   tests and the checked corpus-applicability catalog to scripts and
   documentation. Adding a target must not require hand-editing several
   unrelated arrays.
-- Extend the shared Rust integration-test support module beyond its current
-  target-driver and glibc-identity helpers with RAII temporary directories,
-  compiler invocations, retained failure artifacts, and command diagnostics.
-  The driver tests still repeat those utilities.
+- Finish moving driver integration tests onto the shared support module.
+  Collision-safe RAII workspaces, retain-on-panic artifacts, command status
+  diagnostics, target-driver discovery, and glibc identity are now shared;
+  diagnostics, link-input, and visibility tests use the common workspace.
+  Migrate the remaining object, execution, preprocessing, header, and ABI
+  suites, then factor repeated compiler invocation construction.
 - Unify temporary artifact ownership across the driver and linker. Replace the
   private `_debug_workspace` lifetime side effect in `PackagingReport` with an
   explicit retained-debug-input guard whose cleanup is tested on success,

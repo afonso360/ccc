@@ -9,20 +9,14 @@
 
 use std::fs;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use object::read::{Object as _, ObjectSymbol as _};
 
-static TEST_ID: AtomicU64 = AtomicU64::new(0);
+mod support;
 
 #[test]
 fn elf_visibility_is_exact_for_native_variadic_and_undefined_functions() {
-    let directory = std::env::temp_dir().join(format!(
-        "ccc-visibility-test-{}-{}",
-        std::process::id(),
-        TEST_ID.fetch_add(1, Ordering::Relaxed)
-    ));
-    fs::create_dir(&directory).unwrap();
+    let directory = support::TestWorkspace::new("visibility", "elf-symbols").retain_on_failure();
     let source = directory.join("visibility.c");
     let output = directory.join("visibility.o");
     fs::write(
@@ -69,11 +63,7 @@ int retain_undefined_relocations(void) {
         .arg(&output)
         .output()
         .unwrap();
-    assert!(
-        compilation.status.success(),
-        "ccc failed: {}",
-        String::from_utf8_lossy(&compilation.stderr)
-    );
+    directory.assert_command_success("compile the ELF visibility fixture", &compilation);
 
     let bytes = fs::read(&output).unwrap();
     let object = object::File::parse(bytes.as_slice()).unwrap();
@@ -106,6 +96,4 @@ int retain_undefined_relocations(void) {
             );
         }
     }
-
-    fs::remove_dir_all(directory).unwrap();
 }

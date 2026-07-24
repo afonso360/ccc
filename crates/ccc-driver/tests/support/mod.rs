@@ -1,3 +1,141 @@
+#![allow(dead_code)]
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Output;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_WORKSPACE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug)]
+pub struct TestWorkspace {
+    path: PathBuf,
+    retain_on_failure: bool,
+}
+
+impl TestWorkspace {
+    pub fn new(suite: &str, name: &str) -> Self {
+        let suite = path_component(suite);
+        let name = path_component(name);
+        let path = loop {
+            let serial = NEXT_WORKSPACE.fetch_add(1, Ordering::Relaxed);
+            let candidate = std::env::temp_dir().join(format!(
+                "ccc-{suite}-{}-{serial}-{name}",
+                std::process::id()
+            ));
+            match fs::create_dir(&candidate) {
+                Ok(()) => break candidate,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    panic!(
+                        "failed to create test workspace `{}`: {error}",
+                        candidate.display()
+                    )
+                }
+            }
+        };
+        Self {
+            path,
+            retain_on_failure: false,
+        }
+    }
+
+    #[must_use]
+    pub fn retain_on_failure(mut self) -> Self {
+        self.retain_on_failure = true;
+        self
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn join(&self, path: impl AsRef<Path>) -> PathBuf {
+        self.path.join(path)
+    }
+
+    pub fn assert_command_success(&self, context: &str, output: &Output) {
+        assert_command_status(context, output, true, Some(self.path()));
+    }
+
+    pub fn assert_command_failure(&self, context: &str, output: &Output) {
+        assert_command_status(context, output, false, Some(self.path()));
+    }
+}
+
+impl AsRef<Path> for TestWorkspace {
+    fn as_ref(&self) -> &Path {
+        self.path()
+    }
+}
+
+impl Drop for TestWorkspace {
+    fn drop(&mut self) {
+        if self.retain_on_failure && std::thread::panicking() {
+            eprintln!(
+                "retained failed test workspace at `{}`",
+                self.path.display()
+            );
+            return;
+        }
+        match fs::remove_dir_all(&self.path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => eprintln!(
+                "failed to remove test workspace `{}`: {error}",
+                self.path.display()
+            ),
+        }
+    }
+}
+
+pub fn assert_command_success(context: &str, output: &Output) {
+    assert_command_status(context, output, true, None);
+}
+
+pub fn assert_command_failure(context: &str, output: &Output) {
+    assert_command_status(context, output, false, None);
+}
+
+fn assert_command_status(
+    context: &str,
+    output: &Output,
+    expected_success: bool,
+    workspace: Option<&Path>,
+) {
+    let expectation = if expected_success { "succeed" } else { "fail" };
+    assert!(
+        output.status.success() == expected_success,
+        "{context} was expected to {expectation}, but exited with {}{}\
+         \nstdout:\n{}\
+         \nstderr:\n{}",
+        output.status,
+        workspace
+            .map(|path| format!("\nworkspace: {}", path.display()))
+            .unwrap_or_default(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn path_component(value: &str) -> String {
+    let component = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    if component.is_empty() {
+        "test".to_owned()
+    } else {
+        component
+    }
+}
+
 #[cfg(any(
     all(target_arch = "x86_64", target_os = "linux"),
     all(target_arch = "aarch64", target_os = "linux"),

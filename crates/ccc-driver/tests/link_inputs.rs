@@ -1,25 +1,12 @@
 use std::fs;
-use std::path::PathBuf;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(unix)]
 use std::process::Stdio;
 
 use object::{Object as _, ObjectKind};
 
-static TEST_ID: AtomicU64 = AtomicU64::new(0);
-
-fn test_directory(name: &str) -> PathBuf {
-    let directory = std::env::temp_dir().join(format!(
-        "ccc-link-input-test-{}-{}-{name}",
-        std::process::id(),
-        TEST_ID.fetch_add(1, Ordering::Relaxed)
-    ));
-    let _ = fs::remove_dir_all(&directory);
-    fs::create_dir_all(&directory).unwrap();
-    directory
-}
+mod support;
 
 fn ccc() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_ccc"));
@@ -27,19 +14,9 @@ fn ccc() -> Command {
     command
 }
 
-fn assert_success(output: std::process::Output) {
-    assert!(
-        output.status.success(),
-        "command failed with {}:\nstdout:\n{}\nstderr:\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
 #[test]
 fn links_multiple_c_inputs_in_command_line_order() {
-    let directory = test_directory("multiple-c");
+    let directory = support::TestWorkspace::new("link-inputs", "multiple-c").retain_on_failure();
     let main = directory.join("main.c");
     let answer = directory.join("answer.c");
     let executable = directory.join("program");
@@ -50,8 +27,9 @@ fn links_multiple_c_inputs_in_command_line_order() {
     .unwrap();
     fs::write(&answer, "int answer(void) { return 42; }\n").unwrap();
 
-    assert_success(
-        ccc()
+    directory.assert_command_success(
+        "compile and link multiple C inputs",
+        &ccc()
             .arg(&main)
             .arg(&answer)
             .arg("-o")
@@ -60,18 +38,19 @@ fn links_multiple_c_inputs_in_command_line_order() {
             .unwrap(),
     );
     assert_eq!(Command::new(&executable).status().unwrap().code(), Some(0));
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
 fn explicit_c_language_compiles_an_extensionless_input() {
-    let directory = test_directory("explicit-language");
+    let directory =
+        support::TestWorkspace::new("link-inputs", "explicit-language").retain_on_failure();
     let source = directory.join("program-source");
     let executable = directory.join("program");
     fs::write(&source, "int main(void) { return 0; }\n").unwrap();
 
-    assert_success(
-        ccc()
+    directory.assert_command_success(
+        "compile an extensionless C input",
+        &ccc()
             .args(["-x", "c"])
             .arg(&source)
             .arg("-o")
@@ -80,7 +59,6 @@ fn explicit_c_language_compiles_an_extensionless_input() {
             .unwrap(),
     );
     assert_eq!(Command::new(&executable).status().unwrap().code(), Some(0));
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[cfg(any(
@@ -91,7 +69,8 @@ fn explicit_c_language_compiles_an_extensionless_input() {
 ))]
 #[test]
 fn preprocesses_and_assembles_uppercase_assembly_inputs() {
-    let directory = test_directory("preprocessed-assembly");
+    let directory =
+        support::TestWorkspace::new("link-inputs", "preprocessed-assembly").retain_on_failure();
     let main = directory.join("main.c");
     let assembly = directory.join("answer.S");
     let executable = directory.join("program");
@@ -114,8 +93,9 @@ fn preprocesses_and_assembles_uppercase_assembly_inputs() {
     )
     .unwrap();
 
-    assert_success(
-        ccc()
+    directory.assert_command_success(
+        "compile and link preprocessed assembly",
+        &ccc()
             .arg(&main)
             .arg(&assembly)
             .arg("-o")
@@ -124,12 +104,11 @@ fn preprocesses_and_assembles_uppercase_assembly_inputs() {
             .unwrap(),
     );
     assert_eq!(Command::new(&executable).status().unwrap().code(), Some(0));
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
 fn command_plan_is_non_executing_and_contains_replayable_phase_commands() {
-    let directory = test_directory("command-plan");
+    let directory = support::TestWorkspace::new("link-inputs", "command-plan").retain_on_failure();
     let source = directory.join("source with spaces.c");
     let executable = directory.join("program");
     fs::write(&source, "int main(void) { return 0; }\n").unwrap();
@@ -141,18 +120,18 @@ fn command_plan_is_non_executing_and_contains_replayable_phase_commands() {
         .arg(&executable)
         .output()
         .unwrap();
-    assert_success(output.clone());
+    directory.assert_command_success("print a command plan", &output);
     assert!(!executable.exists());
     let plan = String::from_utf8(output.stderr).unwrap();
     assert!(plan.contains(" -c "), "{plan}");
     assert!(plan.contains("source with spaces.c'"), "{plan}");
     assert!(plan.contains(".ccc-command-plan-0.o"), "{plan}");
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
 fn command_plan_preserves_effective_compile_and_link_options() {
-    let directory = test_directory("command-plan-options");
+    let directory =
+        support::TestWorkspace::new("link-inputs", "command-plan-options").retain_on_failure();
     let source = directory.join("source.c");
     let executable = directory.join("program");
     let dependencies = directory.join("source.d");
@@ -177,7 +156,7 @@ fn command_plan_preserves_effective_compile_and_link_options() {
         .arg(&executable)
         .output()
         .unwrap();
-    assert_success(output.clone());
+    directory.assert_command_success("print an option-preserving command plan", &output);
     let plan = String::from_utf8(output.stderr).unwrap();
     let lines = plan.lines().collect::<Vec<_>>();
     assert_eq!(
@@ -209,7 +188,6 @@ fn command_plan_preserves_effective_compile_and_link_options() {
     }
     assert!(!executable.exists());
     assert!(!dependencies.exists());
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
@@ -218,21 +196,21 @@ fn compiler_identity_queries_are_available_without_inputs() {
         .arg("-dumpmachine")
         .output()
         .unwrap();
-    assert_success(machine.clone());
+    support::assert_command_success("query the target machine", &machine);
     assert!(!String::from_utf8(machine.stdout).unwrap().trim().is_empty());
 
     let version = Command::new(env!("CARGO_BIN_EXE_ccc"))
         .arg("-dumpversion")
         .output()
         .unwrap();
-    assert_success(version.clone());
+    support::assert_command_success("query the compiler version", &version);
     assert_eq!(String::from_utf8(version.stdout).unwrap(), "4.2.1\n");
 
     let effective = Command::new(env!("CARGO_BIN_EXE_ccc"))
         .args(["-std=c11", "-fPIC", "-Oz", "--print-effective-config"])
         .output()
         .unwrap();
-    assert_success(effective.clone());
+    support::assert_command_success("query the effective configuration", &effective);
     let effective = String::from_utf8(effective.stdout).unwrap();
     assert!(effective.contains("language=c11\n"), "{effective}");
     assert!(effective.contains("relocation=pic\n"), "{effective}");
@@ -243,7 +221,7 @@ fn compiler_identity_queries_are_available_without_inputs() {
 
 #[test]
 fn response_file_can_drive_compile_and_link() {
-    let directory = test_directory("response");
+    let directory = support::TestWorkspace::new("link-inputs", "response").retain_on_failure();
     let source = directory.join("source with spaces.c");
     let executable = directory.join("program");
     let response = directory.join("command.rsp");
@@ -254,19 +232,19 @@ fn response_file_can_drive_compile_and_link() {
     )
     .unwrap();
 
-    assert_success(
-        ccc()
+    directory.assert_command_success(
+        "compile and link from a response file",
+        &ccc()
             .arg(format!("@{}", response.display()))
             .output()
             .unwrap(),
     );
     assert_eq!(Command::new(&executable).status().unwrap().code(), Some(0));
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
 fn emits_a_shared_library_with_position_independent_code() {
-    let directory = test_directory("shared");
+    let directory = support::TestWorkspace::new("link-inputs", "shared").retain_on_failure();
     let source = directory.join("answer.c");
     let output = if cfg!(target_os = "macos") {
         directory.join("libanswer.dylib")
@@ -275,8 +253,9 @@ fn emits_a_shared_library_with_position_independent_code() {
     };
     fs::write(&source, "int answer(void) { return 42; }\n").unwrap();
 
-    assert_success(
-        ccc()
+    directory.assert_command_success(
+        "emit a shared library",
+        &ccc()
             .arg("-shared")
             .arg(&source)
             .arg("-o")
@@ -287,12 +266,11 @@ fn emits_a_shared_library_with_position_independent_code() {
     let bytes = fs::read(&output).unwrap();
     let object = object::File::parse(bytes.as_slice()).unwrap();
     assert_eq!(object.kind(), ObjectKind::Dynamic);
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
 fn links_objects_from_a_static_archive() {
-    let directory = test_directory("archive");
+    let directory = support::TestWorkspace::new("link-inputs", "archive").retain_on_failure();
     let main = directory.join("main.c");
     let answer = directory.join("answer.c");
     let answer_object = directory.join("answer.o");
@@ -305,8 +283,9 @@ fn links_objects_from_a_static_archive() {
     .unwrap();
     fs::write(&answer, "int answer(void) { return 42; }\n").unwrap();
 
-    assert_success(
-        ccc()
+    directory.assert_command_success(
+        "compile an archive member",
+        &ccc()
             .arg("-c")
             .arg(&answer)
             .arg("-o")
@@ -314,19 +293,21 @@ fn links_objects_from_a_static_archive() {
             .output()
             .unwrap(),
     );
-    assert_success(
-        Command::new("ar")
+    directory.assert_command_success(
+        "create a static archive",
+        &Command::new("ar")
             .arg("crs")
             .arg(&archive)
             .arg(&answer_object)
             .output()
             .unwrap(),
     );
-    assert_success(
-        ccc()
+    directory.assert_command_success(
+        "link from a static archive",
+        &ccc()
             .arg(&main)
             .arg("-L")
-            .arg(&directory)
+            .arg(directory.path())
             .arg("-lanswer")
             .arg("-o")
             .arg(&executable)
@@ -334,29 +315,27 @@ fn links_objects_from_a_static_archive() {
             .unwrap(),
     );
     assert_eq!(Command::new(&executable).status().unwrap().code(), Some(0));
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
 fn compile_only_accepts_multiple_sources_and_derives_object_names() {
-    let directory = test_directory("compile-many");
+    let directory = support::TestWorkspace::new("link-inputs", "compile-many").retain_on_failure();
     let first = directory.join("first.c");
     let second = directory.join("second.c");
     fs::write(&first, "int first(void) { return 1; }\n").unwrap();
     fs::write(&second, "int second(void) { return 2; }\n").unwrap();
 
     let output = Command::new(env!("CARGO_BIN_EXE_ccc"))
-        .current_dir(&directory)
+        .current_dir(directory.path())
         .arg("-nostdinc")
         .arg("-c")
         .arg(&first)
         .arg(&second)
         .output()
         .unwrap();
-    assert_success(output);
+    directory.assert_command_success("compile multiple sources", &output);
     assert!(directory.join("first.o").is_file());
     assert!(directory.join("second.o").is_file());
-    fs::remove_dir_all(directory).unwrap();
 }
 
 #[cfg(unix)]
@@ -367,7 +346,8 @@ fn termination_signal_removes_temporaries_and_preserves_the_destination() {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    let directory = test_directory("signal-cleanup");
+    let directory =
+        support::TestWorkspace::new("link-inputs", "signal-cleanup").retain_on_failure();
     let main = directory.join("main.c");
     let answer = directory.join("answer.c");
     let executable = directory.join("program");
@@ -476,5 +456,4 @@ fn termination_signal_removes_temporaries_and_preserves_the_destination() {
         fs::read_to_string(&executable).unwrap(),
         "existing destination\n"
     );
-    fs::remove_dir_all(directory).unwrap();
 }
