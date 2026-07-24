@@ -14,6 +14,7 @@ by a host-installed copy.
 | [zstd 1.5.7](zstd/README.md)                      | Fetched official source, audited portable build, bounded upstream checks, and deterministic file/stream round trips      |
 | [zlib 1.3.2](zlib/README.md)                      | Fetched official source, unmodified configure/Make build, static/shared tests, and deterministic minigzip round trip     |
 | [Csmith 2.4.0](csmith/README.md)                  | Pinned generated programs, strict C11 admission, GCC/Clang consensus, reproducible seeds, and retained failure artifacts  |
+| [C-Ray 1.1](c-ray/README.md)                      | Pinned unmodified ray tracer, strict-FP native reference, exact PPM oracle, and raw compile/link/render measurements       |
 
 [`test-adapters.sh`](test-adapters.sh) runs every shell-only adapter regression,
 including the shared native-GCC identity boundary and removal of ambient GNU
@@ -48,3 +49,8 @@ checked emulated execution. Csmith covers native
 executable profiles currently have audited runners only for
 `x86_64-unknown-linux-gnu`. The manifest catalog, not the build host, is
 authoritative for each row.
+
+C-Ray is a native generated-code benchmark rather than a cross-target
+conformance oracle. Its runner supports x86-64 GNU/Linux and Apple-silicon
+macOS, verifies every image before timing it, and rejects emulated or
+cross-host performance comparisons.

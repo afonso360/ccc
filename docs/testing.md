@@ -166,9 +166,9 @@ then compiles and executes every accepted case with CCC at `-O0`, `-O2`, and
 output.
 
 `test-adapters.sh` runs the shared environment test, applicability regression,
-the live applicability report, and the SQLite, Lua, bzip2, Redis, zstd, zlib,
-and Csmith adapter regressions. The SQLite runner regression also invokes its
-source-patch test.
+the live applicability report, and the C-Ray, SQLite, Lua, bzip2, Redis, zstd,
+zlib, and Csmith adapter regressions. The SQLite runner regression also invokes
+its source-patch test.
 
 To print and validate the target/corpus coverage matrix directly:
 
@@ -221,6 +221,9 @@ test-corpus/redis/run.sh \
 
 test-corpus/zstd/run.sh \
   --work-dir "$CCC_TEST_ROOT/zstd"
+
+test-corpus/c-ray/run.sh --profile correctness \
+  --work-dir "$CCC_TEST_ROOT/c-ray-correctness"
 ```
 
 SQLite exposes four exact upstream profiles. Use a fresh empty directory for
@@ -275,6 +278,34 @@ Hosted CI runs this complete bzip2 contract on all four enabled targets. The
 x86-64 profile shares the full corpus job; the other three profiles have
 dedicated target-matrix jobs and retain their object, toolchain, and execution
 evidence as artifacts.
+
+## C-Ray generated-code benchmark
+
+C-Ray 1.1 is a native-only benchmark with correctness checks enabled for every
+measurement. It supports x86-64 GNU/Linux and Apple-silicon macOS. The fast
+profile renders `scene` at 320x240:
+
+```sh
+test-corpus/c-ray/run.sh --profile correctness \
+  --work-dir "$CCC_TEST_ROOT/c-ray-correctness"
+```
+
+The performance profile renders `sphfract` at 800x600, with one warmup and five
+measured samples per CCC optimization profile and native reference:
+
+```sh
+test-corpus/c-ray/run.sh --profile performance \
+  --work-dir "$CCC_TEST_ROOT/c-ray-performance"
+```
+
+Both profiles build the unmodified source at CCC `-O0`, `-O2`, and `-Oz`,
+compare exact `P6` output with a strict-FP native GCC or Apple Clang build, and
+retain raw JSON/TSV timing, CPU, peak-memory, size, tool-identity, and image-hash
+evidence. They require Python 3, OpenSSL with SHA3-256, Tar, `size`, libc, libm,
+pthreads, and Curl unless `--source-archive` supplies the exact pinned release.
+Use only same-host native runs for performance comparisons; the adapter rejects
+cross-target and emulated timing. The full result schema and override options
+are documented in `test-corpus/c-ray/README.md`.
 
 ## Csmith differential suite
 

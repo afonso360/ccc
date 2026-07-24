@@ -1,0 +1,88 @@
+format_version = 2
+name = "c-ray"
+version = "1.1"
+revision = "a1bb24ba76b556565e46ec9327a3029f5b7f284e"
+distribution = "official-release"
+origin = "https://github.com/jtsiomb/c-ray/releases/download/c-ray-1.1/c-ray-1.1.tar.gz"
+archive = "c-ray-1.1.tar.gz"
+archive_bytes = 231074
+archive_sha256 = "6f507aae47a9367334b8cb50f50eb4ad0f6fef99aeae9f2f7d55ba9818e798bf"
+archive_sha3_256 = "f91ca5dc7f0eed3bfd4b68781cff5f3d5136ba06ab18518e2330f29c38faa8b5"
+license = "GPL-2.0-or-later"
+upstream_license_file = "c-ray-mt.c"
+upstream_license_notice_lines = "1-7"
+fetched_not_vendored = true
+source_adjustments = "none"
+
+source = "c-ray-mt.c"
+source_bytes = 18343
+source_sha256 = "4847631a6df9af1685576d62c71975619dd280a70aa40670f7d0ca00bf4eb63a"
+correctness_scene = "scene"
+correctness_scene_bytes = 367
+correctness_scene_sha256 = "a50d2d8effe6b2372830780db80131bd655708a9b645ad6c895d16590cce4515"
+correctness_width = 320
+correctness_height = 240
+correctness_rays_per_pixel = 1
+correctness_threads = 1
+correctness_default_warmups = 0
+correctness_default_samples = 1
+performance_scene = "sphfract"
+performance_scene_bytes = 9225
+performance_scene_sha256 = "b84ee97d101ebf6eed605ba9b5938019ca0651c128b8b4c8053fdcdd7a7c1741"
+performance_width = 800
+performance_height = 600
+performance_rays_per_pixel = 1
+performance_threads = 1
+performance_default_warmups = 1
+performance_default_samples = 5
+
+language_mode = "c11"
+floating_point_contract = "strict-no-fast-math"
+byte_order_contract = "verified-little-endian-target-macro"
+source_build = "unmodified-single-translation-unit"
+target_compiler = "ccc"
+target_optimizations = ["-O0", "-O2", "-Oz"]
+reference_compiler = "native-gcc-linux-or-apple-clang-darwin"
+reference_optimization = "-O2"
+link_libraries = ["m", "pthread"]
+output_format = "binary-ppm-p6"
+output_oracle = "byte-identical-across-ccc-profiles-and-native-reference"
+result_format = "tab-separated-summary-and-raw-timings"
+
+[retained_artifacts]
+run = [
+    "archive-hashes.txt",
+    "artifact-sizes.tsv",
+    "commands.txt",
+    "compiler-identities",
+    "output-sha256.tsv",
+    "reference.ppm",
+    "run-config.txt",
+    "run-stderr",
+    "source-hashes.txt",
+    "summary.tsv",
+    "timings",
+    "timings.tsv",
+    "tool-output",
+    "upstream-license-notice.txt",
+]
+
+[target_applicability."x86_64-unknown-linux-gnu"]
+status = "applicable"
+evidence_kind = "execution"
+runner = "run.sh"
+reason = "The native runner verifies a little-endian x86-64 Linux GNU host, builds unmodified C-Ray with CCC, links through the audited native driver, and compares every image with a strict-FP native GCC reference."
+
+[target_applicability."aarch64-unknown-linux-gnu"]
+status = "inapplicable"
+reason = "The benchmark has no pinned native AArch64 Linux runner or cross-run timing contract; emulated execution would be correctness evidence but not comparable performance evidence."
+
+[target_applicability."riscv64-unknown-linux-gnu"]
+status = "inapplicable"
+reason = "The benchmark has no pinned native RISC-V Linux runner or cross-run timing contract; emulated execution would be correctness evidence but not comparable performance evidence."
+
+[target_applicability."aarch64-apple-darwin"]
+status = "applicable"
+evidence_kind = "execution"
+runner = "run.sh"
+reason = "The native runner verifies an Apple-silicon macOS host, builds unmodified C-Ray with CCC using the active SDK, links through Apple Clang, and compares every image with a strict-FP Apple Clang reference."

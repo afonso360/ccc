@@ -113,12 +113,14 @@ Csmith, and the real-code corpora must agree at `-O0`, `-O2`, and `-Oz`.
 ## Benchmarking and code-generation performance
 
 Optimization work needs reproducible measurements at the CCC-IR, CLIF,
-machine-code, and execution boundaries. Add a checked-in benchmark harness
-before changing inlining heuristics or making broad code-generation changes.
-It must build a release compiler, record the compiler/backend revision and
-complete target configuration, use deterministic inputs, perform warmups and
-repeated samples, and write machine-readable results that can be compared with
-a previous revision. Keep correctness checks enabled in every executable
+machine-code, and execution boundaries. The checked-in C-Ray adapter establishes
+the first executable benchmark with pinned inputs, native reference agreement,
+correctness checks, raw resource measurements, and machine-readable results.
+Generalize that evidence model before changing inlining heuristics or making
+broad code-generation changes: build a release compiler, record the
+compiler/backend revision and complete target configuration, use deterministic
+inputs, perform warmups and repeated samples, and compare results with a
+previous revision. Keep correctness checks enabled in every executable
 benchmark so faster wrong code can never appear as an improvement.
 
 ### Benchmark set
@@ -145,22 +147,11 @@ sources of compiler and generated-code cost:
   with fixed inputs. Record translation time, link time, aggregate object
   size, executable text size, and execution throughput without weakening their
   correctness contracts.
-- Add the classic
-  [C-Ray 1.1](https://github.com/jtsiomb/c-ray/tree/a1bb24ba76b556565e46ec9327a3029f5b7f284e)
-  ray tracer as an explicit generated-code benchmark. Fetch the official
-  release archive by its SHA-256
-  `6f507aae47a9367334b8cb50f50eb4ad0f6fef99aeae9f2f7d55ba9818e798bf`
-  and retain its GPL-2.0-or-later notice in the corpus cache rather than
-  vendoring it into compiler crates. Build the unmodified `c-ray-mt.c` with
-  strict floating-point behavior and the verified target byte-order definition,
-  linking only libc, libm, and pthreads.
-- Use C-Ray's `scene` with `-t 1 -r 1 -s 320x240` as the fast correctness
-  profile and `sphfract` with `-t 1 -r 1 -s 800x600` as the scheduled
-  performance profile. Require a valid `P6` image, byte-identical CCC output
-  across `-O0`, `-O2`, and `-Oz`, and same-host agreement with a strict-FP GCC
-  or Clang reference before accepting timings. Record frontend and Cranelift
-  time, peak memory, CLIF instruction/block/stack-slot counts, executable text
-  size, and median render time with raw samples.
+- Extend the C-Ray result schema with CCC frontend and Cranelift phase timing,
+  CLIF instruction/block/stack-slot counts, and parsed object-section sizes.
+  The existing correctness and performance profiles already retain whole
+  compile/link/render timing, CPU, peak-memory, file-size, command, image-hash,
+  and exact same-host reference evidence.
 
 Run IR and object-size measurements for every enabled target. Runtime
 comparisons are native-target evidence; QEMU runs remain correctness and rough
