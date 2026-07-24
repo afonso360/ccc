@@ -1818,6 +1818,7 @@ fn dump_output(
                 &parsed.session.sources,
                 true,
                 false,
+                false,
             )
             .map_err(|error| with_prior_diagnostics(&parsed.stderr, error))?;
             (generated.clif, parsed.stderr)
@@ -1829,10 +1830,17 @@ fn dump_output(
                 &parsed.session.config,
                 &parsed.session.sources,
                 false,
-                false,
+                options.debug_info,
+                true,
             )
             .map_err(|error| with_prior_diagnostics(&parsed.stderr, error))?;
-            (generated.stats.to_tsv(), parsed.stderr)
+            (
+                generated
+                    .stats
+                    .expect("codegen statistics were requested")
+                    .to_tsv(),
+                parsed.stderr,
+            )
         }
     };
     let dependency_stdout = publish_deferred_dependencies(deferred_dependencies)
@@ -1872,6 +1880,7 @@ fn compile_output_retaining_packaging(
         &parsed.session.sources,
         false,
         options.debug_info,
+        false,
     )
     .map_err(|error| with_prior_diagnostics(&parsed.stderr, error))?;
     let artifact = generated.into_artifact_bundle();
@@ -2283,16 +2292,18 @@ fn codegen_frontend(
     sources: &SourceMap,
     emit_clif: bool,
     debug_info: bool,
+    emit_stats: bool,
 ) -> Result<CodegenOutput, DriverError> {
-    ccc_codegen::generic::emit(
-        ir,
-        config,
-        CodegenOptions {
-            emit_clif,
-            debug_info: debug_info.then_some(sources),
-        },
-    )
-    .map_err(|error| {
+    let codegen_options = CodegenOptions {
+        emit_clif,
+        debug_info: debug_info.then_some(sources),
+    };
+    let generated = if emit_stats {
+        ccc_codegen::generic::emit_with_stats(ir, config, codegen_options)
+    } else {
+        ccc_codegen::generic::emit(ir, config, codegen_options)
+    };
+    generated.map_err(|error| {
         let mut diagnostic = Diagnostic::error(error.code, error.message);
         if let Some(span) = error.span {
             diagnostic = diagnostic.with_primary(span, "while generating native code");
@@ -3004,13 +3015,61 @@ mod tests {
         let stats = run([
             "--emit=codegen-stats".to_owned(),
             "-nostdinc".to_owned(),
-            input,
+            input.clone(),
         ])
         .unwrap()
         .stdout;
         assert!(stats.starts_with("schema_version\t1\n"));
         assert!(stats.contains("post_inline_ir.functions\t1\n"));
         assert!(stats.contains("primary_object.text_bytes\t"));
+        assert!(stats.contains("primary_object.debug_bytes\t0\n"));
+        let debug_stats = run([
+            "--emit=codegen-stats".to_owned(),
+            "-g".to_owned(),
+            "-nostdinc".to_owned(),
+            input.clone(),
+        ])
+        .unwrap()
+        .stdout;
+        let debug_bytes = debug_stats
+            .lines()
+            .find_map(|line| line.strip_prefix("primary_object.debug_bytes\t"))
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        assert!(debug_bytes > 0);
+        let dependencies = directory.join("program.d");
+        let stats_with_dependencies = run([
+            "--emit=codegen-stats".to_owned(),
+            "-MD".to_owned(),
+            "-MF".to_owned(),
+            dependencies.display().to_string(),
+            "-nostdinc".to_owned(),
+            input.clone(),
+        ])
+        .unwrap()
+        .stdout;
+        assert!(stats_with_dependencies.lines().all(|line| {
+            let Some((metric, value)) = line.split_once('\t') else {
+                return false;
+            };
+            !metric.is_empty() && value.parse::<u64>().is_ok()
+        }));
+        assert!(dependencies.exists());
+        let error = run([
+            "--emit=codegen-stats".to_owned(),
+            "-MD".to_owned(),
+            "-MF".to_owned(),
+            "-".to_owned(),
+            "-nostdinc".to_owned(),
+            input,
+        ])
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires dependency output to use a file")
+        );
         fs::remove_dir_all(directory).unwrap();
     }
 

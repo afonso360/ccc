@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
-use ccc_codegen::{CODEGEN_STATS_SCHEMA_VERSION, Options, Output, emit};
-use ccc_ir::generic::{lower_frontend, optimize_frontend_for_config, verify_frontend};
+use ccc_codegen::{CODEGEN_STATS_SCHEMA_VERSION, Options, Output, emit, emit_with_stats};
+use ccc_ir::generic::{FullModule, lower_frontend, optimize_frontend_for_config, verify_frontend};
 use ccc_pp::{PpItem, lex};
 use ccc_sema::generic::analyze_frontend;
 use ccc_session::SourceMap;
@@ -16,7 +16,7 @@ const SOURCE: &str = "
     int entry(int value) { return external(leaf(value)) + global; }
 ";
 
-fn compile(config: &EffectiveCompilationConfig, debug: bool) -> Output {
+fn lower(config: &EffectiveCompilationConfig) -> (SourceMap, FullModule) {
     let mut sources = SourceMap::new();
     let file = sources.add_file("codegen-stats-test.c", SOURCE);
     let tokens = lex(file, sources.source(file).unwrap()).unwrap();
@@ -28,7 +28,12 @@ fn compile(config: &EffectiveCompilationConfig, debug: bool) -> Output {
     verify_frontend(&module).unwrap();
     optimize_frontend_for_config(&mut module, config).unwrap();
     verify_frontend(&module).unwrap();
-    emit(
+    (sources, module)
+}
+
+fn compile(config: &EffectiveCompilationConfig, debug: bool) -> Output {
+    let (sources, module) = lower(config);
+    emit_with_stats(
         &module,
         config,
         Options {
@@ -37,6 +42,14 @@ fn compile(config: &EffectiveCompilationConfig, debug: bool) -> Output {
         },
     )
     .unwrap_or_else(|error| panic!("{}: {error}", config.target.triple))
+}
+
+#[test]
+fn ordinary_emission_does_not_collect_discarded_statistics() {
+    let config = EffectiveCompilationConfig::default();
+    let (_, module) = lower(&config);
+    let output = emit(&module, &config, Options::default()).unwrap();
+    assert!(output.stats.is_none());
 }
 
 #[test]
@@ -53,40 +66,45 @@ fn stats_describe_post_inline_ir_and_primary_objects_on_every_target() {
             &target.with_optimization_level(OptimizationLevel::O2),
             false,
         );
+        let o0_stats = o0.stats.expect("statistics were requested");
+        let o2_stats = o2.stats.expect("statistics were requested");
 
-        assert_eq!(o0.stats.post_inline_ir.functions, 2, "{}", profile.triple);
-        assert_eq!(o2.stats.post_inline_ir.functions, 2, "{}", profile.triple);
+        assert_eq!(o0_stats.post_inline_ir.functions, 2, "{}", profile.triple);
+        assert_eq!(o2_stats.post_inline_ir.functions, 2, "{}", profile.triple);
         assert_eq!(
-            o0.stats.post_inline_ir.call_instructions, 2,
+            o0_stats.post_inline_ir.call_instructions, 2,
             "{}",
             profile.triple
         );
         assert_eq!(
-            o2.stats.post_inline_ir.call_instructions, 1,
+            o2_stats.post_inline_ir.call_instructions, 1,
             "{}",
             profile.triple
         );
         assert!(
-            o2.stats.post_inline_ir.instructions > 0,
+            o2_stats.post_inline_ir.instructions > 0,
             "{}: {:?}",
             profile.triple,
-            o2.stats.post_inline_ir
+            o2_stats.post_inline_ir
         );
 
         assert_primary_object_stats(&o0, &profile.triple.to_string());
         assert_primary_object_stats(&o2, &profile.triple.to_string());
         assert!(
-            o0.stats.primary_object.debug_bytes > 0,
+            o0_stats.primary_object.debug_bytes > 0,
             "{}: {:?}",
             profile.triple,
-            o0.stats.primary_object
+            o0_stats.primary_object
         );
         assert_tsv_schema(&o2);
     }
 }
 
 fn assert_primary_object_stats(output: &Output, target: &str) {
-    let stats = output.stats.primary_object;
+    let stats = output
+        .stats
+        .expect("statistics were requested")
+        .primary_object;
     let object = object::File::parse(output.object.as_slice()).unwrap();
     assert_eq!(stats.file_bytes, output.object.len() as u64, "{target}");
     assert_eq!(stats.sections, object.sections().count() as u64, "{target}");
@@ -113,7 +131,8 @@ fn assert_primary_object_stats(output: &Output, target: &str) {
 }
 
 fn assert_tsv_schema(output: &Output) {
-    let tsv = output.stats.to_tsv();
+    let stats = output.stats.expect("statistics were requested");
+    let tsv = stats.to_tsv();
     let mut keys = BTreeSet::new();
     for line in tsv.lines() {
         let (key, value) = line.split_once('\t').unwrap();
@@ -122,5 +141,5 @@ fn assert_tsv_schema(output: &Output) {
     }
     let schema_row = format!("schema_version\t{CODEGEN_STATS_SCHEMA_VERSION}");
     assert_eq!(tsv.lines().next(), Some(schema_row.as_str()));
-    assert_eq!(keys.len(), output.stats.metrics().len() + 1);
+    assert_eq!(keys.len(), stats.metrics().len() + 1);
 }

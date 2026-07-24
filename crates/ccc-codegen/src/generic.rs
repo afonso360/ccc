@@ -96,8 +96,27 @@ pub fn emit(
     config: &EffectiveCompilationConfig,
     options: Options<'_>,
 ) -> Result<Output, CodegenError> {
+    emit_configured(module, config, options, false)
+}
+
+/// Emits an object and collects stable post-inlining IR and object statistics.
+pub fn emit_with_stats(
+    module: &gir::FullModule,
+    config: &EffectiveCompilationConfig,
+    options: Options<'_>,
+) -> Result<Output, CodegenError> {
+    emit_configured(module, config, options, true)
+}
+
+fn emit_configured(
+    module: &gir::FullModule,
+    config: &EffectiveCompilationConfig,
+    options: Options<'_>,
+    collect_stats: bool,
+) -> Result<Output, CodegenError> {
     let plan = ccc_abi::plan_module(module, config).map_err(abi_error)?;
-    emit_with_plan(module, config, &plan, options)
+    let verified = plan.verify_against(module, config).map_err(abi_error)?;
+    emit_inner(module, config, verified, options, collect_stats)
 }
 
 pub fn emit_with_plan(
@@ -107,7 +126,7 @@ pub fn emit_with_plan(
     options: Options<'_>,
 ) -> Result<Output, CodegenError> {
     let verified = plan.verify_against(module, config).map_err(abi_error)?;
-    emit_inner(module, config, verified, options)
+    emit_inner(module, config, verified, options, false)
 }
 
 fn emit_inner(
@@ -115,6 +134,7 @@ fn emit_inner(
     config: &EffectiveCompilationConfig,
     abi_plan: ccc_abi::VerifiedModuleAbiPlan<'_>,
     options: Options<'_>,
+    collect_stats: bool,
 ) -> Result<Output, CodegenError> {
     super::validate_target(config).map_err(error)?;
     if !config.target.abi.supports_tls_codegen()
@@ -222,7 +242,7 @@ fn emit_inner(
     )?;
 
     let mut clif = String::new();
-    let mut stats = CodegenStats::default();
+    let mut stats = collect_stats.then(CodegenStats::default);
     for mut prepared in prepared_functions {
         let function = &module.functions[prepared.function_index];
         let mut policy = inlining.policy(function.id.0);
@@ -248,7 +268,9 @@ fn emit_inner(
                 function.symbol_name, prepared.context.func
             ));
         }
-        stats.post_inline_ir.record_function(&prepared.context.func);
+        if let Some(stats) = stats.as_mut() {
+            stats.post_inline_ir.record_function(&prepared.context.func);
+        }
         object_module
             .define_function(prepared.id, &mut prepared.context)
             .map_err(module_error)?;
@@ -377,7 +399,9 @@ fn emit_inner(
     }
     let object = product.emit().map_err(module_error)?;
     let parsed_object = object::File::parse(object.as_slice()).map_err(module_error)?;
-    stats.primary_object = PrimaryObjectStats::from_object(&parsed_object, object.len());
+    if let Some(stats) = stats.as_mut() {
+        stats.primary_object = PrimaryObjectStats::from_object(&parsed_object, object.len());
+    }
     let required_runtime_helpers = required_runtime_helper_symbols(module, config);
     validate_runtime_helper_symbols(
         &parsed_object,

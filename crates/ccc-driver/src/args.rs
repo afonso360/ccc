@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ccc_diag::DiagnosticFormat;
 use ccc_target::{LanguageMode, OptimizationLevel, RelocationModel, TrigraphPolicy};
@@ -696,6 +696,13 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
     }
     if dump.is_some() && matches!(dependencies.mode, DependencyMode::Only { .. }) {
         return Err("ccc: dump modes cannot be combined with `-M` or `-MM`".to_owned());
+    }
+    if dump == Some(DumpKind::CodegenStats)
+        && dependencies.output.as_deref() == Some(Path::new("-"))
+    {
+        return Err(
+            "ccc: `--emit=codegen-stats` requires dependency output to use a file".to_owned(),
+        );
     }
     if dump_macros && !preprocess_only {
         return Err("ccc: `-dM` requires `-E`".to_owned());
