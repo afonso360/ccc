@@ -87,6 +87,7 @@ const HELP: &str = "Usage: ccc [options] <input>...\n\
   --dump-ast|--dump-typed-ast|--dump-ir|--dump-abi\n\
                              Dump frontend representations\n\
   --emit=clif                Dump Cranelift IR\n\
+  --emit=codegen-stats       Dump stable machine-readable codegen statistics\n\
   -###                       Print replayable phase commands without executing\n\
   -dumpmachine|-dumpversion  Print build-system compiler identity\n\
   -print-prog-name=name|-print-file-name=name|-print-search-dirs\n\
@@ -1528,9 +1529,9 @@ fn required_compatibility_scope(action: &PrimaryAction) -> CompatibilityScope {
             CompatibilityScope::SemanticAnalysis
         }
         PrimaryAction::Compile { .. }
-        | PrimaryAction::Dump(DumpKind::Ir | DumpKind::Abi | DumpKind::Clif) => {
-            CompatibilityScope::CodeGeneration
-        }
+        | PrimaryAction::Dump(
+            DumpKind::Ir | DumpKind::Abi | DumpKind::Clif | DumpKind::CodegenStats,
+        ) => CompatibilityScope::CodeGeneration,
     }
 }
 
@@ -1820,6 +1821,18 @@ fn dump_output(
             )
             .map_err(|error| with_prior_diagnostics(&parsed.stderr, error))?;
             (generated.clif, parsed.stderr)
+        }
+        DumpKind::CodegenStats => {
+            let (parsed, ir) = lower_frontend_preprocessed(prepared)?;
+            let generated = codegen_frontend(
+                &ir,
+                &parsed.session.config,
+                &parsed.session.sources,
+                false,
+                false,
+            )
+            .map_err(|error| with_prior_diagnostics(&parsed.stderr, error))?;
+            (generated.stats.to_tsv(), parsed.stderr)
         }
     };
     let dependency_stdout = publish_deferred_dependencies(deferred_dependencies)
@@ -2980,10 +2993,24 @@ mod tests {
         assert!(abi.contains(&format!("target={host_target}")));
         assert!(abi.contains("definition function=0"));
         assert!(!abi.contains(std::env::temp_dir().to_string_lossy().as_ref()));
-        let clif = run(["--emit=clif".to_owned(), "-nostdinc".to_owned(), input])
-            .unwrap()
-            .stdout;
+        let clif = run([
+            "--emit=clif".to_owned(),
+            "-nostdinc".to_owned(),
+            input.clone(),
+        ])
+        .unwrap()
+        .stdout;
         assert!(clif.contains("function main"));
+        let stats = run([
+            "--emit=codegen-stats".to_owned(),
+            "-nostdinc".to_owned(),
+            input,
+        ])
+        .unwrap()
+        .stdout;
+        assert!(stats.starts_with("schema_version\t1\n"));
+        assert!(stats.contains("post_inline_ir.functions\t1\n"));
+        assert!(stats.contains("primary_object.text_bytes\t"));
         fs::remove_dir_all(directory).unwrap();
     }
 

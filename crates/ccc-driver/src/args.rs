@@ -16,6 +16,7 @@ pub(crate) enum DumpKind {
     Ir,
     Abi,
     Clif,
+    CodegenStats,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -258,6 +259,7 @@ pub(crate) fn parse(arguments: impl IntoIterator<Item = String>) -> Result<Parse
             "--dump-ir" => select_dump(&mut dump, DumpKind::Ir)?,
             "--dump-abi" => select_dump(&mut dump, DumpKind::Abi)?,
             "--emit=clif" => select_dump(&mut dump, DumpKind::Clif)?,
+            "--emit=codegen-stats" => select_dump(&mut dump, DumpKind::CodegenStats)?,
             "--emit=obj" => compile_only = true,
             "--emit=asm" => {
                 return Err(
@@ -1142,6 +1144,14 @@ mod tests {
         assert_eq!(
             options(&["--dump-abi", "input.c"]).action,
             PrimaryAction::Dump(DumpKind::Abi)
+        );
+    }
+
+    #[test]
+    fn selects_the_codegen_stats_dump() {
+        assert_eq!(
+            options(&["--emit=codegen-stats", "input.c"]).action,
+            PrimaryAction::Dump(DumpKind::CodegenStats)
         );
     }
 

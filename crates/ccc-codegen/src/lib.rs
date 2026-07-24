@@ -1,6 +1,7 @@
 //! Cranelift lowering and ELF object emission for CCC-IR.
 
 pub mod generic;
+mod stats;
 
 use std::fmt;
 
@@ -10,11 +11,13 @@ use cranelift_codegen::ir::{self, AbiParam, ArgumentPurpose, Signature};
 use cranelift_codegen::isa::CallConv;
 
 pub use generic::emit;
+pub use stats::{CODEGEN_STATS_SCHEMA_VERSION, CodegenStats, IrStats, PrimaryObjectStats};
 
 #[derive(Clone, Debug)]
 pub struct Output {
     pub object: Vec<u8>,
     pub clif: String,
+    pub stats: CodegenStats,
     pub assemblies: Vec<ccc_link::bridge::GeneratedAssembly>,
     pub manifest: ccc_link::artifact::BridgeManifestV2,
 }

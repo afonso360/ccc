@@ -92,6 +92,24 @@ cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 ```
 
+### Inspecting code-generation statistics
+
+Use the versioned TSV dump when comparing lowering or inlining changes:
+
+```sh
+target/debug/ccc --emit=codegen-stats -O2 path/to/input.c
+```
+
+`post_inline_ir.*` rows count only live blocks and instructions in the CLIF
+handed to Cranelift's optimization and machine-code pipeline. The
+`primary_object.*` rows count disjoint logical section sizes, symbols, and
+relocations in CCC's primary relocatable object. Generated assembly bridge
+units are deliberately excluded from that primary-object view; benchmark
+runners which care about packaged output must inspect the final `-c` artifact
+as C-Ray does. The schema starts with `schema_version` and retains a stable row
+order so results can be archived and diffed without parsing human-readable
+CLIF.
+
 ## Target oracles
 
 Build CCC first, then run each target explicitly:

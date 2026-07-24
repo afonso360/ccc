@@ -30,11 +30,11 @@ use cranelift_codegen::ir::{
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{DataDescription, DataId as ClifDataId, FuncId, Linkage, Module as _};
 use cranelift_object::ObjectModule;
-use object::read::{Object as _, ObjectSymbol as _};
+use object::read::ObjectSymbol as _;
 use object::write::SymbolSection;
 use object::{FileFlags, SymbolFlags, SymbolKind, SymbolScope};
 
-use crate::{CodegenError, Options, Output};
+use crate::{CodegenError, CodegenStats, Options, Output, PrimaryObjectStats};
 
 const BACKEND_ERROR: &str = "CCC4002";
 const ATOMIC_ERROR: &str = "CCC4011";
@@ -222,6 +222,7 @@ fn emit_inner(
     )?;
 
     let mut clif = String::new();
+    let mut stats = CodegenStats::default();
     for mut prepared in prepared_functions {
         let function = &module.functions[prepared.function_index];
         let mut policy = inlining.policy(function.id.0);
@@ -247,6 +248,7 @@ fn emit_inner(
                 function.symbol_name, prepared.context.func
             ));
         }
+        stats.post_inline_ir.record_function(&prepared.context.func);
         object_module
             .define_function(prepared.id, &mut prepared.context)
             .map_err(module_error)?;
@@ -374,9 +376,11 @@ fn emit_inner(
         debug.emit(&mut product, &declarations)?;
     }
     let object = product.emit().map_err(module_error)?;
+    let parsed_object = object::File::parse(object.as_slice()).map_err(module_error)?;
+    stats.primary_object = PrimaryObjectStats::from_object(&parsed_object, object.len());
     let required_runtime_helpers = required_runtime_helper_symbols(module, config);
     validate_runtime_helper_symbols(
-        &object,
+        &parsed_object,
         module,
         config,
         required_runtime_helpers.iter().copied(),
@@ -391,6 +395,7 @@ fn emit_inner(
     Ok(Output {
         object,
         clif,
+        stats,
         assemblies,
         manifest,
     })
@@ -411,8 +416,8 @@ fn module_contains_returns_twice_call(module: &gir::FullModule) -> bool {
     })
 }
 
-fn validate_runtime_helper_symbols<'a>(
-    object_bytes: &[u8],
+fn validate_runtime_helper_symbols<'data, 'a>(
+    object: &impl object::Object<'data>,
     module: &gir::FullModule,
     config: &EffectiveCompilationConfig,
     selected: impl IntoIterator<Item = &'a str>,
@@ -430,7 +435,6 @@ fn validate_runtime_helper_symbols<'a>(
         .iter()
         .map(|function| function.symbol_name.as_str())
         .collect::<HashSet<_>>();
-    let object = object::File::parse(object_bytes).map_err(module_error)?;
     let undefined = object
         .symbols()
         .filter(|symbol| symbol.is_undefined())
