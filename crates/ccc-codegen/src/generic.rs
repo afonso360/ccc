@@ -137,9 +137,11 @@ fn emit_inner(
     collect_stats: bool,
 ) -> Result<Output, CodegenError> {
     super::validate_target(config).map_err(error)?;
+    let required_symbols = module.source_symbol_requirements();
     if !config.target.abi.supports_tls_codegen()
         && module.globals.iter().any(|global| {
-            global.duration == StorageDuration::Thread || global.emission.tls.is_some()
+            required_symbols.objects.contains(&global.id)
+                && (global.duration == StorageDuration::Thread || global.emission.tls.is_some())
         })
     {
         return Err(CodegenError {
@@ -166,7 +168,13 @@ fn emit_inner(
         .plan()
         .verify_against(module, config)
         .map_err(abi_error)?;
-    let declarations = declare_module(module, config, abi_plan, &mut object_module)?;
+    let declarations = declare_module(
+        module,
+        config,
+        abi_plan,
+        &required_symbols,
+        &mut object_module,
+    )?;
     let mut debug = options
         .debug_info
         .map(|sources| debug::DebugEmitter::new(module, config, sources));
@@ -885,16 +893,16 @@ fn declare_module(
     module: &gir::FullModule,
     config: &EffectiveCompilationConfig,
     abi_plan: ccc_abi::VerifiedModuleAbiPlan<'_>,
+    required_symbols: &gir::SourceSymbolRequirements,
     object_module: &mut ObjectModule,
 ) -> Result<Declarations, CodegenError> {
     let direct_calls = direct_call_signatures(module)?;
-    let required_functions = required_function_declarations(module);
-    let mut functions = HashMap::with_capacity(module.functions.len());
+    let mut functions = HashMap::with_capacity(required_symbols.functions.len());
     let mut definition_functions = HashMap::new();
     let mut definition_signatures = HashMap::new();
     let mut hidden_body_symbols = HashMap::new();
     for function in &module.functions {
-        if !required_functions.contains(&function.id.0) {
+        if !required_symbols.functions.contains(&function.id) {
             continue;
         }
         let definition_plan = abi_plan.plan().definitions.get(&function.id);
@@ -1116,9 +1124,12 @@ fn declare_module(
         }
     }
 
-    let mut globals = HashMap::with_capacity(module.globals.len());
+    let mut globals = HashMap::with_capacity(required_symbols.objects.len());
     let mut commons = Vec::new();
     for global in &module.globals {
+        if !required_symbols.objects.contains(&global.id) {
+            continue;
+        }
         let tls = global.duration == StorageDuration::Thread || global.emission.tls.is_some();
         let is_external_common = !tls
             && global.emission.definition == ObjectDefinitionPolicy::TentativeCommon
@@ -1388,54 +1399,6 @@ fn module_uses_runtime_sized_storage(module: &gir::FullModule) -> bool {
             })
         })
     })
-}
-
-/// Source function definitions must always reach the object, while a
-/// declaration needs an ObjectModule identity only when retained IR can
-/// reference it. Per-function CLIF imports remain independently interned at
-/// first use by `FunctionReferences`.
-fn required_function_declarations(module: &gir::FullModule) -> HashSet<u32> {
-    let mut required = module
-        .functions
-        .iter()
-        .filter(|function| function.entry.is_some())
-        .map(|function| function.id.0)
-        .collect::<HashSet<_>>();
-
-    for instruction in module
-        .functions
-        .iter()
-        .flat_map(|function| &function.blocks)
-        .flat_map(|block| &block.instructions)
-    {
-        let referenced = match &instruction.kind {
-            gir::FullInstructionKind::DirectCall { function, .. }
-            | gir::FullInstructionKind::AddressOfFunction { function, .. } => Some(function.0),
-            gir::FullInstructionKind::AddressConstant {
-                target: gir::RelocationTarget::Function(function),
-                ..
-            } => Some(function.0),
-            _ => None,
-        };
-        required.extend(referenced);
-    }
-
-    for node in module
-        .globals
-        .iter()
-        .filter_map(|global| global.initializer.as_ref())
-        .flat_map(|initializer| &initializer.nodes)
-    {
-        if let gir::InitializerNodeKind::Relocation {
-            target: gir::RelocationTarget::Function(function),
-            ..
-        } = &node.kind
-        {
-            required.insert(function.0);
-        }
-    }
-
-    required
 }
 
 #[derive(Clone, Copy)]

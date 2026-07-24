@@ -19,10 +19,12 @@ pub fn plan_module(
     config: &EffectiveCompilationConfig,
 ) -> Result<ModuleAbiPlan, AbiError> {
     crate::validate_target(config)?;
+    let required_symbols = module.source_symbol_requirements();
     if !config.target.abi.supports_tls_codegen()
         && module.globals.iter().any(|global| {
-            global.duration == ccc_sema::generic::StorageDuration::Thread
-                || global.emission.tls.is_some()
+            required_symbols.objects.contains(&global.id)
+                && (global.duration == ccc_sema::generic::StorageDuration::Thread
+                    || global.emission.tls.is_some())
         })
     {
         return Err(AbiError::new(
@@ -199,6 +201,7 @@ pub fn plan_module(
         module,
         &definitions,
         &calls,
+        &required_symbols,
         translation_unit_digest,
         config.target.abi,
     )?;
@@ -275,6 +278,7 @@ fn plan_artifacts(
         (ccc_sema::generic::FullFunctionId, gir::InstructionId),
         CallPlan,
     >,
+    required_symbols: &gir::SourceSymbolRequirements,
     translation_unit_digest: crate::TranslationUnitDigest,
     abi_identity: ccc_target::AbiIdentity,
 ) -> Result<BridgeArtifactPlan, AbiError> {
@@ -415,6 +419,9 @@ fn plan_artifacts(
         let is_tls = object.duration == ccc_sema::generic::StorageDuration::Thread
             || object.emission.tls.is_some();
         if !is_tls {
+            continue;
+        }
+        if !required_symbols.objects.contains(&object.id) {
             continue;
         }
         if object.duration != ccc_sema::generic::StorageDuration::Thread {

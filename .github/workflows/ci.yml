@@ -282,6 +282,7 @@ jobs:
           --output "$RUNNER_TEMP/ccc-corpus/codegen-benchmarks"
           --profiles O0,O2,Oz --warmups 0 --samples 1
           --declaration-scales 0,256,1024
+          --data-declaration-scales 0,256,1024
           --function-scales 8,32,128
 
       - name: Upload codegen microbenchmark evidence

@@ -3,8 +3,8 @@ use std::fmt;
 
 use ccc_sema::generic::{
     FullFunctionId, FullLocalId, FunctionProperties, GlobalEmission, GlobalId, Linkage,
-    LongDoubleConstant, SemanticStorageClass, StorageDuration, StringId, SymbolBinding,
-    SymbolVisibility,
+    LongDoubleConstant, ObjectDefinitionPolicy, SemanticStorageClass, StorageDuration, StringId,
+    SymbolBinding, SymbolVisibility,
 };
 use ccc_session::Span;
 use ccc_types::{QualifiedType, TypeId, TypeStore};
@@ -32,9 +32,35 @@ pub struct FullModule {
     pub types: TypeStore,
     pub globals: Vec<FullGlobal>,
     pub strings: Vec<FullString>,
-    /// Includes declarations so consumers can declare every symbol before
-    /// translating function bodies.
+    /// Includes declarations so consumers can derive the exact source-symbol
+    /// set needed by retained definitions and references.
     pub functions: Vec<FullFunction>,
+}
+
+/// Source symbols that must receive object identities for this retained IR.
+///
+/// Definitions are always required. Declaration-only symbols enter the set
+/// only through a direct call, address operation, or static initializer
+/// relocation. Ordered sets make the result stable for dumps and consumers
+/// without imposing an object-emission order.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SourceSymbolRequirements {
+    pub functions: BTreeSet<FullFunctionId>,
+    pub objects: BTreeSet<DataId>,
+}
+
+impl SourceSymbolRequirements {
+    fn require_target(&mut self, target: RelocationTarget) {
+        match target {
+            RelocationTarget::Function(function) => {
+                self.functions.insert(function);
+            }
+            RelocationTarget::Object(data) => {
+                self.objects.insert(data);
+            }
+            RelocationTarget::String(_) => {}
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -44,6 +70,60 @@ pub enum NativeInlineAsmHelper {
 }
 
 impl FullModule {
+    /// Returns every source function or data object that retained IR can emit
+    /// or reference.
+    pub fn source_symbol_requirements(&self) -> SourceSymbolRequirements {
+        let mut requirements = SourceSymbolRequirements {
+            functions: self
+                .functions
+                .iter()
+                .filter(|function| function.entry.is_some())
+                .map(|function| function.id)
+                .collect(),
+            objects: self
+                .globals
+                .iter()
+                .filter(|global| global.emission.definition != ObjectDefinitionPolicy::Declaration)
+                .map(|global| global.id)
+                .collect(),
+        };
+
+        for instruction in self
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+        {
+            match &instruction.kind {
+                FullInstructionKind::DirectCall { function, .. }
+                | FullInstructionKind::AddressOfFunction { function, .. } => {
+                    requirements.functions.insert(*function);
+                }
+                FullInstructionKind::AddressOfGlobal { global } => {
+                    requirements.objects.insert(*global);
+                }
+                FullInstructionKind::AddressConstant { target, .. } => {
+                    requirements.require_target(*target);
+                }
+                _ => {}
+            }
+        }
+
+        for node in self
+            .globals
+            .iter()
+            .filter(|global| global.emission.definition != ObjectDefinitionPolicy::Declaration)
+            .filter_map(|global| global.initializer.as_ref())
+            .flat_map(|initializer| &initializer.nodes)
+        {
+            if let InitializerNodeKind::Relocation { target, .. } = &node.kind {
+                requirements.require_target(*target);
+            }
+        }
+
+        requirements
+    }
+
     /// Returns the complete deterministic helper set required by retained
     /// inline-assembly operations. Packaging may use this without rediscovering
     /// source templates or constraints.

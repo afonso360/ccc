@@ -11,14 +11,19 @@ The default set covers:
 - a minimal `main` returning zero;
 - one direct `puts` call;
 - one variadic `printf` call;
-- generated translation units with 0, 32, 256, and 1024 unused declarations;
+- generated translation units with 0, 32, 256, and 1024 unused function
+  declarations;
+- generated translation units with the same independent scale of unused data
+  declarations;
 - generated live call chains with 8, 32, and 128 functions.
 
-The declaration series is also a regression check. Increasing the number of
-unused declarations must not change any `post_inline_ir.*` metric. This catches
-the old behavior where trivial programs accumulated unused CLIF references.
-The live-function series provides a growing backend workload for codegen
-performance work.
+The two declaration series are also regression checks. Increasing either
+unused function prototypes or unused external data declarations must not
+change any `post_inline_ir.*` metric or the selected primary-object byte,
+symbol, undefined-symbol, relocation, and text-size metrics. This catches the
+old behavior where trivial programs accumulated unused CLIF references or
+object declarations. The live-function series provides a growing backend
+workload for codegen performance work.
 
 ## Running
 
@@ -42,13 +47,15 @@ benchmarks/codegen/run.py \
   --warmups 2 \
   --samples 10 \
   --declaration-scales 0,100,1000,10000 \
+  --data-declaration-scales 0,100,1000,10000 \
   --function-scales 1,16,64,256
 ```
 
 Pass `--target=<triple>` to select an enabled target when its compiler driver
 and sysroot are configured. Use `--cases` with a comma-separated subset to
-isolate one family. The output directory must be new or empty so evidence from
-separate runs cannot be mixed accidentally.
+isolate one family; the declaration families are `declaration-heavy` and
+`data-declaration-heavy`. The output directory must be new or empty so evidence
+from separate runs cannot be mixed accidentally.
 
 ## Results
 
@@ -63,8 +70,8 @@ The result directory is self-contained:
 | `sources/` | Exact static and generated C translation units that were measured. |
 | `manifest.tsv` | Source paths, byte counts, and SHA-256 identities. |
 | `commands.jsonl` | Exact compiler argument vectors in execution order. |
-| `environment.json` | Host, compiler hash, effective target, configuration-query paths, and run settings. |
-| `effective-config/` | Target, resource directory, sysroot, and external-tool configuration per profile. |
+| `environment.json` | Host, compiler hash, effective target, and query evidence. |
+| `effective-config/` | Resource, sysroot, and external tools per profile. |
 
 Compare the same profile, target, compiler build mode, and host. The raw
 `post_inline_ir.*` counters describe input to Cranelift's own passes;
@@ -91,7 +98,7 @@ platform convention internally and is normalized to bytes.
 ## Regression test
 
 The self-test uses a fake compiler, performs positive and negative
-no-unused-CLIF checks, and does not require a CCC build:
+no-unused-function/data-declaration checks, and does not require a CCC build:
 
 ```sh
 benchmarks/codegen/test-run.sh

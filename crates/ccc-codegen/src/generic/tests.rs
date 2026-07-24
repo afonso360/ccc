@@ -4,7 +4,7 @@ use ccc_pp::{PpItem, lex};
 use ccc_sema::generic::analyze_frontend;
 use ccc_session::SourceMap;
 use ccc_syntax::frontend as syntax;
-use ccc_target::OptimizationLevel;
+use ccc_target::{ENABLED_TARGET_SPECS, OptimizationLevel};
 use object::read::macho::Nlist as _;
 use object::{
     Object as _, ObjectSection as _, ObjectSymbol as _, RelocationEncoding, RelocationFlags,
@@ -50,6 +50,13 @@ fn lower_source_with_map(
 
 fn lower_source(source: &str) -> gir::FullModule {
     lower_source_with_config(source, &EffectiveCompilationConfig::default())
+}
+
+fn enabled_configs() -> impl Iterator<Item = EffectiveCompilationConfig> {
+    ENABLED_TARGET_SPECS.iter().map(|profile| {
+        EffectiveCompilationConfig::for_target(profile.triple.clone())
+            .expect("catalogued target has an effective configuration")
+    })
 }
 
 #[test]
@@ -459,6 +466,238 @@ fn unused_source_declaration_does_not_conflict_with_selected_runtime_helper() {
         .collect::<Vec<_>>();
     assert_eq!(helpers.len(), 1);
     assert!(helpers[0].is_undefined());
+}
+
+#[test]
+fn unused_data_and_tls_declarations_emit_nothing_on_enabled_targets() {
+    const SOURCE: &str = "extern int unused_object;\n\
+         extern int unused_weak_object __attribute__((weak));\n\
+         extern int unused_hidden_object __attribute__((visibility(\"hidden\")));\n\
+         extern int unused_protected_object __attribute__((visibility(\"protected\")));\n\
+         extern int unused_exact_object asm(\"unused_physical_object\");\n\
+         extern _Thread_local int unused_tls;\n\
+         extern _Thread_local int unused_exact_tls asm(\"unused_physical_tls\");\n\
+         int retained_definition(void) { return 0; }";
+
+    for config in enabled_configs() {
+        let module = lower_source_with_config(SOURCE, &config);
+        let plan = ccc_abi::plan_module(&module, &config).unwrap();
+        assert!(
+            plan.artifacts.tls_accessors.is_empty(),
+            "{} planned unused TLS",
+            config.target.triple
+        );
+        assert_eq!(
+            plan.artifacts.packaging.generated_assembly_units, 0,
+            "{} packaged unused TLS",
+            config.target.triple
+        );
+
+        let output = emit(&module, &config, Options::default()).unwrap();
+        assert!(output.assemblies.is_empty(), "{}", config.target.triple);
+        assert!(
+            output
+                .manifest
+                .symbols()
+                .iter()
+                .all(|symbol| symbol.kind != ccc_link::bridge::GeneratedSymbolKind::TlsAccessor),
+            "{}",
+            config.target.triple
+        );
+        let object = object::File::parse(output.object.as_slice()).unwrap();
+        let prefix = if object.format() == object::BinaryFormat::MachO {
+            "_"
+        } else {
+            ""
+        };
+        for name in [
+            "unused_object",
+            "unused_weak_object",
+            "unused_hidden_object",
+            "unused_protected_object",
+            "unused_tls",
+        ] {
+            let name = format!("{prefix}{name}");
+            assert!(
+                object.symbol_by_name(&name).is_none(),
+                "{} unexpectedly emitted `{name}`",
+                config.target.triple
+            );
+        }
+        for name in [
+            "unused_exact_object",
+            "unused_physical_object",
+            "_unused_physical_object",
+            "unused_exact_tls",
+            "unused_physical_tls",
+            "_unused_physical_tls",
+        ] {
+            assert!(
+                object.symbol_by_name(name).is_none(),
+                "{} unexpectedly emitted `{name}`",
+                config.target.triple
+            );
+        }
+    }
+}
+
+#[test]
+fn referenced_data_and_tls_declarations_preserve_source_contracts_on_enabled_targets() {
+    const SOURCE: &str = "extern int hidden_object __attribute__((visibility(\"hidden\")));\n\
+         extern int weak_object __attribute__((weak));\n\
+         extern int exact_object asm(\"physical_object\");\n\
+         extern _Thread_local int imported_tls;\n\
+         int *saved_object = &exact_object;\n\
+         int read_imports(void) {\n\
+             return hidden_object + weak_object + *saved_object + imported_tls;\n\
+         }";
+
+    for config in enabled_configs() {
+        let module = lower_source_with_config(SOURCE, &config);
+        let plan = ccc_abi::plan_module(&module, &config).unwrap();
+        let tls = module
+            .globals
+            .iter()
+            .find(|global| global.name == "imported_tls")
+            .unwrap();
+        let accessor = plan
+            .artifacts
+            .tls_accessors
+            .get(&tls.id)
+            .expect("referenced TLS declaration has an accessor");
+        assert!(!accessor.source_defined);
+        assert_eq!(plan.artifacts.tls_accessors.len(), 1);
+
+        let output = emit(&module, &config, Options::default()).unwrap();
+        assert_eq!(output.assemblies.len(), 1, "{}", config.target.triple);
+        assert_eq!(
+            output
+                .manifest
+                .symbols()
+                .iter()
+                .filter(|symbol| {
+                    symbol.kind == ccc_link::bridge::GeneratedSymbolKind::TlsAccessor
+                })
+                .count(),
+            1,
+            "{}",
+            config.target.triple
+        );
+        let object = object::File::parse(output.object.as_slice()).unwrap();
+        let macho = object.format() == object::BinaryFormat::MachO;
+        let prefix = if macho { "_" } else { "" };
+        let hidden_name = format!("{prefix}hidden_object");
+        let weak_name = format!("{prefix}weak_object");
+        let tls_name = format!("{prefix}imported_tls");
+
+        let hidden = object.symbol_by_name(&hidden_name).unwrap();
+        assert!(hidden.is_undefined(), "{hidden_name}");
+        if macho {
+            let macho = object::read::macho::MachOFile64::<object::Endianness>::parse(
+                output.object.as_slice(),
+            )
+            .unwrap();
+            let hidden = macho.symbol_by_name(&hidden_name).unwrap();
+            assert_ne!(
+                hidden.macho_symbol().n_type() & object::macho::N_PEXT,
+                0,
+                "{hidden_name}"
+            );
+        } else {
+            assert_eq!(
+                hidden.flags().elf_visibility(),
+                Some(object::elf::STV_HIDDEN),
+                "{hidden_name}"
+            );
+        }
+        let weak = object.symbol_by_name(&weak_name).unwrap();
+        assert!(weak.is_undefined(), "{weak_name}");
+        assert!(weak.is_weak(), "{weak_name}");
+        assert!(
+            object
+                .symbol_by_name("physical_object")
+                .is_some_and(|symbol| symbol.is_undefined())
+        );
+        if macho {
+            assert!(object.symbol_by_name("_physical_object").is_none());
+        }
+        assert!(
+            object
+                .symbol_by_name(&tls_name)
+                .is_some_and(|symbol| symbol.is_undefined()),
+            "{} omitted `{tls_name}`",
+            config.target.triple
+        );
+        assert!(
+            output.assemblies[0].source().contains(&tls_name),
+            "{} accessor omitted `{tls_name}`:\n{}",
+            config.target.triple,
+            output.assemblies[0].source()
+        );
+        output.into_artifact_bundle().verify().unwrap();
+    }
+}
+
+#[test]
+fn unreferenced_data_and_tls_definitions_remain_materialized_on_enabled_targets() {
+    const SOURCE: &str = "int external_definition = 1;\n\
+         static int internal_definition = 2;\n\
+         int tentative_definition;\n\
+         _Thread_local int tls_definition = 3;\n\
+         int entry(void) { return 0; }";
+
+    for config in enabled_configs() {
+        let module = lower_source_with_config(SOURCE, &config);
+        let plan = ccc_abi::plan_module(&module, &config).unwrap();
+        let tls = module
+            .globals
+            .iter()
+            .find(|global| global.name == "tls_definition")
+            .unwrap();
+        let accessor = plan
+            .artifacts
+            .tls_accessors
+            .get(&tls.id)
+            .expect("TLS definition has an accessor");
+        assert!(accessor.source_defined);
+        assert_eq!(plan.artifacts.tls_accessors.len(), 1);
+
+        let output = emit(&module, &config, Options::default()).unwrap();
+        assert_eq!(output.assemblies.len(), 1, "{}", config.target.triple);
+        let object = object::File::parse(output.object.as_slice()).unwrap();
+        let prefix = if object.format() == object::BinaryFormat::MachO {
+            "_"
+        } else {
+            ""
+        };
+        for name in ["external_definition", "internal_definition"] {
+            let name = format!("{prefix}{name}");
+            assert!(
+                object
+                    .symbol_by_name(&name)
+                    .is_some_and(|symbol| symbol.is_definition()),
+                "{} omitted definition `{name}`",
+                config.target.triple
+            );
+        }
+        let tls_name = format!("{prefix}tls_definition");
+        assert!(
+            object.symbol_by_name(&tls_name).is_some_and(|symbol| {
+                !symbol.is_undefined() && symbol.kind() == object::SymbolKind::Tls
+            }),
+            "{} omitted TLS definition `{tls_name}`",
+            config.target.triple
+        );
+        let tentative_name = format!("{prefix}tentative_definition");
+        assert!(
+            object
+                .symbol_by_name(&tentative_name)
+                .is_some_and(|symbol| symbol.is_definition() || symbol.is_common()),
+            "{} omitted tentative definition `{tentative_name}`",
+            config.target.triple
+        );
+        output.into_artifact_bundle().verify().unwrap();
+    }
 }
 
 #[test]
@@ -1512,9 +1751,12 @@ fn thread_local_accesses_use_manifested_generated_accessors() {
 fn debug_information_distinguishes_prototypes_and_locates_tls_definitions() {
     let config = EffectiveCompilationConfig::default();
     let (module, sources) = lower_source_with_map(
-        "_Thread_local int debug_tls = 7;\n\
+        "extern int unused_debug_object;\n\
+         extern _Thread_local int unused_debug_tls;\n\
+         int debug_regular = 5;\n\
+         _Thread_local int debug_tls = 7;\n\
          int (*unspecified_function_pointer)();\n\
-         int prototyped(int value) { return value + debug_tls; }",
+         int prototyped(int value) { return value + debug_regular + debug_tls; }",
         &config,
     );
     let output = emit(
@@ -1527,6 +1769,8 @@ fn debug_information_distinguishes_prototypes_and_locates_tls_definitions() {
     )
     .unwrap();
     let object = object::File::parse(output.object.as_slice()).unwrap();
+    assert!(object.symbol_by_name("unused_debug_object").is_none());
+    assert!(object.symbol_by_name("unused_debug_tls").is_none());
 
     let debug_info = object.section_by_name(".debug_info").unwrap();
     assert!(debug_info.relocations().any(|(_, relocation)| {
@@ -1563,6 +1807,7 @@ fn debug_information_distinguishes_prototypes_and_locates_tls_definitions() {
     let mut prototyped_subprogram = false;
     let mut prototyped_subroutine_type = false;
     let mut unspecified_subroutine_type = false;
+    let mut regular_location = false;
     let mut tls_location = false;
     while let Some(entry) = entries.next_dfs().unwrap() {
         let has_prototype = entry.has_attr(gimli::DW_AT_prototyped);
@@ -1576,6 +1821,9 @@ fn debug_information_distinguishes_prototypes_and_locates_tls_definitions() {
             .map(|name| name.to_string_lossy().into_owned());
         if entry.tag() == gimli::DW_TAG_subprogram && name.as_deref() == Some("prototyped") {
             prototyped_subprogram = has_prototype;
+        }
+        if entry.tag() == gimli::DW_TAG_variable && name.as_deref() == Some("debug_regular") {
+            regular_location = entry.has_attr(gimli::DW_AT_location);
         }
         if entry.tag() == gimli::DW_TAG_variable && name.as_deref() == Some("debug_tls") {
             let gimli::AttributeValue::Exprloc(expression) =
@@ -1599,6 +1847,7 @@ fn debug_information_distinguishes_prototypes_and_locates_tls_definitions() {
     assert!(prototyped_subprogram);
     assert!(prototyped_subroutine_type);
     assert!(unspecified_subroutine_type);
+    assert!(regular_location);
     assert!(tls_location);
 }
 

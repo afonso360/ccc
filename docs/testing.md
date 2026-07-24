@@ -308,8 +308,8 @@ evidence as artifacts.
 ## Code-generation microbenchmarks
 
 The local compiler-only suite measures minimal return, direct `puts`, variadic
-`printf`, unused-declaration scaling, and live-function scaling without link or
-runtime noise:
+`printf`, independent unused function/data-declaration scaling, and
+live-function scaling without link or runtime noise:
 
 ```sh
 cargo build --locked --release -p ccc-driver
@@ -325,18 +325,20 @@ measurement, generated source and hash, exact command, and a comparison-ready
 untimed structural-stat query runs for each case and optimization profile. The
 evidence also records the compiler executable hash, effective target, resource
 directory, sysroot, and selected external-tool configuration. The
-unused-declaration family requires every post-inlining CLIF metric to remain
-identical from zero through 1,024 declarations; the live-function family
-supplies increasing backend work. Use a release compiler for timing
-comparisons; debug builds are only suitable for exercising the harness. Use
-`--declaration-scales`, `--function-scales`, `--profiles`, `--warmups`, and
-`--samples` for focused investigations. See `benchmarks/codegen/README.md` for
-the complete result contract.
+unused function- and data-declaration families require every post-inlining CLIF
+metric plus primary-object byte, symbol, undefined-symbol, relocation, and text
+metrics to remain identical from zero through 1,024 declarations. The
+live-function family supplies increasing backend work. Use a release compiler
+for timing comparisons; debug builds are only suitable for exercising the
+harness. Use `--declaration-scales`, `--data-declaration-scales`,
+`--function-scales`, `--profiles`, `--warmups`, and `--samples` for focused
+investigations. See `benchmarks/codegen/README.md` for the complete result
+contract.
 
 The Linux x86-64 corpus job runs a one-sample matrix and uploads its evidence.
-That gate proves the metrics and no-unused-CLIF invariant; timing comparisons
-must use repeated runs on a controlled host. The runner's independent fake-tool
-regression is:
+That gate proves the metrics and no-unused-function/data-declaration
+invariants; timing comparisons must use repeated runs on a controlled host.
+The runner's independent fake-tool regression is:
 
 ```sh
 benchmarks/codegen/test-run.sh

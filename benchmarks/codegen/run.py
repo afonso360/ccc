@@ -38,6 +38,7 @@ CASE_NAMES = (
     "puts-call",
     "printf-variadic",
     "declaration-heavy",
+    "data-declaration-heavy",
     "live-functions",
 )
 REQUIRED_METRICS = (
@@ -206,7 +207,12 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "--declaration-scales",
         default="0,32,256,1024",
-        help="generated declaration counts (default: 0,32,256,1024)",
+        help="generated function declaration counts (default: 0,32,256,1024)",
+    )
+    parser.add_argument(
+        "--data-declaration-scales",
+        default="0,32,256,1024",
+        help="generated data declaration counts (default: 0,32,256,1024)",
     )
     parser.add_argument(
         "--function-scales",
@@ -239,6 +245,10 @@ def parse_arguments() -> argparse.Namespace:
         )
         arguments.declaration_scales = scales(
             arguments.declaration_scales, label="--declaration-scales"
+        )
+        arguments.data_declaration_scales = scales(
+            arguments.data_declaration_scales,
+            label="--data-declaration-scales",
         )
         arguments.function_scales = scales(
             arguments.function_scales, label="--function-scales"
@@ -293,6 +303,18 @@ def declaration_source(scale: int) -> str:
     return "\n".join(lines)
 
 
+def data_declaration_source(scale: int) -> str:
+    lines = [
+        "/* ccc-benchmark-family: data-declaration-heavy */",
+        f"/* ccc-benchmark-scale: {scale} */",
+        "",
+    ]
+    for index in range(scale):
+        lines.append(f"extern long ccc_data_decl_{index:06d};")
+    lines.extend(("", "int main(void) {", "    return 0;", "}", ""))
+    return "\n".join(lines)
+
+
 def live_functions_source(scale: int) -> str:
     lines = [
         "/* ccc-benchmark-family: live-functions */",
@@ -324,6 +346,7 @@ def live_functions_source(scale: int) -> str:
 def copy_and_generate_cases(
     selected: list[str],
     declaration_scales: list[int],
+    data_declaration_scales: list[int],
     function_scales: list[int],
     output: Path,
 ) -> list[Case]:
@@ -345,6 +368,15 @@ def copy_and_generate_cases(
             source = source_directory / f"{name}.c"
             source.write_text(declaration_source(scale), encoding="utf-8")
             cases.append(Case(name, "declaration-heavy", scale, source, 1))
+
+    if "data-declaration-heavy" in selected:
+        for scale in data_declaration_scales:
+            name = f"data-declaration-heavy-{scale}"
+            source = source_directory / f"{name}.c"
+            source.write_text(data_declaration_source(scale), encoding="utf-8")
+            cases.append(
+                Case(name, "data-declaration-heavy", scale, source, 1)
+            )
 
     if "live-functions" in selected:
         for scale in function_scales:
@@ -547,11 +579,17 @@ def validate_invariants(
                     f"{case} at -{profile} produced nondeterministic object files"
                 )
 
-    declarations: dict[str, list[StatsRecord]] = {}
+    declaration_labels = {
+        "declaration-heavy": "function declarations",
+        "data-declaration-heavy": "data declarations",
+    }
+    declarations: dict[tuple[str, str], list[StatsRecord]] = {}
     for record in records:
-        if record.case.family == "declaration-heavy":
-            declarations.setdefault(record.profile, []).append(record)
-    for profile, group in declarations.items():
+        if record.case.family in declaration_labels:
+            declarations.setdefault(
+                (record.case.family, record.profile), []
+            ).append(record)
+    for (family, profile), group in declarations.items():
         if len(group) < 2:
             continue
         first = group[0]
@@ -570,8 +608,8 @@ def validate_invariants(
             }
             if current_ir != first_ir:
                 raise BenchmarkError(
-                    "unused declarations changed post-inline CLIF or "
-                    "primary-object metrics at "
+                    f"unused {declaration_labels[family]} changed post-inline "
+                    "CLIF or primary-object metrics at "
                     f"-{profile}: {first.case.scale} versus "
                     f"{record.case.scale} declarations"
                 )
@@ -734,6 +772,7 @@ def run(arguments: argparse.Namespace) -> Path:
     cases = copy_and_generate_cases(
         arguments.cases,
         arguments.declaration_scales,
+        arguments.data_declaration_scales,
         arguments.function_scales,
         output,
     )
@@ -766,6 +805,7 @@ def run(arguments: argparse.Namespace) -> Path:
         "warmups": arguments.warmups,
         "samples": arguments.samples,
         "declaration_scales": arguments.declaration_scales,
+        "data_declaration_scales": arguments.data_declaration_scales,
         "function_scales": arguments.function_scales,
     }
     write_json(output / "environment.json", environment)

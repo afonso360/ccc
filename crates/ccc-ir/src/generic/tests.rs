@@ -24,6 +24,116 @@ fn lower_source(source: &str) -> FullModule {
 }
 
 #[test]
+fn source_symbol_requirements_are_complete_minimal_and_deterministic() {
+    let mut module = lower_source(
+        "extern int unused_function(int);\n\
+         extern int called_function(int);\n\
+         extern int addressed_function(int);\n\
+         extern int constant_function(int);\n\
+         extern int initialized_function(int);\n\
+         extern int unused_object;\n\
+         extern int addressed_object;\n\
+         extern int constant_object;\n\
+         extern int initialized_object;\n\
+         int defined_object = 1;\n\
+         int tentative_object;\n\
+         int (*function_slot)(int) = initialized_function;\n\
+         int *object_slot = &initialized_object;\n\
+         int defined_function(void) { return 1; }\n\
+         int use_symbols(int value) {\n\
+             int (*addressed)(int) = addressed_function;\n\
+             int (*constant)(int) = constant_function;\n\
+             return called_function(value) + addressed(value) + constant(value)\n\
+                 + addressed_object + constant_object;\n\
+         }",
+    );
+    verify_frontend(&module).unwrap();
+
+    let function_ids = module
+        .functions
+        .iter()
+        .map(|function| (function.name.clone(), function.id))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let object_ids = module
+        .globals
+        .iter()
+        .map(|global| (global.name.clone(), global.id))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let constant_function = function_ids["constant_function"];
+    let constant_object = object_ids["constant_object"];
+
+    let mut replaced_function = false;
+    let mut replaced_object = false;
+    for instruction in module
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.instructions)
+    {
+        match instruction.kind {
+            FullInstructionKind::AddressOfFunction { function, .. }
+                if function == constant_function =>
+            {
+                instruction.kind = FullInstructionKind::AddressConstant {
+                    target: RelocationTarget::Function(function),
+                    addend: 0,
+                    one_past: false,
+                };
+                replaced_function = true;
+            }
+            FullInstructionKind::AddressOfGlobal { global } if global == constant_object => {
+                instruction.kind = FullInstructionKind::AddressConstant {
+                    target: RelocationTarget::Object(global),
+                    addend: 0,
+                    one_past: false,
+                };
+                replaced_object = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(replaced_function);
+    assert!(replaced_object);
+    verify_frontend(&module).unwrap();
+
+    let requirements = module.source_symbol_requirements();
+    assert_eq!(requirements, module.source_symbol_requirements());
+    for name in [
+        "called_function",
+        "addressed_function",
+        "constant_function",
+        "initialized_function",
+        "defined_function",
+        "use_symbols",
+    ] {
+        assert!(
+            requirements.functions.contains(&function_ids[name]),
+            "missing function `{name}`"
+        );
+    }
+    assert!(
+        !requirements
+            .functions
+            .contains(&function_ids["unused_function"])
+    );
+    for name in [
+        "addressed_object",
+        "constant_object",
+        "initialized_object",
+        "defined_object",
+        "tentative_object",
+        "function_slot",
+        "object_slot",
+    ] {
+        assert!(
+            requirements.objects.contains(&object_ids[name]),
+            "missing object `{name}`"
+        );
+    }
+    assert!(!requirements.objects.contains(&object_ids["unused_object"]));
+}
+
+#[test]
 fn function_inlining_properties_reach_verified_ir_and_dumps() {
     let module = lower_source(
         "static int fast(int value) __attribute__((__always_inline__));\n\
