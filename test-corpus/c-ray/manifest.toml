@@ -1,4 +1,4 @@
-format_version = 2
+format_version = 3
 name = "c-ray"
 version = "1.1"
 revision = "a1bb24ba76b556565e46ec9327a3029f5b7f284e"
@@ -47,13 +47,15 @@ reference_optimization = "-O2"
 link_libraries = ["m", "pthread"]
 output_format = "binary-ppm-p6"
 output_oracle = "byte-identical-across-ccc-profiles-and-native-reference"
-result_format = "tab-separated-summary-and-raw-timings"
+result_format = "tab-separated-summary-raw-timings-and-compiler-phase-evidence"
 
 [retained_artifacts]
 run = [
     "archive-hashes.txt",
     "artifact-sizes.tsv",
     "codegen-stats.tsv",
+    "compile-phase-artifacts.tsv",
+    "compile-phase-timings.tsv",
     "commands.txt",
     "compiler-identities",
     "executable-size.txt",
@@ -61,6 +63,7 @@ run = [
     "object-sections.tsv",
     "object-sections.txt",
     "output-sha256.tsv",
+    "phase-timing-raw",
     "reference.ppm",
     "run-config.txt",
     "run-stderr",

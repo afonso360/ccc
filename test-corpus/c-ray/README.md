@@ -58,20 +58,23 @@ environment with `--target`, `--reference-cc`, `--sdk-root`, and
 `--deployment-target`; cross-target or emulated timings are intentionally
 rejected.
 
-Required common tools are Bash, Python 3, Curl when the archive is not supplied,
-OpenSSL with SHA3-256, Tar, and the usual POSIX file/text utilities. Linux uses
-GNU-compatible `size`; macOS uses the active developer toolchain's `llvm-size`.
-The compiler and reference/link driver must have libc, libm, and pthreads for
-the selected native target.
+Required common tools are Bash, Python 3.8 or newer, Curl when the archive is
+not supplied, OpenSSL with SHA3-256, Tar, and the usual POSIX file/text
+utilities. Linux uses GNU-compatible `size`; macOS uses the active developer
+toolchain's `llvm-size`. The compiler and reference/link driver must have libc,
+libm, and pthreads for the selected native target.
 
 ## Results
 
-`summary.tsv` is the comparison entry point. For each compiler/profile it
-records:
+`summary.tsv` is the comparison entry point. Result format version 3 records,
+for each compiler/profile:
 
 - compile and link wall time;
 - sample count and median/minimum/maximum render wall time;
 - compile peak RSS and median render peak RSS;
+- one untimed observation of CCC preprocessing, parsing, semantic analysis,
+  CCC-IR lowering and optimization, total codegen, object packaging, and total
+  pipeline wall time in nanoseconds;
 - post-inlining CLIF function, block, live-value, instruction, call,
   stack-slot, signature, external-reference, and global-value counts for every
   CCC profile, including allocated-but-unreferenced imported entities;
@@ -81,10 +84,30 @@ records:
 - the validated image SHA-256.
 
 `timings.tsv` and the per-command JSON files under `timings/` retain every raw
-wall, CPU, peak-RSS, exit-status, and command measurement. `commands.txt`,
-compiler identity and macro files, per-run C-Ray stderr, and every validated
-output hash make a result auditable. `object-sections.tsv` retains every exact
-section name and its normalized category;
+wall, CPU, peak-RSS, exit-status, and command measurement. Phase
+instrumentation is deliberately absent from that table: after each measured
+CCC compile and link, the runner performs one separate, untimed `-c`
+invocation with the same compile flags and distinct object and sidecar paths.
+It never links that object. The instrumented object's size and SHA-256 must
+match the measured object before the phases can enter the summary.
+
+`compile-phase-timings.tsv` retains the complete normalized schema-1 sidecar
+for each CCC optimization profile, while `compile-phase-artifacts.tsv` records
+the measured and instrumented object sizes, hashes, and match status.
+`phase-timing-raw/` preserves each instrumented object, original sidecar,
+stdout, stderr, exact command, and result JSON. The eight summary fields are
+blank for `reference-o2`, which does not expose CCC's internal phases. Schema
+version 1 orders the phases as `preprocessing`, `parsing`,
+`semantic_analysis`, `ccc_ir_lowering`, `ccc_ir_optimization`,
+`codegen.total`, `object_packaging`, and `pipeline`; values are canonical
+unsigned decimal nanoseconds. `codegen.total` is intentionally coarse, and
+`pipeline` stops before sidecar serialization and publication. These are
+single wall-clock attribution observations, not per-phase CPU or peak-RSS
+measurements.
+
+`commands.txt`, compiler identity and macro files, per-run C-Ray stderr, and
+every validated output hash make a result auditable. `object-sections.tsv`
+retains every exact section name and its normalized category;
 `object-section-totals.tsv` is the machine-readable input to `summary.tsv`;
 `object-sections.txt` and `executable-size.txt` preserve the raw size-tool
 output. `codegen-stats.tsv` retains CCC's complete versioned compiler-side

@@ -2,9 +2,12 @@
 
 """Create a stable summary from C-Ray's retained raw result tables."""
 
+from __future__ import annotations
+
 import argparse
 import csv
 from pathlib import Path
+import re
 import statistics
 import sys
 from typing import Dict, List
@@ -45,11 +48,55 @@ CODEGEN_STATS_SCHEMA = (
     "primary_object.metadata_bytes",
     "primary_object.other_section_bytes",
 )
+PHASE_TIMING_SCHEMA_VERSION = "1"
+PHASE_TIMING_METRICS = (
+    "preprocessing",
+    "parsing",
+    "semantic_analysis",
+    "ccc_ir_lowering",
+    "ccc_ir_optimization",
+    "codegen.total",
+    "object_packaging",
+    "pipeline",
+)
+PHASE_TIMING_SUMMARY_FIELDS = (
+    ("compile_phase_preprocessing_nanoseconds", "preprocessing"),
+    ("compile_phase_parsing_nanoseconds", "parsing"),
+    ("compile_phase_semantic_analysis_nanoseconds", "semantic_analysis"),
+    ("compile_phase_ccc_ir_lowering_nanoseconds", "ccc_ir_lowering"),
+    ("compile_phase_ccc_ir_optimization_nanoseconds", "ccc_ir_optimization"),
+    ("compile_phase_codegen_total_nanoseconds", "codegen.total"),
+    ("compile_phase_object_packaging_nanoseconds", "object_packaging"),
+    ("compile_phase_pipeline_nanoseconds", "pipeline"),
+)
+PHASE_TIMING_FIELDS = ("label", "metric", "value")
+PHASE_ARTIFACT_FIELDS = (
+    "label",
+    "canonical_object_bytes",
+    "canonical_object_sha256",
+    "instrumented_object_bytes",
+    "instrumented_object_sha256",
+    "objects_match",
+)
+RESULT_LABELS = ("ccc-o0", "ccc-o2", "ccc-oz", "reference-o2")
+CCC_LABELS = RESULT_LABELS[:3]
 
 
 def read_rows(path: Path) -> List[dict]:
     with path.open(encoding="utf-8", newline="") as source:
         return list(csv.DictReader(source, delimiter="\t"))
+
+
+def read_exact_rows(path: Path, fields: tuple[str, ...]) -> List[dict]:
+    with path.open(encoding="utf-8", newline="") as source:
+        reader = csv.DictReader(source, delimiter="\t")
+        if tuple(reader.fieldnames or ()) != fields:
+            raise ValueError(f"{path}: expected header {'/'.join(fields)}")
+        rows = list(reader)
+    for line_number, row in enumerate(rows, 2):
+        if None in row or any(row[field] is None for field in fields):
+            raise ValueError(f"{path}:{line_number}: malformed normalized row")
+    return rows
 
 
 def one_timing(timings: List[dict], label: str, stage: str) -> dict:
@@ -111,6 +158,78 @@ def codegen_stats_by_label(rows: List[dict]) -> Dict[str, Dict[str, str]]:
     return result
 
 
+def phase_timings_by_label(rows: List[dict]) -> Dict[str, Dict[str, str]]:
+    result: Dict[str, Dict[str, str]] = {}
+    orders: Dict[str, List[str]] = {}
+    for row in rows:
+        label = row["label"]
+        metric = row["metric"]
+        value = row["value"]
+        if not label or not metric:
+            raise ValueError("phase-timing labels and metrics must not be empty")
+        if re.fullmatch(r"(0|[1-9][0-9]*)", value) is None:
+            raise ValueError(
+                f"{label}: phase-timing metric {metric!r} "
+                "is not canonical unsigned decimal"
+            )
+        metrics = result.setdefault(label, {})
+        if metric in metrics:
+            raise ValueError(f"{label}: duplicate phase-timing metric {metric!r}")
+        metrics[metric] = value
+        orders.setdefault(label, []).append(metric)
+
+    expected_order = ("schema_version", *PHASE_TIMING_METRICS)
+    for label, metrics in result.items():
+        if metrics.get("schema_version") != PHASE_TIMING_SCHEMA_VERSION:
+            found = metrics.get("schema_version", "missing")
+            raise ValueError(f"{label}: unsupported phase-timing schema {found}")
+        order = orders[label]
+        if tuple(order) != expected_order:
+            missing = [metric for metric in expected_order if metric not in metrics]
+            unexpected = [metric for metric in order if metric not in expected_order]
+            if missing:
+                raise ValueError(f"{label}: missing phase timings {missing!r}")
+            if unexpected:
+                raise ValueError(f"{label}: unexpected phase timings {unexpected!r}")
+            raise ValueError(f"{label}: phase timings are out of schema order")
+    return result
+
+
+def phase_artifacts_by_label(rows: List[dict]) -> Dict[str, dict]:
+    result: Dict[str, dict] = {}
+    for row in rows:
+        label = row["label"]
+        if not label:
+            raise ValueError("phase-artifact labels must not be empty")
+        if label in result:
+            raise ValueError(f"{label}: duplicate phase-artifact record")
+        for field in ("canonical_object_bytes", "instrumented_object_bytes"):
+            value = row[field]
+            if re.fullmatch(r"(0|[1-9][0-9]*)", value) is None:
+                raise ValueError(
+                    f"{label}: phase artifact {field!r} "
+                    "is not canonical unsigned decimal"
+                )
+        for field in ("canonical_object_sha256", "instrumented_object_sha256"):
+            if re.fullmatch(r"[0-9a-f]{64}", row[field]) is None:
+                raise ValueError(f"{label}: phase artifact {field!r} is not SHA-256")
+        if row["objects_match"] != "1":
+            raise ValueError(
+                f"{label}: phase-timing instrumentation did not match "
+                "the measured object"
+            )
+        if (
+            row["canonical_object_bytes"] != row["instrumented_object_bytes"]
+            or row["canonical_object_sha256"]
+            != row["instrumented_object_sha256"]
+        ):
+            raise ValueError(
+                f"{label}: phase artifact claims a match for different objects"
+            )
+        result[label] = row
+    return result
+
+
 SUMMARY_CODEGEN_METRICS = {
     "clif_functions": "post_inline_ir.functions",
     "clif_blocks": "post_inline_ir.blocks",
@@ -134,6 +253,8 @@ def main() -> int:
     parser.add_argument("--timings", required=True, type=Path)
     parser.add_argument("--artifacts", required=True, type=Path)
     parser.add_argument("--codegen-stats", required=True, type=Path)
+    parser.add_argument("--phase-timings", required=True, type=Path)
+    parser.add_argument("--phase-artifacts", required=True, type=Path)
     parser.add_argument("--object-sections", required=True, type=Path)
     parser.add_argument("--hashes", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
@@ -143,10 +264,54 @@ def main() -> int:
         timings = read_rows(arguments.timings)
         artifacts = read_rows(arguments.artifacts)
         codegen_stats = codegen_stats_by_label(read_rows(arguments.codegen_stats))
+        phase_timings = phase_timings_by_label(
+            read_exact_rows(arguments.phase_timings, PHASE_TIMING_FIELDS)
+        )
+        phase_artifacts = phase_artifacts_by_label(
+            read_exact_rows(arguments.phase_artifacts, PHASE_ARTIFACT_FIELDS)
+        )
         object_sections = read_rows(arguments.object_sections)
         hashes = read_rows(arguments.hashes)
         if not artifacts:
             raise ValueError("artifact table is empty")
+        artifact_labels = [artifact["label"] for artifact in artifacts]
+        if tuple(artifact_labels) != RESULT_LABELS:
+            missing = [label for label in RESULT_LABELS if label not in artifact_labels]
+            unexpected = [
+                label for label in artifact_labels if label not in RESULT_LABELS
+            ]
+            if missing or unexpected:
+                raise ValueError(
+                    "artifact labels do not match the result schema: "
+                    f"missing {missing!r}; unexpected {unexpected!r}"
+                )
+            raise ValueError("artifact labels are out of result-schema order")
+        ccc_labels = set(CCC_LABELS)
+        phase_labels = set(phase_timings)
+        phase_artifact_labels = set(phase_artifacts)
+        if phase_labels != ccc_labels:
+            missing = sorted(ccc_labels - phase_labels)
+            unexpected = sorted(phase_labels - ccc_labels)
+            raise ValueError(
+                "phase-timing records do not match CCC artifacts: "
+                f"missing {missing!r}; unexpected {unexpected!r}"
+            )
+        if phase_artifact_labels != ccc_labels:
+            missing = sorted(ccc_labels - phase_artifact_labels)
+            unexpected = sorted(phase_artifact_labels - ccc_labels)
+            raise ValueError(
+                "phase-artifact records do not match CCC artifacts: "
+                f"missing {missing!r}; unexpected {unexpected!r}"
+            )
+        artifacts_by_label = {artifact["label"]: artifact for artifact in artifacts}
+        for label, phase_artifact in phase_artifacts.items():
+            if (
+                phase_artifact["canonical_object_bytes"]
+                != artifacts_by_label[label]["object_bytes"]
+            ):
+                raise ValueError(
+                    f"{label}: phase artifact does not describe the measured object"
+                )
 
         output_fields = (
             "label",
@@ -158,6 +323,7 @@ def main() -> int:
             "render_max_seconds",
             "compile_peak_rss_bytes",
             "render_peak_rss_median_bytes",
+            *(field for field, _metric in PHASE_TIMING_SUMMARY_FIELDS),
             *SUMMARY_CODEGEN_METRICS,
             "object_bytes",
             "object_text_bytes",
@@ -178,7 +344,8 @@ def main() -> int:
             link_timing = one_timing(timings, label, "link")
             section_totals = one_object_sections(object_sections, label)
             label_codegen_stats = codegen_stats.get(label)
-            if label.startswith("ccc-") and label_codegen_stats is None:
+            label_phase_timings = phase_timings.get(label)
+            if label in CCC_LABELS and label_codegen_stats is None:
                 raise ValueError(f"{label}: codegen statistics are missing")
             if label_codegen_stats is not None:
                 missing = [
@@ -221,6 +388,14 @@ def main() -> int:
                     ),
                     **{
                         output_name: (
+                            label_phase_timings[metric]
+                            if label_phase_timings is not None
+                            else ""
+                        )
+                        for output_name, metric in PHASE_TIMING_SUMMARY_FIELDS
+                    },
+                    **{
+                        output_name: (
                             label_codegen_stats[metric]
                             if label_codegen_stats is not None
                             else ""
@@ -254,7 +429,7 @@ def main() -> int:
             )
             writer.writeheader()
             writer.writerows(result_rows)
-    except (KeyError, OSError, ValueError) as error:
+    except (csv.Error, KeyError, OSError, UnicodeError, ValueError) as error:
         print(f"C-Ray result summary failed: {error}", file=sys.stderr)
         return 1
     return 0

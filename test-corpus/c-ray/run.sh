@@ -9,6 +9,7 @@ measure_command="$script_directory/measure-command.py"
 validate_ppm="$script_directory/validate-ppm.py"
 summarize="$script_directory/summarize.py"
 collect_object_sections="$script_directory/collect-object-sections.py"
+collect_phase_timings="$script_directory/collect-phase-timings.py"
 
 manifest_string() {
   sed -n "s/^$1 = \"\\(.*\\)\"$/\\1/p" "$manifest"
@@ -152,7 +153,7 @@ measure() {
   local result_json="$timing_directory/$stage-$label-$iteration.json"
   shift 5
   record_command "$@"
-  "$measure_command" \
+  LC_ALL=C "$measure_command" \
     --stage "$stage" \
     --label "$label" \
     --iteration "$iteration" \
@@ -359,12 +360,14 @@ export CCC_RESOURCE_DIR="$resource_directory"
 compiler_identity_directory="$work_directory/compiler-identities"
 tool_output_directory="$work_directory/tool-output"
 timing_directory="$work_directory/timings"
+phase_timing_directory="$work_directory/phase-timing-raw"
 stderr_directory="$work_directory/run-stderr"
 build_directory="$work_directory/build"
 mkdir -p \
   "$compiler_identity_directory" \
   "$tool_output_directory" \
   "$timing_directory" \
+  "$phase_timing_directory" \
   "$stderr_directory" \
   "$build_directory"
 commands="$work_directory/commands.txt"
@@ -372,6 +375,8 @@ timings="$work_directory/timings.tsv"
 artifact_sizes="$work_directory/artifact-sizes.tsv"
 output_hashes="$work_directory/output-sha256.tsv"
 codegen_stats="$work_directory/codegen-stats.tsv"
+phase_timings="$work_directory/compile-phase-timings.tsv"
+phase_artifacts="$work_directory/compile-phase-artifacts.tsv"
 : >"$commands"
 printf 'label\tobject_bytes\texecutable_bytes\n' >"$artifact_sizes"
 printf 'label\tphase\titeration\tsha256\n' >"$output_hashes"
@@ -460,14 +465,17 @@ for optimization in -O0 -O2 -Oz; do
   executable="$build_directory/$label"
   labels+=("$label")
   executables+=("$executable")
+  compile_command=(
+    "$ccc"
+    "${ccc_target_arguments[@]}"
+    -std=c11 "$optimization" -DLITTLE_ENDIAN=1 -pthread
+    -c "$source_file"
+  )
   measure \
     compile "$label" 0 \
     "$tool_output_directory/$label-compile.stdout" \
     "$tool_output_directory/$label-compile.stderr" \
-    "$ccc" \
-    "${ccc_target_arguments[@]}" \
-    -std=c11 "$optimization" -DLITTLE_ENDIAN=1 -pthread \
-    -c "$source_file" -o "$object"
+    "${compile_command[@]}" -o "$object"
   measure \
     link "$label" 0 \
     "$tool_output_directory/$label-link.stdout" \
@@ -477,6 +485,29 @@ for optimization in -O0 -O2 -Oz; do
     "$object" -o "$executable" -pthread -lm
   [[ -f "$object" && -x "$executable" ]] ||
     die "$label did not produce the expected object and executable"
+
+  phase_label_directory="$phase_timing_directory/$label"
+  phase_object="$phase_label_directory/phase-timings.o"
+  phase_sidecar="$phase_label_directory/phase-timings.tsv"
+  phase_compile_command=(
+    "${compile_command[@]}"
+    "--write-phase-timings=$phase_sidecar"
+    -o "$phase_object"
+  )
+  record_command "${phase_compile_command[@]}"
+  "$collect_phase_timings" \
+    --label "$label" \
+    --canonical-object "$object" \
+    --instrumented-object "$phase_object" \
+    --phase-sidecar "$phase_sidecar" \
+    --stdout "$phase_label_directory/phase-timings.stdout.txt" \
+    --stderr "$phase_label_directory/phase-timings.stderr.txt" \
+    --command-output "$phase_label_directory/phase-timings.command.txt" \
+    --result-output "$phase_label_directory/phase-timings.result.json" \
+    --phase-results "$phase_timings" \
+    --artifact-results "$phase_artifacts" \
+    -- "${phase_compile_command[@]}"
+
   codegen_stats_output="$tool_output_directory/$label-codegen-stats.tsv"
   record_command \
     "$ccc" \
@@ -644,6 +675,8 @@ done
   --timings "$timings" \
   --artifacts "$artifact_sizes" \
   --codegen-stats "$codegen_stats" \
+  --phase-timings "$phase_timings" \
+  --phase-artifacts "$phase_artifacts" \
   --object-sections "$work_directory/object-section-totals.tsv" \
   --hashes "$output_hashes" \
   --output "$work_directory/summary.tsv"

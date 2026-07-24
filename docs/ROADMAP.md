@@ -178,12 +178,15 @@ The current executable slice and next benchmark targets are:
   with fixed inputs. Record translation time, link time, aggregate object
   size, executable text size, and execution throughput without weakening their
   correctness contracts.
-- Add CCC frontend and Cranelift phase timing to C-Ray. Its result schema now
+- C-Ray now records CCC frontend and coarse code-generation phase timing for
+  each optimization profile through a separate untimed compile whose object
+  must match the measured object by size and SHA-256. Its result schema also
   includes post-inlining CLIF instruction, block, live-value, call, stack-slot,
   signature, external-reference, and global-value counts plus parsed
-  final-object section sizes. The correctness and performance profiles also
-  retain whole compile/link/render timing, CPU, peak-memory, file-size, command,
-  image-hash, and exact same-host reference evidence.
+  final-object section sizes. The correctness and performance profiles retain
+  whole compile/link/render timing, CPU, peak-memory, file-size, command,
+  image-hash, and exact same-host reference evidence. Adopt the finer
+  code-generation subphases when `codegen.total` is split.
 
 Run IR and object-size measurements for every enabled target. Runtime
 comparisons are native-target evidence; QEMU runs remain correctness and rough

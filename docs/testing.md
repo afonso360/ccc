@@ -525,12 +525,16 @@ Both profiles build the unmodified source at CCC `-O0`, `-O2`, and `-Oz`,
 compare exact `P6` output with a strict-FP native GCC or Apple Clang build, and
 retain raw JSON/TSV timing, CPU, peak-memory, size, tool-identity, and image-hash
 evidence. The summary includes post-inlining CLIF structure for CCC and parsed
-section totals from every final CCC/reference object. They require Python 3,
-OpenSSL with SHA3-256, Tar, GNU-compatible `size` on Linux or Xcode
-`llvm-size` on macOS, libc, libm, pthreads, and Curl unless `--source-archive`
-supplies the exact pinned release. Use only same-host native runs for
-performance comparisons; the adapter rejects cross-target and emulated timing.
-The full result schema and override options are documented in
+section totals from every final CCC/reference object. Each CCC profile also
+runs a separate untimed phase-instrumented compile with the same source,
+target, and optimization flags. Its object must match the measured compile
+object by byte count and SHA-256 before the complete fixed-order phase sidecar
+can enter the normalized results; the instrumented object is never linked.
+They require Python 3.8 or newer, OpenSSL with SHA3-256, Tar, GNU-compatible
+`size` on Linux or Xcode `llvm-size` on macOS, libc, libm, pthreads, and Curl
+unless `--source-archive` supplies the exact pinned release. Use only same-host
+native runs for performance comparisons; the adapter rejects cross-target and
+emulated timing. The full result schema and override options are documented in
 `test-corpus/c-ray/README.md`.
 
 The Linux x86-64 corpus job runs the correctness profile on every pull request
