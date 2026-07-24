@@ -1,5 +1,6 @@
 //! Cranelift lowering for the typed control-flow IR.
 
+mod backend;
 mod data;
 mod debug;
 mod function;
@@ -14,26 +15,20 @@ use ccc_sema::generic::{
     Linkage as CLinkage, ObjectDefinitionPolicy, StorageDuration, SymbolBinding, SymbolVisibility,
 };
 use ccc_target::{
-    AbiIdentity, BinaryFormat, EffectiveCompilationConfig, LongDoubleFormat, OptimizationLevel,
-    RelocationModel, RuntimeHelperContract, RuntimeHelperValue,
+    AbiIdentity, BinaryFormat, EffectiveCompilationConfig, LongDoubleFormat, RuntimeHelperContract,
+    RuntimeHelperValue,
 };
 use ccc_types::{
     BuiltinType, LayoutShape, QualifiedType, TypeId, TypeKind, TypeQualifiers, TypeStore,
 };
-use cranelift_codegen::Context;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::immediates::{Ieee16, Ieee32, Ieee64};
 use cranelift_codegen::ir::{
-    self, BlockArg, InstBuilder, MemFlagsData, StackSlot, StackSlotData, StackSlotKind, TrapCode,
-    UserFuncName,
+    self, BlockArg, InstBuilder, StackSlot, StackSlotData, StackSlotKind, TrapCode,
 };
-use cranelift_codegen::isa;
-use cranelift_codegen::settings::{self, Configurable as _};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-use cranelift_module::{
-    DataDescription, DataId as ClifDataId, FuncId, Linkage, Module as _, default_libcall_names,
-};
-use cranelift_object::{ObjectBuilder, ObjectModule};
+use cranelift_module::{DataDescription, DataId as ClifDataId, FuncId, Linkage, Module as _};
+use cranelift_object::ObjectModule;
 use object::read::{Object as _, ObjectSymbol as _};
 use object::write::SymbolSection;
 use object::{FileFlags, SymbolFlags, SymbolKind, SymbolScope};
@@ -127,59 +122,13 @@ fn emit_inner(
             span: None,
         });
     }
-    let mut isa_builder = isa::lookup(config.target.triple.clone()).map_err(module_error)?;
-    if config.target.abi == AbiIdentity::RiscvLp64d {
-        for extension in [
-            "has_m",
-            "has_a",
-            "has_f",
-            "has_d",
-            "has_zicsr",
-            "has_zifencei",
-        ] {
-            isa_builder.enable(extension).map_err(module_error)?;
-        }
-    }
-    let mut flag_builder = settings::builder();
-    flag_builder
-        .set("opt_level", cranelift_opt_level(config.optimization))
-        .map_err(module_error)?;
-    match config.relocation_model {
-        RelocationModel::Static => flag_builder.set("is_pic", "false").map_err(module_error)?,
-        RelocationModel::Pic | RelocationModel::Pie => {
-            flag_builder.set("is_pic", "true").map_err(module_error)?
-        }
-    }
-    flag_builder
-        .set(
-            "enable_llvm_abi_extensions",
-            if config.target.abi.supports_int128_values() {
-                "true"
-            } else {
-                "false"
-            },
-        )
-        .map_err(module_error)?;
-    flag_builder
-        .set("enable_multi_ret_implicit_sret", "false")
-        .map_err(module_error)?;
-    flag_builder
-        .set("unwind_info", "true")
-        .map_err(module_error)?;
-    if module_contains_returns_twice_call(module) || options.debug_info.is_some() {
-        // Resuming a saved environment requires a stable native frame. Scalar
-        // locals are already forced to stack storage by IR lowering; retain
-        // the frame pointer as the matching machine-code side of that contract.
-        flag_builder
-            .set("preserve_frame_pointers", "true")
-            .map_err(module_error)?;
-    }
-    let isa = isa_builder
-        .finish(settings::Flags::new(flag_builder))
-        .map_err(module_error)?;
-    let object_builder =
-        ObjectBuilder::new(isa, "ccc", default_libcall_names()).map_err(module_error)?;
-    let mut object_module = ObjectModule::new(object_builder);
+    // Resuming a saved environment requires a stable native frame. Scalar
+    // locals are already forced to stack storage by IR lowering; retain the
+    // frame pointer as the matching machine-code side of that contract. Debug
+    // builds retain it so source-level stack inspection has the same anchor.
+    let preserve_frame_pointers =
+        module_contains_returns_twice_call(module) || options.debug_info.is_some();
+    let mut object_module = backend::object_module(config, preserve_frame_pointers)?;
     let mut unwind = unwind::UnwindEmitter::new(object_module.isa()).map_err(error)?;
 
     // Revalidation at the code-generation boundary prevents a stale plan from
@@ -203,10 +152,8 @@ fn emit_inner(
             .get(&function.id.0)
             .cloned()
             .ok_or_else(|| error(format!("function {} has no ABI signature", function.id.0)))?;
-        let mut context = Context::new();
-        context.func =
-            ir::Function::with_name_signature(UserFuncName::user(0, function.id.0), signature);
-        let frontend_config = object_module.isa().frontend_config();
+        let mut context = backend::function_context(function.id.0, signature);
+        let frontend_config = backend::frontend_config(&object_module);
         let references = function::FunctionReferences::new(&declarations, &mut object_module);
         let definition_plan = abi_plan
             .plan()
@@ -397,14 +344,6 @@ fn emit_inner(
         assemblies,
         manifest,
     })
-}
-
-const fn cranelift_opt_level(optimization: OptimizationLevel) -> &'static str {
-    match optimization {
-        OptimizationLevel::O0 => "none",
-        OptimizationLevel::O1 | OptimizationLevel::O2 | OptimizationLevel::O3 => "speed",
-        OptimizationLevel::Size | OptimizationLevel::SizeMin => "speed_and_size",
-    }
 }
 
 fn module_contains_returns_twice_call(module: &gir::FullModule) -> bool {

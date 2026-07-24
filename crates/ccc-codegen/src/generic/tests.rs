@@ -4,6 +4,7 @@ use ccc_pp::{PpItem, lex};
 use ccc_sema::generic::analyze_frontend;
 use ccc_session::SourceMap;
 use ccc_syntax::frontend as syntax;
+use ccc_target::OptimizationLevel;
 use object::{
     Object as _, ObjectSection as _, ObjectSymbol as _, RelocationEncoding, RelocationFlags,
     RelocationKind, RelocationTarget,
@@ -22,7 +23,7 @@ fn optimization_profiles_map_to_cranelift_without_inventing_backend_tiers() {
         (OptimizationLevel::Size, "speed_and_size"),
         (OptimizationLevel::SizeMin, "speed_and_size"),
     ] {
-        assert_eq!(cranelift_opt_level(optimization), expected);
+        assert_eq!(backend::optimization_level(optimization), expected);
     }
 }
 

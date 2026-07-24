@@ -24,11 +24,10 @@ the reproducibility and single-owner unwind policy.
 
 The scheduled compatibility workflow refreshes an ephemeral candidate lockfile,
 synchronizes candidate provenance, and tests upstream head without modifying
-normal builds. The remaining integration work is to:
-
-- Put the small amount of unstable upstream API use behind a codegen adapter so
-  routine upstream changes do not spread through ABI planning, object
-  packaging, DWARF emission, and tests.
+normal builds. Backend construction, settings, frontend finalization, empty
+memory flags, symbol materialization, and custom data sections now pass through
+one narrow compatibility module; CLIF instruction selection and optimization
+remain direct. The remaining integration work is to:
 - Extend the scheduled candidate beyond the workspace suite and all target
   oracles to dedicated debugger checks, ABI cross-links, Csmith profiles, and
   real-code corpus gates.
@@ -54,11 +53,12 @@ proof that each selected call is safe.
 - Lower all function definitions to CLIF before compiling any one function.
   Build a deterministic map from a caller's direct `FuncRef` to its
   translation-unit-local definition.
-- Establish and test the candidate-preparation order before implementing the
-  policy. The current `Inline` documentation still requires legalized callees
-  even though the pinned API no longer exposes `Context::legalize`; resolve
-  that upstream contract rather than guessing. Verify every candidate and
-  require exactly the signature referenced by the call site. The current
+- Finalize raw frontend-built CLIF and verify caller and candidates before
+  invoking `Context::inline`; verify the rewritten caller again, then pass it
+  through the normal module definition and Cranelift optimization pipeline.
+  Do not invent a legalization or candidate pre-optimization pass: current
+  Cranelift removed the public legalizer and its own inliner tests exercise this
+  order. Require exactly the signature referenced by each call site. The
   inliner remaps global values, memory flags, and alias regions, so do not add a
   blanket rejection for those entities. Keep prepared bodies local to one
   target/configuration invocation; never reuse them across ISA or codegen

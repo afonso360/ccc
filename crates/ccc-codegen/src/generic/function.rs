@@ -408,7 +408,7 @@ pub(super) fn lower_function(
     abi_plan: ccc_abi::VerifiedModuleAbiPlan<'_>,
     definition_plan: DefinitionAbi<'_>,
     references: &FunctionReferences<'_>,
-    frontend_config: isa::TargetFrontendConfig,
+    frontend_config: backend::FrontendConfig,
     clif_function: &mut ir::Function,
     mut debug_locations: Option<&mut super::debug::SourceLocationRegistry>,
 ) -> Result<FunctionDebugLayout, CodegenError> {
@@ -613,7 +613,7 @@ pub(super) fn lower_function(
         })
         .collect();
     builder.seal_all_blocks();
-    builder.finalize(frontend_config);
+    backend::finalize_frontend(builder, frontend_config);
     Ok(FunctionDebugLayout { storage_slots })
 }
 
@@ -624,7 +624,7 @@ struct FunctionState<'a, 'references, 'object> {
     abi_plan: ccc_abi::VerifiedModuleAbiPlan<'a>,
     definition_plan: DefinitionAbi<'a>,
     references: &'references FunctionReferences<'object>,
-    frontend_config: isa::TargetFrontendConfig,
+    frontend_config: backend::FrontendConfig,
     blocks: HashMap<u32, ir::Block>,
     storage: HashMap<u32, StackStorage>,
     runtime_storage: HashMap<u32, StackSlot>,
@@ -695,9 +695,10 @@ impl FunctionState<'_, '_, '_> {
                 _ => unreachable!(),
             };
             self.f80_support_call(builder, opcode, slot, left, Some(right))?;
-            let ordering = builder
-                .ins()
-                .load(ir::types::I32, MemFlagsData::new(), slot, 0);
+            let ordering =
+                builder
+                    .ins()
+                    .load(ir::types::I32, backend::empty_memory_flags(), slot, 0);
             let boolean = match operator {
                 gir::BinaryOperation::Less => builder.ins().icmp_imm_s(IntCC::Equal, ordering, -1),
                 gir::BinaryOperation::LessEqual => {
@@ -769,9 +770,10 @@ impl FunctionState<'_, '_, '_> {
                 let slot = create_stack_backing(builder, 4, 4)?;
                 zero_memory(builder, slot, 4)?;
                 self.f80_support_call(builder, F80_OP_COMPARE_QUIET, slot, operand, Some(zero))?;
-                let ordering = builder
-                    .ins()
-                    .load(ir::types::I32, MemFlagsData::new(), slot, 0);
+                let ordering =
+                    builder
+                        .ins()
+                        .load(ir::types::I32, backend::empty_memory_flags(), slot, 0);
                 let boolean = builder.ins().icmp_imm_s(IntCC::Equal, ordering, 0);
                 let destination = scalar_type(&self.module.types, result_ty, self.config)?;
                 Ok(coerce_integer(
@@ -813,9 +815,10 @@ impl FunctionState<'_, '_, '_> {
             let slot = create_stack_backing(builder, 4, 4)?;
             zero_memory(builder, slot, 4)?;
             self.f80_support_call(builder, F80_OP_COMPARE_QUIET, slot, operand, Some(zero))?;
-            let ordering = builder
-                .ins()
-                .load(ir::types::I32, MemFlagsData::new(), slot, 0);
+            let ordering =
+                builder
+                    .ins()
+                    .load(ir::types::I32, backend::empty_memory_flags(), slot, 0);
             let boolean = builder.ins().icmp_imm_s(IntCC::NotEqual, ordering, 0);
             let destination = scalar_type(&self.module.types, to, self.config)?;
             return Ok(Some(coerce_integer(
@@ -875,7 +878,7 @@ impl FunctionState<'_, '_, '_> {
             )?;
             builder
                 .ins()
-                .store(MemFlagsData::new(), staged_value, source, 0);
+                .store(backend::empty_memory_flags(), staged_value, source, 0);
             let result = create_stack_backing(builder, 16, 16)?;
             zero_memory(builder, result, 16)?;
             self.f80_support_call(builder, opcode, result, source, None)?;
@@ -910,7 +913,7 @@ impl FunctionState<'_, '_, '_> {
             self.f80_support_call(builder, opcode, output, operand, None)?;
             let value = builder
                 .ins()
-                .load(stored_ty, MemFlagsData::new(), output, 0);
+                .load(stored_ty, backend::empty_memory_flags(), output, 0);
             let destination = scalar_type(&self.module.types, to, self.config)?;
             let value = if stored_ty.is_int() && stored_ty != destination {
                 coerce_integer(
@@ -939,8 +942,12 @@ impl FunctionState<'_, '_, '_> {
         slots.sort_unstable_by_key(|(storage, _)| **storage);
         for (_, slot) in slots {
             let state = builder.ins().stack_addr(ir::types::I64, *slot, 0);
-            builder.ins().store(MemFlagsData::new(), zero, state, 0);
-            builder.ins().store(MemFlagsData::new(), zero, state, 8);
+            builder
+                .ins()
+                .store(backend::empty_memory_flags(), zero, state, 0);
+            builder
+                .ins()
+                .store(backend::empty_memory_flags(), zero, state, 8);
         }
     }
 
@@ -1075,7 +1082,7 @@ impl FunctionState<'_, '_, '_> {
                             let destination =
                                 address_offset(builder, address, carrier.source_offset)?;
                             builder.ins().store(
-                                MemFlagsData::new(),
+                                backend::empty_memory_flags(),
                                 incoming_value,
                                 destination,
                                 0,
@@ -1118,7 +1125,7 @@ impl FunctionState<'_, '_, '_> {
             )?;
             self.sret = Some(builder.ins().load(
                 ir::types::I64,
-                MemFlagsData::new(),
+                backend::empty_memory_flags(),
                 saved_sret,
                 0,
             ));
@@ -1171,7 +1178,7 @@ impl FunctionState<'_, '_, '_> {
                         self.function.parameters[source_index].ty,
                         self.config,
                     )?,
-                    MemFlagsData::new(),
+                    backend::empty_memory_flags(),
                     source,
                     0,
                 )
@@ -1182,9 +1189,10 @@ impl FunctionState<'_, '_, '_> {
                 if let Some(piece) = pieces.iter().find(|piece| piece.indirect) {
                     let slot =
                         variadic_parameter_piece_address(builder, *frame, plan, piece.location)?;
-                    let source = builder
-                        .ins()
-                        .load(ir::types::I64, MemFlagsData::new(), slot, 0);
+                    let source =
+                        builder
+                            .ins()
+                            .load(ir::types::I64, backend::empty_memory_flags(), slot, 0);
                     copy_memory(
                         builder,
                         result,
@@ -1260,7 +1268,11 @@ impl FunctionState<'_, '_, '_> {
                 }
                 I::AddressOfString { string } => {
                     let reference = self.references.string(builder, string.0)?;
-                    Ok(Some(builder.ins().symbol_value(ir::types::I64, reference)))
+                    Ok(Some(backend::materialize_symbol(
+                        builder,
+                        ir::types::I64,
+                        reference,
+                    )))
                 }
                 I::AddressOfStorage { storage } => {
                     let storage = self.storage.get(&storage.0).copied().ok_or_else(|| {
@@ -1578,7 +1590,7 @@ impl FunctionState<'_, '_, '_> {
                     let destination_size =
                         object_layout(&self.module.types, *object, self.config)?.size;
                     let source = self.references.string(builder, string.0)?;
-                    let source = builder.ins().symbol_value(ir::types::I64, source);
+                    let source = backend::materialize_symbol(builder, ir::types::I64, source);
                     let string = self
                         .module
                         .strings
@@ -1824,7 +1836,7 @@ impl FunctionState<'_, '_, '_> {
                     let operand = self.value(*operand)?;
                     let old = builder.ins().atomic_rmw(
                         ty,
-                        MemFlagsData::new(),
+                        backend::empty_memory_flags(),
                         operation,
                         self.value(*address)?,
                         operand,
@@ -1856,7 +1868,7 @@ impl FunctionState<'_, '_, '_> {
                 } => {
                     let _ = atomic_scalar_type(&self.module.types, *object, self.config)?;
                     Ok(Some(builder.ins().atomic_cas(
-                        MemFlagsData::new(),
+                        backend::empty_memory_flags(),
                         self.value(*address)?,
                         self.value(*expected)?,
                         self.value(*replacement)?,
@@ -2010,7 +2022,7 @@ impl FunctionState<'_, '_, '_> {
         let value = reference
             .value
             .ok_or_else(|| error("non-TLS data reference has no global value"))?;
-        Ok(builder.ins().symbol_value(ir::types::I64, value))
+        Ok(backend::materialize_symbol(builder, ir::types::I64, value))
     }
 
     fn address_constant(
@@ -2027,7 +2039,7 @@ impl FunctionState<'_, '_, '_> {
             }
             gir::RelocationTarget::String(id) => {
                 let reference = self.references.string(builder, id.0)?;
-                builder.ins().symbol_value(ir::types::I64, reference)
+                backend::materialize_symbol(builder, ir::types::I64, reference)
             }
         };
         let addend = i64::try_from(addend)
@@ -2233,14 +2245,18 @@ impl FunctionState<'_, '_, '_> {
         }
         let gp_offset_address = list;
         let fp_offset_address = address_offset(builder, list, 4)?;
-        let gp_offset =
-            builder
-                .ins()
-                .load(ir::types::I32, MemFlagsData::new(), gp_offset_address, 0);
-        let fp_offset =
-            builder
-                .ins()
-                .load(ir::types::I32, MemFlagsData::new(), fp_offset_address, 0);
+        let gp_offset = builder.ins().load(
+            ir::types::I32,
+            backend::empty_memory_flags(),
+            gp_offset_address,
+            0,
+        );
+        let fp_offset = builder.ins().load(
+            ir::types::I32,
+            backend::empty_memory_flags(),
+            fp_offset_address,
+            0,
+        );
         let gp_limit = 48u32
             .checked_sub(u32::from(plan.gp_slots) * 8)
             .ok_or_else(|| error("va_arg GP slot requirement exceeds the save area"))?;
@@ -2279,10 +2295,12 @@ impl FunctionState<'_, '_, '_> {
 
         builder.switch_to_block(register_block);
         let save_area_address = address_offset(builder, list, 16)?;
-        let save_area =
-            builder
-                .ins()
-                .load(ir::types::I64, MemFlagsData::new(), save_area_address, 0);
+        let save_area = builder.ins().load(
+            ir::types::I64,
+            backend::empty_memory_flags(),
+            save_area_address,
+            0,
+        );
         let mut next_gp = gp_offset;
         let mut next_fp = fp_offset;
         for piece in &plan.classified.pieces {
@@ -2318,12 +2336,12 @@ impl FunctionState<'_, '_, '_> {
         if plan.gp_slots != 0 {
             builder
                 .ins()
-                .store(MemFlagsData::new(), next_gp, gp_offset_address, 0);
+                .store(backend::empty_memory_flags(), next_gp, gp_offset_address, 0);
         }
         if plan.sse_slots != 0 {
             builder
                 .ins()
-                .store(MemFlagsData::new(), next_fp, fp_offset_address, 0);
+                .store(backend::empty_memory_flags(), next_fp, fp_offset_address, 0);
         }
         builder.ins().jump(merge_block, &[]);
 
@@ -2345,14 +2363,18 @@ impl FunctionState<'_, '_, '_> {
     ) -> Result<(), CodegenError> {
         let gr_offset_address = address_offset(builder, list, 24)?;
         let vr_offset_address = address_offset(builder, list, 28)?;
-        let mut gr_offset =
-            builder
-                .ins()
-                .load(ir::types::I32, MemFlagsData::new(), gr_offset_address, 0);
-        let vr_offset =
-            builder
-                .ins()
-                .load(ir::types::I32, MemFlagsData::new(), vr_offset_address, 0);
+        let mut gr_offset = builder.ins().load(
+            ir::types::I32,
+            backend::empty_memory_flags(),
+            gr_offset_address,
+            0,
+        );
+        let vr_offset = builder.ins().load(
+            ir::types::I32,
+            backend::empty_memory_flags(),
+            vr_offset_address,
+            0,
+        );
         if !plan.indirect && plan.gp_slots != 0 && plan.sse_slots == 0 && plan.overflow_align >= 16
         {
             let advanced = builder.ins().iadd_imm_s(gr_offset, 15);
@@ -2391,12 +2413,18 @@ impl FunctionState<'_, '_, '_> {
         builder.switch_to_block(register_block);
         let gr_top_address = address_offset(builder, list, 8)?;
         let vr_top_address = address_offset(builder, list, 16)?;
-        let gr_top = builder
-            .ins()
-            .load(ir::types::I64, MemFlagsData::new(), gr_top_address, 0);
-        let vr_top = builder
-            .ins()
-            .load(ir::types::I64, MemFlagsData::new(), vr_top_address, 0);
+        let gr_top = builder.ins().load(
+            ir::types::I64,
+            backend::empty_memory_flags(),
+            gr_top_address,
+            0,
+        );
+        let vr_top = builder.ins().load(
+            ir::types::I64,
+            backend::empty_memory_flags(),
+            vr_top_address,
+            0,
+        );
         let mut next_gr = gr_offset;
         let mut next_vr = vr_offset;
         if plan.indirect {
@@ -2404,7 +2432,7 @@ impl FunctionState<'_, '_, '_> {
             let slot = builder.ins().iadd(gr_top, offset);
             let source = builder
                 .ins()
-                .load(ir::types::I64, MemFlagsData::new(), slot, 0);
+                .load(ir::types::I64, backend::empty_memory_flags(), slot, 0);
             copy_memory(
                 builder,
                 result,
@@ -2447,12 +2475,12 @@ impl FunctionState<'_, '_, '_> {
         if plan.gp_slots != 0 {
             builder
                 .ins()
-                .store(MemFlagsData::new(), next_gr, gr_offset_address, 0);
+                .store(backend::empty_memory_flags(), next_gr, gr_offset_address, 0);
         }
         if plan.sse_slots != 0 {
             builder
                 .ins()
-                .store(MemFlagsData::new(), next_vr, vr_offset_address, 0);
+                .store(backend::empty_memory_flags(), next_vr, vr_offset_address, 0);
         }
         builder.ins().jump(merge_block, &[]);
 
@@ -2462,15 +2490,21 @@ impl FunctionState<'_, '_, '_> {
         // continue in the overflow area rather than reusing a trailing slot.
         if plan.gp_slots != 0 {
             let exhausted = builder.ins().iconst(ir::types::I32, 0);
-            builder
-                .ins()
-                .store(MemFlagsData::new(), exhausted, gr_offset_address, 0);
+            builder.ins().store(
+                backend::empty_memory_flags(),
+                exhausted,
+                gr_offset_address,
+                0,
+            );
         }
         if plan.sse_slots != 0 {
             let exhausted = builder.ins().iconst(ir::types::I32, 0);
-            builder
-                .ins()
-                .store(MemFlagsData::new(), exhausted, vr_offset_address, 0);
+            builder.ins().store(
+                backend::empty_memory_flags(),
+                exhausted,
+                vr_offset_address,
+                0,
+            );
         }
         self.va_arg_cursor(builder, list, result, plan)?;
         builder.ins().jump(merge_block, &[]);
@@ -2486,9 +2520,12 @@ impl FunctionState<'_, '_, '_> {
         result: ir::Value,
         plan: &ccc_abi::VaArgPlan,
     ) -> Result<(), CodegenError> {
-        let cursor = builder
-            .ins()
-            .load(ir::types::I64, MemFlagsData::new(), cursor_address, 0);
+        let cursor = builder.ins().load(
+            ir::types::I64,
+            backend::empty_memory_flags(),
+            cursor_address,
+            0,
+        );
         let aligned = if plan.overflow_align <= 1 {
             cursor
         } else {
@@ -2506,7 +2543,7 @@ impl FunctionState<'_, '_, '_> {
         let source = if plan.indirect {
             builder
                 .ins()
-                .load(ir::types::I64, MemFlagsData::new(), aligned, 0)
+                .load(ir::types::I64, backend::empty_memory_flags(), aligned, 0)
         } else {
             aligned
         };
@@ -2525,7 +2562,7 @@ impl FunctionState<'_, '_, '_> {
         );
         builder
             .ins()
-            .store(MemFlagsData::new(), next, cursor_address, 0);
+            .store(backend::empty_memory_flags(), next, cursor_address, 0);
         Ok(())
     }
 
@@ -2546,7 +2583,7 @@ impl FunctionState<'_, '_, '_> {
         }
         let unit = builder
             .ins()
-            .load(storage_ty, MemFlagsData::new(), address, 0);
+            .load(storage_ty, backend::empty_memory_flags(), address, 0);
         let shifted = if descriptor.bit_offset == 0 {
             unit
         } else {
@@ -2601,7 +2638,7 @@ impl FunctionState<'_, '_, '_> {
         }
         let old = builder
             .ins()
-            .load(storage_ty, MemFlagsData::new(), address, 0);
+            .load(storage_ty, backend::empty_memory_flags(), address, 0);
         let value_ty = builder.func.dfg.value_type(value);
         let value = coerce_integer(builder, value, value_ty, storage_ty, descriptor.signed);
         let value_mask = low_mask_u128(descriptor.width);
@@ -2618,7 +2655,7 @@ impl FunctionState<'_, '_, '_> {
         let combined = builder.ins().bor(retained, value);
         builder
             .ins()
-            .store(MemFlagsData::new(), combined, address, 0);
+            .store(backend::empty_memory_flags(), combined, address, 0);
         if access.volatile {
             builder.ins().fence();
         }
@@ -2958,7 +2995,7 @@ impl FunctionState<'_, '_, '_> {
                             QualifiedType::unqualified(plan.result.ty),
                             self.config,
                         )?,
-                        MemFlagsData::new(),
+                        backend::empty_memory_flags(),
                         source,
                         0,
                     )))
@@ -3062,7 +3099,7 @@ impl FunctionState<'_, '_, '_> {
                     let address = address_offset(builder, stage, carrier.source_offset)?;
                     lowered.push(builder.ins().load(
                         native_carrier_type(carrier.carrier),
-                        MemFlagsData::new(),
+                        backend::empty_memory_flags(),
                         address,
                         0,
                     ));
@@ -3130,7 +3167,7 @@ impl FunctionState<'_, '_, '_> {
                     let destination = address_offset(builder, address, carrier.source_offset)?;
                     builder
                         .ins()
-                        .store(MemFlagsData::new(), value, destination, 0);
+                        .store(backend::empty_memory_flags(), value, destination, 0);
                 }
                 Ok(Some(address))
             }
@@ -3191,10 +3228,10 @@ impl FunctionState<'_, '_, '_> {
         let state = builder.ins().stack_addr(ir::types::I64, slot, 0);
         let base = builder
             .ins()
-            .load(ir::types::I64, MemFlagsData::new(), state, 0);
+            .load(ir::types::I64, backend::empty_memory_flags(), state, 0);
         let capacity = builder
             .ins()
-            .load(ir::types::I64, MemFlagsData::new(), state, 8);
+            .load(ir::types::I64, backend::empty_memory_flags(), state, 8);
         let grow = builder.create_block();
         let ready = builder.create_block();
         builder.append_block_param(ready, ir::types::I64);
@@ -3215,8 +3252,10 @@ impl FunctionState<'_, '_, '_> {
         builder.ins().trapz(allocated, trap);
         builder
             .ins()
-            .store(MemFlagsData::new(), allocated, state, 0);
-        builder.ins().store(MemFlagsData::new(), required, state, 8);
+            .store(backend::empty_memory_flags(), allocated, state, 0);
+        builder
+            .ins()
+            .store(backend::empty_memory_flags(), required, state, 8);
         builder.ins().jump(ready, &[allocated.into()]);
 
         builder.seal_block(ready);
@@ -3292,7 +3331,7 @@ impl FunctionState<'_, '_, '_> {
             let state = builder.ins().stack_addr(ir::types::I64, *slot, 0);
             let base = builder
                 .ins()
-                .load(ir::types::I64, MemFlagsData::new(), state, 0);
+                .load(ir::types::I64, backend::empty_memory_flags(), state, 0);
             builder.ins().call(free, &[base]);
         }
         Ok(())
@@ -3341,7 +3380,7 @@ impl FunctionState<'_, '_, '_> {
                     let source = address_offset(builder, stage, carrier.source_offset)?;
                     results.push(builder.ins().load(
                         native_carrier_type(carrier.carrier),
-                        MemFlagsData::new(),
+                        backend::empty_memory_flags(),
                         source,
                         0,
                     ));
@@ -3405,9 +3444,12 @@ impl FunctionState<'_, '_, '_> {
                         gir::MemoryAccess::default(),
                     )?;
                 } else {
-                    builder
-                        .ins()
-                        .store(MemFlagsData::new(), self.value(value)?, destination, 0);
+                    builder.ins().store(
+                        backend::empty_memory_flags(),
+                        self.value(value)?,
+                        destination,
+                        0,
+                    );
                 }
             }
             (ccc_abi::PassingMode::Registers, Some(value)) => {
@@ -3636,7 +3678,9 @@ fn coerce_carrier_value(
     if source.bits() == target.bits()
         && ((source.is_int() && target.is_float()) || (source.is_float() && target.is_int()))
     {
-        return Ok(builder.ins().bitcast(target, MemFlagsData::new(), value));
+        return Ok(builder
+            .ins()
+            .bitcast(target, backend::empty_memory_flags(), value));
     }
     if source.is_int() && target.is_int() {
         return Ok(coerce_integer(builder, value, source, target, signed));
@@ -3731,10 +3775,12 @@ fn variadic_parameter_piece_address(
         ),
         ccc_abi::BridgeLocation::Stack { offset } => {
             let overflow_slot = address_offset(builder, frame, 16)?;
-            let overflow =
-                builder
-                    .ins()
-                    .load(ir::types::I64, MemFlagsData::new(), overflow_slot, 0);
+            let overflow = builder.ins().load(
+                ir::types::I64,
+                backend::empty_memory_flags(),
+                overflow_slot,
+                0,
+            );
             let fixed_stack_base = if plan.overflow_arg_offset == 0 {
                 overflow
             } else {
@@ -3828,7 +3874,7 @@ fn store_value(
     let destination = address_offset(builder, base, offset)?;
     builder
         .ins()
-        .store(MemFlagsData::new(), value, destination, 0);
+        .store(backend::empty_memory_flags(), value, destination, 0);
     Ok(())
 }
 
@@ -3896,7 +3942,7 @@ fn va_arg_result(
     } else {
         Ok(builder.ins().load(
             scalar_type(types, requested, config)?,
-            MemFlagsData::new(),
+            backend::empty_memory_flags(),
             address,
             0,
         ))
@@ -4189,7 +4235,9 @@ fn lower_load(
     if access.volatile || access.atomic.is_some() {
         builder.ins().fence();
     }
-    let value = builder.ins().load(ty, MemFlagsData::new(), address, 0);
+    let value = builder
+        .ins()
+        .load(ty, backend::empty_memory_flags(), address, 0);
     if access.volatile || access.atomic.is_some() {
         builder.ins().fence();
     }
@@ -4208,7 +4256,9 @@ fn lower_store(
     if access.volatile || access.atomic.is_some() {
         builder.ins().fence();
     }
-    builder.ins().store(MemFlagsData::new(), value, address, 0);
+    builder
+        .ins()
+        .store(backend::empty_memory_flags(), value, address, 0);
     if access.volatile || access.atomic.is_some() {
         builder.ins().fence();
     }
@@ -4249,7 +4299,9 @@ fn zero_memory(
     let zero = builder.ins().iconst(ir::types::I8, 0);
     for offset in 0..size {
         let address = address_offset(builder, destination, offset)?;
-        builder.ins().store(MemFlagsData::new(), zero, address, 0);
+        builder
+            .ins()
+            .store(backend::empty_memory_flags(), zero, address, 0);
     }
     Ok(())
 }
@@ -4519,7 +4571,7 @@ fn float16_to_f32(builder: &mut FunctionBuilder<'_>, value: ir::Value) -> ir::Va
     let subnormal = builder.ins().fmul(subnormal, scale);
     let subnormal = builder
         .ins()
-        .bitcast(ir::types::I32, MemFlagsData::new(), subnormal);
+        .bitcast(ir::types::I32, backend::empty_memory_flags(), subnormal);
     let subnormal = builder.ins().bor(subnormal, sign);
 
     let is_zero_or_subnormal = builder.ins().icmp_imm_s(IntCC::Equal, exponent, 0);
@@ -4530,13 +4582,13 @@ fn float16_to_f32(builder: &mut FunctionBuilder<'_>, value: ir::Value) -> ir::Va
     let bits = builder.ins().select(is_special, special, finite);
     builder
         .ins()
-        .bitcast(ir::types::F32, MemFlagsData::new(), bits)
+        .bitcast(ir::types::F32, backend::empty_memory_flags(), bits)
 }
 
 fn f32_to_float16(builder: &mut FunctionBuilder<'_>, value: ir::Value) -> ir::Value {
     let raw = builder
         .ins()
-        .bitcast(ir::types::I32, MemFlagsData::new(), value);
+        .bitcast(ir::types::I32, backend::empty_memory_flags(), value);
     let sign = builder.ins().ushr_imm_u(raw, 16);
     let sign = builder.ins().band_imm_u(sign, 0x8000);
     let magnitude = builder.ins().band_imm_u(raw, 0x7fff_ffff);
@@ -4628,7 +4680,7 @@ fn f32_to_float16(builder: &mut FunctionBuilder<'_>, value: ir::Value) -> ir::Va
 fn f64_to_float16(builder: &mut FunctionBuilder<'_>, value: ir::Value) -> ir::Value {
     let raw = builder
         .ins()
-        .bitcast(ir::types::I64, MemFlagsData::new(), value);
+        .bitcast(ir::types::I64, backend::empty_memory_flags(), value);
     let sign = builder.ins().ushr_imm_u(raw, 48);
     let sign = builder.ins().band_imm_u(sign, 0x8000);
     let magnitude = builder.ins().band_imm_u(raw, 0x7fff_ffff_ffff_ffff);
@@ -4721,10 +4773,10 @@ fn f64_to_float16(builder: &mut FunctionBuilder<'_>, value: ir::Value) -> ir::Va
 fn f80_to_float16(builder: &mut FunctionBuilder<'_>, address: ir::Value) -> ir::Value {
     let significand = builder
         .ins()
-        .load(ir::types::I64, MemFlagsData::new(), address, 0);
+        .load(ir::types::I64, backend::empty_memory_flags(), address, 0);
     let high = builder
         .ins()
-        .load(ir::types::I16, MemFlagsData::new(), address, 8);
+        .load(ir::types::I16, backend::empty_memory_flags(), address, 8);
     let high = builder.ins().uextend(ir::types::I64, high);
     let sign = builder.ins().band_imm_u(high, 0x8000);
     let exponent = builder.ins().band_imm_u(high, 0x7fff);

@@ -105,7 +105,7 @@ pub(super) fn define_globals(
             }
             description.set_align(align);
             if let Some(section) = &global.emission.section {
-                description.set_custom_section(section);
+                backend::set_custom_data_section(&mut description, section);
             }
             let declaration = declarations
                 .globals
