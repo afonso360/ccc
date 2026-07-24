@@ -211,10 +211,6 @@ impl CapabilityRegistry {
             "__unused__",
             "deprecated",
             "__deprecated__",
-            "noinline",
-            "__noinline__",
-            "always_inline",
-            "__always_inline__",
             "may_alias",
             "__may_alias__",
             "alloc_size",
@@ -225,6 +221,19 @@ impl CapabilityRegistry {
                 name,
                 CapabilityState::BehaviorCompatibleNoOp,
                 "the optimization or diagnostic contract does not alter generated C behavior",
+            );
+        }
+        for name in [
+            "noinline",
+            "__noinline__",
+            "always_inline",
+            "__always_inline__",
+        ] {
+            registry.insert_with_rationale(
+                CapabilityKind::Attribute,
+                name,
+                CapabilityState::Implemented,
+                "semantic analysis validates the function-only optimization contract and preserves it as an exact CCC-IR function property",
             );
         }
         for name in [
@@ -519,10 +528,6 @@ mod tests {
             "unused",
             "__unused__",
             "__deprecated__",
-            "noinline",
-            "__noinline__",
-            "always_inline",
-            "__always_inline__",
             "may_alias",
             "__may_alias__",
             "alloc_size",
@@ -536,6 +541,10 @@ mod tests {
             assert!(registry.is_available(CapabilityKind::Attribute, name));
         }
         for name in [
+            "noinline",
+            "__noinline__",
+            "always_inline",
+            "__always_inline__",
             "__noreturn__",
             "packed",
             "__packed__",

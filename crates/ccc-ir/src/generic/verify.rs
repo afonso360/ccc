@@ -402,6 +402,12 @@ fn verify_function(module: &FullModule, function: &FullFunction) -> Result<(), I
             "weak function does not have external linkage",
         ));
     }
+    if function.properties.always_inline && function.properties.no_inline {
+        return Err(IrError::verify(format!(
+            "function `{}` is both always-inline and noinline",
+            function.name
+        )));
+    }
     let signature = module
         .types
         .function_signature(function.signature)

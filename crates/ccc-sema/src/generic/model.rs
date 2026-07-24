@@ -82,7 +82,14 @@ pub enum StorageDuration {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct FunctionProperties {
+    /// The C `inline` function specifier. This remains separate from GNU
+    /// optimization attributes because it also participates in C linkage and
+    /// definition semantics.
     pub inline: bool,
+    /// The GNU `always_inline` optimization requirement.
+    pub always_inline: bool,
+    /// The GNU `noinline` optimization prohibition.
+    pub no_inline: bool,
     pub no_return: bool,
     /// The call may resume at its return continuation after control has
     /// executed elsewhere, as with the setjmp family.

@@ -24,6 +24,56 @@ fn lower_source(source: &str) -> FullModule {
 }
 
 #[test]
+fn function_inlining_properties_reach_verified_ir_and_dumps() {
+    let module = lower_source(
+        "static int fast(int value) __attribute__((__always_inline__));\n\
+         static int fast(int value) { return value + 1; }\n\
+         static __attribute__((noinline)) inline int slow(int value) { return value - 1; }",
+    );
+    verify_frontend(&module).unwrap();
+
+    let fast = module
+        .functions
+        .iter()
+        .find(|function| function.name == "fast")
+        .unwrap();
+    assert!(!fast.properties.inline);
+    assert!(fast.properties.always_inline);
+    assert!(!fast.properties.no_inline);
+
+    let slow = module
+        .functions
+        .iter()
+        .find(|function| function.name == "slow")
+        .unwrap();
+    assert!(slow.properties.inline);
+    assert!(!slow.properties.always_inline);
+    assert!(slow.properties.no_inline);
+
+    let dump = dump_frontend_ir(&module);
+    assert!(
+        dump.contains("@fast(") && dump.contains("inline=false always-inline=true noreturn=false"),
+        "{dump}"
+    );
+    assert!(
+        dump.contains("@slow(") && dump.contains("inline=true noinline=true noreturn=false"),
+        "{dump}"
+    );
+}
+
+#[test]
+fn verifier_rejects_conflicting_function_inlining_properties() {
+    let mut module = lower_source("int f(void) { return 0; }");
+    module.functions[0].properties.always_inline = true;
+    module.functions[0].properties.no_inline = true;
+    let error = verify_frontend(&module).unwrap_err();
+    assert_eq!(
+        error.message,
+        "function `f` is both always-inline and noinline"
+    );
+}
+
+#[test]
 fn lowers_variable_bound_effects() {
     for source in [
         "int f(int n, int (*value)[n]) { return 0; }",

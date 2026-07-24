@@ -491,7 +491,10 @@ fn encode_function(encoder: &mut Encoder, function: &gir::FullFunction) {
     encoder.tag(function.binding as u8);
     encoder.tag(function.visibility as u8);
     encoder.bool(function.properties.inline);
+    encoder.bool(function.properties.always_inline);
+    encoder.bool(function.properties.no_inline);
     encoder.bool(function.properties.no_return);
+    encoder.bool(function.properties.returns_twice);
     encoder.string(&function.symbol_name);
     encoder.bool(function.symbol_name_is_exact);
     encoder.qualified(function.result_type);
@@ -1331,6 +1334,61 @@ mod tests {
 
         assert_eq!(first, repeated);
         assert_ne!(first, different_alignment);
+    }
+
+    #[test]
+    fn function_inlining_properties_are_part_of_provenance_digests() {
+        let mut sources = ccc_session::SourceMap::new();
+        let file = sources.add_file("digest.c", "");
+        let span = ccc_session::Span::new(file, 0, 0);
+        let mut types = TypeStore::default();
+        let signature = types.function_type(ccc_types::FunctionType::prototype(
+            ccc_types::QualifiedType::unqualified(ccc_types::TypeId::INT),
+            Vec::new(),
+        ));
+        let mut module = gir::FullModule {
+            types,
+            globals: Vec::new(),
+            strings: Vec::new(),
+            functions: vec![gir::FullFunction {
+                id: ccc_sema::generic::FullFunctionId(0),
+                name: "f".to_owned(),
+                signature,
+                storage_class: ccc_sema::generic::SemanticStorageClass::Extern,
+                linkage: ccc_sema::generic::Linkage::External,
+                binding: ccc_sema::generic::SymbolBinding::Strong,
+                visibility: ccc_sema::generic::SymbolVisibility::Default,
+                properties: ccc_sema::generic::FunctionProperties::default(),
+                symbol_name: "f".to_owned(),
+                symbol_name_is_exact: false,
+                result_type: ccc_types::QualifiedType::unqualified(ccc_types::TypeId::INT),
+                parameters: Vec::new(),
+                storage: Vec::new(),
+                blocks: Vec::new(),
+                entry: None,
+                value_types: Vec::new(),
+                instruction_count: 0,
+                span,
+            }],
+        };
+        let key = abi_config_key(&EffectiveCompilationConfig::default()).unwrap();
+        let baseline_ir = ir_shape_digest(&module, &key).unwrap();
+        let baseline_unit = translation_unit_digest(&module, &key, baseline_ir);
+
+        module.functions[0].properties.always_inline = true;
+        let always_ir = ir_shape_digest(&module, &key).unwrap();
+        let always_unit = translation_unit_digest(&module, &key, always_ir);
+        assert_ne!(always_ir, baseline_ir);
+        assert_ne!(always_unit, baseline_unit);
+
+        module.functions[0].properties.always_inline = false;
+        module.functions[0].properties.no_inline = true;
+        let no_inline_ir = ir_shape_digest(&module, &key).unwrap();
+        let no_inline_unit = translation_unit_digest(&module, &key, no_inline_ir);
+        assert_ne!(no_inline_ir, baseline_ir);
+        assert_ne!(no_inline_ir, always_ir);
+        assert_ne!(no_inline_unit, baseline_unit);
+        assert_ne!(no_inline_unit, always_unit);
     }
 
     #[test]

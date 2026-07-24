@@ -77,10 +77,10 @@ proof that each selected call is safe.
   block, depth, and translation-unit growth budgets; prevent direct and mutual
   recursion from exhausting the compiler. Admit `-Os` and `-Oz` candidates
   only when the measured result is smaller.
-- Promote `always_inline` and `noinline` from behavior-compatible attributes to
-  exact function properties with diagnostics. Treat the C `inline` specifier
-  as a hint, not as permission to ignore its separate C11 definition and
-  linkage rules.
+- Enforce the recorded exact `always_inline` and `noinline` properties in the
+  inlining policy, and diagnose an `always_inline` call that cannot be honored.
+  Treat the separate C `inline` specifier as a hint, not as permission to
+  ignore its C11 definition and linkage rules.
 - Exclude returns-twice paths, generated bridge bodies, and other exceptional
   frame contracts until focused tests prove that cloning them is safe.
 - Record every rejection reason in an optional optimization remark so

@@ -397,6 +397,11 @@ impl<'a> Analyzer<'a> {
         if declaration.declarators.is_empty() {
             self.reject_alignment_specifier(&info, declaration.span, "a type declaration")?;
             self.reject_weak_attribute(&info.attributes, declaration.span, "a type declaration")?;
+            self.reject_function_inlining_attribute(
+                &info.attributes,
+                declaration.span,
+                "a type declaration",
+            )?;
             self.external_items
                 .push(FullTypedExternalItem::TypeDeclaration {
                     ty: info.base.ty,
@@ -1070,6 +1075,7 @@ impl<'a> Analyzer<'a> {
         let info = self.resolve_declaration_specifiers(&type_name.specifiers)?;
         self.reject_packed_attribute(&info.attributes, type_name.specifiers.span)?;
         self.reject_transparent_union_attribute(&info.attributes, type_name.span, "a type name")?;
+        self.reject_function_inlining_attribute(&info.attributes, type_name.span, "a type name")?;
         self.reject_alignment_specifier(&info, type_name.span, "a type name")?;
         if info.storage.is_some()
             || info.thread_local
@@ -1084,6 +1090,11 @@ impl<'a> Analyzer<'a> {
         match &type_name.declarator {
             Some(declarator) => {
                 let resolved = self.resolve_declarator(info.base, declarator)?;
+                self.reject_function_inlining_attribute(
+                    &resolved.attributes,
+                    type_name.span,
+                    "a type name",
+                )?;
                 if resolved.name.is_some() {
                     return self.fail(
                         "CCC2220",
@@ -1371,6 +1382,7 @@ impl<'a> Analyzer<'a> {
         let info = self.resolve_declaration_specifiers(&parameter.specifiers)?;
         self.reject_weak_attribute(&info.attributes, parameter.span, "a parameter")?;
         self.reject_packed_attribute(&info.attributes, parameter.span)?;
+        self.reject_function_inlining_attribute(&info.attributes, parameter.span, "a parameter")?;
         self.reject_transparent_union_attribute(
             &info.attributes,
             parameter.span,
@@ -1391,6 +1403,11 @@ impl<'a> Analyzer<'a> {
                 let resolved =
                     self.resolve_declarator_in_context(info.base, declarator, is_prototype_scope)?;
                 self.reject_weak_attribute(&resolved.attributes, parameter.span, "a parameter")?;
+                self.reject_function_inlining_attribute(
+                    &resolved.attributes,
+                    parameter.span,
+                    "a parameter",
+                )?;
                 (
                     resolved.name,
                     resolved.ty,
@@ -1500,6 +1517,11 @@ impl<'a> Analyzer<'a> {
 
         let record_attributes = self.validate_attributes(&specifier.attributes)?;
         self.reject_weak_attribute(&record_attributes, specifier.span, "a record type")?;
+        self.reject_function_inlining_attribute(
+            &record_attributes,
+            specifier.span,
+            "a record type",
+        )?;
         self.reject_transparent_union_attribute(
             &record_attributes,
             specifier.span,
@@ -1540,6 +1562,11 @@ impl<'a> Analyzer<'a> {
                 syntax::RecordItem::Declaration(declaration) => {
                     let info = self.resolve_declaration_specifiers(&declaration.specifiers)?;
                     self.reject_weak_attribute(
+                        &info.attributes,
+                        declaration.span,
+                        "a record member",
+                    )?;
+                    self.reject_function_inlining_attribute(
                         &info.attributes,
                         declaration.span,
                         "a record member",
@@ -1596,6 +1623,11 @@ impl<'a> Analyzer<'a> {
                             member.span,
                             "a record member",
                         )?;
+                        self.reject_function_inlining_attribute(
+                            &member_attributes,
+                            member.span,
+                            "a record member",
+                        )?;
                         self.reject_packed_attribute(&member_attributes, member.span)?;
                         self.reject_transparent_union_attribute(
                             &member_attributes,
@@ -1606,6 +1638,11 @@ impl<'a> Analyzer<'a> {
                             if let Some(declarator) = &member.declarator {
                                 let resolved = self.resolve_declarator(info.base, declarator)?;
                                 self.reject_weak_attribute(
+                                    &resolved.attributes,
+                                    member.span,
+                                    "a record member",
+                                )?;
+                                self.reject_function_inlining_attribute(
                                     &resolved.attributes,
                                     member.span,
                                     "a record member",
@@ -1800,6 +1837,7 @@ impl<'a> Analyzer<'a> {
         };
         let enum_attributes = self.validate_attributes(&specifier.attributes)?;
         self.reject_weak_attribute(&enum_attributes, specifier.span, "an enum type")?;
+        self.reject_function_inlining_attribute(&enum_attributes, specifier.span, "an enum type")?;
         self.reject_packed_attribute(&enum_attributes, specifier.span)?;
         self.reject_transparent_union_attribute(
             &enum_attributes,
@@ -1825,6 +1863,11 @@ impl<'a> Analyzer<'a> {
         for enumerator in enumerators {
             let enumerator_attributes = self.validate_attributes(&enumerator.attributes)?;
             self.reject_weak_attribute(&enumerator_attributes, enumerator.span, "an enumerator")?;
+            self.reject_function_inlining_attribute(
+                &enumerator_attributes,
+                enumerator.span,
+                "an enumerator",
+            )?;
             self.reject_packed_attribute(&enumerator_attributes, enumerator.span)?;
             self.reject_transparent_union_attribute(
                 &enumerator_attributes,
@@ -1877,6 +1920,7 @@ impl<'a> Analyzer<'a> {
     ) -> AnalysisResult<TypedefId> {
         self.reject_tls_model_attribute(&attributes, span)?;
         self.reject_weak_attribute(&attributes, span, "a typedef")?;
+        self.reject_function_inlining_attribute(&attributes, span, "a typedef")?;
         if matches!(self.types.try_kind(ty.ty), Some(TypeKind::Array(_)))
             && self.type_contains_flexible_array_member(ty.ty)
         {
@@ -1937,6 +1981,21 @@ impl<'a> Analyzer<'a> {
         properties.no_return |= attributes
             .iter()
             .any(|attribute| attribute_has_name(attribute, "noreturn"));
+        properties.always_inline |= attributes
+            .iter()
+            .any(|attribute| attribute_has_name(attribute, "always_inline"));
+        properties.no_inline |= attributes
+            .iter()
+            .any(|attribute| attribute_has_name(attribute, "noinline"));
+        if properties.always_inline && properties.no_inline {
+            return self.fail(
+                "CCC2457",
+                span,
+                format!(
+                    "function `{name}` cannot be declared with both `always_inline` and `noinline`"
+                ),
+            );
+        }
         properties.returns_twice |= attributes
             .iter()
             .any(|attribute| attribute_has_name(attribute, "returns_twice"));
@@ -1998,9 +2057,23 @@ impl<'a> Analyzer<'a> {
                         ),
                     );
                 }
+                let existing_properties = self.functions[id.0 as usize].properties;
+                if (existing_properties.always_inline || properties.always_inline)
+                    && (existing_properties.no_inline || properties.no_inline)
+                {
+                    return self.fail(
+                        "CCC2457",
+                        span,
+                        format!(
+                            "function `{name}` has conflicting `always_inline` and `noinline` declarations"
+                        ),
+                    );
+                }
                 let function = &mut self.functions[id.0 as usize];
                 function.signature = composite;
                 function.properties.inline |= properties.inline;
+                function.properties.always_inline |= properties.always_inline;
+                function.properties.no_inline |= properties.no_inline;
                 function.properties.no_return |= properties.no_return;
                 function.properties.returns_twice |= properties.returns_twice;
                 if let Some(binding) = declared_binding {
@@ -2066,6 +2139,7 @@ impl<'a> Analyzer<'a> {
         initializer: Option<&syntax::Initializer>,
         span: Span,
     ) -> AnalysisResult<GlobalId> {
+        self.reject_function_inlining_attribute(&attributes, span, "an object declaration")?;
         if !thread_local {
             self.reject_tls_model_attribute(&attributes, span)?;
         }
@@ -2363,6 +2437,11 @@ impl<'a> Analyzer<'a> {
         self.reject_packed_attribute(&info.attributes, declaration.span)?;
         if declaration.declarators.is_empty() {
             self.reject_alignment_specifier(&info, declaration.span, "a type declaration")?;
+            self.reject_function_inlining_attribute(
+                &info.attributes,
+                declaration.span,
+                "a type declaration",
+            )?;
         }
         let mut output = Vec::new();
         for (declarator_index, init) in declaration.declarators.iter().enumerate() {
@@ -2398,6 +2477,7 @@ impl<'a> Analyzer<'a> {
                     "a block-scope typedef",
                 )?;
                 self.reject_weak_attribute(&attributes, init.span, "a typedef")?;
+                self.reject_function_inlining_attribute(&attributes, init.span, "a typedef")?;
                 if init.initializer.is_some() || init.asm_label.is_some() {
                     return self.fail(
                         "CCC2255",
@@ -2476,6 +2556,11 @@ impl<'a> Analyzer<'a> {
                 output.push(FullTypedBlockItem::FunctionDeclaration(id));
                 continue;
             }
+            self.reject_function_inlining_attribute(
+                &attributes,
+                init.span,
+                "an object declaration",
+            )?;
             self.reject_unavailable_thread_storage(info.thread_local, init.span)?;
             if info.storage == Some(syntax::StorageClass::Extern) {
                 self.reject_transparent_union_attribute(
@@ -2703,6 +2788,11 @@ impl<'a> Analyzer<'a> {
                 } => {
                     let attributes = self.validate_attributes(attributes)?;
                     self.reject_weak_attribute(&attributes, statement.span, "a statement label")?;
+                    self.reject_function_inlining_attribute(
+                        &attributes,
+                        statement.span,
+                        "a statement label",
+                    )?;
                     self.reject_packed_attribute(&attributes, statement.span)?;
                     self.reject_transparent_union_attribute(
                         &attributes,
@@ -9383,6 +9473,14 @@ impl<'a> Analyzer<'a> {
                 "implemented `noreturn` does not accept arguments",
             );
         }
+        if matches!(canonical_name, "always_inline" | "noinline") && !attribute.arguments.is_empty()
+        {
+            return self.fail(
+                "CCC2457",
+                attribute.span,
+                format!("implemented `{canonical_name}` does not accept arguments"),
+            );
+        }
         if canonical_name == "weak" && !attribute.arguments.is_empty() {
             return self.fail(
                 "CCC2423",
@@ -9442,6 +9540,25 @@ impl<'a> Analyzer<'a> {
                 "CCC2423",
                 span,
                 format!("implemented `weak` cannot be applied to {placement}"),
+            );
+        }
+        Ok(())
+    }
+
+    fn reject_function_inlining_attribute(
+        &mut self,
+        attributes: &[FullTypedAttribute],
+        span: Span,
+        placement: &str,
+    ) -> AnalysisResult<()> {
+        if let Some(name) = attributes.iter().find_map(|attribute| {
+            let name = canonical_gnu_attribute_name(&attribute.name);
+            matches!(name, "always_inline" | "noinline").then_some(name)
+        }) {
+            return self.fail(
+                "CCC2457",
+                span,
+                format!("implemented `{name}` cannot be applied to {placement}"),
             );
         }
         Ok(())

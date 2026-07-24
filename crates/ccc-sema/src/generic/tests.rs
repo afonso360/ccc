@@ -608,20 +608,23 @@ fn assembly_labels_reject_conflicts_and_unsupported_storage() {
 }
 
 #[test]
-fn accepts_function_inlining_attributes_as_behavior_compatible_no_ops() {
+fn function_inlining_attributes_are_exact_properties_distinct_from_c_inline() {
     let unit = analyze_source(
         "static __attribute__((always_inline)) inline int fast(int value) { return value + 1; }\n\
          static int __attribute__((__always_inline__)) fast_alias(int value) { return value + 2; }\n\
-         static __attribute__((noinline)) int slow(int value) { return value - 1; }\n\
-         static int __attribute__((__noinline__)) slow_alias(int value) { return value - 2; }",
+         static __attribute__((noinline)) inline int slow(int value) { return value - 1; }\n\
+         static int __attribute__((__noinline__)) slow_alias(int value) { return value - 2; }\n\
+         extern int accumulated(int) __attribute__((always_inline));\n\
+         extern int accumulated(int);",
     )
     .unwrap();
 
-    for (name, attribute_name) in [
-        ("fast", "always_inline"),
-        ("fast_alias", "__always_inline__"),
-        ("slow", "noinline"),
-        ("slow_alias", "__noinline__"),
+    for (name, attribute_name, c_inline, always_inline, no_inline) in [
+        ("fast", "always_inline", true, true, false),
+        ("fast_alias", "__always_inline__", false, true, false),
+        ("slow", "noinline", true, false, true),
+        ("slow_alias", "__noinline__", false, false, true),
+        ("accumulated", "always_inline", false, true, false),
     ] {
         let function = unit
             .functions
@@ -633,10 +636,35 @@ fn accepts_function_inlining_attributes_as_behavior_compatible_no_ops() {
             .iter()
             .find(|attribute| attribute.name == attribute_name)
             .unwrap();
-        assert_eq!(
-            attribute.capability,
-            CapabilityState::BehaviorCompatibleNoOp
-        );
+        assert_eq!(attribute.capability, CapabilityState::Implemented);
+        assert_eq!(function.properties.inline, c_inline, "{name}");
+        assert_eq!(function.properties.always_inline, always_inline, "{name}");
+        assert_eq!(function.properties.no_inline, no_inline, "{name}");
+    }
+
+    let dump = dump_frontend_typed_ast(&unit);
+    assert!(
+        dump.contains("fast : int (int) storage=Static linkage=Internal visibility=Default inline=true always-inline=true noreturn=false"),
+        "{dump}"
+    );
+    assert!(
+        dump.contains("slow : int (int) storage=Static linkage=Internal visibility=Default inline=true noinline=true noreturn=false"),
+        "{dump}"
+    );
+}
+
+#[test]
+fn function_inlining_attributes_reject_arguments_and_conflicts() {
+    for source in [
+        "int f(void) __attribute__((always_inline, noinline));",
+        "int f(void) __attribute__((__always_inline__)); int f(void) __attribute__((noinline));",
+        "int f(void) __attribute__((always_inline(1)));",
+        "int f(void) __attribute__((__noinline__(1)));",
+        "int object __attribute__((always_inline));",
+        "typedef int scalar __attribute__((noinline));",
+        "int f(int value __attribute__((always_inline))) { return value; }",
+    ] {
+        assert_eq!(diagnostic_codes(source), ["CCC2457"], "{source}");
     }
 }
 

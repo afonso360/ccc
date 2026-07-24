@@ -105,7 +105,7 @@ pub fn dump_frontend_ir(module: &FullModule) -> String {
             .join(", ");
         let _ = writeln!(
             output,
-            "function f{} @{}({}) -> {} [signature={} linkage={:?}{} visibility={:?} inline={} noreturn={}{}] {{",
+            "function f{} @{}({}) -> {} [signature={} linkage={:?}{} visibility={:?} inline={}{}{} noreturn={}{}] {{",
             function.id.0,
             function.symbol_name,
             parameters,
@@ -119,6 +119,16 @@ pub fn dump_frontend_ir(module: &FullModule) -> String {
             },
             function.visibility,
             function.properties.inline,
+            if function.properties.always_inline {
+                " always-inline=true"
+            } else {
+                ""
+            },
+            if function.properties.no_inline {
+                " noinline=true"
+            } else {
+                ""
+            },
             function.properties.no_return,
             if function.properties.returns_twice {
                 " returns-twice=true"

@@ -98,7 +98,7 @@ fn dump_function(output: &mut String, unit: &FullTypedTranslationUnit, id: FullF
         output,
         0,
         format_args!(
-            "function @{} {} : {} storage={:?} linkage={:?}{} visibility={:?} inline={} noreturn={}{} {}",
+            "function @{} {} : {} storage={:?} linkage={:?}{} visibility={:?} inline={}{}{} noreturn={}{} {}",
             id.0,
             function.name,
             unit.types.display(function.signature),
@@ -111,6 +111,16 @@ fn dump_function(output: &mut String, unit: &FullTypedTranslationUnit, id: FullF
             },
             function.visibility,
             function.properties.inline,
+            if function.properties.always_inline {
+                " always-inline=true"
+            } else {
+                ""
+            },
+            if function.properties.no_inline {
+                " noinline=true"
+            } else {
+                ""
+            },
             function.properties.no_return,
             if function.properties.returns_twice {
                 " returns-twice=true"
