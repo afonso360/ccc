@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-script_directory=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+script_directory=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 while IFS='=' read -r variable _; do
   case "$variable" in
     CSMITH_* | CCC | CCC_* | FAKE_*) unset -v "$variable" ;;
@@ -318,13 +318,13 @@ cat >"$fake_bin/ccc" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ "${FAKE_HOST_OS:-Linux}" == Darwin ]]; then
-  expected_cc=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)/clang
-  expected_nmedit=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)/nmedit
+  expected_cc=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)/clang
+  expected_nmedit=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)/nmedit
   [[ "${CCC_NMEDIT:-}" == "$expected_nmedit" ]]
   [[ -z "${CCC_OBJCOPY:-}" ]]
 else
-  expected_cc=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)/gcc
-  expected_objcopy=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)/objcopy
+  expected_cc=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)/gcc
+  expected_objcopy=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)/objcopy
   [[ "${CCC_OBJCOPY:-}" == "$expected_objcopy" ]]
   [[ -z "${CCC_NMEDIT:-}" ]]
 fi
@@ -459,7 +459,7 @@ darwin_arguments=(
   --run-timeout 1
 )
 darwin_directory="$temporary_directory/darwin results"
-darwin_sdk_absolute=$(CDPATH= cd -- "$darwin_sdk_directory" && pwd -P)
+darwin_sdk_absolute=$(CDPATH='' cd -- "$darwin_sdk_directory" && pwd -P)
 darwin_output=$(FAKE_HOST_OS=Darwin FAKE_HOST_ARCH=arm64 \
   "$script_directory/run.sh" \
   "${darwin_arguments[@]}" \
@@ -641,7 +641,7 @@ help_output=$("$script_directory/run.sh" --help 2>&1)
 [[ "$help_output" == *"--csmith-runtime PATH"* ]]
 [[ "$help_output" == *"--max-attempts COUNT"* ]]
 
-repository_directory=$(CDPATH= cd -- "$script_directory/../.." && pwd -P)
+repository_directory=$(CDPATH='' cd -- "$script_directory/../.." && pwd -P)
 cdpath_output=$(
   CDPATH="$repository_directory"
   cd "$repository_directory"
@@ -650,7 +650,7 @@ cdpath_output=$(
 [[ "$cdpath_output" == *"--start-seed SEED"* ]]
 
 leading_dash_output=$(
-  CDPATH= cd -- "$temporary_directory"
+  CDPATH='' cd -- "$temporary_directory"
   "$script_directory/run.sh" \
     "${common_arguments[@]}" \
     --cases 1 \

@@ -87,7 +87,7 @@ if [[ "$host_os" == Linux && "$host_arch" == x86_64 ]]; then
     "$script_directory/run.sh" --target x86_64-unknown-linux-gnu \
       --work-dir "$missing_driver_work" 2>&1)
   missing_driver_status=$?
-  missing_root_output=$(BZIP2_QEMU_ROOT= \
+  missing_root_output=$(BZIP2_QEMU_ROOT='' \
     "$script_directory/run.sh" --target aarch64-unknown-linux-gnu \
       --work-dir "$temporary_directory/missing-root-work" 2>&1)
   missing_root_status=$?

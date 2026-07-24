@@ -346,6 +346,3 @@ performed by Cranelift merely to improve a benchmark score.
 - Split the large target-oracle and corpus shell runners into shared libraries
   plus target/corpus entry points. Derive executed-case totals from declared
   cases instead of maintaining numeric totals beside the tests.
-- Add fast CI gates for formatting, Clippy with warnings denied, shell static
-  analysis, Markdown/link validation, and whitespace checks before the
-  expensive target and corpus jobs.

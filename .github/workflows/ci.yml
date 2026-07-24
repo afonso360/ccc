@@ -9,8 +9,47 @@ permissions:
   contents: read
 
 jobs:
+  quality:
+    name: Fast quality gates
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install shell analysis
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends shellcheck
+
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: clippy, rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check Rust lints
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Check shell scripts
+        run: |
+          git ls-files -z -- '*.sh' | xargs -0 -n 1 bash -n
+          # Profile fragments deliberately define variables consumed by the
+          # scripts that source them, which ShellCheck cannot infer through
+          # dynamically resolved source paths.
+          git ls-files -z -- '*.sh' |
+            xargs -0 shellcheck --severity=warning --exclude=SC2034,SC2154
+
+      - name: Check Markdown links
+        run: python3 .github/scripts/check-markdown-links.py
+
+      - name: Check whitespace
+        run: python3 .github/scripts/check-whitespace.py
+
   test:
     name: Rust tests (${{ matrix.name }})
+    needs: quality
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -105,6 +144,7 @@ jobs:
 
   bzip2-targets:
     name: bzip2 corpus (${{ matrix.name }})
+    needs: quality
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     strategy:
@@ -178,6 +218,7 @@ jobs:
 
   corpus:
     name: Test corpus (Linux x86-64)
+    needs: quality
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     env:

@@ -2,8 +2,8 @@
 
 set -euo pipefail
 
-script_directory=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
-repository=$(CDPATH= cd -- "$script_directory/../.." && pwd -P)
+script_directory=$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+repository=$(CDPATH='' cd -- "$script_directory/../.." && pwd -P)
 source "$script_directory/profile.sh"
 source "$repository/test-corpus/adapter-environment.sh"
 
@@ -55,13 +55,13 @@ require_tool() {
 
 absolute_directory() {
   [[ -d "$1" ]] || die "directory does not exist: $1"
-  (CDPATH= cd -- "$1" && pwd -P)
+  (CDPATH='' cd -- "$1" && pwd -P)
 }
 
 absolute_file() {
   [[ -f "$1" ]] || die "file does not exist: $1"
   printf '%s/%s\n' \
-    "$(CDPATH= cd -- "$(dirname -- "$1")" && pwd -P)" \
+    "$(CDPATH='' cd -- "$(dirname -- "$1")" && pwd -P)" \
     "$(basename -- "$1")"
 }
 

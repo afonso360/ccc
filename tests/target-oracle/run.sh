@@ -125,7 +125,7 @@ case $target_name in
     darwin-arm64)
         platform=macho
         triple=aarch64-apple-darwin
-        nm_tool=nm
+        nm_tool='nm'
         if [[ $(uname -s) != Darwin || $(uname -m) != arm64 ]]; then
             echo "darwin-arm64 evidence requires a native arm64 Darwin host" >&2
             exit 3

@@ -400,8 +400,8 @@ explicit_standard_translations=$(grep '^ccc ' "$CCC_ZSTD_COMMAND_LOG" | \
   grep -Ec -- ' -std=' || true)
 [[ "$explicit_standard_translations" == 0 ]] ||
   die "zstd C translations unexpectedly overrode CCC's default GNU language mode"
-for option in \
-  ' -DZSTD_DISABLE_ASM'; do
+pinned_translation_options=(' -DZSTD_DISABLE_ASM')
+for option in "${pinned_translation_options[@]}"; do
   matches=$(grep '^ccc ' "$CCC_ZSTD_COMMAND_LOG" | grep -c -- "$option" || true)
   [[ "$matches" == "$expected_translation_occurrences" ]] ||
     die "zstd C translations did not all retain the pinned option:$option"
