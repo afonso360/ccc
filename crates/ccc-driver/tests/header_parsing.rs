@@ -26,7 +26,7 @@ impl HeaderWorkspaceExt for support::TestWorkspace {
     }
 
     fn command_for_target(&self, target: &str) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_ccc"));
+        let mut command = support::ccc_command();
         command
             .current_dir(self.path())
             .arg(format!("--target={target}"))
@@ -117,7 +117,7 @@ fn apple_math_private_classification_helpers_reach_the_ast_without_public_replac
          int ccc_public_isfinite(double value) { return isfinite(value); }\n",
     );
     let sdk = macos_sdk_root();
-    let output = Command::new(env!("CARGO_BIN_EXE_ccc"))
+    let output = support::ccc_command()
         .current_dir(directory.path())
         .env("LC_ALL", "C")
         .env("LANG", "C")

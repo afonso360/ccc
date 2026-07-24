@@ -8,7 +8,6 @@
 ))]
 
 use std::fs;
-use std::process::Command;
 
 use object::read::{Object as _, ObjectSymbol as _};
 
@@ -55,7 +54,7 @@ int retain_undefined_relocations(void) {
     )
     .unwrap();
 
-    let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+    let compilation = support::ccc_command()
         .arg("-nostdinc")
         .arg("-c")
         .arg(&source)

@@ -349,10 +349,11 @@ performed by Cranelift merely to improve a benchmark score.
   tests use the common workspace. Preprocessing, hosted-header parsing, and the
   compact ABI oracle now use it as well, and the System V AMD64 interop suite
   completes the temporary-workspace migration. A minimal shared CCC command
-  constructor now covers the diagnostics and execution suites while keeping
-  targets, environments, working directories, and arguments visible at each
-  call site. Migrate the remaining object-emission, link-input, preprocessing,
-  header, visibility, and ABI invocations next.
+  constructor now covers every non-System-V driver integration invocation
+  while keeping targets, environments, working directories, and arguments
+  visible at each call site. The System V AMD64 suite retains its own
+  result-checking runner because that wrapper is part of its ABI-oracle
+  contract.
 - Mach-O debug-map inputs now have explicit ownership:
   `PackagingReport` exposes a must-use `RetainedDebugInputs` guard which the
   driver holds through final linking and `dsymutil`. Success, publication

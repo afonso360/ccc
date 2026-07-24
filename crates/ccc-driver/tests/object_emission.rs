@@ -22,14 +22,14 @@ fn compile_ccc(source: &Path, output: &Path) {
 }
 
 fn compile_ccc_with_options(source: &Path, output: &Path, options: &[&str]) {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ccc"));
+    let mut command = support::ccc_command();
     command.arg("-nostdinc").arg("-c").args(options);
     let result = command.arg(source).arg("-o").arg(output).output().unwrap();
     support::assert_command_success("compile a native object with CCC", &result);
 }
 
 fn compile_x86_64_elf_with_options(source: &Path, output: &Path, options: &[&str]) {
-    let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+    let result = support::ccc_command()
         .arg("--target=x86_64-unknown-linux-gnu")
         .arg("-nostdinc")
         .arg("-c")
@@ -266,7 +266,7 @@ fn objects_built_at_different_optimization_levels_link_and_execute_together() {
         (&library_source, &library_object, "-Oz"),
         (&main_source, &main_object, "-O0"),
     ] {
-        let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+        let compilation = support::ccc_command()
             .arg("-nostdinc")
             .arg("-c")
             .arg(optimization)
@@ -315,7 +315,7 @@ fn optimization_runs_before_ir_dump_and_abi_planning() {
     .unwrap();
 
     let dump = |optimization: &str, representation: &str| {
-        let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+        let result = support::ccc_command()
             .args(["-nostdinc", optimization, representation])
             .arg(&source)
             .output()
@@ -1183,7 +1183,7 @@ int main(void) {
 "#,
     );
     let object = directory.join("glibc-redirect-labels.o");
-    let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+    let result = support::ccc_command()
         .arg("-c")
         .arg(&source)
         .arg("-o")

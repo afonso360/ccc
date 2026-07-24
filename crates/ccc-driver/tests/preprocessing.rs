@@ -19,7 +19,7 @@ impl PreprocessingWorkspaceExt for support::TestWorkspace {
     }
 
     fn command_for_target(&self, target: &str) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_ccc"));
+        let mut command = support::ccc_command();
         command
             .current_dir(self.path())
             .arg(format!("--target={target}"))
@@ -30,7 +30,7 @@ impl PreprocessingWorkspaceExt for support::TestWorkspace {
     }
 
     fn host_command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_ccc"));
+        let mut command = support::ccc_command();
         command
             .current_dir(self.path())
             .env("LC_ALL", "C")
@@ -277,7 +277,7 @@ fn committed_preprocessing_fixtures_match_their_goldens() {
     let repository = repository_fixture("");
 
     for (source, include, expected) in cases {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_ccc"));
+        let mut command = support::ccc_command();
         command
             .current_dir(&repository)
             .env("LC_ALL", "C")
@@ -303,7 +303,7 @@ fn committed_preprocessing_fixtures_match_their_goldens() {
 fn committed_warning_fixture_matches_its_diagnostic_golden() {
     let repository = repository_fixture("");
     let source = repository.join("tests/preprocessing/diagnostics/warning.c");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ccc"));
+    let mut command = support::ccc_command();
     command
         .current_dir(&repository)
         .env("LC_ALL", "C")

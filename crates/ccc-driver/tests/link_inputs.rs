@@ -9,7 +9,7 @@ use object::{Object as _, ObjectKind};
 mod support;
 
 fn ccc() -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ccc"));
+    let mut command = support::ccc_command();
     command.arg("-nostdinc");
     command
 }
@@ -192,21 +192,15 @@ fn command_plan_preserves_effective_compile_and_link_options() {
 
 #[test]
 fn compiler_identity_queries_are_available_without_inputs() {
-    let machine = Command::new(env!("CARGO_BIN_EXE_ccc"))
-        .arg("-dumpmachine")
-        .output()
-        .unwrap();
+    let machine = support::ccc_command().arg("-dumpmachine").output().unwrap();
     support::assert_command_success("query the target machine", &machine);
     assert!(!String::from_utf8(machine.stdout).unwrap().trim().is_empty());
 
-    let version = Command::new(env!("CARGO_BIN_EXE_ccc"))
-        .arg("-dumpversion")
-        .output()
-        .unwrap();
+    let version = support::ccc_command().arg("-dumpversion").output().unwrap();
     support::assert_command_success("query the compiler version", &version);
     assert_eq!(String::from_utf8(version.stdout).unwrap(), "4.2.1\n");
 
-    let effective = Command::new(env!("CARGO_BIN_EXE_ccc"))
+    let effective = support::ccc_command()
         .args(["-std=c11", "-fPIC", "-Oz", "--print-effective-config"])
         .output()
         .unwrap();
@@ -325,7 +319,7 @@ fn compile_only_accepts_multiple_sources_and_derives_object_names() {
     fs::write(&first, "int first(void) { return 1; }\n").unwrap();
     fs::write(&second, "int second(void) { return 2; }\n").unwrap();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_ccc"))
+    let output = support::ccc_command()
         .current_dir(directory.path())
         .arg("-nostdinc")
         .arg("-c")

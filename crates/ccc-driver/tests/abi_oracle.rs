@@ -355,7 +355,7 @@ fn x86_64_layout_objects_match_gcc_and_clang() {
 }
 
 fn compile_ccc(directory: &support::TestWorkspace, source: &Path, output: &Path) {
-    let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+    let result = support::ccc_command()
         .arg("-nostdinc")
         .arg("-c")
         .arg(source)
