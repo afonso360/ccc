@@ -350,6 +350,71 @@ fake-tool regression is:
 benchmarks/codegen/test-run.sh
 ```
 
+## Defined-behavior kernel benchmarks
+
+The executable kernel runner is separate from the compiler-only suite. Its
+first vertical case performs four million calls to a small unsigned-integer
+leaf, validates the exact result, and records whether the call remains in the
+post-inlining CLIF at `-O0`, `-O2`, and `-Oz`. Run a quick native correctness
+check with:
+
+```sh
+benchmarks/kernels/run.py \
+  --ccc target/debug/ccc \
+  --output "$CCC_TEST_ROOT/kernels-correctness" \
+  --mode correctness \
+  --compile-warmups 0 \
+  --compile-samples 1
+```
+
+Use `--mode object` for compile and structural evidence when the selected
+target cannot run on the host. Cross-target correctness requires an explicit
+runner; for example:
+
+```sh
+CCC_CC=riscv64-linux-gnu-gcc \
+benchmarks/kernels/run.py \
+  --ccc target/debug/ccc \
+  --output "$CCC_TEST_ROOT/kernels-riscv64" \
+  --mode correctness \
+  --target riscv64-unknown-linux-gnu \
+  --runner qemu-riscv64 \
+  --runner-arg=-L \
+  --runner-arg=/usr/riscv64-linux-gnu
+```
+
+For native timing, build a release compiler and select performance mode:
+
+```sh
+cargo build --locked --release -p ccc-driver
+benchmarks/kernels/run.py \
+  --ccc target/release/ccc \
+  --output "$CCC_TEST_ROOT/kernels-performance" \
+  --mode performance
+```
+
+Performance mode rejects emulated runners and a compiler target that does not
+match the native host. Every retained executable is validated before warmups
+or samples, and every execution must exit zero without output. Results keep
+the compiler-side `primary_object.*` metrics distinct from the final published
+object, because generated ABI or TLS bridge units may be packaged later.
+`benchmarks/kernels/README.md` documents the versioned TSV/JSON schema and all
+runner options.
+
+The fast harness regression uses a fake compiler, linker, and cross-target
+runner. It exercises all three modes and proves that a nonzero validation
+result or nondeterministic final object fails the run:
+
+```sh
+benchmarks/kernels/test-run.sh
+```
+
+Only this fake-tool regression is in the fast CI job in the initial slice.
+All-target correctness execution and the remaining integer, floating-point,
+control-flow, memory, TLS, atomic, and variadic kernels remain follow-up work.
+QEMU results will be correctness and rough-trend evidence, never native
+performance evidence.
+
 ## C-Ray generated-code benchmark
 
 C-Ray 1.1 is a native-only benchmark with correctness checks enabled for every

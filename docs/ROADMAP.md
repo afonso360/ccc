@@ -149,12 +149,17 @@ unused declarations change either post-inlining CLIF or primary-object
 structural metrics. Timed samples use ordinary object-only compilation; the
 structural-stat query is separate and untimed.
 
-The next benchmark targets are:
+The current executable slice and next benchmark targets are:
 
-- Focused, defined-behavior kernels cover direct calls, inlining, integer and
-  floating loops, branches and switches, loads and stores, aggregate copies,
-  TLS, atomics, and variadic calls. Each kernel validates its result and has a
-  fixed work count.
+- The first focused, defined-behavior kernel is checked in: a fixed
+  four-million-call workload validates its exact unsigned result, records the
+  current direct-call/inlining structure, and runs through separate
+  object-only, correctness, and native-performance modes. Its versioned
+  evidence keeps compiler-side primary-object statistics distinct from the
+  final packaged object. Complete the compact suite with integer and floating
+  loops, branches and switches, loads and stores, aggregate copies, TLS,
+  atomics, and variadic calls; every added kernel must retain a fixed work
+  count and self-validation.
 - Extend generated scaling beyond the implemented declaration and live-function
   axes to declarations per function, block count, SSA values, globals, and
   string literals independently. Use them to detect accidental quadratic

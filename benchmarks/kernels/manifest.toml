@@ -1,0 +1,15 @@
+schema_version = 1
+
+[[case]]
+name = "direct-call"
+family = "direct-calls"
+source = "cases/direct-call.c"
+work_unit = "leaf-call"
+work_count = 4000000
+expected_result = "0x99b0c920"
+expected_post_inline_functions = 2
+
+[case.expected_post_inline_calls]
+O0 = 1
+O2 = 0
+Oz = 1

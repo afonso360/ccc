@@ -50,6 +50,9 @@ jobs:
       - name: Test codegen benchmark harness
         run: benchmarks/codegen/test-run.sh
 
+      - name: Test executable kernel benchmark harness
+        run: benchmarks/kernels/test-run.sh
+
   test:
     name: Rust tests (${{ matrix.name }})
     needs: quality
