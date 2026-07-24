@@ -2,6 +2,7 @@
 
 use std::fmt;
 
+use ccc_diag::codes::syntax as diagnostic_codes;
 use ccc_pp::{LanguageMode, PragmaEvent};
 use ccc_session::Span;
 
@@ -2910,7 +2911,7 @@ impl Parser<'_> {
             .expect("an empty translation unit does not produce parse errors")
             .span();
         ParseError {
-            code: "CCC1020",
+            code: diagnostic_codes::PARSE_ERROR.as_str(),
             span: Span::with_origin(last.file, last.end, last.end, last.origin),
             message: message.to_owned(),
             recovery: None,
@@ -2919,7 +2920,7 @@ impl Parser<'_> {
 
     fn error_at(&self, span: Span, message: &str) -> ParseError {
         ParseError {
-            code: "CCC1020",
+            code: diagnostic_codes::PARSE_ERROR.as_str(),
             span,
             message: message.to_owned(),
             recovery: None,

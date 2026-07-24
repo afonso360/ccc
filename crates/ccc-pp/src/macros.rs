@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use ccc_diag::codes::preprocessor as diagnostic_codes;
 use ccc_session::{OriginKind, SourceMap, Span};
 
 use crate::diagnostic::{PpDiagnostic, PpDiagnosticCategory, PpSeverity};
@@ -192,7 +193,7 @@ impl Expander<'_, '_> {
             if self.emitted_tokens >= self.options.limits.output_tokens {
                 self.error(
                     &stream[index],
-                    "CCC1102",
+                    diagnostic_codes::PREPROCESSING_TOKEN_LIMIT.as_str(),
                     "preprocessing token limit exceeded",
                 );
                 break;
@@ -223,7 +224,11 @@ impl Expander<'_, '_> {
                 if self.emitted_tokens.saturating_add(preserved.len())
                     > self.options.limits.output_tokens
                 {
-                    self.error(&token, "CCC1102", "preprocessing token limit exceeded");
+                    self.error(
+                        &token,
+                        diagnostic_codes::PREPROCESSING_TOKEN_LIMIT.as_str(),
+                        "preprocessing token limit exceeded",
+                    );
                     break;
                 }
                 output.extend_from_slice(preserved);
@@ -248,7 +253,11 @@ impl Expander<'_, '_> {
                 continue;
             }
             if token.expansion_depth > self.options.limits.expansion_depth {
-                self.error(&token, "CCC1101", "macro expansion depth limit exceeded");
+                self.error(
+                    &token,
+                    diagnostic_codes::MACRO_EXPANSION_DEPTH_LIMIT.as_str(),
+                    "macro expansion depth limit exceeded",
+                );
                 output.push(token);
                 trailing_function_macro_can_continue = false;
                 self.emitted_tokens += 1;
@@ -381,7 +390,7 @@ impl Expander<'_, '_> {
                     if depth > self.options.limits.argument_depth {
                         self.error(
                             &tokens[index],
-                            "CCC1103",
+                            diagnostic_codes::MACRO_ARGUMENT_DEPTH_LIMIT.as_str(),
                             "macro argument nesting limit exceeded",
                         );
                         return None;
@@ -404,7 +413,7 @@ impl Expander<'_, '_> {
                         if !valid {
                             self.error(
                                 &tokens[open],
-                                "CCC1104",
+                                diagnostic_codes::MACRO_ARGUMENT_COUNT.as_str(),
                                 format!(
                                     "macro expects {} argument{}, but {} {} provided",
                                     parameter_count,
@@ -425,7 +434,11 @@ impl Expander<'_, '_> {
             }
             index += 1;
         }
-        self.error(&tokens[open], "CCC1105", "unterminated macro invocation");
+        self.error(
+            &tokens[open],
+            diagnostic_codes::UNTERMINATED_MACRO_INVOCATION.as_str(),
+            "unterminated macro invocation",
+        );
         None
     }
 
@@ -469,7 +482,11 @@ impl Expander<'_, '_> {
             let token = &replacement[index];
             if is_hash(token) {
                 let Some(parameter_token) = replacement.get(index + 1) else {
-                    self.error(token, "CCC1106", "'#' must precede a macro parameter");
+                    self.error(
+                        token,
+                        diagnostic_codes::INVALID_STRINGIZE_OPERAND.as_str(),
+                        "'#' must precede a macro parameter",
+                    );
                     index += 1;
                     continue;
                 };
@@ -501,13 +518,21 @@ impl Expander<'_, '_> {
                     index += 2;
                     continue;
                 }
-                self.error(token, "CCC1106", "'#' must precede a macro parameter");
+                self.error(
+                    token,
+                    diagnostic_codes::INVALID_STRINGIZE_OPERAND.as_str(),
+                    "'#' must precede a macro parameter",
+                );
                 index += 1;
                 continue;
             }
             if is_paste(token) {
                 if pending_paste.is_some() || index + 1 == replacement.len() {
-                    self.error(token, "CCC1107", "'##' cannot appear at this position");
+                    self.error(
+                        token,
+                        diagnostic_codes::INVALID_TOKEN_PASTE_POSITION.as_str(),
+                        "'##' cannot appear at this position",
+                    );
                 }
                 pending_paste = Some(token.span);
                 index += 1;
@@ -601,7 +626,11 @@ impl Expander<'_, '_> {
             index += 1;
         }
         if pending_paste.is_some() {
-            self.error(invocation, "CCC1107", "'##' has no right operand");
+            self.error(
+                invocation,
+                diagnostic_codes::INVALID_TOKEN_PASTE_POSITION.as_str(),
+                "'##' has no right operand",
+            );
         }
         if let Some(first) = output.first_mut() {
             first.leading_space = invocation.leading_space;
@@ -656,7 +685,7 @@ impl Expander<'_, '_> {
                 } else {
                     self.error(
                         invocation,
-                        "CCC1108",
+                        diagnostic_codes::INVALID_TOKEN_PASTE_RESULT.as_str(),
                         format!(
                             "pasting '{}' and '{}' does not form a preprocessing token",
                             left.spelling, right.spelling
@@ -855,15 +884,23 @@ pub(crate) fn parse_pragma_operators(tokens: Vec<PpToken>) -> ParsedPragmaOperat
             if let Some((literal, _)) = valid {
                 match unquote_pragma(&literal.spelling) {
                     Ok(text) => pragmas.push((output.len(), text, tokens[index].span)),
-                    Err(message) => diagnostics
-                        .push(PpDiagnostic::error("CCC1109", message).with_span(literal.span)),
+                    Err(message) => diagnostics.push(
+                        PpDiagnostic::error(
+                            diagnostic_codes::INVALID_PRAGMA_OPERATOR.as_str(),
+                            message,
+                        )
+                        .with_span(literal.span),
+                    ),
                 }
                 index += 4;
                 continue;
             }
             diagnostics.push(
-                PpDiagnostic::error("CCC1109", "_Pragma requires one string literal operand")
-                    .with_span(tokens[index].span),
+                PpDiagnostic::error(
+                    diagnostic_codes::INVALID_PRAGMA_OPERATOR.as_str(),
+                    "_Pragma requires one string literal operand",
+                )
+                .with_span(tokens[index].span),
             );
         }
         output.push(tokens[index].clone());
@@ -907,7 +944,7 @@ pub(crate) fn redefinition_diagnostic(
 ) -> PpDiagnostic {
     PpDiagnostic::new(
         PpSeverity::Warning,
-        "CCC1110",
+        diagnostic_codes::MACRO_REDEFINED.as_str(),
         format!("macro '{}' redefined", definition.name),
     )
     .with_span(definition.definition_span)

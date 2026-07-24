@@ -1,3 +1,4 @@
+use ccc_diag::codes::preprocessor as diagnostic_codes;
 use ccc_session::{FileId, Span};
 
 use crate::diagnostic::{PpDiagnostic, PpDiagnosticCategory, PpSeverity};
@@ -131,7 +132,7 @@ fn replace_trigraphs(
                 diagnostics.push(
                     PpDiagnostic::new(
                         PpSeverity::Warning,
-                        "CCC1001",
+                        diagnostic_codes::TRIGRAPH.as_str(),
                         if options.trigraphs {
                             "trigraph converted to a single character"
                         } else {

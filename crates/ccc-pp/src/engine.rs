@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use ccc_diag::codes::preprocessor::WARNING_DIRECTIVE;
+use ccc_diag::codes::preprocessor as diagnostic_codes;
 use ccc_session::{FileId, Session, SourceFileSpec, Span};
 use ccc_target::{CapabilityKind, LanguageMode, SystemIncludeKind};
 
@@ -429,7 +429,7 @@ impl Engine<'_> {
                         self.macros.remove(&name);
                     } else {
                         self.emit(PpDiagnostic::error(
-                            "CCC1301",
+                            diagnostic_codes::INVALID_COMMAND_LINE_MACRO_NAME.as_str(),
                             format!("invalid command-line macro name '{name}'"),
                         ));
                     }
@@ -470,7 +470,7 @@ impl Engine<'_> {
             Ok(loaded) => loaded,
             Err(failure) => {
                 self.emit(PpDiagnostic::error(
-                    "CCC1302",
+                    diagnostic_codes::FORCED_INPUT_UNAVAILABLE.as_str(),
                     format!(
                         "cannot read forced input '{}' at '{}': {}",
                         path.display(),
@@ -492,7 +492,7 @@ impl Engine<'_> {
                 Ok(resolved) => resolved,
                 Err(failure) => {
                     self.emit(PpDiagnostic::error(
-                        "CCC1302",
+                        diagnostic_codes::FORCED_INPUT_UNAVAILABLE.as_str(),
                         format!(
                             "cannot read forced input '{}' at '{}': {}",
                             path.display(),
@@ -546,7 +546,7 @@ impl Engine<'_> {
                 );
             }
             None => self.emit(PpDiagnostic::error(
-                "CCC1302",
+                diagnostic_codes::FORCED_INPUT_UNAVAILABLE.as_str(),
                 format!("cannot open forced input '{}'", path.display()),
             )),
         }
@@ -565,7 +565,7 @@ impl Engine<'_> {
                     .collect::<Vec<_>>();
                 cycle.push(frame.path.display().to_string());
                 let mut diagnostic = PpDiagnostic::error(
-                    "CCC1335",
+                    diagnostic_codes::INCLUDE_CYCLE_DEPTH_LIMIT.as_str(),
                     format!(
                         "include cycle reached the depth limit while entering '{}'",
                         frame.path.display()
@@ -583,7 +583,7 @@ impl Engine<'_> {
                 self.emit(diagnostic);
             } else {
                 self.emit(PpDiagnostic::error(
-                    "CCC1303",
+                    diagnostic_codes::INCLUDE_DEPTH_LIMIT.as_str(),
                     format!(
                         "include depth limit exceeded while entering '{}'",
                         frame.path.display()
@@ -595,7 +595,10 @@ impl Engine<'_> {
         let source = match self.session.sources.source(frame.file) {
             Some(source) => source.to_owned(),
             None => {
-                self.emit(PpDiagnostic::error("CCC1304", "unknown source occurrence"));
+                self.emit(PpDiagnostic::error(
+                    diagnostic_codes::UNKNOWN_SOURCE_OCCURRENCE.as_str(),
+                    "unknown source occurrence",
+                ));
                 return;
             }
         };
@@ -837,8 +840,11 @@ impl Engine<'_> {
         }
         if let Some(conditional) = conditionals.last() {
             self.emit(
-                PpDiagnostic::error("CCC1305", "unterminated conditional directive")
-                    .with_span(conditional.opening_span),
+                PpDiagnostic::error(
+                    diagnostic_codes::UNTERMINATED_CONDITIONAL_DIRECTIVE.as_str(),
+                    "unterminated conditional directive",
+                )
+                .with_span(conditional.opening_span),
             );
         }
         self.include_stack.pop();
@@ -927,7 +933,7 @@ impl Engine<'_> {
                     if !valid {
                         self.emit(
                             PpDiagnostic::error(
-                                "CCC1306",
+                                diagnostic_codes::CONDITIONAL_REQUIRES_IDENTIFIER.as_str(),
                                 format!("#{name} requires one identifier"),
                             )
                             .with_span(span),
@@ -949,13 +955,22 @@ impl Engine<'_> {
             "elif" => {
                 let Some(frame) = stack.last_mut() else {
                     self.emit(
-                        PpDiagnostic::error("CCC1307", "#elif without matching #if")
-                            .with_span(span),
+                        PpDiagnostic::error(
+                            diagnostic_codes::ELIF_WITHOUT_IF.as_str(),
+                            "#elif without matching #if",
+                        )
+                        .with_span(span),
                     );
                     return;
                 };
                 if frame.saw_else {
-                    self.emit(PpDiagnostic::error("CCC1308", "#elif after #else").with_span(span));
+                    self.emit(
+                        PpDiagnostic::error(
+                            diagnostic_codes::ELIF_AFTER_ELSE.as_str(),
+                            "#elif after #else",
+                        )
+                        .with_span(span),
+                    );
                     frame.active = false;
                     return;
                 }
@@ -971,16 +986,31 @@ impl Engine<'_> {
             "else" => {
                 let Some(frame) = stack.last_mut() else {
                     self.emit(
-                        PpDiagnostic::error("CCC1309", "#else without matching #if")
-                            .with_span(span),
+                        PpDiagnostic::error(
+                            diagnostic_codes::ELSE_WITHOUT_IF.as_str(),
+                            "#else without matching #if",
+                        )
+                        .with_span(span),
                     );
                     return;
                 };
                 if !operands.is_empty() {
-                    self.emit(PpDiagnostic::error("CCC1310", "tokens after #else").with_span(span));
+                    self.emit(
+                        PpDiagnostic::error(
+                            diagnostic_codes::TOKENS_AFTER_ELSE.as_str(),
+                            "tokens after #else",
+                        )
+                        .with_span(span),
+                    );
                 }
                 if frame.saw_else {
-                    self.emit(PpDiagnostic::error("CCC1311", "duplicate #else").with_span(span));
+                    self.emit(
+                        PpDiagnostic::error(
+                            diagnostic_codes::DUPLICATE_ELSE.as_str(),
+                            "duplicate #else",
+                        )
+                        .with_span(span),
+                    );
                     frame.active = false;
                 } else {
                     frame.active = frame.parent_active && !frame.branch_taken;
@@ -991,13 +1021,20 @@ impl Engine<'_> {
             "endif" => {
                 if !operands.is_empty() {
                     self.emit(
-                        PpDiagnostic::error("CCC1312", "tokens after #endif").with_span(span),
+                        PpDiagnostic::error(
+                            diagnostic_codes::TOKENS_AFTER_ENDIF.as_str(),
+                            "tokens after #endif",
+                        )
+                        .with_span(span),
                     );
                 }
                 if stack.pop().is_none() {
                     self.emit(
-                        PpDiagnostic::error("CCC1313", "#endif without matching #if")
-                            .with_span(span),
+                        PpDiagnostic::error(
+                            diagnostic_codes::ENDIF_WITHOUT_IF.as_str(),
+                            "#endif without matching #if",
+                        )
+                        .with_span(span),
                     );
                 }
             }
@@ -1042,7 +1079,7 @@ impl Engine<'_> {
         }
         for (header, failure) in read_failures {
             let mut diagnostic = PpDiagnostic::error(
-                "CCC1334",
+                diagnostic_codes::HEADER_READ_FAILURE.as_str(),
                 format!(
                     "cannot read header '{header}' at '{}': {}",
                     failure.path.display(),
@@ -1092,16 +1129,24 @@ impl Engine<'_> {
                     emit_tokens,
                 );
             }
-            "error" => self
-                .emit(PpDiagnostic::error("CCC1314", directive_message(operands)).with_span(span)),
+            "error" => self.emit(
+                PpDiagnostic::error(
+                    diagnostic_codes::ERROR_DIRECTIVE.as_str(),
+                    directive_message(operands),
+                )
+                .with_span(span),
+            ),
             "warning" => self.emit(
-                PpDiagnostic::warning(WARNING_DIRECTIVE.as_str(), directive_message(operands))
-                    .with_span(span),
+                PpDiagnostic::warning(
+                    diagnostic_codes::WARNING_DIRECTIVE.as_str(),
+                    directive_message(operands),
+                )
+                .with_span(span),
             ),
             "pragma" => self.handle_pragma(operands, span, emit_tokens),
             _ => self.emit(
                 PpDiagnostic::error(
-                    "CCC1316",
+                    diagnostic_codes::UNKNOWN_DIRECTIVE.as_str(),
                     format!("unknown preprocessing directive '#{name}'"),
                 )
                 .with_span(span),
@@ -1116,7 +1161,7 @@ impl Engine<'_> {
             .filter(|token| token.kind == PpTokenKind::Identifier)
         else {
             self.emit(PpDiagnostic::error(
-                "CCC1317",
+                diagnostic_codes::DEFINE_REQUIRES_NAME.as_str(),
                 "#define requires a macro name",
             ));
             return;
@@ -1150,7 +1195,7 @@ impl Engine<'_> {
                         {
                             self.emit(
                                 PpDiagnostic::error(
-                                    "CCC1318",
+                                    diagnostic_codes::INVALID_VARIADIC_PARAMETER_POSITION.as_str(),
                                     "'...' must be the final macro parameter",
                                 )
                                 .with_span(name_token.span),
@@ -1165,8 +1210,11 @@ impl Engine<'_> {
                         .filter(|token| token.kind == PpTokenKind::Identifier)
                     else {
                         self.emit(
-                            PpDiagnostic::error("CCC1319", "expected macro parameter name")
-                                .with_span(name_token.span),
+                            PpDiagnostic::error(
+                                diagnostic_codes::EXPECTED_MACRO_PARAMETER.as_str(),
+                                "expected macro parameter name",
+                            )
+                            .with_span(name_token.span),
                         );
                         return;
                     };
@@ -1174,7 +1222,7 @@ impl Engine<'_> {
                     if parameters.contains(&parameter) {
                         self.emit(
                             PpDiagnostic::error(
-                                "CCC1320",
+                                diagnostic_codes::DUPLICATE_MACRO_PARAMETER.as_str(),
                                 format!("duplicate macro parameter '{parameter}'"),
                             )
                             .with_span(name_token.span),
@@ -1200,7 +1248,8 @@ impl Engine<'_> {
                             {
                                 self.emit(
                                     PpDiagnostic::error(
-                                        "CCC1318",
+                                        diagnostic_codes::INVALID_VARIADIC_PARAMETER_POSITION
+                                            .as_str(),
                                         "named variadic parameter must be final",
                                     )
                                     .with_span(name_token.span),
@@ -1230,7 +1279,7 @@ impl Engine<'_> {
                         _ => {
                             self.emit(
                                 PpDiagnostic::error(
-                                    "CCC1321",
+                                    diagnostic_codes::INVALID_MACRO_PARAMETER_LIST.as_str(),
                                     "expected ',' or ')' in macro parameter list",
                                 )
                                 .with_span(name_token.span),
@@ -1266,7 +1315,7 @@ impl Engine<'_> {
         {
             self.emit(
                 PpDiagnostic::error(
-                    "CCC1107",
+                    diagnostic_codes::INVALID_TOKEN_PASTE_POSITION.as_str(),
                     "'##' cannot appear at either end of a macro replacement",
                 )
                 .with_span(definition.definition_span),
@@ -1285,7 +1334,7 @@ impl Engine<'_> {
             if token.kind == PpTokenKind::Identifier && token.identifier_key() == "__VA_OPT__" {
                 self.emit(
                     PpDiagnostic::error(
-                        "CCC1111",
+                        diagnostic_codes::UNSUPPORTED_VA_OPT.as_str(),
                         "__VA_OPT__ is not supported by the selected compatibility profile",
                     )
                     .with_span(token.span),
@@ -1298,7 +1347,7 @@ impl Engine<'_> {
             {
                 self.emit(
                     PpDiagnostic::error(
-                        "CCC1112",
+                        diagnostic_codes::VA_ARGS_OUTSIDE_VARIADIC_MACRO.as_str(),
                         "__VA_ARGS__ may only appear in a variadic macro replacement",
                     )
                     .with_span(token.span),
@@ -1315,8 +1364,11 @@ impl Engine<'_> {
                 });
                 if !valid_operand {
                     self.emit(
-                        PpDiagnostic::error("CCC1106", "'#' must be followed by a macro parameter")
-                            .with_span(token.span),
+                        PpDiagnostic::error(
+                            diagnostic_codes::INVALID_STRINGIZE_OPERAND.as_str(),
+                            "'#' must be followed by a macro parameter",
+                        )
+                        .with_span(token.span),
                     );
                     return;
                 }
@@ -1333,8 +1385,11 @@ impl Engine<'_> {
     fn handle_undef(&mut self, operands: &[PpToken], span: Span) {
         if operands.len() != 1 || operands[0].kind != PpTokenKind::Identifier {
             self.emit(
-                PpDiagnostic::error("CCC1322", "#undef requires exactly one identifier")
-                    .with_span(span),
+                PpDiagnostic::error(
+                    diagnostic_codes::INVALID_UNDEF.as_str(),
+                    "#undef requires exactly one identifier",
+                )
+                .with_span(span),
             );
             return;
         }
@@ -1371,8 +1426,11 @@ impl Engine<'_> {
         };
         let Some((header, angled)) = parse_header_operand(&expanded_tokens) else {
             self.emit(
-                PpDiagnostic::error("CCC1323", "include operand does not form one header name")
-                    .with_span(span),
+                PpDiagnostic::error(
+                    diagnostic_codes::INVALID_INCLUDE_OPERAND.as_str(),
+                    "include operand does not form one header name",
+                )
+                .with_span(span),
             );
             return;
         };
@@ -1388,15 +1446,18 @@ impl Engine<'_> {
             Ok(Some(resolved)) => resolved,
             Ok(None) => {
                 self.emit(
-                    PpDiagnostic::error("CCC1324", format!("header '{header}' not found"))
-                        .with_span(span),
+                    PpDiagnostic::error(
+                        diagnostic_codes::HEADER_NOT_FOUND.as_str(),
+                        format!("header '{header}' not found"),
+                    )
+                    .with_span(span),
                 );
                 return;
             }
             Err(failure) => {
                 self.emit(
                     PpDiagnostic::error(
-                        "CCC1334",
+                        diagnostic_codes::HEADER_READ_FAILURE.as_str(),
                         format!(
                             "cannot read header '{header}' at '{}': {}",
                             failure.path.display(),
@@ -1486,22 +1547,31 @@ impl Engine<'_> {
             .filter(|token| token.kind == PpTokenKind::PpNumber)
         else {
             self.emit(
-                PpDiagnostic::error("CCC1325", "#line requires a decimal line number")
-                    .with_span(span),
+                PpDiagnostic::error(
+                    diagnostic_codes::INVALID_LINE_NUMBER.as_str(),
+                    "#line requires a decimal line number",
+                )
+                .with_span(span),
             );
             return None;
         };
         let Ok(line) = line_token.spelling.parse::<usize>() else {
             self.emit(
-                PpDiagnostic::error("CCC1325", "invalid #line line number")
-                    .with_span(line_token.span),
+                PpDiagnostic::error(
+                    diagnostic_codes::INVALID_LINE_NUMBER.as_str(),
+                    "invalid #line line number",
+                )
+                .with_span(line_token.span),
             );
             return None;
         };
         if line == 0 || line > 2_147_483_647 {
             self.emit(
-                PpDiagnostic::error("CCC1325", "#line line number is out of range")
-                    .with_span(line_token.span),
+                PpDiagnostic::error(
+                    diagnostic_codes::INVALID_LINE_NUMBER.as_str(),
+                    "#line line number is out of range",
+                )
+                .with_span(line_token.span),
             );
             return None;
         }
@@ -1514,16 +1584,22 @@ impl Engine<'_> {
                 .map(str::to_owned),
             Some(token) => {
                 self.emit(
-                    PpDiagnostic::error("CCC1326", "#line file name must be a string literal")
-                        .with_span(token.span),
+                    PpDiagnostic::error(
+                        diagnostic_codes::INVALID_LINE_FILE_NAME.as_str(),
+                        "#line file name must be a string literal",
+                    )
+                    .with_span(token.span),
                 );
                 return None;
             }
         };
         if expansion.tokens.len() > 2 {
             self.emit(
-                PpDiagnostic::error("CCC1327", "trailing tokens after #line")
-                    .with_span(expansion.tokens[2].span),
+                PpDiagnostic::error(
+                    diagnostic_codes::TOKENS_AFTER_LINE.as_str(),
+                    "trailing tokens after #line",
+                )
+                .with_span(expansion.tokens[2].span),
             );
             return None;
         }
@@ -1557,21 +1633,31 @@ impl Engine<'_> {
             .filter(|token| token.kind == PpTokenKind::PpNumber)
         else {
             self.emit(
-                PpDiagnostic::error("CCC1331", "linemarker requires a line number").with_span(span),
+                PpDiagnostic::error(
+                    diagnostic_codes::INVALID_LINEMARKER_NUMBER.as_str(),
+                    "linemarker requires a line number",
+                )
+                .with_span(span),
             );
             return None;
         };
         let Ok(line) = line_token.spelling.parse::<usize>() else {
             self.emit(
-                PpDiagnostic::error("CCC1331", "invalid linemarker line number")
-                    .with_span(line_token.span),
+                PpDiagnostic::error(
+                    diagnostic_codes::INVALID_LINEMARKER_NUMBER.as_str(),
+                    "invalid linemarker line number",
+                )
+                .with_span(line_token.span),
             );
             return None;
         };
         if line == 0 || line > 2_147_483_647 {
             self.emit(
-                PpDiagnostic::error("CCC1331", "linemarker line number is out of range")
-                    .with_span(line_token.span),
+                PpDiagnostic::error(
+                    diagnostic_codes::INVALID_LINEMARKER_NUMBER.as_str(),
+                    "linemarker line number is out of range",
+                )
+                .with_span(line_token.span),
             );
             return None;
         }
@@ -1593,14 +1679,21 @@ impl Engine<'_> {
         for token in &operands[index..] {
             let Ok(flag) = token.spelling.parse::<u8>() else {
                 self.emit(
-                    PpDiagnostic::error("CCC1332", "invalid linemarker flag").with_span(token.span),
+                    PpDiagnostic::error(
+                        diagnostic_codes::INVALID_LINEMARKER_FLAG.as_str(),
+                        "invalid linemarker flag",
+                    )
+                    .with_span(token.span),
                 );
                 return None;
             };
             if !(1..=4).contains(&flag) {
                 self.emit(
-                    PpDiagnostic::error("CCC1332", "linemarker flag must be between 1 and 4")
-                        .with_span(token.span),
+                    PpDiagnostic::error(
+                        diagnostic_codes::INVALID_LINEMARKER_FLAG.as_str(),
+                        "linemarker flag must be between 1 and 4",
+                    )
+                    .with_span(token.span),
                 );
                 return None;
             }
@@ -1645,7 +1738,7 @@ impl Engine<'_> {
             if frame.as_ref().is_some_and(|frame| frame.is_main) {
                 self.emit(
                     PpDiagnostic::warning(
-                        "CCC1333",
+                        diagnostic_codes::MAIN_FILE_SYSTEM_HEADER_PRAGMA.as_str(),
                         "#pragma GCC system_header is ignored in the main file",
                     )
                     .with_span(span)
@@ -1671,8 +1764,11 @@ impl Engine<'_> {
             };
             let Some(action) = action else {
                 self.emit(
-                    PpDiagnostic::warning("CCC1328", "unknown GCC diagnostic pragma")
-                        .with_span(span),
+                    PpDiagnostic::warning(
+                        diagnostic_codes::UNKNOWN_GCC_DIAGNOSTIC_PRAGMA.as_str(),
+                        "unknown GCC diagnostic pragma",
+                    )
+                    .with_span(span),
                 );
                 return;
             };
@@ -1704,10 +1800,14 @@ impl Engine<'_> {
         } else {
             let system = self.include_stack.last().is_some_and(|frame| frame.system);
             self.emit(
-                PpDiagnostic::new(PpSeverity::Warning, "CCC1329", "unknown pragma")
-                    .with_span(span)
-                    .with_category(PpDiagnosticCategory::UnknownPragma)
-                    .in_system_header(system),
+                PpDiagnostic::new(
+                    PpSeverity::Warning,
+                    diagnostic_codes::UNKNOWN_PRAGMA.as_str(),
+                    "unknown pragma",
+                )
+                .with_span(span)
+                .with_category(PpDiagnosticCategory::UnknownPragma)
+                .in_system_header(system),
             );
             PragmaEvent::Unknown { text, span }
         };
@@ -1832,7 +1932,7 @@ impl Engine<'_> {
                 self.diagnostic_limit_reported = true;
                 self.error_count += 1;
                 self.diagnostics.emit(PpDiagnostic::error(
-                    "CCC1399",
+                    diagnostic_codes::TOO_MANY_DIAGNOSTICS.as_str(),
                     "too many preprocessing diagnostics",
                 ));
             }

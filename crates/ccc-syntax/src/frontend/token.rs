@@ -2,6 +2,7 @@
 
 use std::fmt;
 
+use ccc_diag::codes::syntax as diagnostic_codes;
 use ccc_pp::{
     CharacterConstant, FloatingConstant, IntegerConstant, LineMarker, PpItem, PpToken, PpTokenKind,
     PragmaEvent, StringLiteral, concatenate_string_literals, decode_character_constant,
@@ -81,7 +82,7 @@ pub fn convert_pp_items(
         };
         let literal =
             concatenate_string_literals(&pending.values).map_err(|error| TokenConversionError {
-                code: "CCC1012",
+                code: diagnostic_codes::INCOMPATIBLE_STRING_LITERAL_CONCATENATION.as_str(),
                 span: pending.first_span,
                 message: error.message,
             })?;
@@ -103,7 +104,7 @@ pub fn convert_pp_items(
             PpItem::Token(token) if token.kind == PpTokenKind::StringLiteral => {
                 let value = decode_string_literal(&token.spelling).map_err(|error| {
                     TokenConversionError {
-                        code: "CCC1011",
+                        code: diagnostic_codes::INVALID_STRING_LITERAL.as_str(),
                         span: token.span,
                         message: error.message,
                     }
@@ -154,7 +155,7 @@ fn convert_token(token: PpToken) -> Result<Token, TokenConversionError> {
             Err(integer_error) => decode_floating_constant(&token.spelling)
                 .map(TokenKind::Floating)
                 .map_err(|floating_error| TokenConversionError {
-                    code: "CCC1010",
+                    code: diagnostic_codes::INVALID_NUMERIC_CONSTANT.as_str(),
                     span: token.span,
                     message: format!(
                         "invalid numeric constant `{}`: {}; {}",
@@ -165,7 +166,7 @@ fn convert_token(token: PpToken) -> Result<Token, TokenConversionError> {
         PpTokenKind::CharacterConstant => decode_character_constant(&token.spelling)
             .map(TokenKind::Character)
             .map_err(|error| TokenConversionError {
-                code: "CCC1013",
+                code: diagnostic_codes::INVALID_CHARACTER_CONSTANT.as_str(),
                 span: token.span,
                 message: error.message,
             })?,

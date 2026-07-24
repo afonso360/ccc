@@ -6,6 +6,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+ccc-diag = { path = "../ccc-diag" }
 ccc-pp = { path = "../ccc-pp" }
 ccc-session = { path = "../ccc-session" }
 

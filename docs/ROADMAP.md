@@ -377,11 +377,13 @@ performed by Cranelift merely to improve a benchmark score.
   linker, `nmedit`, `dsymutil`, UUID, and LLDB oracle authoritative before
   extending OSO-bearing artifact lifetimes beyond one driver invocation.
 - The typed diagnostic-code registry now defines disjoint owner bands,
-  compile-time format/uniqueness/range checks, and named constants for the four
-  codes whose identity controls recovery or suppression. Complete the registry
-  in subsystem-sized migrations, model the few cross-owner emitters explicitly,
-  generate its Markdown table, and make the workspace audit reject unregistered
-  production emission while keeping serialized `CCCxxxx` strings stable.
+  compile-time format/uniqueness/range/cardinality checks, and a generated
+  Markdown table. Every diagnostics-engine, preprocessor, and parser-owned
+  production code has a named typed constant while public and serialized
+  `CCCxxxx` strings remain stable. Migrate semantic diagnostics in domain-sized
+  groups next, then IR, ABI, code generation, linking, and the driver. Model the
+  few cross-owner emitters explicitly and make a generated workspace audit
+  reject unregistered production emission once those migrations are complete.
 - Generate the GNU capability tables and user-facing status summary from the
   compatibility registry, or fail CI when the prose and registry disagree.
 - Factor the common audited compiler-wrapper mechanics used by the bzip2,

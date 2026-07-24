@@ -1,6 +1,6 @@
 use std::fmt;
 
-use ccc_diag::codes::preprocessor::UNTERMINATED_LITERAL;
+use ccc_diag::codes::preprocessor as diagnostic_codes;
 use ccc_session::{FileId, Span};
 
 use crate::literal::validate_character_constant_ucns;
@@ -118,7 +118,8 @@ impl<'a> Lexer<'a> {
                     self.pending_space = false;
                 }
                 Err(error) => {
-                    let skip_remainder = error.code == UNTERMINATED_LITERAL.as_str();
+                    let skip_remainder =
+                        error.code == diagnostic_codes::UNTERMINATED_LITERAL.as_str();
                     self.line_errors
                         .last_mut()
                         .expect("an error line always exists")
@@ -198,7 +199,7 @@ impl<'a> Lexer<'a> {
                 }
             }
             return Err(self.error(
-                "CCC0001",
+                diagnostic_codes::UNTERMINATED_BLOCK_COMMENT.as_str(),
                 start,
                 self.source.text.len(),
                 "unterminated block comment",
@@ -212,7 +213,7 @@ impl<'a> Lexer<'a> {
         let rest = &self.source.text[start..];
         let kind = if let Some(literal) = scan_prefixed_literal(rest).map_err(|()| {
             self.error(
-                UNTERMINATED_LITERAL.as_str(),
+                diagnostic_codes::UNTERMINATED_LITERAL.as_str(),
                 start,
                 self.source
                     .text
@@ -224,7 +225,7 @@ impl<'a> Lexer<'a> {
             self.index += literal.length;
             if literal.invalid_utf8_character {
                 return Err(self.error(
-                    "CCC0005",
+                    diagnostic_codes::UTF8_CHARACTER_CONSTANT.as_str(),
                     start,
                     self.index,
                     "the u8 prefix is not valid on a character constant",
@@ -236,7 +237,7 @@ impl<'a> Lexer<'a> {
             let spelling = &rest[..end];
             if canonicalize_identifier(spelling).is_none() {
                 return Err(self.error(
-                    "CCC0004",
+                    diagnostic_codes::INVALID_IDENTIFIER_UCN.as_str(),
                     start,
                     self.index,
                     "invalid universal character name in identifier",
@@ -251,7 +252,7 @@ impl<'a> Lexer<'a> {
         } else if matches!(rest.as_bytes()[0], b'\'' | b'"') {
             self.index += scan_quoted(rest, rest.as_bytes()[0]).map_err(|()| {
                 self.error(
-                    UNTERMINATED_LITERAL.as_str(),
+                    diagnostic_codes::UNTERMINATED_LITERAL.as_str(),
                     start,
                     self.source
                         .text
@@ -278,7 +279,12 @@ impl<'a> Lexer<'a> {
             && let Err(error) =
                 validate_character_constant_ucns(&self.source.text[start..self.index])
         {
-            return Err(self.error("CCC0006", start, self.index, &error.message));
+            return Err(self.error(
+                diagnostic_codes::INVALID_CHARACTER_UCN.as_str(),
+                start,
+                self.index,
+                &error.message,
+            ));
         }
 
         Ok(PpToken::direct(

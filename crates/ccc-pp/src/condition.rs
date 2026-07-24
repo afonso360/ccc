@@ -1,9 +1,11 @@
+use ccc_diag::codes::preprocessor as diagnostic_codes;
+use ccc_session::SourceMap;
+
 use crate::diagnostic::PpDiagnostic;
 use crate::literal::{CharacterConstantPrefix, decode_character_constant, decode_integer_constant};
 use crate::macros::{ExpansionLocation, MacroTable, expand_condition};
 use crate::options::PreprocessOptions;
 use crate::token::{PpToken, PpTokenKind};
-use ccc_session::SourceMap;
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ConditionResult {
@@ -50,7 +52,7 @@ where
     if parser.index < parser.tokens.len() {
         parser.error(
             parser.index,
-            "CCC1201",
+            diagnostic_codes::UNEXPECTED_CONDITIONAL_TOKEN.as_str(),
             "unexpected token in conditional expression",
         );
     }
@@ -127,8 +129,11 @@ fn replace_defined(table: &MacroTable, tokens: &[PpToken]) -> (Vec<PpToken>, Vec
                 .filter(|token| token.kind == PpTokenKind::Identifier)
             else {
                 diagnostics.push(
-                    PpDiagnostic::error("CCC1202", "defined requires an identifier operand")
-                        .with_span(reference.span),
+                    PpDiagnostic::error(
+                        diagnostic_codes::DEFINED_REQUIRES_IDENTIFIER.as_str(),
+                        "defined requires an identifier operand",
+                    )
+                    .with_span(reference.span),
                 );
                 index += 1;
                 continue;
@@ -139,8 +144,11 @@ fn replace_defined(table: &MacroTable, tokens: &[PpToken]) -> (Vec<PpToken>, Vec
                     .is_none_or(|token| token.spelling != ")")
                 {
                     diagnostics.push(
-                        PpDiagnostic::error("CCC1203", "missing ')' after defined operand")
-                            .with_span(reference.span),
+                        PpDiagnostic::error(
+                            diagnostic_codes::DEFINED_MISSING_CLOSE.as_str(),
+                            "missing ')' after defined operand",
+                        )
+                        .with_span(reference.span),
                     );
                     index += 1;
                     continue;
@@ -211,8 +219,11 @@ where
             .is_none_or(|next| next.spelling != "(")
         {
             diagnostics.push(
-                PpDiagnostic::error("CCC1204", format!("{predicate} requires parentheses"))
-                    .with_span(token.span),
+                PpDiagnostic::error(
+                    diagnostic_codes::PREDICATE_REQUIRES_PARENTHESES.as_str(),
+                    format!("{predicate} requires parentheses"),
+                )
+                .with_span(token.span),
             );
             output.push(token.clone());
             index += 1;
@@ -220,8 +231,11 @@ where
         }
         let Some(close) = matching_close(&tokens, index + 1) else {
             diagnostics.push(
-                PpDiagnostic::error("CCC1205", format!("unterminated {predicate} invocation"))
-                    .with_span(token.span),
+                PpDiagnostic::error(
+                    diagnostic_codes::UNTERMINATED_PREDICATE.as_str(),
+                    format!("unterminated {predicate} invocation"),
+                )
+                .with_span(token.span),
             );
             output.push(token.clone());
             index += 1;
@@ -356,7 +370,7 @@ impl ExpressionParser<'_> {
         if !self.consume(":") {
             self.error(
                 self.index,
-                "CCC1206",
+                diagnostic_codes::CONDITIONAL_MISSING_COLON.as_str(),
                 "expected ':' in conditional expression",
             );
             return Value::default();
@@ -419,7 +433,7 @@ impl ExpressionParser<'_> {
             if evaluate && right.bits >= 64 {
                 self.error(
                     self.index.saturating_sub(1),
-                    "CCC1207",
+                    diagnostic_codes::SHIFT_COUNT_TOO_LARGE.as_str(),
                     "shift count is too large",
                 );
                 left = Value::default();
@@ -457,7 +471,7 @@ impl ExpressionParser<'_> {
             if evaluate && matches!(operator, "/" | "%") && right.bits == 0 {
                 self.error(
                     self.index.saturating_sub(1),
-                    "CCC1208",
+                    diagnostic_codes::CONDITIONAL_DIVISION_BY_ZERO.as_str(),
                     "division by zero in conditional expression",
                 );
                 left = Value::default();
@@ -494,14 +508,18 @@ impl ExpressionParser<'_> {
             if !self.consume(")") {
                 self.error(
                     self.index,
-                    "CCC1209",
+                    diagnostic_codes::CONDITIONAL_MISSING_CLOSE.as_str(),
                     "expected ')' in conditional expression",
                 );
             }
             return value;
         }
         let Some(token) = self.tokens.get(self.index) else {
-            self.error(self.index, "CCC1210", "expected expression");
+            self.error(
+                self.index,
+                diagnostic_codes::CONDITIONAL_EXPECTED_EXPRESSION.as_str(),
+                "expected expression",
+            );
             return Value::default();
         };
         self.index += 1;
@@ -514,7 +532,7 @@ impl ExpressionParser<'_> {
                 Ok(_) => {
                     self.diagnostics.push(
                         PpDiagnostic::error(
-                            "CCC1211",
+                            diagnostic_codes::INVALID_CONDITIONAL_INTEGER.as_str(),
                             "integer constant is too large for a preprocessor expression",
                         )
                         .with_span(token.span),
@@ -522,8 +540,13 @@ impl ExpressionParser<'_> {
                     Value::default()
                 }
                 Err(error) => {
-                    self.diagnostics
-                        .push(PpDiagnostic::error("CCC1211", error.message).with_span(token.span));
+                    self.diagnostics.push(
+                        PpDiagnostic::error(
+                            diagnostic_codes::INVALID_CONDITIONAL_INTEGER.as_str(),
+                            error.message,
+                        )
+                        .with_span(token.span),
+                    );
                     Value::default()
                 }
             },
@@ -537,15 +560,20 @@ impl ExpressionParser<'_> {
                     },
                 },
                 Err(error) => {
-                    self.diagnostics
-                        .push(PpDiagnostic::error("CCC1212", error.message).with_span(token.span));
+                    self.diagnostics.push(
+                        PpDiagnostic::error(
+                            diagnostic_codes::INVALID_CONDITIONAL_CHARACTER.as_str(),
+                            error.message,
+                        )
+                        .with_span(token.span),
+                    );
                     Value::default()
                 }
             },
             _ => {
                 self.error(
                     self.index - 1,
-                    "CCC1213",
+                    diagnostic_codes::INVALID_CONDITIONAL_TOKEN.as_str(),
                     "invalid token in conditional expression",
                 );
                 Value::default()

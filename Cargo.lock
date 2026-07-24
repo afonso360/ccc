@@ -159,6 +159,7 @@ dependencies = [
 name = "ccc-syntax"
 version = "0.1.0"
 dependencies = [
+ "ccc-diag",
  "ccc-pp",
  "ccc-session",
 ]
