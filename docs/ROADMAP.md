@@ -134,21 +134,23 @@ benchmark so faster wrong code can never appear as an improvement.
 Keep the suite small enough for regular development while covering different
 sources of compiler and generated-code cost. The checked-in compiler-only
 runner now measures minimal return, separate `puts` and variadic `printf`
-calls, independent zero-to-1,024 unused function and data declaration axes, and
-8-to-128 live functions at each optimization level. It retains raw timing/RSS
-samples and the complete versioned codegen-stat stream. One shared CCC-IR
-requirement analysis now materializes ObjectModule function, ordinary-data,
-and TLS declarations only for definitions and retained direct, address, or
-static-initializer references; unused TLS declarations also create no accessor
-artifact. The runner fails if unused declarations change either post-inlining
-CLIF or primary-object structural metrics. Timed samples use ordinary
-object-only compilation; the structural-stat query is separate and untimed.
+calls, a paired minimal/hosted `<stdio.h>` translation, independent
+zero-to-1,024 unused function and data declaration axes, and 8-to-128 live
+functions at each optimization level. The hosted translation references only
+`fputs` and `stdout`; every post-inlining CLIF and primary-object metric must
+match the equivalent minimal declarations at the same target and optimization
+profile. Preprocessing and semantic-analysis work may grow, but code-generation
+structure may not. The runner retains raw timing/RSS samples and the complete
+versioned codegen-stat stream. One shared CCC-IR requirement analysis now
+materializes ObjectModule function, ordinary-data, and TLS declarations only
+for definitions and retained direct, address, or static-initializer references;
+unused TLS declarations also create no accessor artifact. The runner fails if
+unused declarations change either post-inlining CLIF or primary-object
+structural metrics. Timed samples use ordinary object-only compilation; the
+structural-stat query is separate and untimed.
 
 The next benchmark targets are:
 
-- Add a declaration-heavy hosted-header translation which references only one
-  function and one object. Its CLIF size must match the equivalent minimal
-  declarations even when preprocessing and semantic-analysis work grows.
 - Focused, defined-behavior kernels cover direct calls, inlining, integer and
   floating loops, branches and switches, loads and stores, aggregate copies,
   TLS, atomics, and variadic calls. Each kernel validates its result and has a
@@ -200,9 +202,11 @@ trend evidence and must not be compared numerically with native execution.
 
 ### Initial performance targets
 
-- Including hosted headers in the two hello programs must not change their
-  per-function CLIF instruction or imported-entity counts compared with the
-  equivalent minimal declarations.
+- Keep the checked-in `fputs`/`stdout` hosted-header translation exactly equal
+  to its minimal-declaration baseline at the post-inlining CLIF and
+  primary-object boundaries. Add the same paired gate for the variadic
+  `printf` hello case before treating both common hosted-header paths as
+  covered.
 - On the defined-behavior kernel suite, the `-O2` runtime geometric mean must
   not regress against `-O0`, and `-Oz` text size must not exceed `-O2` in the
   geometric mean. Record and justify individual exceptions rather than hiding

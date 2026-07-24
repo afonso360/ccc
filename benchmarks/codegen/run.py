@@ -23,7 +23,7 @@ import time
 from typing import Iterable
 
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 CODEGEN_STATS_SCHEMA_VERSION = 1
 PROFILE_FLAGS = {
     "O0": "-O0",
@@ -37,6 +37,7 @@ CASE_NAMES = (
     "minimal-return",
     "puts-call",
     "printf-variadic",
+    "hosted-header",
     "declaration-heavy",
     "data-declaration-heavy",
     "live-functions",
@@ -121,6 +122,7 @@ class Case:
     scale: int
     source: Path
     expected_functions: int
+    equivalent_to: str | None = None
 
 
 @dataclass(frozen=True)
@@ -362,6 +364,25 @@ def copy_and_generate_cases(
         shutil.copyfile(benchmark_directory / "cases" / f"{name}.c", source)
         cases.append(Case(name, name, 1, source, 1))
 
+    if "hosted-header" in selected:
+        baseline = "hosted-header-minimal"
+        for name, equivalent_to in (
+            (baseline, None),
+            ("hosted-header-stdio", baseline),
+        ):
+            source = source_directory / f"{name}.c"
+            shutil.copyfile(benchmark_directory / "cases" / f"{name}.c", source)
+            cases.append(
+                Case(
+                    name,
+                    "hosted-header",
+                    1,
+                    source,
+                    1,
+                    equivalent_to,
+                )
+            )
+
     if "declaration-heavy" in selected:
         for scale in declaration_scales:
             name = f"declaration-heavy-{scale}"
@@ -400,7 +421,15 @@ def write_manifest(cases: list[Case], output: Path) -> None:
     with (output / "manifest.tsv").open("w", encoding="utf-8", newline="") as file:
         writer = csv.writer(file, delimiter="\t", lineterminator="\n")
         writer.writerow(
-            ("benchmark", "family", "scale", "source", "source_bytes", "source_sha256")
+            (
+                "benchmark",
+                "family",
+                "scale",
+                "equivalent_to",
+                "source",
+                "source_bytes",
+                "source_sha256",
+            )
         )
         for case in cases:
             writer.writerow(
@@ -408,6 +437,7 @@ def write_manifest(cases: list[Case], output: Path) -> None:
                     case.name,
                     case.family,
                     case.scale,
+                    case.equivalent_to or "",
                     case.source.relative_to(output),
                     case.source.stat().st_size,
                     sha256(case.source),
@@ -542,6 +572,53 @@ def validate_invariants(
     invocations: list[CompileInvocation],
     records: list[StatsRecord],
 ) -> None:
+    stats_by_case = {
+        (record.case.name, record.profile): record.stats for record in records
+    }
+    for record in records:
+        if record.case.equivalent_to is None:
+            continue
+        baseline_key = (record.case.equivalent_to, record.profile)
+        if baseline_key not in stats_by_case:
+            raise BenchmarkError(
+                f"{record.case.name} at -{record.profile} has no "
+                f"{record.case.equivalent_to} baseline"
+            )
+        baseline = stats_by_case[baseline_key]
+        for prefix, label in (
+            ("post_inline_ir.", "post-inline CLIF"),
+            ("primary_object.", "primary-object structure"),
+        ):
+            baseline_metrics = {
+                metric: value
+                for metric, value in baseline.items()
+                if metric.startswith(prefix)
+            }
+            current_metrics = {
+                metric: value
+                for metric, value in record.stats.items()
+                if metric.startswith(prefix)
+            }
+            differences = [
+                (
+                    metric,
+                    baseline_metrics.get(metric),
+                    current_metrics.get(metric),
+                )
+                for metric in sorted(baseline_metrics.keys() | current_metrics.keys())
+                if baseline_metrics.get(metric) != current_metrics.get(metric)
+            ]
+            if differences:
+                rendered = ", ".join(
+                    f"{metric}={baseline_value} versus {current_value}"
+                    for metric, baseline_value, current_value in differences
+                )
+                raise BenchmarkError(
+                    f"{record.case.name} changed {label} relative to "
+                    f"{record.case.equivalent_to} at -{record.profile}: "
+                    f"{rendered}"
+                )
+
     for record in records:
         functions = record.stats["post_inline_ir.functions"]
         if functions != record.case.expected_functions:
@@ -551,9 +628,6 @@ def validate_invariants(
                 f"{record.case.expected_functions}"
             )
 
-    stats_by_case = {
-        (record.case.name, record.profile): record.stats for record in records
-    }
     for invocation in invocations:
         expected_bytes = stats_by_case[(invocation.case.name, invocation.profile)][
             "primary_object.file_bytes"

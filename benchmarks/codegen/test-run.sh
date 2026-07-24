@@ -53,6 +53,9 @@ if len(source_arguments) != 1:
 source = Path(source_arguments[0]).read_text(encoding="utf-8")
 family = re.search(r"ccc-benchmark-family: ([a-z-]+)", source).group(1)
 scale = int(re.search(r"ccc-benchmark-scale: ([0-9]+)", source).group(1))
+variant_match = re.search(r"ccc-benchmark-variant: ([a-z-]+)", source)
+variant = variant_match.group(1) if variant_match else None
+hosted_stdio = family == "hosted-header" and variant == "stdio"
 
 if "--emit=codegen-stats" not in sys.argv:
     if "-c" not in sys.argv or "-o" not in sys.argv:
@@ -76,15 +79,27 @@ if family == "declaration-heavy" and os.environ.get("FAKE_CCC_LEAK_DECLS"):
 calls = 1 if family in ("puts-call", "printf-variadic") else 0
 if family == "live-functions":
     calls = scale
+if family == "hosted-header":
+    calls = 1
+external_functions = calls
+if hosted_stdio and os.environ.get("FAKE_CCC_HOSTED_IR_LEAK"):
+    external_functions += 1
 object_file_bytes = 44
 object_undefined_symbols = calls
+object_relocations = calls
+if family == "hosted-header":
+    object_undefined_symbols = 2
 if (
     family == "data-declaration-heavy"
     and os.environ.get("FAKE_CCC_LEAK_DATA_DECLS")
 ):
     object_file_bytes += scale
     object_undefined_symbols += scale
+if hosted_stdio and os.environ.get("FAKE_CCC_HOSTED_OBJECT_LEAK"):
+    object_undefined_symbols += 1
+    object_relocations += 1
 object_symbols = functions + object_undefined_symbols
+global_values = 2 if family == "hosted-header" else 0
 
 metrics = [
     ("post_inline_ir.functions", functions),
@@ -95,8 +110,8 @@ metrics = [
     ("post_inline_ir.fixed_stack_bytes", 0),
     ("post_inline_ir.dynamic_stack_slots", 0),
     ("post_inline_ir.signatures", calls),
-    ("post_inline_ir.external_functions", calls),
-    ("post_inline_ir.global_values", 0),
+    ("post_inline_ir.external_functions", external_functions),
+    ("post_inline_ir.global_values", global_values),
     ("post_inline_ir.constants", 0),
     ("post_inline_ir.jump_tables", 0),
     ("primary_object.file_bytes", object_file_bytes),
@@ -104,7 +119,7 @@ metrics = [
     ("primary_object.symbols", object_symbols),
     ("primary_object.defined_symbols", functions),
     ("primary_object.undefined_symbols", object_undefined_symbols),
-    ("primary_object.relocations", calls),
+    ("primary_object.relocations", object_relocations),
     ("primary_object.text_bytes", functions * 8),
     ("primary_object.read_only_data_bytes", 0),
     ("primary_object.writable_data_bytes", 0),
@@ -139,9 +154,11 @@ grep -Fq $'declaration-heavy-3\tdeclaration-heavy\t3\tO2\tpost_inline_ir.functio
   "$results/codegen-stats.tsv"
 grep -Fq $'data-declaration-heavy-3\tdata-declaration-heavy\t3\tO2\tprimary_object.symbols\t1' \
   "$results/codegen-stats.tsv"
+grep -Fq $'hosted-header-stdio\thosted-header\t1\tO2\tpost_inline_ir.external_functions\t1' \
+  "$results/codegen-stats.tsv"
 grep -Fq $'live-functions-4\tlive-functions\t4\tO2\t2\t' \
   "$results/summary.tsv"
-grep -Fq '"format_version":1' "$results/environment.json"
+grep -Fq '"format_version":2' "$results/environment.json"
 expected_compiler_sha=$(
   python3 -c \
     'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' \
@@ -154,15 +171,21 @@ grep -Fq '"data_declaration_scales":[0,3]' "$results/environment.json"
 grep -Fq '"effective_configs":{"O0":' "$results/environment.json"
 grep -Fq '"exit_status":0' "$results/environment.json"
 grep -Fq '"benchmark":"printf-variadic"' "$results/commands.jsonl"
-[[ "$(grep -c '"kind":"object-compile"' "$results/commands.jsonl")" == 54 ]]
-[[ "$(grep -c '"kind":"codegen-stats"' "$results/commands.jsonl")" == 18 ]]
+[[ "$(grep -c '"kind":"object-compile"' "$results/commands.jsonl")" == 66 ]]
+[[ "$(grep -c '"kind":"codegen-stats"' "$results/commands.jsonl")" == 22 ]]
 [[ "$(grep -c '^extern long ccc_decl_' \
   "$results/sources/declaration-heavy-3.c")" == 3 ]]
 [[ "$(grep -c '^extern long ccc_data_decl_' \
   "$results/sources/data-declaration-heavy-3.c")" == 3 ]]
+grep -Fq $'hosted-header-stdio\thosted-header\t1\thosted-header-minimal\t' \
+  "$results/manifest.tsv"
+grep -Fq '#include <stdio.h>' \
+  "$results/sources/hosted-header-stdio.c"
+grep -Fq 'extern struct ccc_benchmark_file *stdout;' \
+  "$results/sources/hosted-header-minimal.c"
 [[ "$(find "$results/raw" -name 'codegen-stats.stdout.tsv' |
-  wc -l | tr -d '[:space:]')" == 18 ]]
-[[ "$(find "$results/raw" -name '*.o' | wc -l | tr -d '[:space:]')" == 54 ]]
+  wc -l | tr -d '[:space:]')" == 22 ]]
+[[ "$(find "$results/raw" -name '*.o' | wc -l | tr -d '[:space:]')" == 66 ]]
 [[ -f "$results/raw/printf-variadic/O2/sample-002.timing.json" ]]
 [[ -s "$results/raw/printf-variadic/O2/sample-002.o" ]]
 [[ -f "$results/raw/printf-variadic/O2/sample-002.stdout.txt" ]]
@@ -217,6 +240,40 @@ grep -Fq "${data_leak_prefix}primary_object.symbols"$'\t3' \
   "$negative_data_results/codegen-stats.tsv"
 grep -Fq "${data_leak_prefix}primary_object.undefined_symbols"$'\t2' \
   "$negative_data_results/codegen-stats.tsv"
+
+negative_hosted_ir_results="$temporary_directory/negative-hosted-ir-results"
+set +e
+negative_hosted_ir_output=$(
+  FAKE_CCC_HOSTED_IR_LEAK=1 "$script_directory/run.py" \
+    --ccc "$fake_ccc" \
+    --output "$negative_hosted_ir_results" \
+    --cases hosted-header \
+    --profiles O0 \
+    --warmups 0 \
+    --samples 1 2>&1
+)
+negative_hosted_ir_status=$?
+set -e
+[[ "$negative_hosted_ir_status" == 1 ]]
+[[ "$negative_hosted_ir_output" == *"hosted-header-stdio changed post-inline CLIF relative to hosted-header-minimal at -O0"* ]]
+[[ "$negative_hosted_ir_output" == *"post_inline_ir.external_functions=1 versus 2"* ]]
+
+negative_hosted_object_results="$temporary_directory/negative-hosted-object-results"
+set +e
+negative_hosted_object_output=$(
+  FAKE_CCC_HOSTED_OBJECT_LEAK=1 "$script_directory/run.py" \
+    --ccc "$fake_ccc" \
+    --output "$negative_hosted_object_results" \
+    --cases hosted-header \
+    --profiles O0 \
+    --warmups 0 \
+    --samples 1 2>&1
+)
+negative_hosted_object_status=$?
+set -e
+[[ "$negative_hosted_object_status" == 1 ]]
+[[ "$negative_hosted_object_output" == *"hosted-header-stdio changed primary-object structure relative to hosted-header-minimal at -O0"* ]]
+[[ "$negative_hosted_object_output" == *"primary_object.undefined_symbols=2 versus 3"* ]]
 
 help_output=$("$script_directory/run.py" --help)
 [[ "$help_output" == *"--declaration-scales"* ]]

@@ -11,6 +11,8 @@ The default set covers:
 - a minimal `main` returning zero;
 - one direct `puts` call;
 - one variadic `printf` call;
+- equivalent `fputs`/`stdout` programs using either minimal declarations or
+  the target's complete hosted `<stdio.h>`;
 - generated translation units with 0, 32, 256, and 1024 unused function
   declarations;
 - generated translation units with the same independent scale of unused data
@@ -24,6 +26,16 @@ symbol, undefined-symbol, relocation, and text-size metrics. This catches the
 old behavior where trivial programs accumulated unused CLIF references or
 object declarations. The live-function series provides a growing backend
 workload for codegen performance work.
+
+The hosted-header pair references exactly one function and one data object.
+For each optimization profile, the `<stdio.h>` case must match the
+minimal-declaration baseline in every `post_inline_ir.*` and
+`primary_object.*` metric. Preprocessing and semantic-analysis time may grow;
+CLIF and object structure may not. The two objects are not required to have the
+same hash because libc headers may give `fputs` or `stdout` target-specific
+physical symbol spellings. CI runs this structural check on every enabled
+target; only controlled native runs should use its timings as performance
+evidence.
 
 ## Running
 
@@ -52,10 +64,11 @@ benchmarks/codegen/run.py \
 ```
 
 Pass `--target=<triple>` to select an enabled target when its compiler driver
-and sysroot are configured. Use `--cases` with a comma-separated subset to
-isolate one family; the declaration families are `declaration-heavy` and
-`data-declaration-heavy`. The output directory must be new or empty so evidence
-from separate runs cannot be mixed accidentally.
+and sysroot are configured. The `hosted-header` family additionally requires
+that target's `<stdio.h>`. Use `--cases` with a comma-separated subset to
+isolate one family; declaration-only scaling uses `declaration-heavy` and
+`data-declaration-heavy`. The output directory must be new or empty so
+evidence from separate runs cannot be mixed accidentally.
 
 ## Results
 
@@ -68,7 +81,7 @@ The result directory is self-contained:
 | `codegen-stats.tsv` | One normalized structural-stats record per case/profile. |
 | `raw/` | Objects, compiler output, timing JSON, and untimed raw stats output. |
 | `sources/` | Exact static and generated C translation units that were measured. |
-| `manifest.tsv` | Source paths, byte counts, and SHA-256 identities. |
+| `manifest.tsv` | Source identities and any exact-equivalence baseline. |
 | `commands.jsonl` | Exact compiler argument vectors in execution order. |
 | `environment.json` | Host, compiler hash, effective target, and query evidence. |
 | `effective-config/` | Resource, sysroot, and external tools per profile. |
@@ -98,7 +111,8 @@ platform convention internally and is normalized to bytes.
 ## Regression test
 
 The self-test uses a fake compiler, performs positive and negative
-no-unused-function/data-declaration checks, and does not require a CCC build:
+declaration-liveness and hosted-header-equivalence checks, and does not require
+a CCC build:
 
 ```sh
 benchmarks/codegen/test-run.sh

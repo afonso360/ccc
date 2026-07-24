@@ -308,8 +308,9 @@ evidence as artifacts.
 ## Code-generation microbenchmarks
 
 The local compiler-only suite measures minimal return, direct `puts`, variadic
-`printf`, independent unused function/data-declaration scaling, and
-live-function scaling without link or runtime noise:
+`printf`, equivalent minimal/hosted `fputs` plus `stdout` programs, independent
+unused function/data-declaration scaling, and live-function scaling without
+link or runtime noise:
 
 ```sh
 cargo build --locked --release -p ccc-driver
@@ -328,17 +329,22 @@ directory, sysroot, and selected external-tool configuration. The
 unused function- and data-declaration families require every post-inlining CLIF
 metric plus primary-object byte, symbol, undefined-symbol, relocation, and text
 metrics to remain identical from zero through 1,024 declarations. The
-live-function family supplies increasing backend work. Use a release compiler
-for timing comparisons; debug builds are only suitable for exercising the
-harness. Use `--declaration-scales`, `--data-declaration-scales`,
-`--function-scales`, `--profiles`, `--warmups`, and `--samples` for focused
-investigations. See `benchmarks/codegen/README.md` for the complete result
-contract.
+hosted-header pair requires every post-inlining CLIF and primary-object metric
+to match the equivalent minimal declarations at each profile while retaining
+the extra frontend cost in its timing samples. The live-function family
+supplies increasing backend work. Use a release compiler for timing
+comparisons; debug builds are only suitable for exercising the harness. Use
+`--cases hosted-header` to isolate the pair, and
+`--declaration-scales`, `--data-declaration-scales`, `--function-scales`,
+`--profiles`, `--warmups`, and `--samples` for focused investigations. See
+`benchmarks/codegen/README.md` for the complete result contract.
 
-The Linux x86-64 corpus job runs a one-sample matrix and uploads its evidence.
-That gate proves the metrics and no-unused-function/data-declaration
-invariants; timing comparisons must use repeated runs on a controlled host.
-The runner's independent fake-tool regression is:
+Every enabled-target job runs the hosted-header pair at `-O0`, `-O2`, and
+`-Oz`, requires exact structural equivalence, and uploads the evidence. The
+Linux x86-64 corpus job also runs the complete one-sample matrix, proving the
+scaling and no-unused-function/data-declaration invariants. Timing comparisons
+must use repeated runs on a controlled native host. The runner's independent
+fake-tool regression is:
 
 ```sh
 benchmarks/codegen/test-run.sh
