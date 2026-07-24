@@ -35,13 +35,34 @@ pub struct PackagingToolIdentity {
 }
 
 /// Details of a successfully materialized relocatable artifact.
+#[must_use = "keep the packaging report alive through final linking and debug-artifact creation"]
 pub struct PackagingReport {
     pub used_generated_assembly: bool,
     pub symbol_localizer: Option<PackagingToolIdentity>,
-    // Apple's relocatable linker replaces embedded DWARF with an OSO debug
-    // map. Keep the registered workspace containing that map's primary object
-    // alive until the caller has finished its final link and `dsymutil` pass.
-    _debug_workspace: Option<ArtifactWorkspace>,
+    /// Inputs referenced by a Mach-O OSO debug map.
+    ///
+    /// Callers performing a final link must keep this guard alive through the
+    /// link and `dsymutil`. Dropping it removes the retained inputs; the shared
+    /// temporary-path signal handler removes them if the process is terminated.
+    pub retained_debug_inputs: Option<RetainedDebugInputs>,
+}
+
+/// Owns temporary object files referenced by a packaged Mach-O OSO debug map.
+///
+/// The files remain available until this guard is dropped. They are also
+/// registered for process-signal cleanup.
+#[must_use = "dropping this guard removes object files required by dsymutil"]
+pub struct RetainedDebugInputs {
+    workspace: ArtifactWorkspace,
+}
+
+impl fmt::Debug for RetainedDebugInputs {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RetainedDebugInputs")
+            .field("workspace", &self.workspace.path())
+            .finish_non_exhaustive()
+    }
 }
 
 impl fmt::Debug for PackagingReport {
@@ -52,7 +73,7 @@ impl fmt::Debug for PackagingReport {
             .field("symbol_localizer", &self.symbol_localizer)
             .field(
                 "retains_macho_debug_inputs",
-                &self._debug_workspace.is_some(),
+                &self.retained_debug_inputs.is_some(),
             )
             .finish()
     }
@@ -71,7 +92,7 @@ pub fn package_artifact_bundle(
         return Ok(PackagingReport {
             used_generated_assembly: false,
             symbol_localizer: None,
-            _debug_workspace: None,
+            retained_debug_inputs: None,
         });
     }
 
@@ -110,7 +131,7 @@ pub fn package_artifact_bundle_with_runner<R: ProbeRunner>(
         return Ok(PackagingReport {
             used_generated_assembly: false,
             symbol_localizer: None,
-            _debug_workspace: None,
+            retained_debug_inputs: None,
         });
     }
     let candidates = if config.target.triple.binary_format == BinaryFormat::Macho {
@@ -214,12 +235,12 @@ fn package_with_runner<R: ProbeRunner>(
         macho,
     )?;
     inspect_combined_object(&final_object, bundle, true)?;
-    let retain_debug_workspace = macho && primary_contains_debug_sections(bundle)?;
-    let debug_workspace = workspace.publish(&final_object, output, retain_debug_workspace)?;
+    let retain_debug_inputs = macho && primary_contains_debug_sections(bundle)?;
+    let retained_debug_inputs = workspace.publish(&final_object, output, retain_debug_inputs)?;
     Ok(PackagingReport {
         used_generated_assembly: true,
         symbol_localizer: localizer,
-        _debug_workspace: debug_workspace,
+        retained_debug_inputs,
     })
 }
 
@@ -906,8 +927,8 @@ impl ArtifactWorkspace {
         mut self,
         source: &Path,
         destination: &Path,
-        preserve_workspace: bool,
-    ) -> Result<Option<Self>, LinkError> {
+        retain_debug_inputs: bool,
+    ) -> Result<Option<RetainedDebugInputs>, LinkError> {
         File::open(source)
             .and_then(|file| file.sync_all())
             .map_err(|error| artifact_error(format!("cannot sync packaged object: {error}")))?;
@@ -917,8 +938,8 @@ impl ArtifactWorkspace {
                 destination.display()
             ))
         })?;
-        if preserve_workspace {
-            Ok(Some(self))
+        if retain_debug_inputs {
+            Ok(Some(RetainedDebugInputs { workspace: self }))
         } else {
             // Publication is the commit point. A best-effort cleanup failure
             // must not turn a successfully replaced, fully verified
@@ -944,6 +965,48 @@ mod tests {
     use crate::bridge::{GeneratedSymbolKind, render_generic_call_helper};
 
     use super::*;
+
+    #[cfg(unix)]
+    struct ReapedChild {
+        child: std::process::Child,
+        reaped: bool,
+    }
+
+    #[cfg(unix)]
+    impl ReapedChild {
+        fn new(child: std::process::Child) -> Self {
+            Self {
+                child,
+                reaped: false,
+            }
+        }
+
+        fn id(&self) -> u32 {
+            self.child.id()
+        }
+
+        fn try_wait(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+            let status = self.child.try_wait()?;
+            self.reaped = status.is_some();
+            Ok(status)
+        }
+
+        fn wait(&mut self) -> io::Result<std::process::ExitStatus> {
+            let status = self.child.wait()?;
+            self.reaped = true;
+            Ok(status)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ReapedChild {
+        fn drop(&mut self) {
+            if !self.reaped {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+            }
+        }
+    }
 
     fn make_object(symbols: &[(&str, bool, SymbolScope)]) -> Vec<u8> {
         let symbols = symbols
@@ -1243,6 +1306,121 @@ mod tests {
     }
 
     #[test]
+    fn retained_debug_inputs_own_the_workspace_until_drop() {
+        let directory = test_directory("retained-debug-inputs-drop");
+        let output = directory.join("result.o");
+        let workspace = ArtifactWorkspace::create(&output).unwrap();
+        let workspace_path = workspace.path().to_path_buf();
+        let source = workspace.path().join("final.o");
+        fs::write(&source, b"published object").unwrap();
+
+        let retained = workspace.publish(&source, &output, true).unwrap().unwrap();
+
+        assert!(workspace_path.is_dir());
+        assert_eq!(fs::read(&output).unwrap(), b"published object");
+        assert!(
+            format!("{retained:?}").contains(&workspace_path.display().to_string()),
+            "the guard's debug view should identify the workspace it owns"
+        );
+        drop(retained);
+        assert!(!workspace_path.exists());
+        assert_eq!(fs::read(&output).unwrap(), b"published object");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn failed_publication_cleans_debug_inputs_without_a_guard() {
+        let directory = test_directory("retained-debug-inputs-failure");
+        let output = directory.join("result.o");
+        let workspace = ArtifactWorkspace::create(&output).unwrap();
+        let workspace_path = workspace.path().to_path_buf();
+        fs::write(workspace.path().join("primary.o"), b"debug input").unwrap();
+        let missing_source = workspace.path().join("missing.o");
+
+        let error = workspace
+            .publish(&missing_source, &output, true)
+            .unwrap_err();
+
+        assert_eq!(error.code, "CCC5010");
+        assert!(error.message.starts_with("cannot sync packaged object:"));
+        assert!(!workspace_path.exists());
+        assert!(!output.exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "process-isolated helper for retained_debug_inputs_are_removed_by_signal"]
+    fn retained_debug_inputs_signal_child() {
+        use std::time::Duration;
+
+        let Some(directory) = env::var_os("CCC_TEST_RETAINED_DEBUG_INPUTS_DIRECTORY") else {
+            return;
+        };
+        let directory = PathBuf::from(directory);
+        let output = directory.join("published.o");
+        let marker = directory.join("ready");
+        let workspace = ArtifactWorkspace::create(&output).unwrap();
+        let workspace_path = workspace.path().to_path_buf();
+        let source = workspace.path().join("final.o");
+        fs::write(&source, b"published object").unwrap();
+        let _retained = workspace.publish(&source, &output, true).unwrap().unwrap();
+        fs::write(marker, workspace_path.display().to_string()).unwrap();
+
+        loop {
+            std::thread::sleep(Duration::from_secs(30));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_debug_inputs_are_removed_by_signal() {
+        use std::os::unix::process::ExitStatusExt as _;
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        let directory = test_directory("retained-debug-inputs-signal");
+        let marker = directory.join("ready");
+        let output = directory.join("published.o");
+        let mut child = ReapedChild::new(
+            Command::new(env::current_exe().unwrap())
+                .arg("retained_debug_inputs_signal_child")
+                .arg("--ignored")
+                .arg("--nocapture")
+                .env("CCC_TEST_RETAINED_DEBUG_INPUTS_DIRECTORY", &directory)
+                .stdout(Stdio::null())
+                .stderr(Stdio::inherit())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !marker.exists() && Instant::now() < deadline {
+            if let Some(status) = child.try_wait().unwrap() {
+                panic!("retained-debug-input child exited before becoming ready: {status}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !marker.exists() {
+            panic!("retained-debug-input child did not become ready");
+        }
+
+        let workspace_path = PathBuf::from(fs::read_to_string(&marker).unwrap());
+        assert!(workspace_path.is_dir());
+        assert_eq!(fs::read(&output).unwrap(), b"published object");
+        let kill_status = Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(kill_status.success());
+        let status = child.wait().unwrap();
+
+        assert_eq!(status.signal(), Some(signal_hook::consts::SIGTERM));
+        assert!(!workspace_path.exists());
+        assert_eq!(fs::read(&output).unwrap(), b"published object");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn object_copier_fallbacks_cover_target_and_driver_adjacent_tools() {
         let mut toolchain = toolchain();
         toolchain.compiler_driver = Some(ToolCommandSpec::new("/tools/bin/clang"));
@@ -1303,7 +1481,7 @@ mod tests {
         let directory = test_directory("bridge-free");
         let output = directory.join("result.o");
         let runner = FakeRunner::successful();
-        package_artifact_bundle_with_runner(
+        let _report = package_artifact_bundle_with_runner(
             ArtifactBundle::bridge_free(
                 make_object(&[("main", true, SymbolScope::Linkage)]),
                 [0; 32],
@@ -1507,7 +1685,7 @@ mod tests {
             .iter()
             .map(|(name, defined, scope)| (name.as_str(), *defined, *scope))
             .collect::<Vec<_>>();
-        package_artifact_bundle_with_runner(
+        let _report = package_artifact_bundle_with_runner(
             ArtifactBundle::new(
                 make_object(&primary_symbols),
                 assemblies,
@@ -1763,7 +1941,7 @@ mod tests {
                 ],
             ),
         );
-        package_artifact_bundle_with_runner(
+        let _report = package_artifact_bundle_with_runner(
             bundle,
             &output,
             &EffectiveCompilationConfig::x86_64_unknown_linux_gnu(),

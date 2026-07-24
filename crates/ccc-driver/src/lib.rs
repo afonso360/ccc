@@ -891,7 +891,7 @@ fn link_output(options: DriverOptions) -> Result<DriverOutput, DriverError> {
             DriverLinkOutputKind::Relocatable => PathBuf::from("a.o"),
         });
     let mut temporaries = Vec::new();
-    let mut packaging_reports = Vec::new();
+    let mut retained_debug_inputs = Vec::new();
     let mut linker_inputs = Vec::<OsString>::new();
     let mut stdout = String::new();
     let mut stderr = String::new();
@@ -918,7 +918,7 @@ fn link_output(options: DriverOptions) -> Result<DriverOutput, DriverError> {
                     let (result, packaging) =
                         compile_output_retaining_packaging(&per_input, prepared, false)
                             .map_err(|error| with_prior_diagnostics(&stderr, error))?;
-                    packaging_reports.push(packaging);
+                    retained_debug_inputs.extend(packaging.retained_debug_inputs);
                     stdout.push_str(&result.stdout);
                     append_diagnostic_output(
                         &mut stderr,
@@ -997,7 +997,9 @@ fn link_output(options: DriverOptions) -> Result<DriverOutput, DriverError> {
             .map_err(|error| with_prior_diagnostics(&stderr, error))?;
         append_diagnostic_output(&mut stderr, &debug_stderr, options.diagnostic_format);
     }
-    drop(packaging_reports);
+    // Mach-O OSO maps reference the pre-package object files. Keep their
+    // guards alive until both the final link and `dsymutil` have completed.
+    drop(retained_debug_inputs);
     drop(temporaries);
     Ok(DriverOutput { stdout, stderr })
 }

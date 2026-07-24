@@ -10,7 +10,7 @@ pub use artifact::{
     GeneratedSymbolOwner, GeneratedSymbolVisibility, VerifiedArtifactBundle,
 };
 pub use package::{
-    PackagingReport, PackagingToolIdentity, package_artifact_bundle,
+    PackagingReport, PackagingToolIdentity, RetainedDebugInputs, package_artifact_bundle,
     package_artifact_bundle_with_runner,
 };
 #[doc(hidden)]

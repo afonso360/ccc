@@ -351,10 +351,12 @@ performed by Cranelift merely to improve a benchmark score.
   targets, environments, working directories, and arguments visible at each
   call site. Migrate the remaining object-emission, link-input, preprocessing,
   header, visibility, and ABI invocations next.
-- Unify temporary artifact ownership across the driver and linker. Replace the
-  private `_debug_workspace` lifetime side effect in `PackagingReport` with an
-  explicit retained-debug-input guard whose cleanup is tested on success,
-  failure, and signals.
+- Mach-O debug-map inputs now have explicit ownership:
+  `PackagingReport` exposes a must-use `RetainedDebugInputs` guard which the
+  driver holds through final linking and `dsymutil`. Success, publication
+  failure, and process-isolated signal cleanup are tested. Add an object-only
+  Mach-O bridge-debug oracle before extending OSO-bearing artifact lifetimes
+  beyond one driver invocation.
 - Create a typed diagnostic-code registry and generate uniqueness, ownership,
   range, and documentation checks while keeping serialized `CCCxxxx` strings
   stable.
