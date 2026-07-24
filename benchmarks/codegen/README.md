@@ -105,7 +105,7 @@ accidentally.
 
 ## Results
 
-The result directory is self-contained:
+The result directory uses format version 5 and is self-contained:
 
 | Path | Contents |
 | --- | --- |
@@ -123,7 +123,11 @@ Compare the same profile, target, compiler build mode, and host. The raw
 `post_inline_ir.*` counters describe input to Cranelift's own passes. In
 particular, `post_inline_ir.values` counts block parameters plus instruction
 results reachable through the final CLIF layout, not detached data-flow-graph
-entities.
+entities. Schema version 3 also reports allocated signature,
+external-function, and global-value table sizes together with their
+`unused_*` subsets. “Unused” means unreachable from live layout instructions
+and Cranelift's function-level semantic roots after inlining; the runner
+measures that residue without asking CCC to duplicate Cranelift cleanup.
 `primary_object.*` describes CCC's primary object and excludes generated bridge
 assembly. Compile timings cover only ordinary `-c` invocations. The structural
 stats query runs after the timed samples and is never included in timing

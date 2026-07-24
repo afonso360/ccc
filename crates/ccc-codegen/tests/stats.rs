@@ -146,6 +146,23 @@ fn stats_describe_post_inline_ir_and_primary_objects_on_every_target() {
             profile.triple,
             o2_stats.post_inline_ir
         );
+        for stats in [o0_stats.post_inline_ir, o2_stats.post_inline_ir] {
+            assert!(
+                stats.unused_signatures <= stats.signatures,
+                "{}: {stats:?}",
+                profile.triple
+            );
+            assert!(
+                stats.unused_external_functions <= stats.external_functions,
+                "{}: {stats:?}",
+                profile.triple
+            );
+            assert!(
+                stats.unused_global_values <= stats.global_values,
+                "{}: {stats:?}",
+                profile.triple
+            );
+        }
 
         assert_primary_object_stats(&o0, &profile.triple.to_string());
         assert_primary_object_stats(&o2, &profile.triple.to_string());

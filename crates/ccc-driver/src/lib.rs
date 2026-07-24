@@ -3021,7 +3021,7 @@ mod tests {
         ])
         .unwrap()
         .stdout;
-        assert!(stats.starts_with("schema_version\t2\n"));
+        assert!(stats.starts_with("schema_version\t3\n"));
         assert!(stats.contains("post_inline_ir.functions\t1\n"));
         assert!(stats.contains("post_inline_ir.values\t"));
         assert!(stats.contains("primary_object.text_bytes\t"));

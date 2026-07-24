@@ -10,6 +10,43 @@ import sys
 from typing import Dict, List
 
 
+CODEGEN_STATS_SCHEMA = (
+    "schema_version",
+    "post_inline_ir.functions",
+    "post_inline_ir.blocks",
+    "post_inline_ir.values",
+    "post_inline_ir.instructions",
+    "post_inline_ir.call_instructions",
+    "post_inline_ir.fixed_stack_slots",
+    "post_inline_ir.fixed_stack_bytes",
+    "post_inline_ir.dynamic_stack_slots",
+    "post_inline_ir.signatures",
+    "post_inline_ir.unused_signatures",
+    "post_inline_ir.external_functions",
+    "post_inline_ir.unused_external_functions",
+    "post_inline_ir.global_values",
+    "post_inline_ir.unused_global_values",
+    "post_inline_ir.constants",
+    "post_inline_ir.jump_tables",
+    "primary_object.file_bytes",
+    "primary_object.sections",
+    "primary_object.symbols",
+    "primary_object.defined_symbols",
+    "primary_object.undefined_symbols",
+    "primary_object.relocations",
+    "primary_object.text_bytes",
+    "primary_object.read_only_data_bytes",
+    "primary_object.writable_data_bytes",
+    "primary_object.bss_bytes",
+    "primary_object.tls_data_bytes",
+    "primary_object.tls_bss_bytes",
+    "primary_object.unwind_bytes",
+    "primary_object.debug_bytes",
+    "primary_object.metadata_bytes",
+    "primary_object.other_section_bytes",
+)
+
+
 def read_rows(path: Path) -> List[dict]:
     with path.open(encoding="utf-8", newline="") as source:
         return list(csv.DictReader(source, delimiter="\t"))
@@ -57,8 +94,20 @@ def codegen_stats_by_label(rows: List[dict]) -> Dict[str, Dict[str, str]]:
         metrics[metric] = value
 
     for label, metrics in result.items():
-        if metrics.get("schema_version") != "2":
+        if metrics.get("schema_version") != "3":
             raise ValueError(f"{label}: unsupported codegen statistics schema")
+        if tuple(metrics) != CODEGEN_STATS_SCHEMA:
+            missing = [metric for metric in CODEGEN_STATS_SCHEMA if metric not in metrics]
+            unexpected = [metric for metric in metrics if metric not in CODEGEN_STATS_SCHEMA]
+            if missing:
+                raise ValueError(
+                    f"{label}: missing codegen statistics {missing!r}"
+                )
+            if unexpected:
+                raise ValueError(
+                    f"{label}: unexpected codegen statistics {unexpected!r}"
+                )
+            raise ValueError(f"{label}: codegen statistics are out of schema order")
     return result
 
 
@@ -72,8 +121,11 @@ SUMMARY_CODEGEN_METRICS = {
     "clif_fixed_stack_bytes": "post_inline_ir.fixed_stack_bytes",
     "clif_dynamic_stack_slots": "post_inline_ir.dynamic_stack_slots",
     "clif_signatures": "post_inline_ir.signatures",
+    "clif_unused_signatures": "post_inline_ir.unused_signatures",
     "clif_external_functions": "post_inline_ir.external_functions",
+    "clif_unused_external_functions": "post_inline_ir.unused_external_functions",
     "clif_global_values": "post_inline_ir.global_values",
+    "clif_unused_global_values": "post_inline_ir.unused_global_values",
 }
 
 

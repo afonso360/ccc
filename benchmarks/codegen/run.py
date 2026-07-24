@@ -23,8 +23,42 @@ import time
 from typing import Iterable
 
 
-FORMAT_VERSION = 4
-CODEGEN_STATS_SCHEMA_VERSION = 2
+FORMAT_VERSION = 5
+CODEGEN_STATS_SCHEMA_VERSION = 3
+CODEGEN_STATS_METRICS = (
+    "post_inline_ir.functions",
+    "post_inline_ir.blocks",
+    "post_inline_ir.values",
+    "post_inline_ir.instructions",
+    "post_inline_ir.call_instructions",
+    "post_inline_ir.fixed_stack_slots",
+    "post_inline_ir.fixed_stack_bytes",
+    "post_inline_ir.dynamic_stack_slots",
+    "post_inline_ir.signatures",
+    "post_inline_ir.unused_signatures",
+    "post_inline_ir.external_functions",
+    "post_inline_ir.unused_external_functions",
+    "post_inline_ir.global_values",
+    "post_inline_ir.unused_global_values",
+    "post_inline_ir.constants",
+    "post_inline_ir.jump_tables",
+    "primary_object.file_bytes",
+    "primary_object.sections",
+    "primary_object.symbols",
+    "primary_object.defined_symbols",
+    "primary_object.undefined_symbols",
+    "primary_object.relocations",
+    "primary_object.text_bytes",
+    "primary_object.read_only_data_bytes",
+    "primary_object.writable_data_bytes",
+    "primary_object.bss_bytes",
+    "primary_object.tls_data_bytes",
+    "primary_object.tls_bss_bytes",
+    "primary_object.unwind_bytes",
+    "primary_object.debug_bytes",
+    "primary_object.metadata_bytes",
+    "primary_object.other_section_bytes",
+)
 DECLARATIONS_PER_FUNCTION_FUNCTIONS = 4
 PROFILE_FLAGS = {
     "O0": "-O0",
@@ -55,7 +89,10 @@ REQUIRED_METRICS = (
     "post_inline_ir.values",
     "post_inline_ir.instructions",
     "post_inline_ir.call_instructions",
+    "post_inline_ir.unused_signatures",
+    "post_inline_ir.unused_external_functions",
     "post_inline_ir.global_values",
+    "post_inline_ir.unused_global_values",
     "primary_object.file_bytes",
     "primary_object.symbols",
     "primary_object.defined_symbols",
@@ -116,7 +153,10 @@ SUMMARY_FIELDS = (
     "post_inline_ir.values",
     "post_inline_ir.instructions",
     "post_inline_ir.call_instructions",
+    "post_inline_ir.unused_signatures",
+    "post_inline_ir.unused_external_functions",
     "post_inline_ir.global_values",
+    "post_inline_ir.unused_global_values",
     "primary_object.file_bytes",
     "primary_object.symbols",
     "primary_object.defined_symbols",
@@ -860,9 +900,18 @@ def parse_stats(path: Path) -> tuple[dict[str, int], tuple[str, ...]]:
         raise BenchmarkError(
             f"{path}: unsupported codegen-stats schema {stats['schema_version']}"
         )
-    missing = [metric for metric in REQUIRED_METRICS if metric not in stats]
-    if missing:
-        raise BenchmarkError(f"{path}: missing required metric(s): {', '.join(missing)}")
+    expected_order = ("schema_version", *CODEGEN_STATS_METRICS)
+    if tuple(order) != expected_order:
+        missing = [metric for metric in expected_order if metric not in stats]
+        unexpected = [metric for metric in order if metric not in expected_order]
+        details = []
+        if missing:
+            details.append(f"missing {', '.join(missing)}")
+        if unexpected:
+            details.append(f"unexpected {', '.join(unexpected)}")
+        if not details:
+            details.append("metrics are out of schema order")
+        raise BenchmarkError(f"{path}: invalid codegen-stats schema: {'; '.join(details)}")
     return stats, tuple(order)
 
 

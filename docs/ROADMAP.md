@@ -201,8 +201,10 @@ trend evidence and must not be compared numerically with native execution.
 - Count CCC-IR functions, blocks, values, operations, and dead operations
   before and after CCC-owned optimization. CLIF live blocks, values,
   instructions, stack slots, signatures, external function references, and
-  global values are implemented; add the remaining count of imported entities
-  which are never used.
+  global values are implemented. Schema version 3 also records the allocated
+  signature, external-function, and global-value entries left unreachable from
+  live post-inlining CLIF and Cranelift's function-level semantic roots. Keep
+  these as observational metrics rather than adding a duplicate cleanup pass.
 - Record emitted text, read-only data, writable data, debug-section, unwind,
   relocation, and symbol-table sizes. Keep debug and non-debug measurements
   separate.

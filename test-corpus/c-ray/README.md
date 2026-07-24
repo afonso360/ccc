@@ -74,7 +74,7 @@ records:
 - compile peak RSS and median render peak RSS;
 - post-inlining CLIF function, block, live-value, instruction, call,
   stack-slot, signature, external-reference, and global-value counts for every
-  CCC profile;
+  CCC profile, including allocated-but-unreferenced imported entities;
 - object and executable byte size;
 - portable object-section totals for text, read-only data, writable data, BSS,
   unwind metadata, debug metadata, and uncategorized sections;

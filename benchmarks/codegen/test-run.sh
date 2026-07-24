@@ -168,8 +168,11 @@ metrics = [
     ("post_inline_ir.fixed_stack_bytes", 0),
     ("post_inline_ir.dynamic_stack_slots", 0),
     ("post_inline_ir.signatures", calls),
+    ("post_inline_ir.unused_signatures", 0),
     ("post_inline_ir.external_functions", external_functions),
+    ("post_inline_ir.unused_external_functions", 0),
     ("post_inline_ir.global_values", global_values),
+    ("post_inline_ir.unused_global_values", 0),
     ("post_inline_ir.constants", 0),
     ("post_inline_ir.jump_tables", 0),
     ("primary_object.file_bytes", object_file_bytes),
@@ -192,8 +195,13 @@ metrics = [
     ("primary_object.metadata_bytes", 4),
     ("primary_object.other_section_bytes", 0),
 ]
-print("schema_version\t2")
+print("schema_version\t3")
 for metric, value in metrics:
+    if (
+        os.environ.get("FAKE_CCC_DROP_UNUSED_METRIC")
+        and metric == "post_inline_ir.unused_global_values"
+    ):
+        continue
     print(f"{metric}\t{value}")
 PYTHON
 chmod +x "$fake_ccc"
@@ -236,8 +244,8 @@ grep -Fq $'live-globals-2\tlive-globals\t2\tO2\tpost_inline_ir.global_values\t2'
   "$results/codegen-stats.tsv"
 grep -Fq $'string-literals-2\tstring-literals\t2\tO2\tprimary_object.read_only_data_bytes\t36' \
   "$results/codegen-stats.tsv"
-grep -Fq '"format_version":4' "$results/environment.json"
-grep -Fq '"codegen_stats_schema_version":2' "$results/environment.json"
+grep -Fq '"format_version":5' "$results/environment.json"
+grep -Fq '"codegen_stats_schema_version":3' "$results/environment.json"
 expected_compiler_sha=$(
   python3 -c \
     'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' \
@@ -498,6 +506,22 @@ single_scoped_scale_status=$?
 set -e
 [[ "$single_scoped_scale_status" == 1 ]]
 [[ "$single_scoped_scale_output" == *"declarations-per-function at -O0 requires at least two scales"* ]]
+
+missing_stats_results="$temporary_directory/missing-stats-results"
+set +e
+missing_stats_output=$(
+  FAKE_CCC_DROP_UNUSED_METRIC=1 "$script_directory/run.py" \
+    --ccc "$fake_ccc" \
+    --output "$missing_stats_results" \
+    --cases minimal-return \
+    --profiles O0 \
+    --warmups 0 \
+    --samples 1 2>&1
+)
+missing_stats_status=$?
+set -e
+[[ "$missing_stats_status" == 1 ]]
+[[ "$missing_stats_output" == *"invalid codegen-stats schema: missing post_inline_ir.unused_global_values"* ]]
 
 help_output=$("$script_directory/run.py" --help)
 [[ "$help_output" == *"--declaration-scales"* ]]

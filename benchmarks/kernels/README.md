@@ -100,7 +100,7 @@ only native `performance` results as comparison-ready.
 
 ## Results
 
-The result directory uses format version 2:
+The result directory uses format version 3:
 
 | Path | Contents |
 | --- | --- |
@@ -117,6 +117,10 @@ The result directory uses format version 2:
 Compile samples must produce identical final-object hashes. Runtime summaries
 exclude validation and warmup executions. `runtime_ns_per_work_unit` is useful
 only for comparing the same kernel and fixed work contract.
+The runner accepts only the complete codegen-stat schema in its stable row
+order. Schema version 3 includes allocated-but-unreferenced CLIF signatures,
+external functions, and global values so inlining residue can be correlated
+with compile time and peak RSS without adding a CCC cleanup pass.
 
 The fake-tool regression needs no CCC build:
 

@@ -116,13 +116,18 @@ Use the versioned TSV dump when comparing lowering or inlining changes:
 target/debug/ccc --emit=codegen-stats -O2 path/to/input.c
 ```
 
-`post_inline_ir.*` rows count only live entities in the CLIF handed to
-Cranelift's optimization and machine-code pipeline. In schema version 2,
-`post_inline_ir.values` counts block parameters plus instruction results
-reachable through the final layout; detached data-flow-graph entities are not
-reported. The `primary_object.*` rows count disjoint logical section sizes,
-symbols, and relocations in CCC's primary relocatable object. Generated assembly bridge
-units are deliberately excluded from that primary-object view; benchmark
+`post_inline_ir.*` rows describe the CLIF handed to Cranelift's optimization
+and machine-code pipeline. In schema version 3, `post_inline_ir.values` counts
+block parameters plus instruction results reachable through the final layout;
+detached data-flow-graph values are not reported. Signature, external-function,
+and global-value totals count their allocated Cranelift tables. Their
+`unused_*` companions count entries unreachable from live layout instructions
+and Cranelift's function-level semantic roots, including transitive
+global-value bases. These counters observe inlining residue; CCC does not run a
+duplicate cleanup pass. The `primary_object.*` rows count disjoint logical
+section sizes, symbols, and relocations in CCC's primary relocatable object.
+Generated assembly bridge units are deliberately excluded from that
+primary-object view; benchmark
 runners which care about packaged output must inspect the final `-c` artifact
 as C-Ray does. The schema starts with `schema_version` and retains a stable row
 order so results can be archived and diffed without parsing human-readable

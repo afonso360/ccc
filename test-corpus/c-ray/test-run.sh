@@ -182,7 +182,7 @@ fixture	123	456
 EOF
 cat >"$temporary_directory/codegen-stats.tsv" <<'EOF'
 label	metric	value
-fixture	schema_version	2
+fixture	schema_version	3
 fixture	post_inline_ir.functions	2
 fixture	post_inline_ir.blocks	7
 fixture	post_inline_ir.values	31
@@ -192,8 +192,29 @@ fixture	post_inline_ir.fixed_stack_slots	4
 fixture	post_inline_ir.fixed_stack_bytes	64
 fixture	post_inline_ir.dynamic_stack_slots	0
 fixture	post_inline_ir.signatures	3
+fixture	post_inline_ir.unused_signatures	1
 fixture	post_inline_ir.external_functions	3
+fixture	post_inline_ir.unused_external_functions	1
 fixture	post_inline_ir.global_values	2
+fixture	post_inline_ir.unused_global_values	0
+fixture	post_inline_ir.constants	0
+fixture	post_inline_ir.jump_tables	0
+fixture	primary_object.file_bytes	123
+fixture	primary_object.sections	7
+fixture	primary_object.symbols	4
+fixture	primary_object.defined_symbols	2
+fixture	primary_object.undefined_symbols	2
+fixture	primary_object.relocations	3
+fixture	primary_object.text_bytes	100
+fixture	primary_object.read_only_data_bytes	25
+fixture	primary_object.writable_data_bytes	4
+fixture	primary_object.bss_bytes	16
+fixture	primary_object.tls_data_bytes	0
+fixture	primary_object.tls_bss_bytes	0
+fixture	primary_object.unwind_bytes	8
+fixture	primary_object.debug_bytes	0
+fixture	primary_object.metadata_bytes	3
+fixture	primary_object.other_section_bytes	0
 EOF
 cat >"$temporary_directory/summary-object-sections.tsv" <<'EOF'
 label	text_bytes	read_only_data_bytes	writable_data_bytes	bss_bytes	unwind_bytes	debug_bytes	other_bytes	total_section_bytes
@@ -213,8 +234,26 @@ EOF
   --output "$temporary_directory/summary.tsv"
 grep -Fq $'fixture\t0.500000000\t0.250000000\t3\t2.000000000\t1.000000000\t3.000000000' \
   "$temporary_directory/summary.tsv"
-grep -Fq $'\t2\t7\t31\t40\t3\t4\t64\t0\t3\t3\t2\t123\t100\t25\t4\t16\t8\t0\t3\t156\t456\t' \
+grep -Fq $'\t2\t7\t31\t40\t3\t4\t64\t0\t3\t1\t3\t1\t2\t0\t123\t100\t25\t4\t16\t8\t0\t3\t156\t456\t' \
   "$temporary_directory/summary.tsv"
+
+grep -Fv $'fixture\tpost_inline_ir.unused_global_values\t0' \
+  "$temporary_directory/codegen-stats.tsv" \
+  >"$temporary_directory/incomplete-codegen-stats.tsv"
+set +e
+incomplete_stats_output=$(
+  "$script_directory/summarize.py" \
+    --timings "$temporary_directory/summary-timings.tsv" \
+    --artifacts "$temporary_directory/artifacts.tsv" \
+    --codegen-stats "$temporary_directory/incomplete-codegen-stats.tsv" \
+    --object-sections "$temporary_directory/summary-object-sections.tsv" \
+    --hashes "$temporary_directory/hashes.tsv" \
+    --output "$temporary_directory/incomplete-summary.tsv" 2>&1
+)
+incomplete_stats_status=$?
+set -e
+[[ "$incomplete_stats_status" == 1 ]]
+[[ "$incomplete_stats_output" == *"missing codegen statistics ['post_inline_ir.unused_global_values']"* ]]
 
 bash -n "$script_directory/run.sh"
 

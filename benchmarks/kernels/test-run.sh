@@ -188,8 +188,11 @@ if "--emit=codegen-stats" in sys.argv:
         ("post_inline_ir.fixed_stack_bytes", 0),
         ("post_inline_ir.dynamic_stack_slots", 0),
         ("post_inline_ir.signatures", structure["calls"]),
+        ("post_inline_ir.unused_signatures", 0),
         ("post_inline_ir.external_functions", 0),
+        ("post_inline_ir.unused_external_functions", 0),
         ("post_inline_ir.global_values", structure["global_values"]),
+        ("post_inline_ir.unused_global_values", 0),
         ("post_inline_ir.constants", structure["constants"]),
         ("post_inline_ir.jump_tables", structure["jump_tables"]),
         ("primary_object.file_bytes", 41 + len(case_name)),
@@ -209,8 +212,13 @@ if "--emit=codegen-stats" in sys.argv:
         ("primary_object.metadata_bytes", 4),
         ("primary_object.other_section_bytes", 0),
     ]
-    print("schema_version\t2")
+    print("schema_version\t3")
     for metric, value in metrics:
+        if (
+            os.environ.get("FAKE_CCC_DROP_UNUSED_METRIC")
+            and metric == "post_inline_ir.unused_global_values"
+        ):
+            continue
         print(f"{metric}\t{value}")
     sys.exit(0)
 
@@ -313,7 +321,7 @@ grep -Fq $'direct-call\tO2\tfinal-object\t' \
   "$performance_results/artifacts.tsv"
 grep -Fq $'direct-call\tO2\texecutable\t' \
   "$performance_results/artifacts.tsv"
-grep -Fq '"format_version":2' "$performance_results/environment.json"
+grep -Fq '"format_version":3' "$performance_results/environment.json"
 grep -Fq '"mode":"performance"' "$performance_results/environment.json"
 grep -Fq '"kind":"link"' "$performance_results/commands.jsonl"
 grep -Fq '"phase":"validation"' "$performance_results/commands.jsonl"
@@ -387,6 +395,22 @@ nondeterministic_status=$?
 set -e
 [[ "$nondeterministic_status" == 1 ]]
 [[ "$nondeterministic_output" == *"produced nondeterministic final objects"* ]]
+
+missing_stats_results="$temporary_directory/missing-stats"
+set +e
+missing_stats_output=$(
+  FAKE_TARGET="$native_target" FAKE_CCC_DROP_UNUSED_METRIC=1 \
+    "$script_directory/run.py" \
+    --ccc "$fake_ccc" \
+    --output "$missing_stats_results" \
+    --mode object \
+    --profiles O0 \
+    --compile-samples 1 2>&1
+)
+missing_stats_status=$?
+set -e
+[[ "$missing_stats_status" == 1 ]]
+[[ "$missing_stats_output" == *"invalid codegen-stats schema: missing post_inline_ir.unused_global_values"* ]]
 
 help_output=$("$script_directory/run.py" --help)
 [[ "$help_output" == *"--mode"* ]]
