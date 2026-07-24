@@ -164,10 +164,12 @@ The current executable slice and next benchmark targets are:
   packaged objects. Establish controlled native baselines and extend
   cross-target correctness execution next.
 - Independent block-count, live-SSA-value, referenced-global, and
-  string-literal scaling now joins the declaration and live-function axes.
-  Each family rejects dead fixtures and superlinear structural growth. Add
-  declarations-per-function scaling next, then correlate every axis with
-  phase timing and peak-memory growth.
+  string-literal scaling now joins the translation-unit and per-function
+  declaration and live-function axes. The per-function family grows unused
+  block-scope prototypes across a fixed live call graph while requiring every
+  post-inlining CLIF and primary-object metric to stay identical. Each
+  structural family rejects dead fixtures and superlinear growth. Correlate
+  every axis with phase timing and peak-memory growth next.
 - Whole-program measurements use the existing bzip2, zlib, and zstd adapters
   with fixed inputs. Record translation time, link time, aggregate object
   size, executable text size, and execution throughput without weakening their

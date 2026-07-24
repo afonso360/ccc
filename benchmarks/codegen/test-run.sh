@@ -87,6 +87,8 @@ scaling_families = {
 functions = scale + 1 if family == "live-functions" else 1
 if family in scaling_families:
     functions = 2
+if family == "declarations-per-function":
+    functions = 5
 if family == "declaration-heavy" and os.environ.get("FAKE_CCC_LEAK_DECLS"):
     functions += scale
 calls = 1 if family in ("puts-call", "printf-variadic") else 0
@@ -94,6 +96,8 @@ if family == "live-functions":
     calls = scale
 if family in scaling_families:
     calls = 1
+if family == "declarations-per-function":
+    calls = 4
 if hosted_family:
     calls = 1
 external_functions = calls
@@ -113,6 +117,11 @@ if (
 if hosted_stdio and os.environ.get("FAKE_CCC_HOSTED_OBJECT_LEAK"):
     object_undefined_symbols += 1
     object_relocations += 1
+if family == "declarations-per-function" and os.environ.get(
+    "FAKE_CCC_LEAK_SCOPED_DECLS_OBJECT"
+):
+    object_undefined_symbols += scale * 4
+    object_relocations += scale * 4
 if family == "string-literals":
     object_relocations += scale
 object_defined_symbols = functions
@@ -125,6 +134,10 @@ if family in ("live-globals", "string-literals"):
 blocks = functions
 values = functions * 2 + calls
 instructions = functions * 3 + calls
+if family == "declarations-per-function" and os.environ.get(
+    "FAKE_CCC_LEAK_SCOPED_DECLS_IR"
+):
+    values += scale * 4
 if family == "block-count":
     blocks += scale * 2
     values += scale * 8
@@ -137,7 +150,7 @@ if family == "ssa-values":
 if family == "live-globals":
     values += scale * 4
     instructions += scale * 4
-string_count = scale
+string_count = scale if family == "string-literals" else 0
 if family == "string-literals" and os.environ.get(
     "FAKE_CCC_DROP_STRING_LITERAL"
 ):
@@ -194,6 +207,7 @@ results="$temporary_directory/results"
   --samples 2 \
   --declaration-scales 0,3 \
   --data-declaration-scales 0,3 \
+  --declarations-per-function-scales 0,2 \
   --function-scales 2,4 \
   --block-scales 0,2 \
   --value-scales 0,2 \
@@ -205,6 +219,8 @@ grep -Fq $'benchmark\tfamily\tscale\tprofile\tphase\titeration\twall_seconds' \
 grep -Fq $'declaration-heavy-3\tdeclaration-heavy\t3\tO2\tpost_inline_ir.functions\t1' \
   "$results/codegen-stats.tsv"
 grep -Fq $'data-declaration-heavy-3\tdata-declaration-heavy\t3\tO2\tprimary_object.symbols\t1' \
+  "$results/codegen-stats.tsv"
+grep -Fq $'declarations-per-function-2\tdeclarations-per-function\t2\tO2\tpost_inline_ir.functions\t5' \
   "$results/codegen-stats.tsv"
 grep -Fq $'hosted-header-stdio\thosted-header\t1\tO2\tpost_inline_ir.external_functions\t1' \
   "$results/codegen-stats.tsv"
@@ -220,7 +236,7 @@ grep -Fq $'live-globals-2\tlive-globals\t2\tO2\tpost_inline_ir.global_values\t2'
   "$results/codegen-stats.tsv"
 grep -Fq $'string-literals-2\tstring-literals\t2\tO2\tprimary_object.read_only_data_bytes\t36' \
   "$results/codegen-stats.tsv"
-grep -Fq '"format_version":3' "$results/environment.json"
+grep -Fq '"format_version":4' "$results/environment.json"
 grep -Fq '"codegen_stats_schema_version":2' "$results/environment.json"
 expected_compiler_sha=$(
   python3 -c \
@@ -231,15 +247,23 @@ grep -Fq "\"compiler_sha256\":\"$expected_compiler_sha\"" \
   "$results/environment.json"
 grep -Fq '"target":"x86_64-unknown-linux-gnu"' "$results/environment.json"
 grep -Fq '"data_declaration_scales":[0,3]' "$results/environment.json"
+grep -Fq '"declarations_per_function_scales":[0,2]' \
+  "$results/environment.json"
+grep -Fq '"declarations_per_function_functions":4' \
+  "$results/environment.json"
 grep -Fq '"effective_configs":{"O0":' "$results/environment.json"
 grep -Fq '"exit_status":0' "$results/environment.json"
 grep -Fq '"benchmark":"printf-variadic"' "$results/commands.jsonl"
-[[ "$(grep -c '"kind":"object-compile"' "$results/commands.jsonl")" == 126 ]]
-[[ "$(grep -c '"kind":"codegen-stats"' "$results/commands.jsonl")" == 42 ]]
+[[ "$(grep -c '"kind":"object-compile"' "$results/commands.jsonl")" == 138 ]]
+[[ "$(grep -c '"kind":"codegen-stats"' "$results/commands.jsonl")" == 46 ]]
 [[ "$(grep -c '^extern long ccc_decl_' \
   "$results/sources/declaration-heavy-3.c")" == 3 ]]
 [[ "$(grep -c '^extern long ccc_data_decl_' \
   "$results/sources/data-declaration-heavy-3.c")" == 3 ]]
+[[ "$(grep -c '^    extern unsigned ccc_scoped_decl_' \
+  "$results/sources/declarations-per-function-2.c")" == 8 ]]
+[[ "$(grep -c '^static unsigned ccc_declaration_scope_' \
+  "$results/sources/declarations-per-function-2.c")" == 4 ]]
 [[ "$(grep -c '^    if (selector ==' \
   "$results/sources/block-count-2.c")" == 2 ]]
 [[ "$(grep -c '^    value = value \\*' \
@@ -261,8 +285,8 @@ grep -Fq '#include <stdio.h>' \
 grep -Fq 'extern int printf(const char *format, ...);' \
   "$results/sources/hosted-printf-minimal.c"
 [[ "$(find "$results/raw" -name 'codegen-stats.stdout.tsv' |
-  wc -l | tr -d '[:space:]')" == 42 ]]
-[[ "$(find "$results/raw" -name '*.o' | wc -l | tr -d '[:space:]')" == 126 ]]
+  wc -l | tr -d '[:space:]')" == 46 ]]
+[[ "$(find "$results/raw" -name '*.o' | wc -l | tr -d '[:space:]')" == 138 ]]
 [[ -f "$results/raw/printf-variadic/O2/sample-002.timing.json" ]]
 [[ -s "$results/raw/printf-variadic/O2/sample-002.o" ]]
 [[ "$(wc -c <"$results/raw/hosted-printf-minimal/O2/sample-002.o" |
@@ -319,6 +343,42 @@ grep -Fq "${data_leak_prefix}primary_object.symbols"$'\t3' \
   "$negative_data_results/codegen-stats.tsv"
 grep -Fq "${data_leak_prefix}primary_object.undefined_symbols"$'\t2' \
   "$negative_data_results/codegen-stats.tsv"
+
+negative_scoped_ir_results="$temporary_directory/negative-scoped-ir-results"
+set +e
+negative_scoped_ir_output=$(
+  FAKE_CCC_LEAK_SCOPED_DECLS_IR=1 "$script_directory/run.py" \
+    --ccc "$fake_ccc" \
+    --output "$negative_scoped_ir_results" \
+    --cases declarations-per-function \
+    --profiles O0 \
+    --warmups 0 \
+    --samples 1 \
+    --declarations-per-function-scales 0,2 2>&1
+)
+negative_scoped_ir_status=$?
+set -e
+[[ "$negative_scoped_ir_status" == 1 ]]
+[[ "$negative_scoped_ir_output" == *"unused declarations per function changed post-inline CLIF or primary-object structure at -O0"* ]]
+[[ "$negative_scoped_ir_output" == *"post_inline_ir.values=14 versus 22"* ]]
+
+negative_scoped_object_results="$temporary_directory/negative-scoped-object-results"
+set +e
+negative_scoped_object_output=$(
+  FAKE_CCC_LEAK_SCOPED_DECLS_OBJECT=1 "$script_directory/run.py" \
+    --ccc "$fake_ccc" \
+    --output "$negative_scoped_object_results" \
+    --cases declarations-per-function \
+    --profiles O0 \
+    --warmups 0 \
+    --samples 1 \
+    --declarations-per-function-scales 0,2 2>&1
+)
+negative_scoped_object_status=$?
+set -e
+[[ "$negative_scoped_object_status" == 1 ]]
+[[ "$negative_scoped_object_output" == *"unused declarations per function changed post-inline CLIF or primary-object structure at -O0"* ]]
+[[ "$negative_scoped_object_output" == *"primary_object.relocations=4 versus 12"* ]]
 
 negative_hosted_ir_results="$temporary_directory/negative-hosted-ir-results"
 set +e
@@ -422,9 +482,27 @@ set -e
 [[ "$single_scale_status" == 1 ]]
 [[ "$single_scale_output" == *"block-count at -O0 requires at least two scales"* ]]
 
+single_scoped_scale_results="$temporary_directory/single-scoped-scale-results"
+set +e
+single_scoped_scale_output=$(
+  "$script_directory/run.py" \
+    --ccc "$fake_ccc" \
+    --output "$single_scoped_scale_results" \
+    --cases declarations-per-function \
+    --profiles O0 \
+    --warmups 0 \
+    --samples 1 \
+    --declarations-per-function-scales 2 2>&1
+)
+single_scoped_scale_status=$?
+set -e
+[[ "$single_scoped_scale_status" == 1 ]]
+[[ "$single_scoped_scale_output" == *"declarations-per-function at -O0 requires at least two scales"* ]]
+
 help_output=$("$script_directory/run.py" --help)
 [[ "$help_output" == *"--declaration-scales"* ]]
 [[ "$help_output" == *"--data-declaration-scales"* ]]
+[[ "$help_output" == *"--declarations-per-function-scales"* ]]
 [[ "$help_output" == *"--function-scales"* ]]
 [[ "$help_output" == *"--block-scales"* ]]
 [[ "$help_output" == *"--value-scales"* ]]

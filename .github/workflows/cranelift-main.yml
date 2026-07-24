@@ -145,14 +145,16 @@ jobs:
       - name: Test the workspace
         run: cargo test --workspace --all-targets
 
-      - name: Check structural codegen benchmark axes
+      - name: Check structural and declaration codegen benchmark axes
         run: >-
           benchmarks/codegen/run.py
           --ccc "${{ github.workspace }}/${{ matrix.ccc_bin }}"
           --output
           "$RUNNER_TEMP/ccc-benchmark-smoke-${{ matrix.oracle }}/codegen"
-          --cases block-count,ssa-values,live-globals,string-literals
+          --cases
+          declarations-per-function,block-count,ssa-values,live-globals,string-literals
           --profiles O0,O2,Oz
+          --declarations-per-function-scales 0,2
           --block-scales 0,2
           --value-scales 0,2
           --global-scales 0,2

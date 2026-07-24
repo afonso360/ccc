@@ -23,8 +23,9 @@ import time
 from typing import Iterable
 
 
-FORMAT_VERSION = 3
+FORMAT_VERSION = 4
 CODEGEN_STATS_SCHEMA_VERSION = 2
+DECLARATIONS_PER_FUNCTION_FUNCTIONS = 4
 PROFILE_FLAGS = {
     "O0": "-O0",
     "O1": "-O1",
@@ -41,6 +42,7 @@ CASE_NAMES = (
     "hosted-printf",
     "declaration-heavy",
     "data-declaration-heavy",
+    "declarations-per-function",
     "live-functions",
     "block-count",
     "ssa-values",
@@ -233,6 +235,14 @@ def parse_arguments() -> argparse.Namespace:
         help="generated data declaration counts (default: 0,32,256,1024)",
     )
     parser.add_argument(
+        "--declarations-per-function-scales",
+        default="0,32,256,1024",
+        help=(
+            "generated unused declarations in each fixed live function "
+            "(default: 0,32,256,1024)"
+        ),
+    )
+    parser.add_argument(
         "--function-scales",
         default="8,32,128",
         help="generated live function counts (default: 8,32,128)",
@@ -287,6 +297,10 @@ def parse_arguments() -> argparse.Namespace:
         arguments.data_declaration_scales = scales(
             arguments.data_declaration_scales,
             label="--data-declaration-scales",
+        )
+        arguments.declarations_per_function_scales = scales(
+            arguments.declarations_per_function_scales,
+            label="--declarations-per-function-scales",
         )
         arguments.function_scales = scales(
             arguments.function_scales, label="--function-scales"
@@ -363,6 +377,80 @@ def data_declaration_source(scale: int) -> str:
         lines.append(f"extern long ccc_data_decl_{index:06d};")
     lines.extend(("", "int main(void) {", "    return 0;", "}", ""))
     return "\n".join(lines)
+
+
+def declarations_per_function_source(scale: int) -> str:
+    lines = [
+        "/* ccc-benchmark-family: declarations-per-function */",
+        f"/* ccc-benchmark-scale: {scale} */",
+        (
+            "/* ccc-benchmark-functions: "
+            f"{DECLARATIONS_PER_FUNCTION_FUNCTIONS} */"
+        ),
+        "",
+    ]
+    for function_index in range(DECLARATIONS_PER_FUNCTION_FUNCTIONS):
+        lines.extend(
+            (
+                "__attribute__((noinline))",
+                (
+                    "static unsigned "
+                    f"ccc_declaration_scope_{function_index:06d}"
+                    "(unsigned value) {"
+                ),
+            )
+        )
+        for declaration_index in range(scale):
+            lines.append(
+                "    extern unsigned "
+                f"ccc_scoped_decl_{function_index:06d}_{declaration_index:06d}"
+                "(unsigned value);"
+            )
+        lines.extend(
+            (
+                f"    return value + {function_index + 1}u;",
+                "}",
+                "",
+            )
+        )
+    lines.extend(
+        (
+            "int main(int argc, char **argv) {",
+            "    unsigned value = (unsigned)argc;",
+            "    (void)argv;",
+        )
+    )
+    for function_index in range(DECLARATIONS_PER_FUNCTION_FUNCTIONS):
+        lines.append(
+            "    value = "
+            f"ccc_declaration_scope_{function_index:06d}(value);"
+        )
+    lines.extend(("    return (int)(value & 255u);", "}", ""))
+    return "\n".join(lines)
+
+
+def validate_declarations_per_function_input(case: Case) -> None:
+    declarations: list[tuple[int, int]] = []
+    for line in case.source.read_text(encoding="utf-8").splitlines():
+        match = re.fullmatch(
+            r"    extern unsigned ccc_scoped_decl_([0-9]{6,})_"
+            r"([0-9]{6,})\(unsigned value\);",
+            line,
+        )
+        if match:
+            declarations.append((int(match.group(1)), int(match.group(2))))
+    expected = [
+        (function_index, declaration_index)
+        for function_index in range(DECLARATIONS_PER_FUNCTION_FUNCTIONS)
+        for declaration_index in range(case.scale)
+    ]
+    if declarations != expected:
+        raise BenchmarkError(
+            f"{case.name} generated {len(declarations)} ordered scoped "
+            f"declarations; expected exactly {len(expected)} "
+            f"({case.scale} in each of "
+            f"{DECLARATIONS_PER_FUNCTION_FUNCTIONS} functions)"
+        )
 
 
 def live_functions_source(scale: int) -> str:
@@ -516,6 +604,7 @@ def copy_and_generate_cases(
     selected: list[str],
     declaration_scales: list[int],
     data_declaration_scales: list[int],
+    declarations_per_function_scales: list[int],
     function_scales: list[int],
     block_scales: list[int],
     value_scales: list[int],
@@ -598,6 +687,25 @@ def copy_and_generate_cases(
             cases.append(
                 Case(name, "data-declaration-heavy", scale, source, 1)
             )
+
+    if "declarations-per-function" in selected:
+        for scale in declarations_per_function_scales:
+            name = f"declarations-per-function-{scale}"
+            source = source_directory / f"{name}.c"
+            source.write_text(
+                declarations_per_function_source(scale),
+                encoding="utf-8",
+            )
+            cases.append(
+                Case(
+                    name,
+                    "declarations-per-function",
+                    scale,
+                    source,
+                    DECLARATIONS_PER_FUNCTION_FUNCTIONS + 1,
+                )
+            )
+            validate_declarations_per_function_input(cases[-1])
 
     if "live-functions" in selected:
         for scale in function_scales:
@@ -905,6 +1013,54 @@ def validate_invariants(
                     f"{record.case.scale} declarations"
                 )
 
+    declarations_per_function: dict[str, list[StatsRecord]] = {}
+    for record in records:
+        if record.case.family == "declarations-per-function":
+            declarations_per_function.setdefault(record.profile, []).append(record)
+    for profile, group in declarations_per_function.items():
+        if len(group) < 2:
+            raise BenchmarkError(
+                f"declarations-per-function at -{profile} requires at least "
+                "two scales for no-leak validation"
+            )
+        ordered = sorted(group, key=lambda record: record.case.scale)
+        baseline = ordered[0]
+        baseline_structure = {
+            metric: value
+            for metric, value in baseline.stats.items()
+            if metric.startswith("post_inline_ir.")
+            or metric.startswith("primary_object.")
+        }
+        for record in ordered[1:]:
+            current_structure = {
+                metric: value
+                for metric, value in record.stats.items()
+                if metric.startswith("post_inline_ir.")
+                or metric.startswith("primary_object.")
+            }
+            differences = [
+                (
+                    metric,
+                    baseline_structure.get(metric),
+                    current_structure.get(metric),
+                )
+                for metric in sorted(
+                    baseline_structure.keys() | current_structure.keys()
+                )
+                if baseline_structure.get(metric) != current_structure.get(metric)
+            ]
+            if differences:
+                rendered = ", ".join(
+                    f"{metric}={baseline_value} versus {current_value}"
+                    for metric, baseline_value, current_value in differences
+                )
+                raise BenchmarkError(
+                    "unused declarations per function changed post-inline "
+                    "CLIF or primary-object structure at "
+                    f"-{profile}: scales {baseline.case.scale} and "
+                    f"{record.case.scale}: {rendered}"
+                )
+
     axis_bounds = {
         "block-count": {
             "post_inline_ir.blocks": (1, 4),
@@ -1126,6 +1282,7 @@ def run(arguments: argparse.Namespace) -> Path:
         arguments.cases,
         arguments.declaration_scales,
         arguments.data_declaration_scales,
+        arguments.declarations_per_function_scales,
         arguments.function_scales,
         arguments.block_scales,
         arguments.value_scales,
@@ -1164,6 +1321,12 @@ def run(arguments: argparse.Namespace) -> Path:
         "samples": arguments.samples,
         "declaration_scales": arguments.declaration_scales,
         "data_declaration_scales": arguments.data_declaration_scales,
+        "declarations_per_function_scales": (
+            arguments.declarations_per_function_scales
+        ),
+        "declarations_per_function_functions": (
+            DECLARATIONS_PER_FUNCTION_FUNCTIONS
+        ),
         "function_scales": arguments.function_scales,
         "block_scales": arguments.block_scales,
         "value_scales": arguments.value_scales,

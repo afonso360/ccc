@@ -19,25 +19,36 @@ The default set covers:
   declarations;
 - generated translation units with the same independent scale of unused data
   declarations;
+- four fixed live functions containing 0, 32, 256, or 1024 unused block-scope
+  function declarations apiece;
 - generated live call chains with 8, 32, and 128 functions;
 - independent generated axes for live conditional blocks, dependent SSA
   values, referenced global definitions, and distinct referenced string
   literals.
 
-The two declaration series are also regression checks. Increasing either
-unused function prototypes or unused external data declarations must not
-change any `post_inline_ir.*` metric or the selected primary-object byte,
-symbol, undefined-symbol, relocation, and text-size metrics. This catches the
-old behavior where trivial programs accumulated unused CLIF references or
-object declarations. The live-function series provides a growing backend
-workload for codegen performance work. The four structural axes fail closed
-per optimization profile: every adjacent scale must grow its defining metric
-within a checked linear bound. The block series tracks live CLIF blocks; the
-SSA series tracks live block parameters and results of live instructions; the
-global series tracks CLIF global values, defined symbols, and initialized data;
-and the string series tracks CLIF global values, relocations, and read-only
-data. These checks reject accidentally dead fixtures and structural quadratic
-growth before their timings are considered.
+The declaration series are also regression checks. Increasing either
+translation-unit-level unused function prototypes or unused external data
+declarations must not change any `post_inline_ir.*` metric or the selected
+primary-object byte, symbol, undefined-symbol, relocation, and text-size
+metrics. The independent `declarations-per-function` family keeps a four-call,
+five-emitted-function backend workload fixed while adding exactly the selected
+number of unused block-scope prototypes to each of the four callees. It
+requires every `post_inline_ir.*` and `primary_object.*` metric to remain
+identical across scales. Its archived source and environment record both the
+per-function scale and fixed function count, so increasing frontend input
+cannot masquerade as increasing CLIF or object work. These checks catch the old
+behavior where trivial programs accumulated unused CLIF references or object
+declarations.
+
+The live-function series provides a growing backend workload for codegen
+performance work. The four structural axes fail closed per optimization
+profile: every adjacent scale must grow its defining metric within a checked
+linear bound. The block series tracks live CLIF blocks; the SSA series tracks
+live block parameters and results of live instructions; the global series
+tracks CLIF global values, defined symbols, and initialized data; and the
+string series tracks CLIF global values, relocations, and read-only data. These
+checks reject accidentally dead fixtures and structural quadratic growth
+before their timings are considered.
 
 The `hosted-header` pair references exactly one function and one data object;
 the `hosted-printf` pair references exactly one variadic function. For each
@@ -72,6 +83,7 @@ benchmarks/codegen/run.py \
   --samples 10 \
   --declaration-scales 0,100,1000,10000 \
   --data-declaration-scales 0,100,1000,10000 \
+  --declarations-per-function-scales 0,100,1000,10000 \
   --function-scales 1,16,64,256 \
   --block-scales 0,16,128,512 \
   --value-scales 0,100,1000,10000 \
@@ -83,11 +95,13 @@ Pass `--target=<triple>` to select an enabled target when its compiler driver
 and sysroot are configured. The `hosted-header` and `hosted-printf` families
 additionally require that target's `<stdio.h>`. Use `--cases` with a
 comma-separated subset to isolate one family; declaration-only scaling uses
-`declaration-heavy` and `data-declaration-heavy`, while structural scaling
-uses `block-count`, `ssa-values`, `live-globals`, and `string-literals`. Supply
-at least two scales when using a generated family so its adjacent-scale
-invariants run. The output directory must be new or empty so evidence from
-separate runs cannot be mixed accidentally.
+`declaration-heavy`, `data-declaration-heavy`, and
+`declarations-per-function`, while structural scaling uses `block-count`,
+`ssa-values`, `live-globals`, and `string-literals`.
+`declarations-per-function` and every structural family require at least two
+scales so their adjacent-scale invariants cannot be bypassed. The output
+directory must be new or empty so evidence from separate runs cannot be mixed
+accidentally.
 
 ## Results
 
@@ -137,8 +151,9 @@ platform convention internally and is normalized to bytes.
 ## Regression test
 
 The self-test uses a fake compiler, performs positive and negative
-declaration-liveness, hosted-header-equivalence, dead-axis, and superlinear
-structural-growth checks, and does not require a CCC build:
+translation-unit and per-function declaration-liveness,
+hosted-header-equivalence, dead-axis, and superlinear structural-growth checks,
+and does not require a CCC build:
 
 ```sh
 benchmarks/codegen/test-run.sh

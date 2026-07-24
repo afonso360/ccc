@@ -315,8 +315,9 @@ evidence as artifacts.
 The local compiler-only suite measures minimal return, direct `puts`, variadic
 `printf`, equivalent minimal/hosted `fputs` plus `stdout` programs, equivalent
 minimal/hosted variadic `printf` programs, independent unused function/data
-declaration scaling, live-function scaling, and independent live block, SSA
-value, global, and string-literal scaling without link or runtime noise:
+declaration scaling, unused block-scope declarations in a fixed live function
+graph, live-function scaling, and independent live block, SSA value, global,
+and string-literal scaling without link or runtime noise:
 
 ```sh
 cargo build --locked --release -p ccc-driver
@@ -332,18 +333,22 @@ measurement, generated source and hash, exact command, and a comparison-ready
 untimed structural-stat query runs for each case and optimization profile. The
 evidence also records the compiler executable hash, effective target, resource
 directory, sysroot, and selected external-tool configuration. The
-unused function- and data-declaration families require every post-inlining CLIF
-metric plus primary-object byte, symbol, undefined-symbol, relocation, and text
-metrics to remain identical from zero through 1,024 declarations. The
-two hosted-stdio pairs require every post-inlining CLIF and primary-object
+unused function-, data-, and per-function declaration families require every
+post-inlining CLIF metric plus primary-object byte, symbol, undefined-symbol,
+relocation, and text metrics to remain identical from zero through 1,024
+declarations. The per-function family adds that many unused block-scope
+prototypes to each of four fixed live callees, proving frontend input growth
+does not masquerade as increasing backend work. The two hosted-stdio pairs
+require every post-inlining CLIF and primary-object
 metric to match the equivalent minimal declarations at each profile while
 retaining the extra frontend cost in their timing samples. The live-function
 family supplies increasing backend work. Use a release compiler for timing
 comparisons; debug builds are only suitable for exercising the harness. Use
 `--cases hosted-header` or `--cases hosted-printf` to isolate one pair, and
-`--declaration-scales`, `--data-declaration-scales`, `--function-scales`,
-`--block-scales`, `--value-scales`, `--global-scales`, `--string-scales`,
-`--profiles`, `--warmups`, and `--samples` for focused investigations. Each
+`--declaration-scales`, `--data-declaration-scales`,
+`--declarations-per-function-scales`, `--function-scales`, `--block-scales`,
+`--value-scales`, `--global-scales`, `--string-scales`, `--profiles`,
+`--warmups`, and `--samples` for focused investigations. Each
 structural axis must grow its defining metric within checked adjacent-scale
 bounds, rejecting dead fixtures and accidental quadratic IR growth before
 timings are considered. See `benchmarks/codegen/README.md` for the complete
@@ -425,11 +430,12 @@ benchmarks/kernels/test-run.sh
 
 The fast CI job runs the fake-tool regression. The all-target matrix also runs
 all nine kernels in object mode at `-O0`, `-O2`, and `-Oz`, retains their
-structural evidence, and checks the four generated codegen-scaling axes at two
-bounded scales. The scheduled Cranelift-`main` candidate runs the same gate.
-All-target correctness execution and controlled native runtime baselines
-remain follow-up work. QEMU results are correctness and rough-trend evidence,
-never native performance evidence.
+structural evidence, and checks the declaration-per-function invariant plus
+the four generated structural codegen-scaling axes at two bounded scales. The
+scheduled Cranelift-`main` candidate runs the same gate. All-target correctness
+execution and controlled native runtime baselines remain follow-up work. QEMU
+results are correctness and rough-trend evidence, never native performance
+evidence.
 
 ## C-Ray generated-code benchmark
 
