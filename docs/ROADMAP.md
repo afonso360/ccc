@@ -189,17 +189,9 @@ trend evidence and must not be compared numerically with native execution.
 
 ### Initial performance targets
 
-- Final CLIF must contain no unused `sig`, `fn`, or `gv` entities. Replace the
-  eager population in `declare_function_references` with deterministic lazy
-  interning when a CCC-IR operation actually needs a function, object, string,
-  TLS accessor, or support helper.
-- The minimal return program must lower to one block containing only the
-  constant and return, with no stack slot, load, store, external signature,
-  function reference, or global value. Lock this down as an exact CLIF
-  quality test on every target.
-- The two hello programs may contain only the data and external-call entities
-  they use. Adding unrelated declarations or hosted headers must not change
-  their per-function CLIF instruction or imported-entity counts.
+- Including hosted headers in the two hello programs must not change their
+  per-function CLIF instruction or imported-entity counts compared with the
+  equivalent minimal declarations.
 - Variadic-call setup must initialize only protocol fields and argument bytes
   that a helper can read. It must not clear the complete maximum-size frame
   byte by byte. Reduce the checked-in `printf` CLIF instruction baseline by at

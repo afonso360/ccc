@@ -1,5 +1,6 @@
 use super::data::{low_mask_u128, scalar_constant_bits, string_unit_bytes};
 use super::*;
+use std::cell::{Cell, RefCell};
 
 const F80_OP_ADD: i64 = 1;
 const F80_OP_SUBTRACT: i64 = 2;
@@ -23,17 +24,25 @@ const F80_OP_TO_I128: i64 = 19;
 const F80_OP_TO_U128: i64 = 20;
 const F80_OP_COMPARE_SIGNALING: i64 = 21;
 
-pub(super) struct FunctionReferences {
-    functions: HashMap<u32, FunctionReference>,
-    globals: HashMap<u32, DataReference>,
-    strings: HashMap<u32, ir::GlobalValue>,
-    call_helper: Option<ir::FuncRef>,
-    runtime_realloc: Option<ir::FuncRef>,
-    runtime_free: Option<ir::FuncRef>,
-    runtime_helpers: HashMap<&'static str, ir::FuncRef>,
-    f80_support: Option<ir::FuncRef>,
-    inline_cpuid_support: Option<ir::FuncRef>,
-    inline_rdtsc_support: Option<ir::FuncRef>,
+/// Per-function imports, interned in deterministic lowering order.
+///
+/// Module declarations describe what may be referenced, but importing all of
+/// them into every CLIF function creates unused signatures, function refs, and
+/// global values. Keeping the declaration table separate from these caches
+/// makes the first actual use the only point that creates a CLIF entity.
+pub(super) struct FunctionReferences<'a> {
+    declarations: &'a Declarations,
+    object_module: RefCell<&'a mut ObjectModule>,
+    functions: RefCell<HashMap<u32, FunctionReference>>,
+    globals: RefCell<HashMap<u32, DataReference>>,
+    strings: RefCell<HashMap<u32, ir::GlobalValue>>,
+    call_helper: Cell<Option<ir::FuncRef>>,
+    runtime_realloc: Cell<Option<ir::FuncRef>>,
+    runtime_free: Cell<Option<ir::FuncRef>>,
+    runtime_helpers: RefCell<HashMap<&'static str, ir::FuncRef>>,
+    f80_support: Cell<Option<ir::FuncRef>>,
+    inline_cpuid_support: Cell<Option<ir::FuncRef>>,
+    inline_rdtsc_support: Cell<Option<ir::FuncRef>>,
 }
 
 #[derive(Clone, Copy)]
@@ -42,10 +51,10 @@ pub(super) enum DefinitionAbi<'a> {
     Variadic(&'a ccc_abi::BridgeBoundaryPlan),
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct FunctionReference {
-    address: ir::FuncRef,
-    direct_call: ir::FuncRef,
+    address: Option<ir::FuncRef>,
+    direct_call: Option<ir::FuncRef>,
 }
 
 #[derive(Clone, Copy)]
@@ -69,85 +78,238 @@ pub(super) struct FunctionDebugLayout {
     pub(super) storage_slots: HashMap<u32, StackSlot>,
 }
 
-pub(super) fn declare_function_references(
-    declarations: &Declarations,
-    object_module: &mut ObjectModule,
-    function: &mut ir::Function,
-) -> FunctionReferences {
-    let mut function_declarations = declarations.functions.iter().collect::<Vec<_>>();
-    function_declarations.sort_unstable_by_key(|(raw, _)| **raw);
-    let mut functions = HashMap::with_capacity(function_declarations.len());
-    for (raw, id) in function_declarations {
-        let address = object_module.declare_func_in_func(*id, function);
-        let mut direct_call_data = function.dfg.ext_funcs[address].clone();
-        // A native C direct call uses the target's PC-relative call
-        // relocation. Keep a distinct reference for address materialization,
-        // whose linkage and preemption semantics remain module-defined.
-        direct_call_data.colocated = true;
-        let direct_call = function.import_function(direct_call_data);
-        functions.insert(
-            *raw,
-            FunctionReference {
-                address,
-                direct_call,
-            },
-        );
+impl<'a> FunctionReferences<'a> {
+    pub(super) fn new(declarations: &'a Declarations, object_module: &'a mut ObjectModule) -> Self {
+        Self {
+            declarations,
+            object_module: RefCell::new(object_module),
+            functions: RefCell::new(HashMap::new()),
+            globals: RefCell::new(HashMap::new()),
+            strings: RefCell::new(HashMap::new()),
+            call_helper: Cell::new(None),
+            runtime_realloc: Cell::new(None),
+            runtime_free: Cell::new(None),
+            runtime_helpers: RefCell::new(HashMap::new()),
+            f80_support: Cell::new(None),
+            inline_cpuid_support: Cell::new(None),
+            inline_rdtsc_support: Cell::new(None),
+        }
     }
-    let mut global_declarations = declarations.globals.iter().collect::<Vec<_>>();
-    global_declarations.sort_unstable_by_key(|(raw, _)| **raw);
-    let mut globals = HashMap::with_capacity(global_declarations.len());
-    for (raw, declaration) in global_declarations {
-        globals.insert(
-            *raw,
-            DataReference {
-                value: (!declaration.tls)
-                    .then(|| object_module.declare_data_in_func(declaration.id, function)),
-                tls_accessor: declaration
-                    .tls_accessor
-                    .map(|id| object_module.declare_func_in_func(id, function)),
-            },
-        );
+}
+
+impl FunctionReferences<'_> {
+    fn import_function(&self, builder: &mut FunctionBuilder<'_>, id: FuncId) -> ir::FuncRef {
+        self.object_module
+            .borrow_mut()
+            .declare_func_in_func(id, builder.func)
     }
-    let mut string_declarations = declarations.strings.iter().collect::<Vec<_>>();
-    string_declarations.sort_unstable_by_key(|(raw, _)| **raw);
-    let mut strings = HashMap::with_capacity(string_declarations.len());
-    for (raw, id) in string_declarations {
-        strings.insert(*raw, object_module.declare_data_in_func(*id, function));
+
+    fn function_address(
+        &self,
+        builder: &mut FunctionBuilder<'_>,
+        raw: u32,
+    ) -> Result<ir::FuncRef, CodegenError> {
+        if let Some(reference) = self
+            .functions
+            .borrow()
+            .get(&raw)
+            .and_then(|reference| reference.address)
+        {
+            return Ok(reference);
+        }
+        let id = self
+            .declarations
+            .functions
+            .get(&raw)
+            .copied()
+            .ok_or_else(|| error(format!("reference to undeclared function {raw}")))?;
+        let reference = self.import_function(builder, id);
+        self.functions.borrow_mut().entry(raw).or_default().address = Some(reference);
+        Ok(reference)
     }
-    let call_helper = declarations
-        .call_helper
-        .map(|id| object_module.declare_func_in_func(id, function));
-    let runtime_realloc = declarations
-        .runtime_realloc
-        .map(|id| object_module.declare_func_in_func(id, function));
-    let runtime_free = declarations
-        .runtime_free
-        .map(|id| object_module.declare_func_in_func(id, function));
-    let runtime_helpers = declarations
-        .runtime_helpers
-        .iter()
-        .map(|(symbol, id)| (*symbol, object_module.declare_func_in_func(*id, function)))
-        .collect();
-    let f80_support = declarations
-        .f80_support
-        .map(|id| object_module.declare_func_in_func(id, function));
-    let inline_cpuid_support = declarations
-        .inline_cpuid_support
-        .map(|id| object_module.declare_func_in_func(id, function));
-    let inline_rdtsc_support = declarations
-        .inline_rdtsc_support
-        .map(|id| object_module.declare_func_in_func(id, function));
-    FunctionReferences {
-        functions,
-        globals,
-        strings,
-        call_helper,
-        runtime_realloc,
-        runtime_free,
-        runtime_helpers,
-        f80_support,
-        inline_cpuid_support,
-        inline_rdtsc_support,
+
+    fn direct_function(
+        &self,
+        builder: &mut FunctionBuilder<'_>,
+        raw: u32,
+    ) -> Result<ir::FuncRef, CodegenError> {
+        if let Some(reference) = self
+            .functions
+            .borrow()
+            .get(&raw)
+            .and_then(|reference| reference.direct_call)
+        {
+            return Ok(reference);
+        }
+        let id = self
+            .declarations
+            .functions
+            .get(&raw)
+            .copied()
+            .ok_or_else(|| error(format!("call references undeclared function {raw}")))?;
+        let reference = self.import_function(builder, id);
+        // Native C direct calls use the target's PC-relative call relocation.
+        // Address materialization is interned separately so that its linkage
+        // and preemption semantics remain module-defined.
+        builder.func.dfg.ext_funcs[reference].colocated = true;
+        self.functions
+            .borrow_mut()
+            .entry(raw)
+            .or_default()
+            .direct_call = Some(reference);
+        Ok(reference)
+    }
+
+    fn global(
+        &self,
+        builder: &mut FunctionBuilder<'_>,
+        raw: u32,
+    ) -> Result<DataReference, CodegenError> {
+        if let Some(reference) = self.globals.borrow().get(&raw).copied() {
+            return Ok(reference);
+        }
+        let declaration = self
+            .declarations
+            .globals
+            .get(&raw)
+            .copied()
+            .ok_or_else(|| error(format!("reference to undeclared data object {raw}")))?;
+        let reference = DataReference {
+            value: (!declaration.tls).then(|| {
+                self.object_module
+                    .borrow_mut()
+                    .declare_data_in_func(declaration.id, builder.func)
+            }),
+            tls_accessor: declaration
+                .tls_accessor
+                .map(|id| self.import_function(builder, id)),
+        };
+        self.globals.borrow_mut().insert(raw, reference);
+        Ok(reference)
+    }
+
+    fn string(
+        &self,
+        builder: &mut FunctionBuilder<'_>,
+        raw: u32,
+    ) -> Result<ir::GlobalValue, CodegenError> {
+        if let Some(reference) = self.strings.borrow().get(&raw).copied() {
+            return Ok(reference);
+        }
+        let id = self
+            .declarations
+            .strings
+            .get(&raw)
+            .copied()
+            .ok_or_else(|| error(format!("reference to undeclared string {raw}")))?;
+        let reference = self
+            .object_module
+            .borrow_mut()
+            .declare_data_in_func(id, builder.func);
+        self.strings.borrow_mut().insert(raw, reference);
+        Ok(reference)
+    }
+
+    fn optional_function(
+        &self,
+        builder: &mut FunctionBuilder<'_>,
+        declaration: Option<FuncId>,
+        cache: &Cell<Option<ir::FuncRef>>,
+        missing: &'static str,
+    ) -> Result<ir::FuncRef, CodegenError> {
+        if let Some(reference) = cache.get() {
+            return Ok(reference);
+        }
+        let id = declaration.ok_or_else(|| error(missing))?;
+        let reference = self.import_function(builder, id);
+        cache.set(Some(reference));
+        Ok(reference)
+    }
+
+    fn call_helper(&self, builder: &mut FunctionBuilder<'_>) -> Result<ir::FuncRef, CodegenError> {
+        self.optional_function(
+            builder,
+            self.declarations.call_helper,
+            &self.call_helper,
+            "variadic call bridge has no translation-unit helper",
+        )
+    }
+
+    fn runtime_realloc(
+        &self,
+        builder: &mut FunctionBuilder<'_>,
+    ) -> Result<ir::FuncRef, CodegenError> {
+        self.optional_function(
+            builder,
+            self.declarations.runtime_realloc,
+            &self.runtime_realloc,
+            "runtime-sized storage has no realloc declaration",
+        )
+    }
+
+    fn runtime_free(&self, builder: &mut FunctionBuilder<'_>) -> Result<ir::FuncRef, CodegenError> {
+        self.optional_function(
+            builder,
+            self.declarations.runtime_free,
+            &self.runtime_free,
+            "runtime-sized storage has no free declaration",
+        )
+    }
+
+    fn f80_support(&self, builder: &mut FunctionBuilder<'_>) -> Result<ir::FuncRef, CodegenError> {
+        self.optional_function(
+            builder,
+            self.declarations.f80_support,
+            &self.f80_support,
+            "x87 operation has no generated support helper",
+        )
+    }
+
+    fn inline_cpuid_support(
+        &self,
+        builder: &mut FunctionBuilder<'_>,
+    ) -> Result<ir::FuncRef, CodegenError> {
+        self.optional_function(
+            builder,
+            self.declarations.inline_cpuid_support,
+            &self.inline_cpuid_support,
+            "x86 CPUID operation has no generated native helper",
+        )
+    }
+
+    fn inline_rdtsc_support(
+        &self,
+        builder: &mut FunctionBuilder<'_>,
+    ) -> Result<ir::FuncRef, CodegenError> {
+        self.optional_function(
+            builder,
+            self.declarations.inline_rdtsc_support,
+            &self.inline_rdtsc_support,
+            "x86 RDTSC operation has no generated native helper",
+        )
+    }
+
+    fn runtime_helper(
+        &self,
+        builder: &mut FunctionBuilder<'_>,
+        symbol: &'static str,
+    ) -> Result<ir::FuncRef, CodegenError> {
+        if let Some(reference) = self.runtime_helpers.borrow().get(symbol).copied() {
+            return Ok(reference);
+        }
+        let id = self
+            .declarations
+            .runtime_helpers
+            .get(symbol)
+            .copied()
+            .ok_or_else(|| {
+                error(format!(
+                    "runtime helper `{symbol}` has no target manifest entry"
+                ))
+            })?;
+        let reference = self.import_function(builder, id);
+        self.runtime_helpers.borrow_mut().insert(symbol, reference);
+        Ok(reference)
     }
 }
 
@@ -245,7 +407,7 @@ pub(super) fn lower_function(
     config: &EffectiveCompilationConfig,
     abi_plan: ccc_abi::VerifiedModuleAbiPlan<'_>,
     definition_plan: DefinitionAbi<'_>,
-    references: &FunctionReferences,
+    references: &FunctionReferences<'_>,
     frontend_config: isa::TargetFrontendConfig,
     clif_function: &mut ir::Function,
     mut debug_locations: Option<&mut super::debug::SourceLocationRegistry>,
@@ -455,13 +617,13 @@ pub(super) fn lower_function(
     Ok(FunctionDebugLayout { storage_slots })
 }
 
-struct FunctionState<'a> {
+struct FunctionState<'a, 'references, 'object> {
     module: &'a gir::FullModule,
     function: &'a gir::FullFunction,
     config: &'a EffectiveCompilationConfig,
     abi_plan: ccc_abi::VerifiedModuleAbiPlan<'a>,
     definition_plan: DefinitionAbi<'a>,
-    references: &'a FunctionReferences,
+    references: &'references FunctionReferences<'object>,
     frontend_config: isa::TargetFrontendConfig,
     blocks: HashMap<u32, ir::Block>,
     storage: HashMap<u32, StackStorage>,
@@ -472,7 +634,7 @@ struct FunctionState<'a> {
     variadic_frame: Option<ir::Value>,
 }
 
-impl FunctionState<'_> {
+impl FunctionState<'_, '_, '_> {
     fn f80_support_call(
         &self,
         builder: &mut FunctionBuilder<'_>,
@@ -481,10 +643,7 @@ impl FunctionState<'_> {
         left: ir::Value,
         right: Option<ir::Value>,
     ) -> Result<(), CodegenError> {
-        let helper = self
-            .references
-            .f80_support
-            .ok_or_else(|| error("x87 operation has no generated support helper"))?;
+        let helper = self.references.f80_support(builder)?;
         let frame = create_stack_backing(builder, 32, 16)?;
         zero_memory(builder, frame, 32)?;
         store_integer(builder, frame, 0, ir::types::I32, opcode)?;
@@ -1096,27 +1255,11 @@ impl FunctionState<'_> {
                             function.0
                         )));
                     }
-                    let reference = self
-                        .references
-                        .functions
-                        .get(&function.0)
-                        .copied()
-                        .ok_or_else(|| {
-                            error(format!("reference to undeclared function {}", function.0))
-                        })?;
-                    Ok(Some(
-                        builder.ins().func_addr(ir::types::I64, reference.address),
-                    ))
+                    let reference = self.references.function_address(builder, function.0)?;
+                    Ok(Some(builder.ins().func_addr(ir::types::I64, reference)))
                 }
                 I::AddressOfString { string } => {
-                    let reference =
-                        self.references
-                            .strings
-                            .get(&string.0)
-                            .copied()
-                            .ok_or_else(|| {
-                                error(format!("reference to undeclared string {}", string.0))
-                            })?;
+                    let reference = self.references.string(builder, string.0)?;
                     Ok(Some(builder.ins().symbol_value(ir::types::I64, reference)))
                 }
                 I::AddressOfStorage { storage } => {
@@ -1434,14 +1577,7 @@ impl FunctionState<'_> {
                 } => {
                     let destination_size =
                         object_layout(&self.module.types, *object, self.config)?.size;
-                    let source =
-                        self.references
-                            .strings
-                            .get(&string.0)
-                            .copied()
-                            .ok_or_else(|| {
-                                error(format!("reference to undeclared string {}", string.0))
-                            })?;
+                    let source = self.references.string(builder, string.0)?;
                     let source = builder.ins().symbol_value(ir::types::I64, source);
                     let string = self
                         .module
@@ -1542,7 +1678,7 @@ impl FunctionState<'_> {
                             *from,
                             *to,
                             self.config,
-                            &self.references.runtime_helpers,
+                            self.references,
                         )
                     }
                 }
@@ -1601,7 +1737,7 @@ impl FunctionState<'_> {
                         floating,
                         signed,
                         result,
-                        &self.references.runtime_helpers,
+                        self.references,
                     )?))
                 }
                 I::IntegerIntrinsic { operation, operand } => {
@@ -1794,9 +1930,7 @@ impl FunctionState<'_> {
                     ecx,
                     edx,
                 } => {
-                    let helper = self.references.inline_cpuid_support.ok_or_else(|| {
-                        error("x86 CPUID operation has no generated native helper")
-                    })?;
+                    let helper = self.references.inline_cpuid_support(builder)?;
                     let subleaf = if let Some(subleaf) = subleaf {
                         self.value(*subleaf)?
                     } else {
@@ -1820,9 +1954,7 @@ impl FunctionState<'_> {
                     Ok(None)
                 }
                 I::X86Rdtsc { low, high } => {
-                    let helper = self.references.inline_rdtsc_support.ok_or_else(|| {
-                        error("x86 RDTSC operation has no generated native helper")
-                    })?;
+                    let helper = self.references.inline_rdtsc_support(builder)?;
                     builder
                         .ins()
                         .call(helper, &[self.value(*low)?, self.value(*high)?]);
@@ -1866,12 +1998,7 @@ impl FunctionState<'_> {
         builder: &mut FunctionBuilder<'_>,
         raw: u32,
     ) -> Result<ir::Value, CodegenError> {
-        let reference = self
-            .references
-            .globals
-            .get(&raw)
-            .copied()
-            .ok_or_else(|| error(format!("reference to undeclared data object {raw}")))?;
+        let reference = self.references.global(builder, raw)?;
         if let Some(accessor) = reference.tls_accessor {
             let call = builder.ins().call(accessor, &[]);
             return builder
@@ -1895,21 +2022,11 @@ impl FunctionState<'_> {
         let address = match target {
             gir::RelocationTarget::Object(id) => self.global_address(builder, id.0)?,
             gir::RelocationTarget::Function(id) => {
-                let reference = self
-                    .references
-                    .functions
-                    .get(&id.0)
-                    .copied()
-                    .ok_or_else(|| error(format!("reference to undeclared function {}", id.0)))?;
-                builder.ins().func_addr(ir::types::I64, reference.address)
+                let reference = self.references.function_address(builder, id.0)?;
+                builder.ins().func_addr(ir::types::I64, reference)
             }
             gir::RelocationTarget::String(id) => {
-                let reference = self
-                    .references
-                    .strings
-                    .get(&id.0)
-                    .copied()
-                    .ok_or_else(|| error(format!("reference to undeclared string {}", id.0)))?;
+                let reference = self.references.string(builder, id.0)?;
                 builder.ins().symbol_value(ir::types::I64, reference)
             }
         };
@@ -2518,21 +2635,17 @@ impl FunctionState<'_> {
         variadic_boundary: usize,
     ) -> Result<Option<ir::Value>, CodegenError> {
         let boundary = self.call_boundary(instruction, signature, arguments, variadic_boundary)?;
-        let reference = self
-            .references
-            .functions
-            .get(&function)
-            .copied()
-            .ok_or_else(|| error(format!("call references undeclared function {function}")))?;
         match boundary {
             ccc_abi::BoundaryPlan::Native(plan) => {
                 let (arguments, result_storage) =
                     self.marshal_native_call_arguments(builder, plan, arguments)?;
-                let call = builder.ins().call(reference.direct_call, &arguments);
+                let reference = self.references.direct_function(builder, function)?;
+                let call = builder.ins().call(reference, &arguments);
                 self.finish_native_call(builder, call, plan, result_storage)
             }
             ccc_abi::BoundaryPlan::Bridge(plan) => {
-                let target = builder.ins().func_addr(ir::types::I64, reference.address);
+                let reference = self.references.function_address(builder, function)?;
+                let target = builder.ins().func_addr(ir::types::I64, reference);
                 self.bridge_call(builder, target, plan, arguments)
             }
         }
@@ -2620,10 +2733,7 @@ impl FunctionState<'_> {
         plan: &ccc_abi::BridgeBoundaryPlan,
         arguments: &[gir::ValueId],
     ) -> Result<Option<ir::Value>, CodegenError> {
-        let helper = self
-            .references
-            .call_helper
-            .ok_or_else(|| error("variadic call bridge has no translation-unit helper"))?;
+        let helper = self.references.call_helper(builder)?;
         let layout = bridge_frame_layout(plan.abi_identity);
         let frame_size = layout
             .call_fixed_size
@@ -3056,10 +3166,7 @@ impl FunctionState<'_> {
                     storage.0
                 ))
             })?;
-        let realloc = self
-            .references
-            .runtime_realloc
-            .ok_or_else(|| error("runtime-sized storage has no realloc declaration"))?;
+        let realloc = self.references.runtime_realloc(builder)?;
         let layout = object_layout(&self.module.types, element, self.config)?;
         const HOSTED_VLA_MINIMUM_ALIGNMENT: u64 = 16;
         let alignment = requested_alignment
@@ -3178,10 +3285,7 @@ impl FunctionState<'_> {
         if self.runtime_storage.is_empty() {
             return Ok(());
         }
-        let free = self
-            .references
-            .runtime_free
-            .ok_or_else(|| error("runtime-sized storage has no free declaration"))?;
+        let free = self.references.runtime_free(builder)?;
         let mut slots = self.runtime_storage.iter().collect::<Vec<_>>();
         slots.sort_unstable_by_key(|(storage, _)| **storage);
         for (_, slot) in slots {
@@ -4207,7 +4311,7 @@ fn lower_conversion(
     from: QualifiedType,
     to: QualifiedType,
     config: &EffectiveCompilationConfig,
-    runtime_helpers: &HashMap<&'static str, ir::FuncRef>,
+    runtime_helpers: &FunctionReferences<'_>,
 ) -> Result<Option<ir::Value>, CodegenError> {
     if kind == gir::ScalarConversion::ToVoid {
         return Ok(None);
@@ -4794,7 +4898,7 @@ fn lower_binary(
     floating: bool,
     signed: bool,
     result: ir::Type,
-    runtime_helpers: &HashMap<&'static str, ir::FuncRef>,
+    runtime_helpers: &FunctionReferences<'_>,
 ) -> Result<ir::Value, CodegenError> {
     let float16 = floating && builder.func.dfg.value_type(left) == ir::types::I16;
     if float16 {
@@ -4892,15 +4996,11 @@ fn lower_binary(
 
 fn runtime_helper_call(
     builder: &mut FunctionBuilder<'_>,
-    runtime_helpers: &HashMap<&'static str, ir::FuncRef>,
+    runtime_helpers: &FunctionReferences<'_>,
     symbol: &'static str,
     arguments: &[ir::Value],
 ) -> Result<ir::Value, CodegenError> {
-    let reference = runtime_helpers.get(symbol).copied().ok_or_else(|| {
-        error(format!(
-            "runtime helper `{symbol}` has no target manifest entry"
-        ))
-    })?;
+    let reference = runtime_helpers.runtime_helper(builder, symbol)?;
     let call = builder.ins().call(reference, arguments);
     match builder.inst_results(call) {
         [result] => Ok(*result),

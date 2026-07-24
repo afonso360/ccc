@@ -206,12 +206,8 @@ fn emit_inner(
         let mut context = Context::new();
         context.func =
             ir::Function::with_name_signature(UserFuncName::user(0, function.id.0), signature);
-        let references = function::declare_function_references(
-            &declarations,
-            &mut object_module,
-            &mut context.func,
-        );
         let frontend_config = object_module.isa().frontend_config();
+        let references = function::FunctionReferences::new(&declarations, &mut object_module);
         let definition_plan = abi_plan
             .plan()
             .definitions
@@ -233,6 +229,7 @@ fn emit_inner(
             debug.as_mut().map(|emitter| &mut emitter.locations),
         )
         .map_err(|error| error.with_span_if_none(function.span))?;
+        drop(references);
         if options.emit_clif {
             clif.push_str(&format!(
                 "; function {}\n{}\n",

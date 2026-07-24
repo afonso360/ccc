@@ -1610,6 +1610,73 @@ fn function_clif<'a>(clif: &'a str, name: &str) -> &'a str {
     &body[..end]
 }
 
+fn clif_entities<'a>(function: &'a str, prefix: &str) -> Vec<&'a str> {
+    function
+        .lines()
+        .filter_map(|line| {
+            let (name, _) = line.trim().split_once(" = ")?;
+            let suffix = name.strip_prefix(prefix)?;
+            (!suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())).then_some(name)
+        })
+        .collect()
+}
+
+fn assert_all_clif_entities_are_used(function: &str) {
+    for prefix in ["sig", "fn", "gv"] {
+        for entity in clif_entities(function, prefix) {
+            let uses = function
+                .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+                .filter(|token| *token == entity)
+                .count();
+            assert!(
+                uses >= 2,
+                "{entity} is declared but unused in generated CLIF:\n{function}"
+            );
+        }
+    }
+}
+
+#[test]
+fn tiny_functions_intern_only_referenced_clif_entities_on_every_target() {
+    let source = "int puts(const char *);\n\
+                  int printf(const char *, ...);\n\
+                  int minimal(void) { return 0; }\n\
+                  int call_puts(void) { return puts(\"hello\"); }\n\
+                  int call_printf(void) { return printf(\"%d\", 7); }";
+    for config in [
+        EffectiveCompilationConfig::default(),
+        EffectiveCompilationConfig::aarch64_unknown_linux_gnu(),
+        EffectiveCompilationConfig::riscv64_unknown_linux_gnu(),
+        EffectiveCompilationConfig::aarch64_apple_darwin(),
+    ] {
+        let output = emit_source_with_config(source, &config);
+        let minimal = function_clif(&output.clif, "minimal");
+        assert!(clif_entities(minimal, "sig").is_empty(), "{minimal}");
+        assert!(clif_entities(minimal, "fn").is_empty(), "{minimal}");
+        assert!(clif_entities(minimal, "gv").is_empty(), "{minimal}");
+        assert_eq!(minimal.matches("\nblock").count(), 1, "{minimal}");
+        assert!(
+            minimal.contains("block0:\n    v0 = iconst.i32 0\n    return v0  ; v0 = 0\n"),
+            "{minimal}"
+        );
+        for forbidden in ["ss0", "load", "store", "call", "symbol_value"] {
+            assert!(!minimal.contains(forbidden), "{minimal}");
+        }
+
+        let puts = function_clif(&output.clif, "call_puts");
+        assert_eq!(clif_entities(puts, "sig").len(), 1, "{puts}");
+        assert_eq!(clif_entities(puts, "fn").len(), 1, "{puts}");
+        assert_eq!(clif_entities(puts, "gv").len(), 1, "{puts}");
+        assert_all_clif_entities_are_used(puts);
+
+        let printf = function_clif(&output.clif, "call_printf");
+        assert_eq!(clif_entities(printf, "sig").len(), 2, "{printf}");
+        assert_eq!(clif_entities(printf, "fn").len(), 2, "{printf}");
+        assert_eq!(clif_entities(printf, "gv").len(), 1, "{printf}");
+        assert_all_clif_entities_are_used(printf);
+    }
+}
+
 #[test]
 fn computed_goto_uses_a_dense_br_table_and_nonrelocatable_label_tokens() {
     let output = emit_source(
@@ -1702,7 +1769,7 @@ fn complete_abi_plan_and_aggregate_clif_have_exact_snapshots() {
     .unwrap();
     assert_eq!(
         sha256(&output.clif),
-        "1230dc2a71cb86d3c7598aa2cd7832e0e568a5fd9aeb510f2bda40e979eb753c"
+        "f901647419fc95b176ec80193242a4b14a01ea5d345276e24eddd17367597868"
     );
 }
 
