@@ -336,6 +336,11 @@ performance comparisons; the adapter rejects cross-target and emulated timing.
 The full result schema and override options are documented in
 `test-corpus/c-ray/README.md`.
 
+The Linux x86-64 corpus job runs the correctness profile on every pull request
+and push to `master`, then uploads the complete retained work directory. Those
+single-sample results prove the benchmark and schema remain executable; they
+are not an authoritative performance baseline.
+
 ## Csmith differential suite
 
 Csmith differential execution is supported on native x86-64 GNU/Linux and

@@ -268,3 +268,16 @@ jobs:
 
       - name: Test zstd
         run: test-corpus/zstd/run.sh --work-dir "$RUNNER_TEMP/ccc-corpus/zstd"
+
+      - name: Run C-Ray correctness benchmark
+        run: >-
+          test-corpus/c-ray/run.sh --profile correctness
+          --work-dir "$RUNNER_TEMP/ccc-corpus/c-ray"
+
+      - name: Upload C-Ray benchmark evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: c-ray-correctness-linux-x86-64
+          path: ${{ runner.temp }}/ccc-corpus/c-ray
+          if-no-files-found: ignore
