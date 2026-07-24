@@ -1,5 +1,6 @@
 use ccc_diag::{
     Diagnostic, DiagnosticEngine, DiagnosticOptions, Severity, WarningCategory, WarningLevel,
+    codes::preprocessor::WARNING_DIRECTIVE,
 };
 use ccc_pp::{
     DiagnosticPragmaAction, DiagnosticSink, PpDiagnostic, PpDiagnosticCategory, PpSeverity,
@@ -59,7 +60,7 @@ impl DiagnosticSink for PreprocessorDiagnostics {
         if diagnostic.severity == PpSeverity::Warning
             && diagnostic.is_system_header
             && !self.warn_in_system_headers
-            && diagnostic.code != "CCC1315"
+            && diagnostic.code != WARNING_DIRECTIVE.as_str()
         {
             return;
         }

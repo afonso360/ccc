@@ -130,6 +130,7 @@ dependencies = [
 name = "ccc-pp"
 version = "0.1.0"
 dependencies = [
+ "ccc-diag",
  "ccc-session",
  "ccc-target",
 ]

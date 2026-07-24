@@ -1,5 +1,6 @@
 use std::fmt;
 
+use ccc_diag::codes::preprocessor::UNTERMINATED_LITERAL;
 use ccc_session::{FileId, Span};
 
 use crate::literal::validate_character_constant_ucns;
@@ -117,7 +118,7 @@ impl<'a> Lexer<'a> {
                     self.pending_space = false;
                 }
                 Err(error) => {
-                    let skip_remainder = error.code == "CCC0002";
+                    let skip_remainder = error.code == UNTERMINATED_LITERAL.as_str();
                     self.line_errors
                         .last_mut()
                         .expect("an error line always exists")
@@ -211,7 +212,7 @@ impl<'a> Lexer<'a> {
         let rest = &self.source.text[start..];
         let kind = if let Some(literal) = scan_prefixed_literal(rest).map_err(|()| {
             self.error(
-                "CCC0002",
+                UNTERMINATED_LITERAL.as_str(),
                 start,
                 self.source
                     .text
@@ -250,7 +251,7 @@ impl<'a> Lexer<'a> {
         } else if matches!(rest.as_bytes()[0], b'\'' | b'"') {
             self.index += scan_quoted(rest, rest.as_bytes()[0]).map_err(|()| {
                 self.error(
-                    "CCC0002",
+                    UNTERMINATED_LITERAL.as_str(),
                     start,
                     self.source
                         .text

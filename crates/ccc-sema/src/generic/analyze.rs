@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use ccc_diag::Diagnostic;
+use ccc_diag::{Diagnostic, codes::semantic::UNDECLARED_IDENTIFIER};
 use ccc_pp::{
     CharacterConstantPrefix, FloatingConstant, FloatingConstantSuffix, PragmaEvent,
     StringLiteralPrefix, canonicalize_identifier,
@@ -5613,7 +5613,7 @@ impl<'a> Analyzer<'a> {
                 });
             }
             return self.fail(
-                "CCC2274",
+                UNDECLARED_IDENTIFIER.as_str(),
                 identifier.span,
                 format!("use of undeclared identifier `{}`", identifier.name),
             );

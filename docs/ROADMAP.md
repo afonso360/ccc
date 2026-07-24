@@ -369,9 +369,12 @@ performed by Cranelift merely to improve a benchmark score.
   and proves guard-controlled cleanup. Keep the native Darwin assembler,
   linker, `nmedit`, `dsymutil`, UUID, and LLDB oracle authoritative before
   extending OSO-bearing artifact lifetimes beyond one driver invocation.
-- Create a typed diagnostic-code registry and generate uniqueness, ownership,
-  range, and documentation checks while keeping serialized `CCCxxxx` strings
-  stable.
+- The typed diagnostic-code registry now defines disjoint owner bands,
+  compile-time format/uniqueness/range checks, and named constants for the four
+  codes whose identity controls recovery or suppression. Complete the registry
+  in subsystem-sized migrations, model the few cross-owner emitters explicitly,
+  generate its Markdown table, and make the workspace audit reject unregistered
+  production emission while keeping serialized `CCCxxxx` strings stable.
 - Generate the GNU capability tables and user-facing status summary from the
   compatibility registry, or fail CI when the prose and registry disagree.
 - Factor the common audited compiler-wrapper mechanics used by the bzip2,

@@ -1,9 +1,16 @@
 //! Structured diagnostics, warning policy, and deterministic text rendering.
 
+mod code;
+
 use std::collections::HashMap;
 use std::fmt;
 
 use ccc_session::{OriginKind, SourceLocation, SourceMap, Span};
+
+pub use code::{
+    ALL, DiagnosticCode, DiagnosticCodeDefinition, DiagnosticOwner, DiagnosticOwnerBand,
+    OWNER_BANDS, codes,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Severity {
@@ -542,7 +549,7 @@ impl DiagnosticEngine {
         if self.options.error_limit != 0 && self.error_count >= self.options.error_limit {
             self.diagnostics.push(
                 Diagnostic::error(
-                    "CCC0000",
+                    codes::diagnostics::TOO_MANY_ERRORS,
                     format!(
                         "too many errors emitted; stopping after {}",
                         self.options.error_limit

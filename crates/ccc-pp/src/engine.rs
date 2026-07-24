@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use ccc_diag::codes::preprocessor::WARNING_DIRECTIVE;
 use ccc_session::{FileId, Session, SourceFileSpec, Span};
 use ccc_target::{CapabilityKind, LanguageMode, SystemIncludeKind};
 
@@ -1094,7 +1095,8 @@ impl Engine<'_> {
             "error" => self
                 .emit(PpDiagnostic::error("CCC1314", directive_message(operands)).with_span(span)),
             "warning" => self.emit(
-                PpDiagnostic::warning("CCC1315", directive_message(operands)).with_span(span),
+                PpDiagnostic::warning(WARNING_DIRECTIVE.as_str(), directive_message(operands))
+                    .with_span(span),
             ),
             "pragma" => self.handle_pragma(operands, span, emit_tokens),
             _ => self.emit(

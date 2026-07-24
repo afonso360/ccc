@@ -27,7 +27,7 @@ use args::{
 use ccc_codegen::{Options as CodegenOptions, Output as CodegenOutput};
 use ccc_diag::{
     Diagnostic, DiagnosticEngine, DiagnosticFormat, EmitOutcome, RenderOptions,
-    render_json_document,
+    codes::semantic::UNDECLARED_IDENTIFIER, render_json_document,
 };
 use ccc_ir::generic::{FullModule, IrError as FrontendIrError};
 use ccc_link::{RegisteredTemporaryFile, ToolchainRequirements, ToolchainResolver};
@@ -2316,7 +2316,7 @@ fn diagnostic_depends_on_recovery(
     bindings: &[PoisonedBinding],
     sources: &SourceMap,
 ) -> bool {
-    if diagnostic.code != "CCC2274" {
+    if diagnostic.code != UNDECLARED_IDENTIFIER.as_str() {
         return false;
     }
     let Some(primary) = diagnostic.primary.as_ref() else {
