@@ -120,6 +120,15 @@ pub fn assert_command_failure(context: &str, output: &Output) {
     assert_command_status(context, output, false, None);
 }
 
+/// Constructs a command for the CCC binary under test.
+///
+/// This intentionally supplies only the executable. Callers must keep target
+/// selection, environment overrides, working directories, and arguments
+/// explicit at the invocation site.
+pub fn ccc_command() -> std::process::Command {
+    std::process::Command::new(env!("CARGO_BIN_EXE_ccc"))
+}
+
 #[track_caller]
 pub fn assert_command_text_success(
     context: &str,

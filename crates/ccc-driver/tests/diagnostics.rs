@@ -1,6 +1,5 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 mod support;
 
@@ -101,7 +100,7 @@ fn rejected_translations_match_diagnostic_goldens_and_emit_no_object() {
         let directory = support::TestWorkspace::new("diagnostics", case.name).retain_on_failure();
         let output = directory.join(format!("{}.o", case.name));
         let input = format!("tests/diagnostics/cases/{}.c", case.name);
-        let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+        let result = support::ccc_command()
             .current_dir(&repository)
             .env("LC_ALL", "C")
             .env("LANG", "C")
@@ -159,7 +158,7 @@ fn binary128_long_double_rejections_match_diagnostic_goldens() {
         let directory = support::TestWorkspace::new("diagnostics", case.name).retain_on_failure();
         let output = directory.join(format!("{}.o", case.name));
         let input = format!("tests/diagnostics/cases/{}.c", case.name);
-        let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+        let result = support::ccc_command()
             .current_dir(&repository)
             .env("LC_ALL", "C")
             .env("LANG", "C")
@@ -230,7 +229,7 @@ fn inline_assembly_near_misses_fail_closed_before_object_emission() {
         let source = directory.join(format!("{name}.c"));
         let object = directory.join(format!("{name}.o"));
         fs::write(&source, text).unwrap();
-        let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+        let result = support::ccc_command()
             .arg("-c")
             .arg(&source)
             .arg("-o")
@@ -254,7 +253,7 @@ fn parser_recovery_reports_independent_errors_and_preserves_publications() {
     fs::write(&object, b"existing object").unwrap();
     fs::write(&dependencies, b"existing dependencies").unwrap();
 
-    let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+    let result = support::ccc_command()
         .current_dir(&repository)
         .env("LC_ALL", "C")
         .env("LANG", "C")
@@ -279,7 +278,7 @@ fn parser_recovery_reports_independent_errors_and_preserves_publications() {
 fn error_limit_is_shared_across_preprocessing_parsing_and_semantics() {
     let repository = repository();
     let run = |limit: usize| {
-        Command::new(env!("CARGO_BIN_EXE_ccc"))
+        support::ccc_command()
             .current_dir(&repository)
             .env("LC_ALL", "C")
             .env("LANG", "C")
@@ -314,7 +313,7 @@ fn error_limit_is_shared_across_preprocessing_parsing_and_semantics() {
 fn json_diagnostics_match_the_versioned_deterministic_golden() {
     let repository = repository();
     let run = || {
-        Command::new(env!("CARGO_BIN_EXE_ccc"))
+        support::ccc_command()
             .current_dir(&repository)
             .env("LC_ALL", "C")
             .env("LANG", "C")
@@ -343,7 +342,7 @@ fn json_diagnostics_match_the_versioned_deterministic_golden() {
 #[test]
 fn json_diagnostics_carry_include_and_macro_provenance() {
     let repository = repository();
-    let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+    let result = support::ccc_command()
         .current_dir(&repository)
         .env("LC_ALL", "C")
         .env("LANG", "C")
@@ -374,7 +373,7 @@ fn json_diagnostics_carry_include_and_macro_provenance() {
 
 #[test]
 fn json_mode_formats_command_line_parse_errors() {
-    let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+    let result = support::ccc_command()
         .args(["-fdiagnostics-format=json", "--unsupported-for-json-test"])
         .output()
         .unwrap();
@@ -402,7 +401,7 @@ fn recovery_poison_suppresses_only_dependent_semantic_errors() {
     )
     .unwrap();
 
-    let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+    let result = support::ccc_command()
         .args(["-nostdinc", "-fsyntax-only", "-ferror-limit=0"])
         .arg(&source)
         .output()
@@ -428,7 +427,7 @@ fn recovery_poison_suppresses_only_dependent_semantic_errors() {
 #[test]
 fn json_mode_composes_driver_and_frontend_diagnostics_once() {
     let repository = repository();
-    let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+    let result = support::ccc_command()
         .current_dir(&repository)
         .env("LC_ALL", "C")
         .env("LANG", "C")
@@ -462,7 +461,7 @@ fn json_mode_composes_publication_failures_with_prior_warnings() {
     let directory =
         support::TestWorkspace::new("diagnostics", "json-publication").retain_on_failure();
     let missing = directory.join("missing").join("output.d");
-    let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+    let result = support::ccc_command()
         .current_dir(&repository)
         .env("LC_ALL", "C")
         .env("LANG", "C")
@@ -500,7 +499,7 @@ fn json_mode_composes_diagnostics_across_multiple_inputs() {
     )
     .unwrap();
 
-    let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+    let result = support::ccc_command()
         .current_dir(directory.path())
         .env("LC_ALL", "C")
         .env("LANG", "C")
@@ -541,7 +540,7 @@ fn preprocessing_stops_when_the_shared_error_budget_is_exhausted() {
         "#error stop here\n#include \"must-not-be-opened.h\"\nint malformed = ;\n",
     )
     .unwrap();
-    let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+    let result = support::ccc_command()
         .args(["-nostdinc", "-fsyntax-only", "-ferror-limit=1"])
         .arg(&source)
         .output()
@@ -564,7 +563,7 @@ fn failed_assembly_preserves_an_existing_object() {
     fs::write(&source, ".definitely_not_a_real_directive\n").unwrap();
     fs::write(&object, b"existing object").unwrap();
 
-    let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+    let result = support::ccc_command()
         .args(["-c", "-x", "assembler"])
         .arg(&source)
         .arg("-o")
@@ -607,7 +606,7 @@ fn float16_value_paths_publish_objects() {
         let input = directory.join(format!("float16-{name}.c"));
         let output = directory.join(format!("float16-{name}.o"));
         fs::write(&input, source).unwrap();
-        let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+        let result = support::ccc_command()
             .env("LC_ALL", "C")
             .env("LANG", "C")
             .args(["-nostdinc", "-c"])

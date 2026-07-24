@@ -346,8 +346,11 @@ performed by Cranelift merely to improve a benchmark score.
   shared; diagnostics, link-input, visibility, object-emission, and execution
   tests use the common workspace. Preprocessing, hosted-header parsing, and the
   compact ABI oracle now use it as well, and the System V AMD64 interop suite
-  completes the temporary-workspace migration. Factor repeated compiler
-  invocation construction next.
+  completes the temporary-workspace migration. A minimal shared CCC command
+  constructor now covers the diagnostics and execution suites while keeping
+  targets, environments, working directories, and arguments visible at each
+  call site. Migrate the remaining object-emission, link-input, preprocessing,
+  header, visibility, and ABI invocations next.
 - Unify temporary artifact ownership across the driver and linker. Replace the
   private `_debug_workspace` lifetime side effect in `PackagingReport` with an
   explicit retained-debug-input guard whose cleanup is tested on success,

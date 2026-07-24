@@ -36,7 +36,7 @@ fn compile_and_run_darwin_header_program(name: &str, source_text: &str) {
     let source = directory.join(format!("{name}.c"));
     let executable = directory.join(name);
     fs::write(&source, source_text).unwrap();
-    let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+    let compilation = support::ccc_command()
         .arg("--target=aarch64-apple-darwin")
         .args(["--sdk-root", &macos_sdk_root()])
         .arg("-mmacosx-version-min=11.0")
@@ -67,7 +67,7 @@ fn host_default_emits_a_native_relocatable_object() {
 
     let directory = support::TestWorkspace::new("execution", "empty-object").retain_on_failure();
     let output = directory.join("empty.o");
-    let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+    let result = support::ccc_command()
         .arg("-c")
         .arg(fixture("empty.c"))
         .arg("-o")
@@ -98,7 +98,7 @@ fn host_default_emits_a_native_relocatable_object() {
 fn float16_values_execute_with_exact_payloads_and_native_varargs() {
     let directory = support::TestWorkspace::new("execution", "float16-values").retain_on_failure();
     let executable = directory.join("float16-values");
-    let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+    let compilation = support::ccc_command()
         .arg(fixture("float16_values.c"))
         .arg("-o")
         .arg(&executable)
@@ -134,7 +134,7 @@ fn selected_c11_results_match_the_host_compiler() {
         let ccc_executable = directory.join(format!("{source_name}-ccc"));
         let reference_executable = directory.join(format!("{source_name}-reference"));
 
-        let ccc_compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+        let ccc_compilation = support::ccc_command()
             .arg(&source)
             .arg("-o")
             .arg(&ccc_executable)
@@ -180,7 +180,7 @@ fn darwin_linker_accepts_unwind_when_functions_reference_constant_data() {
     )
     .unwrap();
 
-    let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+    let compilation = support::ccc_command()
         .arg("--target=aarch64-apple-darwin")
         .arg("-nostdinc")
         .arg(&source)
@@ -218,7 +218,7 @@ fn darwin_setjmp_and_longjmp_resume_materialized_automatic_objects() {
         support::TestWorkspace::new("execution", "darwin-returns-twice").retain_on_failure();
     for optimization in ["-O0", "-O2", "-Oz"] {
         let executable = directory.join(format!("returns-twice-{}", &optimization[1..]));
-        let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+        let compilation = support::ccc_command()
             .arg("--target=aarch64-apple-darwin")
             .args(["--sdk-root", &macos_sdk_root()])
             .arg("-mmacosx-version-min=11.0")
@@ -247,7 +247,7 @@ fn linux_setjmp_and_longjmp_resume_materialized_automatic_objects() {
         support::TestWorkspace::new("execution", "linux-returns-twice").retain_on_failure();
     for optimization in ["-O0", "-O2", "-Oz"] {
         let executable = directory.join(format!("returns-twice-{}", &optimization[1..]));
-        let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+        let compilation = support::ccc_command()
             .arg(optimization)
             .arg(fixture("returns_twice.c"))
             .arg("-o")
@@ -324,7 +324,7 @@ fn execution_programs_emit_native_objects() {
         let directory = support::TestWorkspace::new("execution-objects", name).retain_on_failure();
         for (optimization, artifact) in EXECUTION_OPTIMIZATION_PROFILES {
             let output = directory.join(format!("program-{artifact}.o"));
-            let result = Command::new(env!("CARGO_BIN_EXE_ccc"))
+            let result = support::ccc_command()
                 .arg(format!("--target={}", native_target_triple()))
                 .arg(optimization)
                 .arg("-c")
@@ -370,7 +370,7 @@ fn execution_programs_produce_the_expected_exit_status() {
         let directory = support::TestWorkspace::new("execution-programs", name).retain_on_failure();
         for (optimization, artifact) in EXECUTION_OPTIMIZATION_PROFILES {
             let executable = directory.join(format!("program-{artifact}"));
-            let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+            let compilation = support::ccc_command()
                 .arg(format!("--target={}", native_target_triple()))
                 .arg(optimization)
                 .arg(fixture(name))
@@ -441,7 +441,7 @@ int main(void) {
     )
     .unwrap();
 
-    let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+    let compilation = support::ccc_command()
         .arg(&source)
         .arg("-o")
         .arg(&executable)
@@ -512,7 +512,7 @@ int main(void) {
 
     for compiler in ["gcc", "clang"] {
         let executable = directory.join(format!("program-{compiler}"));
-        let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+        let compilation = support::ccc_command()
             .env("CCC_CC", compiler)
             .arg("--target=x86_64-unknown-linux-gnu")
             .arg(&source)
@@ -545,7 +545,7 @@ fn thread_local_objects_are_isolated_in_pthreads_and_pie() {
     let directory =
         support::TestWorkspace::new("execution", "thread-local-pthreads").retain_on_failure();
     let executable = directory.join("thread-local-pthreads");
-    let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+    let compilation = support::ccc_command()
         .arg(fixture("thread_local_pthreads.c"))
         .arg("-o")
         .arg(&executable)
@@ -610,7 +610,7 @@ int main(void) {
 "#,
     )
     .unwrap();
-    let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+    let compilation = support::ccc_command()
         .arg(&source)
         .arg("-o")
         .arg(&executable)
@@ -649,7 +649,7 @@ fn an_invalid_computed_goto_target_traps() {
     let directory =
         support::TestWorkspace::new("execution", "computed-goto-null").retain_on_failure();
     let executable = directory.join("program");
-    let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+    let compilation = support::ccc_command()
         .arg(fixture("computed_goto_null.c"))
         .arg("-o")
         .arg(&executable)
@@ -679,7 +679,7 @@ fn runtime_sized_aggregate_return_is_materialized_before_cleanup() {
     let directory = support::TestWorkspace::new("execution", "runtime-sized-aggregate-return")
         .retain_on_failure();
     let executable = directory.join("program");
-    let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+    let compilation = support::ccc_command()
         .arg(fixture("runtime_sized_storage_reuse.c"))
         .arg("-o")
         .arg(&executable)
@@ -720,7 +720,7 @@ fn invalid_runtime_sized_storage_extents_trap() {
         let directory = support::TestWorkspace::new("execution-invalid-runtime-sized", name)
             .retain_on_failure();
         let executable = directory.join("program");
-        let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+        let compilation = support::ccc_command()
             .arg(fixture(name))
             .arg("-o")
             .arg(&executable)
@@ -769,7 +769,7 @@ int main(void) {
     )
     .unwrap();
 
-    let compilation = Command::new(env!("CARGO_BIN_EXE_ccc"))
+    let compilation = support::ccc_command()
         .arg("-c")
         .arg(&source)
         .arg("-o")
