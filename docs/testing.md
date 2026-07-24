@@ -100,8 +100,11 @@ Use the versioned TSV dump when comparing lowering or inlining changes:
 target/debug/ccc --emit=codegen-stats -O2 path/to/input.c
 ```
 
-`post_inline_ir.*` rows count only live blocks and instructions in the CLIF
-handed to Cranelift's optimization and machine-code pipeline. The
+`post_inline_ir.*` rows count only live entities in the CLIF handed to
+Cranelift's optimization and machine-code pipeline. In schema version 2,
+`post_inline_ir.values` counts block parameters plus instruction results
+reachable through the final layout; detached data-flow-graph entities are not
+reported. The
 `primary_object.*` rows count disjoint logical section sizes, symbols, and
 relocations in CCC's primary relocatable object. Generated assembly bridge
 units are deliberately excluded from that primary-object view; benchmark
@@ -313,7 +316,8 @@ evidence as artifacts.
 The local compiler-only suite measures minimal return, direct `puts`, variadic
 `printf`, equivalent minimal/hosted `fputs` plus `stdout` programs, equivalent
 minimal/hosted variadic `printf` programs, independent unused function/data
-declaration scaling, and live-function scaling without link or runtime noise:
+declaration scaling, live-function scaling, and independent live block, SSA
+value, global, and string-literal scaling without link or runtime noise:
 
 ```sh
 cargo build --locked --release -p ccc-driver
@@ -339,8 +343,12 @@ family supplies increasing backend work. Use a release compiler for timing
 comparisons; debug builds are only suitable for exercising the harness. Use
 `--cases hosted-header` or `--cases hosted-printf` to isolate one pair, and
 `--declaration-scales`, `--data-declaration-scales`, `--function-scales`,
-`--profiles`, `--warmups`, and `--samples` for focused investigations. See
-`benchmarks/codegen/README.md` for the complete result contract.
+`--block-scales`, `--value-scales`, `--global-scales`, `--string-scales`,
+`--profiles`, `--warmups`, and `--samples` for focused investigations. Each
+structural axis must grow its defining metric within checked adjacent-scale
+bounds, rejecting dead fixtures and accidental quadratic IR growth before
+timings are considered. See `benchmarks/codegen/README.md` for the complete
+result contract.
 
 Every enabled-target job runs both hosted-header pairs at `-O0`, `-O2`, and
 `-Oz`, requires exact structural equivalence, and uploads the evidence. The

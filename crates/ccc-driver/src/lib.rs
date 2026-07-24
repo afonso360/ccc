@@ -3019,8 +3019,9 @@ mod tests {
         ])
         .unwrap()
         .stdout;
-        assert!(stats.starts_with("schema_version\t1\n"));
+        assert!(stats.starts_with("schema_version\t2\n"));
         assert!(stats.contains("post_inline_ir.functions\t1\n"));
+        assert!(stats.contains("post_inline_ir.values\t"));
         assert!(stats.contains("primary_object.text_bytes\t"));
         assert!(stats.contains("primary_object.debug_bytes\t0\n"));
         let debug_stats = run([

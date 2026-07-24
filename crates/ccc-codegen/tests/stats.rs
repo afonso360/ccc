@@ -129,6 +129,18 @@ fn stats_describe_post_inline_ir_and_primary_objects_on_every_target() {
             profile.triple
         );
         assert!(
+            o0_stats.post_inline_ir.values > o0_stats.post_inline_ir.call_instructions,
+            "{}: {:?}",
+            profile.triple,
+            o0_stats.post_inline_ir
+        );
+        assert!(
+            o2_stats.post_inline_ir.values > o2_stats.post_inline_ir.call_instructions,
+            "{}: {:?}",
+            profile.triple,
+            o2_stats.post_inline_ir
+        );
+        assert!(
             o2_stats.post_inline_ir.instructions > 0,
             "{}: {:?}",
             profile.triple,

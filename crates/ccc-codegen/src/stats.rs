@@ -4,17 +4,20 @@ use cranelift_codegen::ir;
 use object::{ObjectSection as _, ObjectSymbol as _, SectionKind};
 
 /// Version of the stable key/value schema emitted by [`CodegenStats::write_tsv`].
-pub const CODEGEN_STATS_SCHEMA_VERSION: u64 = 1;
+pub const CODEGEN_STATS_SCHEMA_VERSION: u64 = 2;
 
 /// Aggregate structure of the post-inlining Cranelift IR.
 ///
 /// These counters describe the IR handed to Cranelift's own optimization and
 /// machine-code lowering passes. Removed instructions which remain allocated in
-/// Cranelift's data-flow graph are deliberately excluded.
+/// Cranelift's data-flow graph are deliberately excluded. `values` counts the
+/// parameters of blocks in the final layout plus the results of instructions in
+/// those blocks; detached blocks, instructions, and their values do not count.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct IrStats {
     pub functions: u64,
     pub blocks: u64,
+    pub values: u64,
     pub instructions: u64,
     pub call_instructions: u64,
     pub fixed_stack_slots: u64,
@@ -30,12 +33,15 @@ pub struct IrStats {
 impl IrStats {
     pub(crate) fn record_function(&mut self, function: &ir::Function) {
         let mut blocks = 0_u64;
+        let mut values = 0_u64;
         let mut instructions = 0_u64;
         let mut call_instructions = 0_u64;
         for block in function.layout.blocks() {
             blocks = blocks.saturating_add(1);
+            values = values.saturating_add(count(function.dfg.block_params(block).len()));
             for instruction in function.layout.block_insts(block) {
                 instructions = instructions.saturating_add(1);
+                values = values.saturating_add(count(function.dfg.inst_results(instruction).len()));
                 if function.dfg.insts[instruction].opcode().is_call() {
                     call_instructions = call_instructions.saturating_add(1);
                 }
@@ -44,6 +50,7 @@ impl IrStats {
 
         self.functions = self.functions.saturating_add(1);
         self.blocks = self.blocks.saturating_add(blocks);
+        self.values = self.values.saturating_add(values);
         self.instructions = self.instructions.saturating_add(instructions);
         self.call_instructions = self.call_instructions.saturating_add(call_instructions);
         self.fixed_stack_slots = self
@@ -196,10 +203,11 @@ pub struct CodegenStats {
 
 impl CodegenStats {
     /// Return the metrics in the stable schema order used by [`Self::write_tsv`].
-    pub fn metrics(&self) -> [(&'static str, u64); 28] {
+    pub fn metrics(&self) -> [(&'static str, u64); 29] {
         [
             ("post_inline_ir.functions", self.post_inline_ir.functions),
             ("post_inline_ir.blocks", self.post_inline_ir.blocks),
+            ("post_inline_ir.values", self.post_inline_ir.values),
             (
                 "post_inline_ir.instructions",
                 self.post_inline_ir.instructions,
@@ -375,10 +383,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ir_value_count_excludes_detached_dfg_entities() {
+        let mut function = ir::Function::new();
+        let live_block = function.dfg.make_block();
+        function.dfg.append_block_param(live_block, ir::types::I32);
+        function.layout.append_block(live_block);
+        let live_instruction = function.dfg.make_inst(ir::InstructionData::UnaryImm {
+            opcode: ir::Opcode::Iconst,
+            imm: 7_i64.into(),
+        });
+        function
+            .dfg
+            .make_inst_results(live_instruction, ir::types::I32);
+        function.layout.append_inst(live_instruction, live_block);
+
+        let detached_block = function.dfg.make_block();
+        function
+            .dfg
+            .append_block_param(detached_block, ir::types::I64);
+        let detached_instruction = function.dfg.make_inst(ir::InstructionData::UnaryImm {
+            opcode: ir::Opcode::Iconst,
+            imm: 11_i64.into(),
+        });
+        function
+            .dfg
+            .make_inst_results(detached_instruction, ir::types::I64);
+
+        let mut stats = IrStats::default();
+        stats.record_function(&function);
+        assert_eq!(stats.functions, 1);
+        assert_eq!(stats.blocks, 1);
+        assert_eq!(stats.instructions, 1);
+        assert_eq!(stats.values, 2);
+    }
+
+    #[test]
     fn tsv_schema_is_versioned_and_deterministic() {
         let stats = CodegenStats {
             post_inline_ir: IrStats {
                 functions: 2,
+                values: 23,
                 instructions: 17,
                 ..IrStats::default()
             },
@@ -390,11 +434,12 @@ mod tests {
         };
         let first = stats.to_tsv();
         assert_eq!(first, stats.to_tsv());
-        assert!(first.starts_with("schema_version\t1\npost_inline_ir.functions\t2\n"));
+        assert!(first.starts_with("schema_version\t2\npost_inline_ir.functions\t2\n"));
+        assert!(first.contains("post_inline_ir.values\t23\n"));
         assert!(first.contains("post_inline_ir.instructions\t17\n"));
         assert!(first.contains("primary_object.file_bytes\t4096\n"));
         assert!(first.ends_with("primary_object.other_section_bytes\t0\n"));
-        assert_eq!(first.lines().count(), 29);
+        assert_eq!(first.lines().count(), 30);
     }
 
     #[test]

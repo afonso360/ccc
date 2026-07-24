@@ -23,8 +23,8 @@ import time
 from typing import Iterable
 
 
-FORMAT_VERSION = 2
-CODEGEN_STATS_SCHEMA_VERSION = 1
+FORMAT_VERSION = 3
+CODEGEN_STATS_SCHEMA_VERSION = 2
 PROFILE_FLAGS = {
     "O0": "-O0",
     "O1": "-O1",
@@ -42,17 +42,26 @@ CASE_NAMES = (
     "declaration-heavy",
     "data-declaration-heavy",
     "live-functions",
+    "block-count",
+    "ssa-values",
+    "live-globals",
+    "string-literals",
 )
 REQUIRED_METRICS = (
     "post_inline_ir.functions",
     "post_inline_ir.blocks",
+    "post_inline_ir.values",
     "post_inline_ir.instructions",
     "post_inline_ir.call_instructions",
+    "post_inline_ir.global_values",
     "primary_object.file_bytes",
     "primary_object.symbols",
+    "primary_object.defined_symbols",
     "primary_object.undefined_symbols",
     "primary_object.relocations",
     "primary_object.text_bytes",
+    "primary_object.read_only_data_bytes",
+    "primary_object.writable_data_bytes",
 )
 DECLARATION_OBJECT_INVARIANTS = (
     "primary_object.file_bytes",
@@ -102,13 +111,18 @@ SUMMARY_FIELDS = (
     "median_peak_rss_bytes",
     "post_inline_ir.functions",
     "post_inline_ir.blocks",
+    "post_inline_ir.values",
     "post_inline_ir.instructions",
     "post_inline_ir.call_instructions",
+    "post_inline_ir.global_values",
     "primary_object.file_bytes",
     "primary_object.symbols",
+    "primary_object.defined_symbols",
     "primary_object.undefined_symbols",
     "primary_object.relocations",
     "primary_object.text_bytes",
+    "primary_object.read_only_data_bytes",
+    "primary_object.writable_data_bytes",
 )
 
 
@@ -224,6 +238,26 @@ def parse_arguments() -> argparse.Namespace:
         help="generated live function counts (default: 8,32,128)",
     )
     parser.add_argument(
+        "--block-scales",
+        default="0,16,64,256",
+        help="generated live conditional counts (default: 0,16,64,256)",
+    )
+    parser.add_argument(
+        "--value-scales",
+        default="0,32,256,1024",
+        help="generated dependent SSA-operation counts (default: 0,32,256,1024)",
+    )
+    parser.add_argument(
+        "--global-scales",
+        default="0,32,256,1024",
+        help="generated live global-object counts (default: 0,32,256,1024)",
+    )
+    parser.add_argument(
+        "--string-scales",
+        default="0,32,256,1024",
+        help="generated distinct live string-literal counts (default: 0,32,256,1024)",
+    )
+    parser.add_argument(
         "--warmups",
         default=1,
         type=int,
@@ -256,6 +290,18 @@ def parse_arguments() -> argparse.Namespace:
         )
         arguments.function_scales = scales(
             arguments.function_scales, label="--function-scales"
+        )
+        arguments.block_scales = scales(
+            arguments.block_scales, label="--block-scales"
+        )
+        arguments.value_scales = scales(
+            arguments.value_scales, label="--value-scales"
+        )
+        arguments.global_scales = scales(
+            arguments.global_scales, label="--global-scales"
+        )
+        arguments.string_scales = scales(
+            arguments.string_scales, label="--string-scales"
         )
         if arguments.warmups < 0:
             raise BenchmarkError("--warmups must be nonnegative")
@@ -347,11 +393,134 @@ def live_functions_source(scale: int) -> str:
     return "\n".join(lines)
 
 
+def block_count_source(scale: int) -> str:
+    lines = [
+        "/* ccc-benchmark-family: block-count */",
+        f"/* ccc-benchmark-scale: {scale} */",
+        "",
+        "__attribute__((noinline))",
+        "unsigned ccc_block_path(unsigned selector) {",
+    ]
+    for index in range(scale):
+        lines.extend(
+            (
+                f"    if (selector == {index}u)",
+                f"        return selector + {index + 17}u;",
+            )
+        )
+    lines.extend(
+        (
+            "    return selector ^ 0x9e3779b9u;",
+            "}",
+            "",
+            "int main(int argc, char **argv) {",
+            "    (void)argv;",
+            "    return (int)(ccc_block_path((unsigned)argc) & 255u);",
+            "}",
+            "",
+        )
+    )
+    return "\n".join(lines)
+
+
+def ssa_values_source(scale: int) -> str:
+    lines = [
+        "/* ccc-benchmark-family: ssa-values */",
+        f"/* ccc-benchmark-scale: {scale} */",
+        "",
+        "__attribute__((noinline))",
+        "unsigned ccc_value_chain(unsigned value) {",
+    ]
+    for index in range(scale):
+        addend = 1_013_904_223 ^ index
+        lines.append(f"    value = value * 1664525u + {addend}u;")
+    lines.extend(
+        (
+            "    return value;",
+            "}",
+            "",
+            "int main(int argc, char **argv) {",
+            "    (void)argv;",
+            "    return (int)(ccc_value_chain((unsigned)argc) & 255u);",
+            "}",
+            "",
+        )
+    )
+    return "\n".join(lines)
+
+
+def live_globals_source(scale: int) -> str:
+    lines = [
+        "/* ccc-benchmark-family: live-globals */",
+        f"/* ccc-benchmark-scale: {scale} */",
+        "",
+    ]
+    for index in range(scale):
+        initializer = ((index + 1) * 2_654_435_761) & 0xFFFF_FFFF
+        lines.append(f"unsigned ccc_global_{index:06d} = {initializer}u;")
+    lines.extend(
+        (
+            "",
+            "__attribute__((noinline))",
+            "unsigned ccc_read_globals(unsigned value) {",
+        )
+    )
+    for index in range(scale):
+        lines.append(f"    value ^= ccc_global_{index:06d} + {index + 1}u;")
+    lines.extend(
+        (
+            "    return value;",
+            "}",
+            "",
+            "int main(int argc, char **argv) {",
+            "    (void)argv;",
+            "    return (int)(ccc_read_globals((unsigned)argc) & 255u);",
+            "}",
+            "",
+        )
+    )
+    return "\n".join(lines)
+
+
+def string_literals_source(scale: int) -> str:
+    lines = [
+        "/* ccc-benchmark-family: string-literals */",
+        f"/* ccc-benchmark-scale: {scale} */",
+        "",
+        "__attribute__((noinline))",
+        "unsigned ccc_read_strings(unsigned index) {",
+        "    unsigned value = index;",
+    ]
+    for literal_index in range(scale):
+        lines.append(
+            "    value += (unsigned)(unsigned char)"
+            f'"ccc-string-{literal_index:06d}"'
+            f"[(index + {literal_index}u) % 17u];"
+        )
+    lines.extend(
+        (
+            "    return value;",
+            "}",
+            "",
+            "int main(int argc, char **argv) {",
+            "    (void)argv;",
+            "    return (int)(ccc_read_strings((unsigned)argc) & 255u);",
+            "}",
+            "",
+        )
+    )
+    return "\n".join(lines)
+
+
 def copy_and_generate_cases(
     selected: list[str],
     declaration_scales: list[int],
     data_declaration_scales: list[int],
     function_scales: list[int],
+    block_scales: list[int],
+    value_scales: list[int],
+    global_scales: list[int],
+    string_scales: list[int],
     output: Path,
 ) -> list[Case]:
     benchmark_directory = Path(__file__).resolve().parent
@@ -436,6 +605,21 @@ def copy_and_generate_cases(
             source = source_directory / f"{name}.c"
             source.write_text(live_functions_source(scale), encoding="utf-8")
             cases.append(Case(name, "live-functions", scale, source, scale + 1))
+
+    generated_axes = (
+        ("block-count", block_scales, block_count_source),
+        ("ssa-values", value_scales, ssa_values_source),
+        ("live-globals", global_scales, live_globals_source),
+        ("string-literals", string_scales, string_literals_source),
+    )
+    for family, family_scales, source_generator in generated_axes:
+        if family not in selected:
+            continue
+        for scale in family_scales:
+            name = f"{family}-{scale}"
+            source = source_directory / f"{name}.c"
+            source.write_text(source_generator(scale), encoding="utf-8")
+            cases.append(Case(name, family, scale, source, 2))
 
     return cases
 
@@ -721,6 +905,68 @@ def validate_invariants(
                     f"{record.case.scale} declarations"
                 )
 
+    axis_bounds = {
+        "block-count": {
+            "post_inline_ir.blocks": (1, 4),
+            "post_inline_ir.values": (6, 14),
+            "post_inline_ir.instructions": (8, 14),
+        },
+        "ssa-values": {
+            "post_inline_ir.values": (2, 5),
+            "post_inline_ir.instructions": (2, 5),
+        },
+        "live-globals": {
+            "post_inline_ir.values": (3, 6),
+            "post_inline_ir.instructions": (3, 6),
+            "post_inline_ir.global_values": (1, 2),
+            "primary_object.defined_symbols": (1, 2),
+            "primary_object.writable_data_bytes": (4, 4),
+        },
+        "string-literals": {
+            "post_inline_ir.global_values": (1, 2),
+            "primary_object.relocations": (1, 2),
+            "primary_object.read_only_data_bytes": (18, 32),
+        },
+    }
+    axis_records: dict[tuple[str, str], list[StatsRecord]] = {}
+    for record in records:
+        if record.case.family in axis_bounds:
+            axis_records.setdefault(
+                (record.case.family, record.profile), []
+            ).append(record)
+    for (family, profile), group in axis_records.items():
+        if len(group) < 2:
+            raise BenchmarkError(
+                f"{family} at -{profile} requires at least two scales for "
+                "structural growth validation"
+            )
+        ordered = sorted(group, key=lambda record: record.case.scale)
+        for previous, record in zip(ordered, ordered[1:]):
+            scale_growth = record.case.scale - previous.case.scale
+            for metric, (minimum_per_item, maximum_per_item) in axis_bounds[
+                family
+            ].items():
+                metric_growth = record.stats[metric] - previous.stats[metric]
+                minimum = minimum_per_item * scale_growth
+                maximum = maximum_per_item * scale_growth
+                if not minimum <= metric_growth <= maximum:
+                    raise BenchmarkError(
+                        f"{family} at -{profile} produced non-linear structural "
+                        f"growth for {metric}: scales {previous.case.scale} to "
+                        f"{record.case.scale} changed the metric by "
+                        f"{metric_growth}; expected {minimum}..{maximum}"
+                    )
+
+        if family == "ssa-values":
+            baseline = ordered[0]
+            baseline_blocks = baseline.stats["post_inline_ir.blocks"]
+            for record in ordered[1:]:
+                if record.stats["post_inline_ir.blocks"] != baseline_blocks:
+                    raise BenchmarkError(
+                        f"ssa-values at -{profile} changed block count across "
+                        f"scales {baseline.case.scale} and {record.case.scale}"
+                    )
+
 
 def format_seconds(value: float) -> str:
     return f"{value:.9f}"
@@ -881,6 +1127,10 @@ def run(arguments: argparse.Namespace) -> Path:
         arguments.declaration_scales,
         arguments.data_declaration_scales,
         arguments.function_scales,
+        arguments.block_scales,
+        arguments.value_scales,
+        arguments.global_scales,
+        arguments.string_scales,
         output,
     )
     if not cases:
@@ -892,6 +1142,7 @@ def run(arguments: argparse.Namespace) -> Path:
 
     environment = {
         "format_version": FORMAT_VERSION,
+        "codegen_stats_schema_version": CODEGEN_STATS_SCHEMA_VERSION,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "compiler": os.fspath(compiler),
         "compiler_sha256": sha256(compiler),
@@ -914,6 +1165,10 @@ def run(arguments: argparse.Namespace) -> Path:
         "declaration_scales": arguments.declaration_scales,
         "data_declaration_scales": arguments.data_declaration_scales,
         "function_scales": arguments.function_scales,
+        "block_scales": arguments.block_scales,
+        "value_scales": arguments.value_scales,
+        "global_scales": arguments.global_scales,
+        "string_scales": arguments.string_scales,
     }
     write_json(output / "environment.json", environment)
 

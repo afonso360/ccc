@@ -159,18 +159,19 @@ The current executable slice and next benchmark targets are:
   primary-object statistics distinct from final packaged objects. Complete
   the compact suite with TLS, atomics, and variadic calls; every added kernel
   must retain a fixed work count and self-validation.
-- Extend generated scaling beyond the implemented declaration and live-function
-  axes to declarations per function, block count, SSA values, globals, and
-  string literals independently. Use them to detect accidental quadratic
-  behavior and peak-memory growth.
+- Independent block-count, live-SSA-value, referenced-global, and
+  string-literal scaling now joins the declaration and live-function axes.
+  Each family rejects dead fixtures and superlinear structural growth. Add
+  declarations-per-function scaling next, then correlate every axis with
+  phase timing and peak-memory growth.
 - Whole-program measurements use the existing bzip2, zlib, and zstd adapters
   with fixed inputs. Record translation time, link time, aggregate object
   size, executable text size, and execution throughput without weakening their
   correctness contracts.
 - Add CCC frontend and Cranelift phase timing to C-Ray. Its result schema now
-  includes post-inlining CLIF instruction, block, call, stack-slot, signature,
-  external-reference, and global-value counts plus parsed final-object section
-  sizes. The correctness and performance profiles also retain whole
+  includes post-inlining CLIF instruction, block, live-value, call, stack-slot,
+  signature, external-reference, and global-value counts plus parsed
+  final-object section sizes. The correctness and performance profiles also retain whole
   compile/link/render timing, CPU, peak-memory, file-size, command, image-hash,
   and exact same-host reference evidence.
 
@@ -182,17 +183,20 @@ trend evidence and must not be compared numerically with native execution.
 
 - `--emit=codegen-stats` now emits a versioned deterministic TSV view of
   post-inlining CLIF structure and the primary relocatable object on every
-  enabled target. C-Ray archives that complete view and uses the CLIF subset in
-  its summary; its independent final-object parser accounts for generated
-  bridge packaging.
+  enabled target. Schema version 2 includes the exact live CLIF value count:
+  final-layout block parameters plus instruction results, excluding detached
+  data-flow-graph entities. C-Ray archives that complete view and uses the CLIF
+  subset in its summary; its independent final-object parser accounts for
+  generated bridge packaging.
 - Report preprocessing, parsing, semantic analysis, CCC-IR lowering and
   optimization, ABI planning, CLIF lowering, Cranelift compilation, object
   packaging, and linking separately. Also record end-to-end wall time, CPU
   time, and peak resident memory.
 - Count CCC-IR functions, blocks, values, operations, and dead operations
-  before and after CCC-owned optimization. Count CLIF blocks, instructions,
-  stack slots, signatures, external function references, global values, and
-  how many imported entities are never used.
+  before and after CCC-owned optimization. CLIF live blocks, values,
+  instructions, stack slots, signatures, external function references, and
+  global values are implemented; add the remaining count of imported entities
+  which are never used.
 - Record emitted text, read-only data, writable data, debug-section, unwind,
   relocation, and symbol-table sizes. Keep debug and non-debug measurements
   separate.

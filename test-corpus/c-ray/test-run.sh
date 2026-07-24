@@ -182,9 +182,10 @@ fixture	123	456
 EOF
 cat >"$temporary_directory/codegen-stats.tsv" <<'EOF'
 label	metric	value
-fixture	schema_version	1
+fixture	schema_version	2
 fixture	post_inline_ir.functions	2
 fixture	post_inline_ir.blocks	7
+fixture	post_inline_ir.values	31
 fixture	post_inline_ir.instructions	40
 fixture	post_inline_ir.call_instructions	3
 fixture	post_inline_ir.fixed_stack_slots	4
@@ -212,7 +213,7 @@ EOF
   --output "$temporary_directory/summary.tsv"
 grep -Fq $'fixture\t0.500000000\t0.250000000\t3\t2.000000000\t1.000000000\t3.000000000' \
   "$temporary_directory/summary.tsv"
-grep -Fq $'\t2\t7\t40\t3\t4\t64\t0\t3\t3\t2\t123\t100\t25\t4\t16\t8\t0\t3\t156\t456\t' \
+grep -Fq $'\t2\t7\t31\t40\t3\t4\t64\t0\t3\t3\t2\t123\t100\t25\t4\t16\t8\t0\t3\t156\t456\t' \
   "$temporary_directory/summary.tsv"
 
 bash -n "$script_directory/run.sh"

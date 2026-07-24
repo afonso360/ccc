@@ -148,6 +148,10 @@ if "--emit=codegen-stats" in sys.argv:
     metrics = [
         ("post_inline_ir.functions", structure["functions"]),
         ("post_inline_ir.blocks", structure["blocks"]),
+        (
+            "post_inline_ir.values",
+            structure["instructions"] - structure["blocks"] + structure["functions"],
+        ),
         ("post_inline_ir.instructions", structure["instructions"]),
         ("post_inline_ir.call_instructions", structure["calls"]),
         ("post_inline_ir.fixed_stack_slots", 0),
@@ -175,7 +179,7 @@ if "--emit=codegen-stats" in sys.argv:
         ("primary_object.metadata_bytes", 4),
         ("primary_object.other_section_bytes", 0),
     ]
-    print("schema_version\t1")
+    print("schema_version\t2")
     for metric, value in metrics:
         print(f"{metric}\t{value}")
     sys.exit(0)
@@ -264,7 +268,7 @@ grep -Fq $'direct-call\tO2\tfinal-object\t' \
   "$performance_results/artifacts.tsv"
 grep -Fq $'direct-call\tO2\texecutable\t' \
   "$performance_results/artifacts.tsv"
-grep -Fq '"format_version":1' "$performance_results/environment.json"
+grep -Fq '"format_version":2' "$performance_results/environment.json"
 grep -Fq '"mode":"performance"' "$performance_results/environment.json"
 grep -Fq '"kind":"link"' "$performance_results/commands.jsonl"
 grep -Fq '"phase":"validation"' "$performance_results/commands.jsonl"

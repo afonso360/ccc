@@ -25,9 +25,9 @@ import tomllib
 from typing import Iterable
 
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 MANIFEST_SCHEMA_VERSION = 1
-CODEGEN_STATS_SCHEMA_VERSION = 1
+CODEGEN_STATS_SCHEMA_VERSION = 2
 PROFILE_FLAGS = {
     "O0": "-O0",
     "O1": "-O1",
@@ -39,6 +39,7 @@ PROFILE_FLAGS = {
 REQUIRED_METRICS = (
     "post_inline_ir.functions",
     "post_inline_ir.blocks",
+    "post_inline_ir.values",
     "post_inline_ir.instructions",
     "post_inline_ir.call_instructions",
     "primary_object.file_bytes",
@@ -119,6 +120,7 @@ SUMMARY_FIELDS = (
     "runtime_ns_per_work_unit",
     "post_inline_ir.functions",
     "post_inline_ir.blocks",
+    "post_inline_ir.values",
     "post_inline_ir.instructions",
     "post_inline_ir.call_instructions",
     "primary_object.file_bytes",

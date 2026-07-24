@@ -57,7 +57,7 @@ def codegen_stats_by_label(rows: List[dict]) -> Dict[str, Dict[str, str]]:
         metrics[metric] = value
 
     for label, metrics in result.items():
-        if metrics.get("schema_version") != "1":
+        if metrics.get("schema_version") != "2":
             raise ValueError(f"{label}: unsupported codegen statistics schema")
     return result
 
@@ -65,6 +65,7 @@ def codegen_stats_by_label(rows: List[dict]) -> Dict[str, Dict[str, str]]:
 SUMMARY_CODEGEN_METRICS = {
     "clif_functions": "post_inline_ir.functions",
     "clif_blocks": "post_inline_ir.blocks",
+    "clif_values": "post_inline_ir.values",
     "clif_instructions": "post_inline_ir.instructions",
     "clif_call_instructions": "post_inline_ir.call_instructions",
     "clif_fixed_stack_slots": "post_inline_ir.fixed_stack_slots",

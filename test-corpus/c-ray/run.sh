@@ -489,7 +489,7 @@ for optimization in -O0 -O2 -Oz; do
     --emit=codegen-stats "$source_file" \
     >"$codegen_stats_output" \
     2>"$tool_output_directory/$label-codegen-stats.stderr"
-  grep -Fxq $'schema_version\t1' "$codegen_stats_output" ||
+  grep -Fxq $'schema_version\t2' "$codegen_stats_output" ||
     die "$label emitted an unsupported codegen statistics schema"
   awk -v label="$label" '
     BEGIN { FS = OFS = "\t" }

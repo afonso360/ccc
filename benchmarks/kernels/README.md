@@ -88,7 +88,7 @@ only native `performance` results as comparison-ready.
 
 ## Results
 
-The result directory uses format version 1:
+The result directory uses format version 2:
 
 | Path | Contents |
 | --- | --- |

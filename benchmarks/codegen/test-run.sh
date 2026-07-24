@@ -78,12 +78,22 @@ if "--emit=codegen-stats" not in sys.argv:
     output.write_bytes(payload)
     sys.exit(0)
 
+scaling_families = {
+    "block-count",
+    "ssa-values",
+    "live-globals",
+    "string-literals",
+}
 functions = scale + 1 if family == "live-functions" else 1
+if family in scaling_families:
+    functions = 2
 if family == "declaration-heavy" and os.environ.get("FAKE_CCC_LEAK_DECLS"):
     functions += scale
 calls = 1 if family in ("puts-call", "printf-variadic") else 0
 if family == "live-functions":
     calls = scale
+if family in scaling_families:
+    calls = 1
 if hosted_family:
     calls = 1
 external_functions = calls
@@ -103,13 +113,43 @@ if (
 if hosted_stdio and os.environ.get("FAKE_CCC_HOSTED_OBJECT_LEAK"):
     object_undefined_symbols += 1
     object_relocations += 1
-object_symbols = functions + object_undefined_symbols
+if family == "string-literals":
+    object_relocations += scale
+object_defined_symbols = functions
+if family == "live-globals":
+    object_defined_symbols += scale
+object_symbols = object_defined_symbols + object_undefined_symbols
 global_values = 2 if family == "hosted-header" else 0
+if family in ("live-globals", "string-literals"):
+    global_values = scale
+blocks = functions
+values = functions * 2 + calls
+instructions = functions * 3 + calls
+if family == "block-count":
+    blocks += scale * 2
+    values += scale * 8
+    instructions += scale * 10
+if family == "ssa-values":
+    values += scale * 2
+    instructions += scale * 2
+    if os.environ.get("FAKE_CCC_QUADRATIC_VALUES"):
+        values += scale * scale
+if family == "live-globals":
+    values += scale * 4
+    instructions += scale * 4
+string_count = scale
+if family == "string-literals" and os.environ.get(
+    "FAKE_CCC_DROP_STRING_LITERAL"
+):
+    string_count = max(0, scale - 1)
+    global_values = string_count
+    object_relocations = calls + string_count
 
 metrics = [
     ("post_inline_ir.functions", functions),
-    ("post_inline_ir.blocks", functions),
-    ("post_inline_ir.instructions", functions * 3 + calls),
+    ("post_inline_ir.blocks", blocks),
+    ("post_inline_ir.values", values),
+    ("post_inline_ir.instructions", instructions),
     ("post_inline_ir.call_instructions", calls),
     ("post_inline_ir.fixed_stack_slots", 0),
     ("post_inline_ir.fixed_stack_bytes", 0),
@@ -122,12 +162,15 @@ metrics = [
     ("primary_object.file_bytes", object_file_bytes),
     ("primary_object.sections", 3),
     ("primary_object.symbols", object_symbols),
-    ("primary_object.defined_symbols", functions),
+    ("primary_object.defined_symbols", object_defined_symbols),
     ("primary_object.undefined_symbols", object_undefined_symbols),
     ("primary_object.relocations", object_relocations),
     ("primary_object.text_bytes", functions * 8),
-    ("primary_object.read_only_data_bytes", 0),
-    ("primary_object.writable_data_bytes", 0),
+    ("primary_object.read_only_data_bytes", string_count * 18),
+    (
+        "primary_object.writable_data_bytes",
+        scale * 4 if family == "live-globals" else 0,
+    ),
     ("primary_object.bss_bytes", 0),
     ("primary_object.tls_data_bytes", 0),
     ("primary_object.tls_bss_bytes", 0),
@@ -136,7 +179,7 @@ metrics = [
     ("primary_object.metadata_bytes", 4),
     ("primary_object.other_section_bytes", 0),
 ]
-print("schema_version\t1")
+print("schema_version\t2")
 for metric, value in metrics:
     print(f"{metric}\t{value}")
 PYTHON
@@ -151,7 +194,11 @@ results="$temporary_directory/results"
   --samples 2 \
   --declaration-scales 0,3 \
   --data-declaration-scales 0,3 \
-  --function-scales 2,4
+  --function-scales 2,4 \
+  --block-scales 0,2 \
+  --value-scales 0,2 \
+  --global-scales 0,2 \
+  --string-scales 0,2
 
 grep -Fq $'benchmark\tfamily\tscale\tprofile\tphase\titeration\twall_seconds' \
   "$results/compile-times.tsv"
@@ -165,7 +212,16 @@ grep -Fq $'hosted-printf-stdio\thosted-printf\t1\tO2\tpost_inline_ir.external_fu
   "$results/codegen-stats.tsv"
 grep -Fq $'live-functions-4\tlive-functions\t4\tO2\t2\t' \
   "$results/summary.tsv"
-grep -Fq '"format_version":2' "$results/environment.json"
+grep -Fq $'block-count-2\tblock-count\t2\tO2\tpost_inline_ir.blocks\t6' \
+  "$results/codegen-stats.tsv"
+grep -Fq $'ssa-values-2\tssa-values\t2\tO2\tpost_inline_ir.values\t9' \
+  "$results/codegen-stats.tsv"
+grep -Fq $'live-globals-2\tlive-globals\t2\tO2\tpost_inline_ir.global_values\t2' \
+  "$results/codegen-stats.tsv"
+grep -Fq $'string-literals-2\tstring-literals\t2\tO2\tprimary_object.read_only_data_bytes\t36' \
+  "$results/codegen-stats.tsv"
+grep -Fq '"format_version":3' "$results/environment.json"
+grep -Fq '"codegen_stats_schema_version":2' "$results/environment.json"
 expected_compiler_sha=$(
   python3 -c \
     'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' \
@@ -178,12 +234,20 @@ grep -Fq '"data_declaration_scales":[0,3]' "$results/environment.json"
 grep -Fq '"effective_configs":{"O0":' "$results/environment.json"
 grep -Fq '"exit_status":0' "$results/environment.json"
 grep -Fq '"benchmark":"printf-variadic"' "$results/commands.jsonl"
-[[ "$(grep -c '"kind":"object-compile"' "$results/commands.jsonl")" == 78 ]]
-[[ "$(grep -c '"kind":"codegen-stats"' "$results/commands.jsonl")" == 26 ]]
+[[ "$(grep -c '"kind":"object-compile"' "$results/commands.jsonl")" == 126 ]]
+[[ "$(grep -c '"kind":"codegen-stats"' "$results/commands.jsonl")" == 42 ]]
 [[ "$(grep -c '^extern long ccc_decl_' \
   "$results/sources/declaration-heavy-3.c")" == 3 ]]
 [[ "$(grep -c '^extern long ccc_data_decl_' \
   "$results/sources/data-declaration-heavy-3.c")" == 3 ]]
+[[ "$(grep -c '^    if (selector ==' \
+  "$results/sources/block-count-2.c")" == 2 ]]
+[[ "$(grep -c '^    value = value \\*' \
+  "$results/sources/ssa-values-2.c")" == 2 ]]
+[[ "$(grep -c '^unsigned ccc_global_' \
+  "$results/sources/live-globals-2.c")" == 2 ]]
+[[ "$(grep -c '"ccc-string-' \
+  "$results/sources/string-literals-2.c")" == 2 ]]
 grep -Fq $'hosted-header-stdio\thosted-header\t1\thosted-header-minimal\t' \
   "$results/manifest.tsv"
 grep -Fq $'hosted-printf-stdio\thosted-printf\t1\thosted-printf-minimal\t' \
@@ -197,8 +261,8 @@ grep -Fq '#include <stdio.h>' \
 grep -Fq 'extern int printf(const char *format, ...);' \
   "$results/sources/hosted-printf-minimal.c"
 [[ "$(find "$results/raw" -name 'codegen-stats.stdout.tsv' |
-  wc -l | tr -d '[:space:]')" == 26 ]]
-[[ "$(find "$results/raw" -name '*.o' | wc -l | tr -d '[:space:]')" == 78 ]]
+  wc -l | tr -d '[:space:]')" == 42 ]]
+[[ "$(find "$results/raw" -name '*.o' | wc -l | tr -d '[:space:]')" == 126 ]]
 [[ -f "$results/raw/printf-variadic/O2/sample-002.timing.json" ]]
 [[ -s "$results/raw/printf-variadic/O2/sample-002.o" ]]
 [[ "$(wc -c <"$results/raw/hosted-printf-minimal/O2/sample-002.o" |
@@ -307,10 +371,65 @@ set -e
 [[ "$negative_printf_output" == *"hosted-printf-stdio changed post-inline CLIF relative to hosted-printf-minimal at -O0"* ]]
 [[ "$negative_printf_output" == *"post_inline_ir.external_functions=1 versus 2"* ]]
 
+negative_quadratic_results="$temporary_directory/negative-quadratic-results"
+set +e
+negative_quadratic_output=$(
+  FAKE_CCC_QUADRATIC_VALUES=1 "$script_directory/run.py" \
+    --ccc "$fake_ccc" \
+    --output "$negative_quadratic_results" \
+    --cases ssa-values \
+    --profiles O0 \
+    --warmups 0 \
+    --samples 1 \
+    --value-scales 1,3 2>&1
+)
+negative_quadratic_status=$?
+set -e
+[[ "$negative_quadratic_status" == 1 ]]
+[[ "$negative_quadratic_output" == *"ssa-values at -O0 produced non-linear structural growth for post_inline_ir.values"* ]]
+
+negative_string_results="$temporary_directory/negative-string-results"
+set +e
+negative_string_output=$(
+  FAKE_CCC_DROP_STRING_LITERAL=1 "$script_directory/run.py" \
+    --ccc "$fake_ccc" \
+    --output "$negative_string_results" \
+    --cases string-literals \
+    --profiles O0 \
+    --warmups 0 \
+    --samples 1 \
+    --string-scales 0,2 2>&1
+)
+negative_string_status=$?
+set -e
+[[ "$negative_string_status" == 1 ]]
+[[ "$negative_string_output" == *"string-literals at -O0 produced non-linear structural growth for post_inline_ir.global_values"* ]]
+
+single_scale_results="$temporary_directory/single-scale-results"
+set +e
+single_scale_output=$(
+  "$script_directory/run.py" \
+    --ccc "$fake_ccc" \
+    --output "$single_scale_results" \
+    --cases block-count \
+    --profiles O0 \
+    --warmups 0 \
+    --samples 1 \
+    --block-scales 2 2>&1
+)
+single_scale_status=$?
+set -e
+[[ "$single_scale_status" == 1 ]]
+[[ "$single_scale_output" == *"block-count at -O0 requires at least two scales"* ]]
+
 help_output=$("$script_directory/run.py" --help)
 [[ "$help_output" == *"--declaration-scales"* ]]
 [[ "$help_output" == *"--data-declaration-scales"* ]]
 [[ "$help_output" == *"--function-scales"* ]]
+[[ "$help_output" == *"--block-scales"* ]]
+[[ "$help_output" == *"--value-scales"* ]]
+[[ "$help_output" == *"--global-scales"* ]]
+[[ "$help_output" == *"--string-scales"* ]]
 
 PYTHONPYCACHEPREFIX="$temporary_directory/pycache" \
   python3 -m py_compile "$script_directory/run.py"
