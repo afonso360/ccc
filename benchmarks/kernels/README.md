@@ -1,16 +1,30 @@
 # CCC defined-behavior kernel benchmarks
 
 This suite measures small executable workloads with fixed work counts and
-built-in correctness checks. The first vertical slice contains
-`direct-call`, a four-million-call unsigned-integer kernel whose leaf is
-eligible for CCC's current `-O2` inlining policy. It validates the exact
-`0x99b0c920` result and returns zero only on success.
+built-in correctness checks. The current scalar/control slice covers direct
+calls and inlining, an unsigned-integer loop, exact binary32/binary64 loops,
+and data-dependent branches plus a dense switch.
 
 The suite is intentionally separate from the compiler-only runner in
 `benchmarks/codegen`. Kernel results distinguish CCC's compiler-side
 `primary_object.*` statistics from the final published `-c` object. Generated
 TLS or ABI bridge units can be packaged into that final object after the
 primary object is measured, so the two sizes must not be treated as equal.
+
+## Cases
+
+| Case | Fixed work | Self-validation |
+| --- | ---: | --- |
+| `direct-call` | 4,000,000 leaf calls | Unsigned result `0x99b0c920`; the call remains at `-O0`/`-Oz` and is inlined at `-O2`. |
+| `integer-loop` | 4,000,000 integer iterations | Unsigned result `0x2b37aed1`. |
+| `floating-loop` | 4,000,000 additions in 2,000,000 paired iterations | Both the binary32 and binary64 results equal exactly `1250001`. |
+| `branch-switch` | 4,000,000 switch/branch iterations | Unsigned result `0x2f58cc08`. |
+
+All wrapping calculations use unsigned arithmetic, every shift count is in
+range, and all inputs are initialized. The floating-point steps and every
+intermediate result are exactly representable in the enabled targets'
+binary32/binary64 formats. Volatile seeds prevent a compiler from replacing a
+kernel with its recorded answer.
 
 ## Modes
 

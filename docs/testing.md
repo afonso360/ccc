@@ -353,10 +353,11 @@ benchmarks/codegen/test-run.sh
 ## Defined-behavior kernel benchmarks
 
 The executable kernel runner is separate from the compiler-only suite. Its
-first vertical case performs four million calls to a small unsigned-integer
-leaf, validates the exact result, and records whether the call remains in the
-post-inlining CLIF at `-O0`, `-O2`, and `-Oz`. Run a quick native correctness
-check with:
+current scalar/control slice performs fixed-work direct-call, unsigned-integer,
+binary32/binary64, and branch/switch workloads. Every case validates its exact
+result. The direct-call case additionally records whether its leaf call remains
+in the post-inlining CLIF at `-O0`, `-O2`, and `-Oz`; the other three contain
+one source function and no calls. Run a quick native correctness check with:
 
 ```sh
 benchmarks/kernels/run.py \
@@ -410,10 +411,9 @@ benchmarks/kernels/test-run.sh
 ```
 
 Only this fake-tool regression is in the fast CI job in the initial slice.
-All-target correctness execution and the remaining integer, floating-point,
-control-flow, memory, TLS, atomic, and variadic kernels remain follow-up work.
-QEMU results will be correctness and rough-trend evidence, never native
-performance evidence.
+All-target correctness execution and the remaining memory, aggregate-copy,
+TLS, atomic, and variadic kernels remain follow-up work. QEMU results will be
+correctness and rough-trend evidence, never native performance evidence.
 
 ## C-Ray generated-code benchmark
 

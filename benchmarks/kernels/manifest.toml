@@ -13,3 +13,45 @@ expected_post_inline_functions = 2
 O0 = 1
 O2 = 0
 Oz = 1
+
+[[case]]
+name = "integer-loop"
+family = "integer-loops"
+source = "cases/integer-loop.c"
+work_unit = "integer-iteration"
+work_count = 4000000
+expected_result = "0x2b37aed1"
+expected_post_inline_functions = 1
+
+[case.expected_post_inline_calls]
+O0 = 0
+O2 = 0
+Oz = 0
+
+[[case]]
+name = "floating-loop"
+family = "floating-loops"
+source = "cases/floating-loop.c"
+work_unit = "floating-addition"
+work_count = 4000000
+expected_result = "float=1250001.0f,double=1250001.0"
+expected_post_inline_functions = 1
+
+[case.expected_post_inline_calls]
+O0 = 0
+O2 = 0
+Oz = 0
+
+[[case]]
+name = "branch-switch"
+family = "branches-switches"
+source = "cases/branch-switch.c"
+work_unit = "switch-branch-iteration"
+work_count = 4000000
+expected_result = "0x2f58cc08"
+expected_post_inline_functions = 1
+
+[case.expected_post_inline_calls]
+O0 = 0
+O2 = 0
+Oz = 0

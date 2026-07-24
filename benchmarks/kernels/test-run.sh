@@ -27,6 +27,7 @@ cat >"$fake_ccc" <<'PYTHON'
 import hashlib
 import os
 from pathlib import Path
+import re
 import sys
 
 
@@ -62,32 +63,79 @@ profile = next(
     (argument for argument in sys.argv if argument.startswith("-O")),
     "-O0",
 )
+case_name = None
+if len(source_arguments) == 1:
+    source_text = Path(source_arguments[0]).read_text(encoding="utf-8")
+    case_match = re.search(r"ccc-kernel-benchmark: ([a-z-]+)", source_text)
+    if case_match:
+        case_name = case_match.group(1)
 
 if "--emit=codegen-stats" in sys.argv:
     if len(source_arguments) != 1:
         print("expected one kernel source for stats", file=sys.stderr)
         sys.exit(2)
-    calls = 0 if profile == "-O2" else 1
+    structures = {
+        "direct-call": {
+            "functions": 2,
+            "calls": 0 if profile == "-O2" else 1,
+            "blocks": 5,
+            "instructions": 24,
+            "global_values": 1,
+            "constants": 4,
+            "jump_tables": 0,
+        },
+        "integer-loop": {
+            "functions": 1,
+            "calls": 0,
+            "blocks": 4,
+            "instructions": 20,
+            "global_values": 1,
+            "constants": 3,
+            "jump_tables": 0,
+        },
+        "floating-loop": {
+            "functions": 1,
+            "calls": 0,
+            "blocks": 4,
+            "instructions": 18,
+            "global_values": 4,
+            "constants": 4,
+            "jump_tables": 0,
+        },
+        "branch-switch": {
+            "functions": 1,
+            "calls": 0,
+            "blocks": 15,
+            "instructions": 45,
+            "global_values": 1,
+            "constants": 4,
+            "jump_tables": 0,
+        },
+    }
+    if case_name not in structures:
+        print(f"unknown fake kernel case: {case_name}", file=sys.stderr)
+        sys.exit(2)
+    structure = structures[case_name]
     metrics = [
-        ("post_inline_ir.functions", 2),
-        ("post_inline_ir.blocks", 5),
-        ("post_inline_ir.instructions", 24 + calls),
-        ("post_inline_ir.call_instructions", calls),
+        ("post_inline_ir.functions", structure["functions"]),
+        ("post_inline_ir.blocks", structure["blocks"]),
+        ("post_inline_ir.instructions", structure["instructions"]),
+        ("post_inline_ir.call_instructions", structure["calls"]),
         ("post_inline_ir.fixed_stack_slots", 0),
         ("post_inline_ir.fixed_stack_bytes", 0),
         ("post_inline_ir.dynamic_stack_slots", 0),
-        ("post_inline_ir.signatures", calls),
+        ("post_inline_ir.signatures", structure["calls"]),
         ("post_inline_ir.external_functions", 0),
-        ("post_inline_ir.global_values", 1),
-        ("post_inline_ir.constants", 4),
-        ("post_inline_ir.jump_tables", 0),
-        ("primary_object.file_bytes", 41),
+        ("post_inline_ir.global_values", structure["global_values"]),
+        ("post_inline_ir.constants", structure["constants"]),
+        ("post_inline_ir.jump_tables", structure["jump_tables"]),
+        ("primary_object.file_bytes", 41 + len(case_name)),
         ("primary_object.sections", 3),
-        ("primary_object.symbols", 3),
-        ("primary_object.defined_symbols", 3),
+        ("primary_object.symbols", structure["functions"] + 1),
+        ("primary_object.defined_symbols", structure["functions"] + 1),
         ("primary_object.undefined_symbols", 0),
         ("primary_object.relocations", 1),
-        ("primary_object.text_bytes", 16),
+        ("primary_object.text_bytes", structure["instructions"]),
         ("primary_object.read_only_data_bytes", 0),
         ("primary_object.writable_data_bytes", 4),
         ("primary_object.bss_bytes", 0),
@@ -157,8 +205,30 @@ grep -Fq $'benchmark\tfamily\tprofile\ttarget\tmode\texecution_kind' \
   "$performance_results/summary.tsv"
 grep -Fq $'direct-call\tdirect-calls\tO2\t'"$native_target"$'\tperformance\tnative\t1' \
   "$performance_results/summary.tsv"
-grep -Fq $'direct-call\tdirect-calls\tO2\tpost_inline_ir.call_instructions\t0' \
-  "$performance_results/codegen-stats.tsv"
+for kernel in direct-call integer-loop floating-loop branch-switch; do
+  expected_functions=1
+  case "$kernel" in
+    direct-call)
+      family=direct-calls
+      expected_functions=2
+      ;;
+    integer-loop) family=integer-loops ;;
+    floating-loop) family=floating-loops ;;
+    branch-switch) family=branches-switches ;;
+  esac
+  for profile in O0 O2 Oz; do
+    expected_calls=0
+    if [[ "$kernel" == direct-call && "$profile" != O2 ]]; then
+      expected_calls=1
+    fi
+    grep -Fq \
+      "$kernel"$'\t'"$family"$'\t'"$profile"$'\tpost_inline_ir.functions\t'"$expected_functions" \
+      "$performance_results/codegen-stats.tsv"
+    grep -Fq \
+      "$kernel"$'\t'"$family"$'\t'"$profile"$'\tpost_inline_ir.call_instructions\t'"$expected_calls" \
+      "$performance_results/codegen-stats.tsv"
+  done
+done
 grep -Fq $'direct-call\tO2\tfinal-object\t' \
   "$performance_results/artifacts.tsv"
 grep -Fq $'direct-call\tO2\texecutable\t' \
@@ -167,9 +237,9 @@ grep -Fq '"format_version":1' "$performance_results/environment.json"
 grep -Fq '"mode":"performance"' "$performance_results/environment.json"
 grep -Fq '"kind":"link"' "$performance_results/commands.jsonl"
 grep -Fq '"phase":"validation"' "$performance_results/commands.jsonl"
-[[ "$(grep -c $'\tsample\t' "$performance_results/run-times.tsv")" == 6 ]]
+[[ "$(grep -c $'\tsample\t' "$performance_results/run-times.tsv")" == 24 ]]
 [[ "$(find "$performance_results/raw" -name 'compile-sample-*.o' |
-  wc -l | tr -d '[:space:]')" == 6 ]]
+  wc -l | tr -d '[:space:]')" == 24 ]]
 
 object_results="$temporary_directory/object"
 FAKE_TARGET="$native_target" "$script_directory/run.py" \
@@ -179,6 +249,7 @@ FAKE_TARGET="$native_target" "$script_directory/run.py" \
   --profiles O2 \
   --compile-samples 1
 [[ "$(wc -l <"$object_results/run-times.tsv" | tr -d '[:space:]')" == 1 ]]
+[[ "$(wc -l <"$object_results/summary.tsv" | tr -d '[:space:]')" == 5 ]]
 if grep -Fq $'\texecutable\t' "$object_results/artifacts.tsv"; then
   echo "object mode unexpectedly produced an executable artifact" >&2
   exit 1
@@ -199,6 +270,8 @@ FAKE_TARGET="$cross_target" "$script_directory/run.py" \
   --runner "$fake_runner"
 grep -Fq $'\tcorrectness\trunner\t0\t' "$correctness_results/summary.tsv"
 grep -Fq $'\trunner\tvalidation\t1\t' "$correctness_results/run-times.tsv"
+[[ "$(grep -c $'\trunner\tvalidation\t' \
+  "$correctness_results/run-times.tsv")" == 4 ]]
 
 nonzero_results="$temporary_directory/nonzero"
 set +e

@@ -385,9 +385,13 @@ def load_manifest(path: Path) -> list[Case]:
             raise BenchmarkError(
                 f"{path}: {name} expected_post_inline_functions must be positive"
             )
-        if not re.fullmatch(r"0x[0-9a-f]+", expected_result):
+        if (
+            len(expected_result) > 128
+            or any(character.isspace() for character in expected_result)
+            or not expected_result.isprintable()
+        ):
             raise BenchmarkError(
-                f"{path}: {name} expected_result must be lowercase hexadecimal"
+                f"{path}: {name} expected_result must be a compact printable token"
             )
         if not isinstance(expected_calls, dict) or not expected_calls:
             raise BenchmarkError(
