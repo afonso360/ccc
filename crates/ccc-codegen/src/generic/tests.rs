@@ -974,6 +974,11 @@ fn optimized_aggregate_parameters_use_their_local_storage_as_abi_backing() {
             "{}:\n{baseline_clif}",
             baseline.target.triple
         );
+        assert!(
+            baseline_clif.contains("iconst.i64 0"),
+            "{}:\n{baseline_clif}",
+            baseline.target.triple
+        );
 
         let optimized = base.with_optimization_level(OptimizationLevel::O2);
         let optimized_output = emit_source_with_config(source, &optimized);
@@ -981,6 +986,11 @@ fn optimized_aggregate_parameters_use_their_local_storage_as_abi_backing() {
         assert_eq!(
             optimized_clif.matches("explicit_slot 24").count(),
             2,
+            "{}:\n{optimized_clif}",
+            optimized.target.triple
+        );
+        assert!(
+            !optimized_clif.contains("iconst.i64 0"),
             "{}:\n{optimized_clif}",
             optimized.target.triple
         );

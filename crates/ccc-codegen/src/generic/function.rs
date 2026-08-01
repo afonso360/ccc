@@ -1346,7 +1346,15 @@ impl FunctionState<'_, '_, '_> {
                 } else {
                     create_stack_backing(builder, padded, parameter.classified.align)?
                 };
-                zero_memory(builder, address, padded)?;
+                let fully_overwritten = matches!(
+                    self.config.optimization,
+                    OptimizationLevel::O2 | OptimizationLevel::O3
+                ) && native_aggregate_parameter_fully_overwrites_storage(
+                    plan, &parameter, padded,
+                )?;
+                if !fully_overwritten {
+                    zero_memory(builder, address, padded)?;
+                }
                 for index in &parameter.carrier_indices {
                     let carrier = plan
                         .clif_parameters
@@ -3966,6 +3974,59 @@ fn native_carrier_type(carrier: ccc_abi::AbiCarrier) -> ir::Type {
         ccc_abi::AbiCarrier::V32 => ir::types::I8X4,
         ccc_abi::AbiCarrier::V64 => ir::types::I8X8,
     }
+}
+
+/// Returns whether exact-width ABI carriers overwrite every destination byte.
+///
+/// The false path keeps the zero seed for ABI tail bytes, partial carriers,
+/// and any unsupported transport. The true path is byte-for-byte equivalent
+/// because every seed byte is immediately replaced before the value is used.
+fn native_aggregate_parameter_fully_overwrites_storage(
+    plan: &ccc_abi::NativeBoundaryPlan,
+    parameter: &ccc_abi::NativeParameterPlan,
+    size: u64,
+) -> Result<bool, CodegenError> {
+    let mut ranges = Vec::with_capacity(parameter.carrier_indices.len());
+    for index in &parameter.carrier_indices {
+        let carrier = plan
+            .clif_parameters
+            .get(*index as usize)
+            .ok_or_else(|| error("aggregate ABI carrier index is invalid"))?;
+        match carrier.purpose {
+            ccc_abi::NativePurpose::Normal => {
+                let width = u64::from(native_carrier_type(carrier.carrier).bytes());
+                if u64::from(carrier.valid_bytes) != width {
+                    return Ok(false);
+                }
+                let end = carrier
+                    .source_offset
+                    .checked_add(width)
+                    .ok_or_else(|| error("aggregate ABI carrier range overflows"))?;
+                if end > size {
+                    return Ok(false);
+                }
+                ranges.push((carrier.source_offset, end));
+            }
+            ccc_abi::NativePurpose::StructArgument(_)
+            | ccc_abi::NativePurpose::IndirectArgument => {
+                return Ok(
+                    parameter.carrier_indices.len() == 1 && parameter.classified.size == size
+                );
+            }
+            ccc_abi::NativePurpose::StructReturn | ccc_abi::NativePurpose::Padding => {
+                return Ok(false);
+            }
+        }
+    }
+    ranges.sort_unstable();
+    let mut covered = 0;
+    for (start, end) in ranges {
+        if start > covered {
+            return Ok(false);
+        }
+        covered = covered.max(end);
+    }
+    Ok(covered == size)
 }
 
 fn zero_carrier_value(
