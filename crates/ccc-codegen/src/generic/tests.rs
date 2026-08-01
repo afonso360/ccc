@@ -1127,6 +1127,13 @@ fn read_only_register_aggregate_parameters_use_their_input_carriers() {
                   double alter(struct Vector value) {\n\
                       value.x = 1.0;\n\
                       return value.y;\n\
+                  }\n\
+                  struct Vector make(void) {\n\
+                      struct Vector value;\n\
+                      value.x = 1.0;\n\
+                      value.y = 2.0;\n\
+                      value.z = 3.0;\n\
+                      return value;\n\
                   }";
     let baseline = EffectiveCompilationConfig::aarch64_unknown_linux_gnu()
         .with_optimization_level(OptimizationLevel::O1);
@@ -1152,6 +1159,12 @@ fn read_only_register_aggregate_parameters_use_their_input_carriers() {
     assert!(
         altered.contains("load.f64") && altered.contains("store"),
         "{}:\n{altered}",
+        optimized.target.triple
+    );
+    let made = function_clif(&optimized_output.clif, "make");
+    assert!(
+        !made.contains("load.f64") && !made.contains("store"),
+        "{}:\n{made}",
         optimized.target.triple
     );
 }
