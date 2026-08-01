@@ -433,14 +433,16 @@ benchmarks/codegen/test-run.sh
 ## Defined-behavior kernel benchmarks
 
 The executable kernel runner is separate from the compiler-only suite. Its
-nine fixed-work cases cover direct calls, unsigned integers,
+fourteen fixed-work cases cover direct calls, unsigned integers,
 binary32/binary64, branch/switch control flow, indexed load/store traffic,
 32-byte aggregate copies, TLS access, C11 atomic read-modify-write operations,
-and a variadic definition plus caller. Every case validates its exact result.
-The direct-call case records whether its leaf call remains in the
-post-inlining CLIF at `-O0`, `-O2`, and `-Oz`; TLS records the expected
-target-accessor calls, while the variadic case retains two functions and one
-call at every profile. Run a quick native correctness check with:
+and a variadic definition plus caller. CRC32, dense matrix multiply, heap sort,
+Dijkstra routing, and a five-point image stencil add compact complete programs
+with distinct control-flow, memory, and arithmetic behavior. Every case
+validates its exact result. The direct-call case records whether its leaf call
+remains in the post-inlining CLIF at `-O0`, `-O2`, and `-Oz`; TLS records the
+expected target-accessor calls, while the variadic case retains two functions
+and one call at every profile. Run a quick native correctness check with:
 
 ```sh
 benchmarks/kernels/run.py \
@@ -494,13 +496,42 @@ benchmarks/kernels/test-run.sh
 ```
 
 The fast CI job runs the fake-tool regression. The all-target matrix also runs
-all nine kernels in object mode at `-O0`, `-O2`, and `-Oz`, retains their
+all fourteen kernels in object mode at `-O0`, `-O2`, and `-Oz`, retains their
 structural evidence, and checks the declaration-per-function invariant plus
 the four generated structural codegen-scaling axes at two bounded scales. The
 scheduled Cranelift-`main` candidate runs the same gate. All-target correctness
 execution and controlled native runtime baselines remain follow-up work. QEMU
 results are correctness and rough-trend evidence, never native performance
 evidence.
+
+## Real-program workload benchmarks
+
+The real-program runner measures CCC-built bzip2, zlib/minigzip, zstd, and Lua
+executables on large deterministic workloads. It accepts their executable paths
+and never invokes a corpus build, a compiler, or an upstream test suite; those
+are separate workflows. It validates only the timed workload itself: the three
+compressors must round-trip a generated 32 MiB mixed input byte-for-byte, and
+Lua checks the fixed result of its generated interpreter loop.
+
+After producing the executables through a separate CCC build workflow, run:
+
+~~~sh
+benchmarks/real-world/run.py \
+  --output "$CCC_TEST_ROOT/real-world" \
+  --program bzip2=/path/to/bzip2 \
+  --program zlib=/path/to/minigzip \
+  --program zstd=/path/to/zstd \
+  --program lua=/path/to/lua
+~~~
+
+The runner performs one unmeasured validation, then records warmups and repeated
+native samples while writing timed output to /dev/null. It retains exact program
+hashes, commands, input hashes, validation artifacts, and raw timing data. Use
+--input-mebibytes to make the compression corpus larger, and use --cases with
+the corresponding one --program path to focus on a single program. The renderer
+remains at test-corpus/c-ray/run.sh --profile performance, which owns its own
+separate reference-image contract. See benchmarks/real-world/README.md for the
+result schema and fake-program runner regression.
 
 ## C-Ray generated-code benchmark
 

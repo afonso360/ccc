@@ -125,3 +125,73 @@ expected_post_inline_functions = 2
 O0 = 1
 O2 = 1
 Oz = 1
+
+[[case]]
+name = "crc32"
+family = "checksums"
+source = "cases/crc32.c"
+work_unit = "input-byte"
+work_count = 1048576
+expected_result = "0xaf3f6d98"
+expected_post_inline_functions = 1
+
+[case.expected_post_inline_calls]
+O0 = 0
+O2 = 0
+Oz = 0
+
+[[case]]
+name = "matrix-multiply"
+family = "dense-linear-algebra"
+source = "cases/matrix-multiply.c"
+work_unit = "unsigned-multiply-accumulate"
+work_count = 1048576
+expected_result = "0xfe6cbaf0"
+expected_post_inline_functions = 1
+
+[case.expected_post_inline_calls]
+O0 = 0
+O2 = 0
+Oz = 0
+
+[[case]]
+name = "heap-sort"
+family = "comparison-sorting"
+source = "cases/heap-sort.c"
+work_unit = "1024-element-sort"
+work_count = 128
+expected_result = "0x6236dd0a"
+expected_post_inline_functions = 1
+
+[case.expected_post_inline_calls]
+O0 = 0
+O2 = 0
+Oz = 0
+
+[[case]]
+name = "dijkstra"
+family = "shortest-path-routing"
+source = "cases/dijkstra.c"
+work_unit = "64-node-shortest-path"
+work_count = 512
+expected_result = "0xced1bd1d"
+expected_post_inline_functions = 1
+
+[case.expected_post_inline_calls]
+O0 = 0
+O2 = 0
+Oz = 0
+
+[[case]]
+name = "image-stencil"
+family = "image-stencils"
+source = "cases/image-stencil.c"
+work_unit = "five-point-stencil"
+work_count = 1016064
+expected_result = "0x2c970468"
+expected_post_inline_functions = 1
+
+[case.expected_post_inline_calls]
+O0 = 0
+O2 = 0
+Oz = 0

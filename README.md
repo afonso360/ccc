@@ -92,6 +92,8 @@ A separate x86-64 Linux job builds and runs the bounded SQLite, Lua, bzip2,
 zlib, Redis, and zstd corpus profiles, the codegen microbenchmark matrix, and
 the C-Ray correctness benchmark. Additional AArch64 Linux, RISC-V Linux, and
 arm64 Darwin jobs run bzip2's complete target-specific corpus contract.
+The fast kernel and supplied-executable real-program performance suites are
+documented alongside their separate correctness workflows in
 
 The complete local commands and target-specific prerequisites are in
 [Test commands and prerequisites](docs/testing.md).

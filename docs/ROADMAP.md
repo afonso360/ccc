@@ -25,7 +25,7 @@ the reproducibility and single-owner unwind policy.
 The scheduled compatibility workflow refreshes an ephemeral candidate lockfile,
 synchronizes candidate provenance, and tests upstream head without modifying
 normal builds. It runs the workspace suite, every target oracle, bounded
-structural-scaling axes, and all nine kernel objects at every optimization
+structural-scaling axes, and all fourteen kernel objects at every optimization
 profile and enabled target. Backend construction, settings, frontend
 finalization, empty memory flags, symbol materialization, and custom data
 sections now pass through one narrow compatibility module; CLIF instruction
@@ -155,13 +155,14 @@ structural-stat query is separate and untimed.
 
 The current executable slice and next benchmark targets are:
 
-- The compact nine-case defined-behavior suite is checked in: fixed-work
+- The fast fourteen-case defined-behavior suite is checked in: fixed-work
   direct-call/inlining, unsigned-integer, exact binary32/binary64,
   branch/switch, indexed load/store, 32-byte aggregate-copy, TLS, C11 atomic,
-  and variadic-call workloads all self-validate. They run through separate
-  object-only, correctness, and native-performance modes, and their versioned
-  evidence keeps compiler-side primary-object statistics distinct from final
-  packaged objects. Establish controlled native baselines and extend
+  and variadic-call workloads are joined by CRC32, dense matrix multiply, heap
+  sort, Dijkstra routing, and image-stencil programs. All self-validate and run
+  through separate object-only, correctness, and native-performance modes; the
+  versioned evidence keeps compiler-side primary-object statistics distinct from
+  final packaged objects. Establish controlled native baselines and extend
   cross-target correctness execution next.
 - Independent block-count, live-SSA-value, referenced-global, and
   string-literal scaling now joins the translation-unit and per-function
@@ -174,10 +175,11 @@ The current executable slice and next benchmark targets are:
   and SHA-256, and retains the complete sidecar beside whole-process peak RSS.
   Establish pinned-runner baselines before turning those noisy phase and memory
   correlations into growth gates.
-- Whole-program measurements use the existing bzip2, zlib, and zstd adapters
-  with fixed inputs. Record translation time, link time, aggregate object
-  size, executable text size, and execution throughput without weakening their
-  correctness contracts.
+- The real-program runner measures supplied CCC-built bzip2, zlib/minigzip,
+  zstd, and Lua executables on deterministic large inputs, recording native
+  compression/decompression or interpreter throughput with a workload-local
+  output check. It never invokes the separate build or upstream test workflows,
+  so timing evidence cannot accidentally include compiler or test-suite work.
 - C-Ray now records CCC frontend and coarse code-generation phase timing for
   each optimization profile through a separate untimed compile whose object
   must match the measured object by size and SHA-256. Its result schema also

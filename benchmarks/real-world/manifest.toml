@@ -1,0 +1,35 @@
+schema_version = 1
+
+[[case]]
+name = "bzip2"
+family = "block-sorting-compression"
+workload = "compression"
+work_unit = "input-byte"
+work_count = "input_bytes"
+compression_arguments = ["-9", "-c"]
+decompression_arguments = ["-d", "-c"]
+
+[[case]]
+name = "zlib"
+family = "deflate-compression"
+workload = "compression"
+work_unit = "input-byte"
+work_count = "input_bytes"
+compression_arguments = ["-9", "-c"]
+decompression_arguments = ["-d", "-c"]
+
+[[case]]
+name = "zstd"
+family = "dictionary-compression"
+workload = "compression"
+work_unit = "input-byte"
+work_count = "input_bytes"
+compression_arguments = ["-q", "-T1", "-c"]
+decompression_arguments = ["-q", "-T1", "-d", "-c"]
+
+[[case]]
+name = "lua"
+family = "bytecode-interpreter"
+workload = "lua"
+work_unit = "interpreter-step"
+work_count = 3145728

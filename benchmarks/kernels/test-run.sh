@@ -30,6 +30,11 @@ kernels=(
   tls-access
   atomic-rmw
   variadic-call
+  crc32
+  matrix-multiply
+  heap-sort
+  dijkstra
+  image-stencil
 )
 kernel_count=${#kernels[@]}
 performance_sample_count=$((kernel_count * 3 * 2))
@@ -80,7 +85,7 @@ profile = next(
 case_name = None
 if len(source_arguments) == 1:
     source_text = Path(source_arguments[0]).read_text(encoding="utf-8")
-    case_match = re.search(r"ccc-kernel-benchmark: ([a-z-]+)", source_text)
+    case_match = re.search(r"ccc-kernel-benchmark: ([a-z0-9-]+)", source_text)
     if case_match:
         case_name = case_match.group(1)
 
@@ -168,6 +173,51 @@ if "--emit=codegen-stats" in sys.argv:
             "instructions": 63,
             "global_values": 3,
             "constants": 8,
+            "jump_tables": 0,
+        },
+        "crc32": {
+            "functions": 1,
+            "calls": 0,
+            "blocks": 8,
+            "instructions": 46,
+            "global_values": 1,
+            "constants": 5,
+            "jump_tables": 0,
+        },
+        "matrix-multiply": {
+            "functions": 1,
+            "calls": 0,
+            "blocks": 12,
+            "instructions": 112,
+            "global_values": 4,
+            "constants": 9,
+            "jump_tables": 0,
+        },
+        "heap-sort": {
+            "functions": 1,
+            "calls": 0,
+            "blocks": 22,
+            "instructions": 144,
+            "global_values": 2,
+            "constants": 10,
+            "jump_tables": 0,
+        },
+        "dijkstra": {
+            "functions": 1,
+            "calls": 0,
+            "blocks": 17,
+            "instructions": 126,
+            "global_values": 4,
+            "constants": 8,
+            "jump_tables": 0,
+        },
+        "image-stencil": {
+            "functions": 1,
+            "calls": 0,
+            "blocks": 12,
+            "instructions": 87,
+            "global_values": 3,
+            "constants": 7,
             "jump_tables": 0,
         },
     }
@@ -294,6 +344,11 @@ for kernel in "${kernels[@]}"; do
       family=variadic-abi
       expected_functions=2
       ;;
+    crc32) family=checksums ;;
+    matrix-multiply) family=dense-linear-algebra ;;
+    heap-sort) family=comparison-sorting ;;
+    dijkstra) family=shortest-path-routing ;;
+    image-stencil) family=image-stencils ;;
   esac
   for profile in O0 O2 Oz; do
     expected_calls=0
