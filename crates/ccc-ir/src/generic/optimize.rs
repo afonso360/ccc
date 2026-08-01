@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use ccc_target::{EffectiveCompilationConfig, OptimizationLevel};
-use ccc_types::TypeStore;
+use ccc_types::{QualifiedType, RecordKind, TypeKind, TypeStore};
 
 mod cse;
 mod effects;
@@ -14,7 +14,8 @@ use super::lower::{compact_values, remap_promoted_local_update_positions};
 use super::verify::{instruction_operands, terminator_operands};
 use super::{
     BlockId, FullEdge, FullFunction, FullInstructionKind, FullModule, FullTerminator, IrError,
-    MemoryAccess, ScalarConstant, ScalarConversion, UnaryOperation, ValueId, verify_frontend,
+    MemoryAccess, MemoryResidencyReason, ScalarConstant, ScalarConversion, StorageId,
+    StorageLocation, UnaryOperation, ValueId, verify_frontend,
 };
 
 /// Runs the C-aware cleanup pipeline and validates the IR on both boundaries.
@@ -106,6 +107,8 @@ fn optimize_function(
         changed |= forward_empty_blocks(function)
             .map_err(|error| pass_failure(error, "empty-block forwarding"))?;
         if profile.local_cse {
+            changed |= forward_automatic_aggregate_field_loads(types, function)
+                .map_err(|error| pass_failure(error, "automatic aggregate field forwarding"))?;
             changed |= elide_immediate_aggregate_snapshots(function)
                 .map_err(|error| pass_failure(error, "aggregate snapshot cleanup"))?;
             changed |= cse::eliminate_common_expressions(function)
@@ -190,6 +193,322 @@ fn elide_immediate_aggregate_snapshots(function: &mut FullFunction) -> Result<bo
         compact_values(function, &BTreeMap::new())?;
     }
     Ok(changed)
+}
+
+#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
+struct AutomaticAggregateField {
+    storage: StorageId,
+    fields: Vec<usize>,
+}
+
+#[derive(Clone)]
+struct AutomaticAggregateAddress {
+    field: AutomaticAggregateField,
+    forwardable: bool,
+}
+
+/// Finds direct field addresses within automatic aggregates after proving that
+/// every derived address remains in a modeled, non-escaping use. Residency
+/// metadata cheaply excludes normal address-taken objects, while the use proof
+/// covers malformed or underclassified IR as well. Only struct paths are
+/// forwardable; union paths remain tracked solely to detect escapes.
+fn automatic_aggregate_field_locations(
+    types: &TypeStore,
+    function: &FullFunction,
+) -> BTreeMap<ValueId, AutomaticAggregateAddress> {
+    let storages = function
+        .storage
+        .iter()
+        .filter(|storage| {
+            storage.location == StorageLocation::Automatic
+                && storage.required_by.as_slice() == [MemoryResidencyReason::Aggregate]
+        })
+        .map(|storage| storage.id)
+        .collect::<BTreeSet<_>>();
+    let mut result = BTreeMap::new();
+
+    for instruction in function.blocks.iter().flat_map(|block| &block.instructions) {
+        let Some(value) = instruction.result else {
+            continue;
+        };
+        match &instruction.kind {
+            FullInstructionKind::AddressOfStorage { storage } if storages.contains(storage) => {
+                result.insert(
+                    value,
+                    AutomaticAggregateAddress {
+                        field: AutomaticAggregateField {
+                            storage: *storage,
+                            fields: Vec::new(),
+                        },
+                        forwardable: true,
+                    },
+                );
+            }
+            FullInstructionKind::ProjectField {
+                base,
+                record,
+                field_index,
+                ..
+            } => {
+                let Some(mut location) = result.get(base).cloned() else {
+                    continue;
+                };
+                let Some(TypeKind::Record(record_id)) = types.try_kind(record.ty) else {
+                    continue;
+                };
+                let forwardable = location.forwardable
+                    && types
+                        .record(*record_id)
+                        .is_some_and(|definition| definition.kind == RecordKind::Struct);
+                location.field.fields.push(*field_index);
+                result.insert(
+                    value,
+                    AutomaticAggregateAddress {
+                        field: location.field,
+                        forwardable,
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
+
+    let mut escaped_storages = BTreeSet::new();
+    for instruction in function.blocks.iter().flat_map(|block| &block.instructions) {
+        if !has_only_modeled_aggregate_address_uses(&instruction.kind, &result) {
+            for value in instruction_operands(&instruction.kind) {
+                if let Some(location) = result.get(&value) {
+                    escaped_storages.insert(location.field.storage);
+                }
+            }
+        }
+    }
+    for terminator in function
+        .blocks
+        .iter()
+        .filter_map(|block| block.terminator.as_ref())
+    {
+        for value in terminator_operands(terminator) {
+            if let Some(location) = result.get(&value) {
+                escaped_storages.insert(location.field.storage);
+            }
+        }
+    }
+    result.retain(|_, location| !escaped_storages.contains(&location.field.storage));
+    result
+}
+
+/// Returns true only for exact direct-address consumers whose effects are
+/// modeled below. Everything else is an escape, including conversions and
+/// pointer arithmetic, so malformed metadata cannot grant a no-alias proof.
+fn has_only_modeled_aggregate_address_uses(
+    kind: &FullInstructionKind,
+    locations: &BTreeMap<ValueId, AutomaticAggregateAddress>,
+) -> bool {
+    let is_location = |value| locations.contains_key(&value);
+    match kind {
+        FullInstructionKind::ProjectField { .. }
+        | FullInstructionKind::Load { .. }
+        | FullInstructionKind::BitfieldLoad { .. }
+        | FullInstructionKind::ZeroInitialize { .. }
+        | FullInstructionKind::StringInitialize { .. }
+        | FullInstructionKind::AggregateCopy { .. }
+        | FullInstructionKind::AggregateSnapshot { .. }
+        | FullInstructionKind::MemoryCopy { .. }
+        | FullInstructionKind::MemorySet { .. }
+        | FullInstructionKind::X86Rdtsc { .. }
+        | FullInstructionKind::VaStart { .. }
+        | FullInstructionKind::VaArg { .. }
+        | FullInstructionKind::VaEnd { .. } => true,
+        FullInstructionKind::Store { value, .. }
+        | FullInstructionKind::BitfieldStore { value, .. } => !is_location(*value),
+        FullInstructionKind::AtomicReadModifyWrite { operand, .. } => !is_location(*operand),
+        FullInstructionKind::AtomicCompareExchange {
+            expected,
+            replacement,
+            ..
+        } => !is_location(*expected) && !is_location(*replacement),
+        FullInstructionKind::X86Cpuid { leaf, subleaf, .. } => {
+            !is_location(*leaf) && !subleaf.is_some_and(is_location)
+        }
+        FullInstructionKind::VaCopy { source, .. } => !is_location(*source),
+        _ => !instruction_operands(kind).into_iter().any(is_location),
+    }
+}
+
+fn is_forwardable_scalar(types: &TypeStore, object: QualifiedType) -> bool {
+    object.qualifiers.is_empty()
+        && (types.is_arithmetic(object.ty)
+            || matches!(types.try_kind(object.ty), Some(TypeKind::Pointer(_))))
+}
+
+fn invalidate_automatic_aggregate_field(
+    values: &mut BTreeMap<AutomaticAggregateField, (ValueId, QualifiedType)>,
+    locations: &BTreeMap<ValueId, AutomaticAggregateAddress>,
+    address: ValueId,
+) {
+    let Some(destination) = locations.get(&address) else {
+        return;
+    };
+    values.retain(|location, _| {
+        location.storage != destination.field.storage
+            || !location.fields.starts_with(&destination.field.fields)
+    });
+}
+
+fn invalidate_automatic_aggregate_storage(
+    values: &mut BTreeMap<AutomaticAggregateField, (ValueId, QualifiedType)>,
+    locations: &BTreeMap<ValueId, AutomaticAggregateAddress>,
+    address: ValueId,
+) {
+    let Some(destination) = locations.get(&address) else {
+        return;
+    };
+    values.retain(|location, _| location.storage != destination.field.storage);
+}
+
+/// Forwards scalar loads from a preceding store to the same direct field of a
+/// non-escaping automatic aggregate in one basic block.
+///
+/// Calls and unknown pointers cannot modify these aggregates because their
+/// addresses never escape. Writes with a recognized aggregate destination
+/// invalidate its mapped field range; unions, volatile/atomic accesses, and
+/// address-taken storage are excluded entirely.
+fn forward_automatic_aggregate_field_loads(
+    types: &TypeStore,
+    function: &mut FullFunction,
+) -> Result<bool, IrError> {
+    let locations = automatic_aggregate_field_locations(types, function);
+    if locations.is_empty() {
+        return Ok(false);
+    }
+
+    let mut aliases = BTreeMap::new();
+    let mut retained_instructions = Vec::with_capacity(function.blocks.len());
+    for block in &function.blocks {
+        let mut values = BTreeMap::<AutomaticAggregateField, (ValueId, QualifiedType)>::new();
+        let mut retained = Vec::with_capacity(block.instructions.len());
+        for instruction in &block.instructions {
+            let mut forwarded = false;
+            match &instruction.kind {
+                FullInstructionKind::Load {
+                    address,
+                    object,
+                    access,
+                } => {
+                    if *access == MemoryAccess::default()
+                        && is_forwardable_scalar(types, *object)
+                        && let Some(location) = locations.get(address)
+                        && location.forwardable
+                        && !location.field.fields.is_empty()
+                        && let Some((value, stored_object)) = values.get(&location.field)
+                        && *stored_object == *object
+                        && let Some(result) = instruction.result
+                    {
+                        aliases.insert(result, *value);
+                        forwarded = true;
+                    }
+                }
+                FullInstructionKind::Store {
+                    address,
+                    value,
+                    object,
+                    access,
+                } => {
+                    invalidate_automatic_aggregate_field(&mut values, &locations, *address);
+                    if *access == MemoryAccess::default()
+                        && is_forwardable_scalar(types, *object)
+                        && let Some(location) = locations.get(address)
+                        && location.forwardable
+                        && !location.field.fields.is_empty()
+                    {
+                        values.insert(
+                            location.field.clone(),
+                            (resolve_alias(*value, &aliases)?, *object),
+                        );
+                    }
+                }
+                FullInstructionKind::MemoryCopy { destination, .. }
+                | FullInstructionKind::MemorySet { destination, .. } => {
+                    invalidate_automatic_aggregate_storage(&mut values, &locations, *destination);
+                }
+                FullInstructionKind::ZeroInitialize { destination, .. }
+                | FullInstructionKind::StringInitialize { destination, .. }
+                | FullInstructionKind::AggregateCopy { destination, .. }
+                | FullInstructionKind::BitfieldStore {
+                    address: destination,
+                    ..
+                }
+                | FullInstructionKind::AtomicReadModifyWrite {
+                    address: destination,
+                    ..
+                }
+                | FullInstructionKind::AtomicCompareExchange {
+                    address: destination,
+                    ..
+                }
+                | FullInstructionKind::VaCopy { destination, .. } => {
+                    invalidate_automatic_aggregate_field(&mut values, &locations, *destination);
+                }
+                FullInstructionKind::X86Cpuid {
+                    eax, ebx, ecx, edx, ..
+                } => {
+                    for destination in [*eax, *ebx, *ecx, *edx].into_iter().flatten() {
+                        invalidate_automatic_aggregate_field(&mut values, &locations, destination);
+                    }
+                }
+                FullInstructionKind::X86Rdtsc { low, high } => {
+                    for destination in [*low, *high] {
+                        invalidate_automatic_aggregate_field(&mut values, &locations, destination);
+                    }
+                }
+                FullInstructionKind::VaStart { list, .. }
+                | FullInstructionKind::VaEnd { list }
+                | FullInstructionKind::VaArg { list, .. } => {
+                    invalidate_automatic_aggregate_field(&mut values, &locations, *list);
+                }
+                FullInstructionKind::Constant(_)
+                | FullInstructionKind::AddressConstant { .. }
+                | FullInstructionKind::AddressOfGlobal { .. }
+                | FullInstructionKind::AddressOfFunction { .. }
+                | FullInstructionKind::AddressOfString { .. }
+                | FullInstructionKind::AddressOfStorage { .. }
+                | FullInstructionKind::ProjectField { .. }
+                | FullInstructionKind::PointerOffset { .. }
+                | FullInstructionKind::PointerDifference { .. }
+                | FullInstructionKind::AggregateSnapshot { .. }
+                | FullInstructionKind::AggregateProject { .. }
+                | FullInstructionKind::Convert { .. }
+                | FullInstructionKind::Unary { .. }
+                | FullInstructionKind::Binary { .. }
+                | FullInstructionKind::IntegerIntrinsic { .. }
+                | FullInstructionKind::DirectCall { .. }
+                | FullInstructionKind::IndirectCall { .. }
+                | FullInstructionKind::RuntimeSize { .. }
+                | FullInstructionKind::RuntimePointerOffset { .. }
+                | FullInstructionKind::RuntimePointerDifference { .. } => {}
+                // New or otherwise unmodeled effects are write barriers.
+                _ => values.clear(),
+            }
+            retained.push(!forwarded);
+        }
+        retained_instructions.push(retained);
+    }
+
+    if aliases.is_empty() {
+        return Ok(false);
+    }
+    for (block, retained) in function.blocks.iter_mut().zip(&retained_instructions) {
+        let mut index = 0;
+        block.instructions.retain(|_| {
+            let retain = retained[index];
+            index += 1;
+            retain
+        });
+    }
+    remap_promoted_local_update_positions(function, &retained_instructions)?;
+    compact_values(function, &aliases)?;
+    Ok(true)
 }
 
 fn sparsify_block_parameters(function: &mut FullFunction) -> Result<bool, IrError> {

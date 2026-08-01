@@ -1,14 +1,13 @@
+use super::super::super::{
+    BinaryOperation, FullInstructionKind, FullModule, MemoryResidencyReason, dump_frontend_ir,
+    lower_frontend, verify_frontend,
+};
+use super::{optimize_frontend_for_config, terminator_edges};
 use ccc_pp::{PpItem, lex};
 use ccc_sema::generic::analyze_frontend;
 use ccc_session::SourceMap;
 use ccc_syntax::frontend as syntax;
 use ccc_target::{EffectiveCompilationConfig, OptimizationLevel, enabled_compilation_configs};
-
-use super::super::super::{
-    BinaryOperation, FullInstructionKind, FullModule, dump_frontend_ir, lower_frontend,
-    verify_frontend,
-};
-use super::{optimize_frontend_for_config, terminator_edges};
 
 fn lower_source(source: &str, config: &EffectiveCompilationConfig) -> FullModule {
     let mut sources = SourceMap::new();
@@ -342,4 +341,206 @@ fn immediate_aggregate_snapshot_copy_is_elided_at_o2() {
     assert_eq!(snapshot_count(&o2), 1, "{}", dump_frontend_ir(&o2));
     verify_frontend(&o1).unwrap();
     verify_frontend(&o2).unwrap();
+}
+
+fn function_load_count(module: &FullModule, name: &str) -> usize {
+    module
+        .functions
+        .iter()
+        .find(|function| function.name == name)
+        .unwrap_or_else(|| panic!("missing function {name}"))
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter(|instruction| matches!(instruction.kind, FullInstructionKind::Load { .. }))
+        .count()
+}
+
+#[test]
+fn direct_non_escaping_struct_field_loads_are_forwarded_only_at_o2() {
+    let source = "struct Pair { int left; int right; };\n\
+                  union Number { int integer; float floating; };\n\
+                  extern void observe(void);\n\
+                  extern void touch(struct Pair *);\n\
+                  extern struct Pair replacement(void);\n\
+                  int forward_direct_fields(int left, int right) {\n\
+                      struct Pair pair;\n\
+                      pair.left = left;\n\
+                      pair.right = right;\n\
+                      return pair.left + pair.right;\n\
+                  }\n\
+                  int call_cannot_alias(int value) {\n\
+                      struct Pair pair;\n\
+                      pair.left = value;\n\
+                      observe();\n\
+                      return pair.left;\n\
+                  }\n\
+                  int address_taken_is_not_forwarded(int value) {\n\
+                      struct Pair pair;\n\
+                      pair.left = value;\n\
+                      touch(&pair);\n\
+                      return pair.left;\n\
+                  }\n\
+                  int aggregate_write_invalidates_field(int value) {\n\
+                      struct Pair pair;\n\
+                      pair.left = value;\n\
+                      pair = replacement();\n\
+                      return pair.left;\n\
+                  }\n\
+                  int union_field_is_not_forwarded(int value) {\n\
+                      union Number number;\n\
+                      number.integer = value;\n\
+                      return number.integer;\n\
+                  }\n\
+                  int volatile_field_is_not_forwarded(int value) {\n\
+                      struct { volatile int member; } object;\n\
+                      object.member = value;\n\
+                      return object.member;\n\
+                  }";
+    let base = EffectiveCompilationConfig::default();
+    let mut o1 = lower_source(
+        source,
+        &base.clone().with_optimization_level(OptimizationLevel::O1),
+    );
+    let o2_config = base.with_optimization_level(OptimizationLevel::O2);
+    let mut o2 = lower_source(source, &o2_config);
+
+    optimize_frontend_for_config(
+        &mut o1,
+        &EffectiveCompilationConfig::default().with_optimization_level(OptimizationLevel::O1),
+    )
+    .unwrap();
+    optimize_frontend_for_config(&mut o2, &o2_config).unwrap();
+
+    for name in ["forward_direct_fields", "call_cannot_alias"] {
+        assert_eq!(
+            function_load_count(&o1, name),
+            1 + (name == "forward_direct_fields") as usize
+        );
+        assert_eq!(
+            function_load_count(&o2, name),
+            0,
+            "{}",
+            dump_frontend_ir(&o2)
+        );
+    }
+    for name in [
+        "address_taken_is_not_forwarded",
+        "aggregate_write_invalidates_field",
+        "union_field_is_not_forwarded",
+        "volatile_field_is_not_forwarded",
+    ] {
+        assert_eq!(
+            function_load_count(&o1, name),
+            1,
+            "{}",
+            dump_frontend_ir(&o1)
+        );
+        assert_eq!(
+            function_load_count(&o2, name),
+            1,
+            "{}",
+            dump_frontend_ir(&o2)
+        );
+    }
+    verify_frontend(&o1).unwrap();
+    verify_frontend(&o2).unwrap();
+}
+
+fn mark_storage_aggregate_only(module: &mut FullModule, name: &str) {
+    let function = module
+        .functions
+        .iter_mut()
+        .find(|function| function.name == name)
+        .unwrap_or_else(|| panic!("missing function {name}"));
+    for storage in &mut function.storage {
+        storage.required_by = vec![MemoryResidencyReason::Aggregate];
+    }
+}
+
+#[test]
+fn aggregate_field_forwarding_rejects_forged_escapes_and_preserves_local_boundaries() {
+    let config =
+        EffectiveCompilationConfig::default().with_optimization_level(OptimizationLevel::O2);
+    let source = "struct Pair { int left; int right; };\n\
+                  struct Outer { struct Pair inner; int sibling; };\n\
+                  struct AtomicMember { _Atomic int member; };\n\
+                  extern void touch(struct Pair *);\n\
+                  extern struct Pair replacement(void);\n\
+                  int forged_call_escape(int value) {\n\
+                      struct Pair pair;\n\
+                      pair.left = value;\n\
+                      touch(&pair);\n\
+                      return pair.left;\n\
+                  }\n\
+                  int converted_memory_destination(int value) {\n\
+                      struct Pair pair;\n\
+                      pair.left = value;\n\
+                      __builtin_memset((void *)&pair.left, 0, sizeof pair.left);\n\
+                      return pair.left;\n\
+                  }\n\
+                  int nested_paths_and_siblings(int value) {\n\
+                      struct Outer object;\n\
+                      object.inner.left = value;\n\
+                      object.sibling = 0;\n\
+                      return object.inner.left;\n\
+                  }\n\
+                  int nested_ancestor_write(int value) {\n\
+                      struct Outer object;\n\
+                      object.inner.left = value;\n\
+                      object.inner = replacement();\n\
+                      return object.inner.left;\n\
+                  }\n\
+                  int cross_block_does_not_forward(int value, int condition) {\n\
+                      struct Pair pair;\n\
+                      pair.left = value;\n\
+                      if (condition) return pair.left;\n\
+                      return pair.left;\n\
+                  }\n\
+                  int atomic_field_is_not_forwarded(int value) {\n\
+                      struct AtomicMember object;\n\
+                      object.member = value;\n\
+                      return object.member;\n\
+                  }";
+    let mut module = lower_source(source, &config);
+
+    // Deliberately erase lowering's AddressTaken reason. The optimizer must
+    // still reject these pointers by following their actual IR uses.
+    mark_storage_aggregate_only(&mut module, "forged_call_escape");
+    mark_storage_aggregate_only(&mut module, "converted_memory_destination");
+    optimize_frontend_for_config(&mut module, &config).unwrap();
+
+    for name in ["forged_call_escape", "converted_memory_destination"] {
+        assert_eq!(
+            function_load_count(&module, name),
+            1,
+            "{}",
+            dump_frontend_ir(&module)
+        );
+    }
+    assert_eq!(
+        function_load_count(&module, "nested_paths_and_siblings"),
+        0,
+        "{}",
+        dump_frontend_ir(&module)
+    );
+    assert_eq!(
+        function_load_count(&module, "nested_ancestor_write"),
+        1,
+        "{}",
+        dump_frontend_ir(&module)
+    );
+    assert_eq!(
+        function_load_count(&module, "cross_block_does_not_forward"),
+        2,
+        "{}",
+        dump_frontend_ir(&module)
+    );
+    assert_eq!(
+        function_load_count(&module, "atomic_field_is_not_forwarded"),
+        1,
+        "{}",
+        dump_frontend_ir(&module)
+    );
+    verify_frontend(&module).unwrap();
 }
