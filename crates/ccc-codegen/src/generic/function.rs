@@ -758,19 +758,26 @@ struct DirectAggregateParameterFieldLoad {
     clif_type: ir::Type,
 }
 
+#[derive(Default)]
+struct DirectAggregateParameterFieldLoads {
+    loads: BTreeMap<gir::InstructionId, DirectAggregateParameterFieldLoad>,
+    elided_backings: BTreeSet<gir::StorageId>,
+}
+
 /// Finds register-passed aggregate parameters whose backing storage is only
-/// used to copy the entry value and load plain, directly projected fields.
+/// used to copy the entry value and load plain, directly projected scalar
+/// fields.
 ///
 /// Such a parameter does not need to be materialized: the exact normal ABI
 /// carrier for each observed field already holds the value the load would
-/// produce. Any use that could observe the backing object itself disqualifies
-/// the whole parameter.
+/// produce. The proof follows nested record projections and rejects every
+/// pointer use other than the entry copy, projection, or mapped scalar load.
 fn direct_aggregate_parameter_field_loads(
     module: &gir::FullModule,
     function: &gir::FullFunction,
     config: &EffectiveCompilationConfig,
     plan: &ccc_abi::NativeBoundaryPlan,
-) -> BTreeMap<gir::InstructionId, DirectAggregateParameterFieldLoad> {
+) -> DirectAggregateParameterFieldLoads {
     let uses = gir::value_use_counts(function);
     let mut parameters = BTreeMap::new();
     for parameter in &plan.parameters {
@@ -812,7 +819,9 @@ fn direct_aggregate_parameter_field_loads(
         }
     }
 
-    let mut result = BTreeMap::new();
+    let definitions = field_projection_definitions(function);
+    let global_roots = field_projection_global_roots(function);
+    let mut result = DirectAggregateParameterFieldLoads::default();
     'parameters: for (storage, parameter) in parameters {
         let Some(addresses) = storage_addresses.get(&storage) else {
             continue;
@@ -821,104 +830,85 @@ fn direct_aggregate_parameter_field_loads(
         let Some(incoming) = function.parameters[source].incoming else {
             continue;
         };
-        let mut expected_address_uses = addresses
-            .iter()
-            .copied()
-            .map(|address| (address, 0_usize))
-            .collect::<BTreeMap<_, _>>();
-        let mut expected_incoming_uses = 0;
-        let mut fields = BTreeMap::<gir::ValueId, (u64, u64)>::new();
-        for block in &function.blocks {
-            for instruction in &block.instructions {
-                match &instruction.kind {
-                    gir::FullInstructionKind::AggregateCopy {
-                        destination,
-                        source,
-                        destination_access,
-                        source_access,
-                        ..
-                    } if expected_address_uses.contains_key(destination) => {
-                        if *source != incoming
-                            || *destination_access != gir::MemoryAccess::default()
-                            || *source_access != gir::MemoryAccess::default()
-                        {
-                            continue 'parameters;
-                        }
-                        *expected_address_uses
-                            .get_mut(destination)
-                            .expect("aggregate copy destination is a parameter address") += 1;
-                        expected_incoming_uses += 1;
-                    }
-                    gir::FullInstructionKind::ProjectField {
-                        base,
-                        record,
-                        field_index,
-                        ..
-                    } if expected_address_uses.contains_key(base) => {
-                        let Some(field_address) = instruction.result else {
-                            continue 'parameters;
-                        };
-                        let Ok(layout) = object_layout(&module.types, *record, config) else {
-                            continue 'parameters;
-                        };
-                        let LayoutShape::Record(record_layout) = layout.shape else {
-                            continue 'parameters;
-                        };
-                        let Some(field) = record_layout.fields.get(*field_index) else {
-                            continue 'parameters;
-                        };
-                        if field.bitfield.is_some() {
-                            continue 'parameters;
-                        }
-                        let Some(end) = field.offset.checked_add(field.size) else {
-                            continue 'parameters;
-                        };
-                        *expected_address_uses
-                            .get_mut(base)
-                            .expect("field base is a parameter address") += 1;
-                        if fields.insert(field_address, (field.offset, end)).is_some() {
-                            continue 'parameters;
-                        }
-                    }
-                    _ => {}
+        let mut pointers = addresses.iter().copied().collect::<BTreeSet<_>>();
+        loop {
+            let mut changed = false;
+            for instruction in function.blocks.iter().flat_map(|block| &block.instructions) {
+                let gir::FullInstructionKind::ProjectField { base, .. } = &instruction.kind else {
+                    continue;
+                };
+                if pointers.contains(base) {
+                    let Some(projected) = instruction.result else {
+                        continue 'parameters;
+                    };
+                    changed |= pointers.insert(projected);
                 }
             }
-        }
-        if expected_incoming_uses == 0
-            || uses[incoming.0 as usize] != expected_incoming_uses
-            || expected_address_uses
-                .iter()
-                .any(|(address, expected)| uses[address.0 as usize] != *expected)
-        {
-            continue;
+            if !changed {
+                break;
+            }
         }
 
+        let mut expected_pointer_uses = pointers
+            .iter()
+            .copied()
+            .map(|pointer| (pointer, 0_usize))
+            .collect::<BTreeMap<_, _>>();
+        let mut expected_incoming_uses = 0;
         let mut loads = BTreeMap::new();
-        for (field_address, (source_offset, end)) in fields {
-            if uses[field_address.0 as usize] != 1 {
-                continue 'parameters;
-            }
-            let mut matching_load = None;
-            for block in &function.blocks {
-                for instruction in &block.instructions {
-                    let gir::FullInstructionKind::Load {
-                        address,
-                        object,
-                        access,
-                    } = &instruction.kind
-                    else {
-                        continue;
-                    };
-                    if *address != field_address {
-                        continue;
+        for instruction in function.blocks.iter().flat_map(|block| &block.instructions) {
+            match &instruction.kind {
+                gir::FullInstructionKind::AggregateCopy {
+                    destination,
+                    source,
+                    destination_access,
+                    source_access,
+                    ..
+                } if addresses.contains(destination) => {
+                    if *source != incoming
+                        || *destination_access != gir::MemoryAccess::default()
+                        || *source_access != gir::MemoryAccess::default()
+                    {
+                        continue 'parameters;
                     }
+                    *expected_pointer_uses
+                        .get_mut(destination)
+                        .expect("aggregate copy destination is a parameter address") += 1;
+                    expected_incoming_uses += 1;
+                }
+                gir::FullInstructionKind::ProjectField { base, .. } if pointers.contains(base) => {
+                    *expected_pointer_uses
+                        .get_mut(base)
+                        .expect("projected parameter pointer is tracked") += 1;
+                }
+                gir::FullInstructionKind::Load {
+                    address,
+                    object,
+                    access,
+                } if pointers.contains(address) => {
+                    *expected_pointer_uses
+                        .get_mut(address)
+                        .expect("loaded parameter pointer is tracked") += 1;
                     if *access != gir::MemoryAccess::default() || !object.qualifiers.is_empty() {
                         continue 'parameters;
                     }
+                    let (root, projections) =
+                        field_projection_path(*address, &definitions, &global_roots);
+                    let FieldProjectionRoot::Value(root) = root else {
+                        continue 'parameters;
+                    };
+                    if !addresses.contains(&root) || projections.is_empty() {
+                        continue 'parameters;
+                    }
+                    let Some((source_offset, size)) =
+                        field_projection_offset(module, &projections, config)
+                    else {
+                        continue 'parameters;
+                    };
                     let Ok(layout) = object_layout(&module.types, *object, config) else {
                         continue 'parameters;
                     };
-                    if layout.size != end - source_offset {
+                    if layout.size != size {
                         continue 'parameters;
                     }
                     let Ok(clif_type) = scalar_type(&module.types, *object, config) else {
@@ -938,31 +928,37 @@ fn direct_aggregate_parameter_field_loads(
                     else {
                         continue 'parameters;
                     };
-                    if instruction.result.is_none()
-                        || matching_load
-                            .replace((
-                                instruction.id,
-                                DirectAggregateParameterFieldLoad {
-                                    source_index: parameter.source_index,
-                                    carrier_index,
-                                    clif_type,
-                                },
-                            ))
-                            .is_some()
+                    let Some(_) = instruction.result else {
+                        continue 'parameters;
+                    };
+                    if loads
+                        .insert(
+                            instruction.id,
+                            DirectAggregateParameterFieldLoad {
+                                source_index: parameter.source_index,
+                                carrier_index,
+                                clif_type,
+                            },
+                        )
+                        .is_some()
                     {
                         continue 'parameters;
                     }
                 }
+                _ => {}
             }
-            let Some((load, descriptor)) = matching_load else {
-                continue 'parameters;
-            };
-            loads.insert(load, descriptor);
         }
-        if loads.is_empty() {
+        if expected_incoming_uses == 0
+            || uses[incoming.0 as usize] != expected_incoming_uses
+            || expected_pointer_uses
+                .iter()
+                .any(|(pointer, expected)| uses[pointer.0 as usize] != *expected)
+            || loads.is_empty()
+        {
             continue;
         }
-        result.extend(loads);
+        result.loads.extend(loads);
+        result.elided_backings.insert(storage);
     }
     result
 }
@@ -975,6 +971,7 @@ struct DirectAggregateReturnFieldStore {
 #[derive(Default)]
 struct DirectAggregateReturnFieldStores {
     return_values: BTreeMap<gir::ValueId, BTreeMap<u32, DirectAggregateReturnFieldStore>>,
+    elided_backings: BTreeSet<gir::StorageId>,
     stores: BTreeSet<gir::InstructionId>,
 }
 
@@ -1211,6 +1208,7 @@ fn direct_aggregate_return_field_stores(
             continue;
         }
         result.return_values.insert(snapshot_value, return_values);
+        result.elided_backings.insert(storage);
         result.stores.extend(stores);
     }
     result
@@ -1758,6 +1756,40 @@ pub(super) fn lower_function(
         }
     }
 
+    let DirectAggregateParameterFieldLoads {
+        loads: direct_aggregate_parameter_field_loads,
+        elided_backings: direct_aggregate_parameter_backing_elisions,
+    } = (!collect_debug_values
+        && matches!(
+            config.optimization,
+            OptimizationLevel::O2 | OptimizationLevel::O3
+        ))
+    .then(|| match definition_plan {
+        DefinitionAbi::Native(plan) => {
+            direct_aggregate_parameter_field_loads(module, function, config, plan)
+        }
+        DefinitionAbi::Variadic(_) => DirectAggregateParameterFieldLoads::default(),
+    })
+    .unwrap_or_default();
+    let direct_aggregate_return_field_stores = (!collect_debug_values
+        && matches!(
+            config.optimization,
+            OptimizationLevel::O2 | OptimizationLevel::O3
+        ))
+    .then(|| match definition_plan {
+        DefinitionAbi::Native(plan) => {
+            direct_aggregate_return_field_stores(module, function, config, plan)
+        }
+        DefinitionAbi::Variadic(_) => DirectAggregateReturnFieldStores::default(),
+    })
+    .unwrap_or_default();
+    let mut elided_aggregate_backings = direct_aggregate_parameter_backing_elisions;
+    elided_aggregate_backings.extend(
+        direct_aggregate_return_field_stores
+            .elided_backings
+            .iter()
+            .copied(),
+    );
     let mut storage = HashMap::new();
     let mut runtime_storage = HashMap::new();
     for object in &function.storage {
@@ -1775,6 +1807,9 @@ pub(super) fn lower_function(
             }
             continue;
         } else if object.location != gir::StorageLocation::Automatic {
+            continue;
+        }
+        if elided_aggregate_backings.contains(&object.id) {
             continue;
         }
         let layout = object_layout(&module.types, object.ty, config)?;
@@ -1879,30 +1914,6 @@ pub(super) fn lower_function(
             module, function, config,
         ));
     }
-    let direct_aggregate_parameter_field_loads = (!collect_debug_values
-        && matches!(
-            config.optimization,
-            OptimizationLevel::O2 | OptimizationLevel::O3
-        ))
-    .then(|| match definition_plan {
-        DefinitionAbi::Native(plan) => {
-            direct_aggregate_parameter_field_loads(module, function, config, plan)
-        }
-        DefinitionAbi::Variadic(_) => BTreeMap::new(),
-    })
-    .unwrap_or_default();
-    let direct_aggregate_return_field_stores = (!collect_debug_values
-        && matches!(
-            config.optimization,
-            OptimizationLevel::O2 | OptimizationLevel::O3
-        ))
-    .then(|| match definition_plan {
-        DefinitionAbi::Native(plan) => {
-            direct_aggregate_return_field_stores(module, function, config, plan)
-        }
-        DefinitionAbi::Variadic(_) => DirectAggregateReturnFieldStores::default(),
-    })
-    .unwrap_or_default();
     let mut state = FunctionState {
         module,
         function,
@@ -1926,6 +1937,7 @@ pub(super) fn lower_function(
         direct_aggregate_result_field_loads,
         direct_aggregate_return_field_stores,
         direct_aggregate_parameter_field_loads,
+        elided_aggregate_backings,
         direct_aggregate_parameter_load_values: RefCell::new(BTreeMap::new()),
         direct_aggregate_result_load_values: RefCell::new(BTreeMap::new()),
         loop_global_address_slots,
@@ -2085,6 +2097,7 @@ struct FunctionState<'a, 'references, 'object> {
     direct_aggregate_return_field_stores: DirectAggregateReturnFieldStores,
     direct_aggregate_parameter_field_loads:
         BTreeMap<gir::InstructionId, DirectAggregateParameterFieldLoad>,
+    elided_aggregate_backings: BTreeSet<gir::StorageId>,
     direct_aggregate_parameter_load_values: RefCell<BTreeMap<gir::InstructionId, ir::Value>>,
     lazy_loop_global_addresses: BTreeSet<u32>,
     sret: Option<ir::Value>,
@@ -2548,6 +2561,15 @@ impl FunctionState<'_, '_, '_> {
                     && parameter.classified.size == padded
                     && self.function.parameters[source].ty.qualifiers.is_empty()
                     && native_aggregate_parameter_uses_single_pointer_carrier(plan, &parameter)?;
+                let direct_field_loads = self
+                    .direct_aggregate_parameter_field_loads
+                    .iter()
+                    .filter(|(_, descriptor)| descriptor.source_index == parameter.source_index)
+                    .collect::<Vec<_>>();
+                let forwards_register_fields = !direct_field_loads.is_empty();
+                let backing_elided = self.function.parameters[source]
+                    .storage
+                    .is_some_and(|storage| self.elided_aggregate_backings.contains(&storage));
                 let caller_storage = direct_caller_backing
                     .then_some(self.function.parameters[source].storage)
                     .flatten();
@@ -2582,18 +2604,19 @@ impl FunctionState<'_, '_, '_> {
                     let address = stack_storage_address(builder, data);
                     self.cached_storage_addresses.insert(storage, address);
                     (address, false)
+                } else if backing_elided && forwards_register_fields {
+                    let storage = self.function.parameters[source]
+                        .storage
+                        .expect("elided aggregate backing belongs to a parameter storage");
+                    let address = builder.ins().iconst(ir::types::I64, 0);
+                    self.cached_storage_addresses.insert(storage.0, address);
+                    (address, false)
                 } else {
                     (
                         create_stack_backing(builder, padded, parameter.classified.align)?,
                         false,
                     )
                 };
-                let direct_field_loads = self
-                    .direct_aggregate_parameter_field_loads
-                    .iter()
-                    .filter(|(_, descriptor)| descriptor.source_index == parameter.source_index)
-                    .collect::<Vec<_>>();
-                let forwards_register_fields = !direct_field_loads.is_empty();
                 if forwards_register_fields {
                     let values = direct_field_loads
                         .into_iter()
@@ -2860,6 +2883,9 @@ impl FunctionState<'_, '_, '_> {
                 I::AddressOfStorage { storage } => {
                     if let Some(address) = self.cached_storage_addresses.get(&storage.0) {
                         return Ok(Some(*address));
+                    }
+                    if self.elided_aggregate_backings.contains(storage) {
+                        return Ok(Some(builder.ins().iconst(ir::types::I64, 0)));
                     }
                     let storage = self.storage.get(&storage.0).copied().ok_or_else(|| {
                         error(format!(

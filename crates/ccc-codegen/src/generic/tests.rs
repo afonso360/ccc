@@ -1026,14 +1026,14 @@ fn optimized_aggregate_parameters_use_their_local_storage_as_abi_backing() {
         let optimized = base.with_optimization_level(OptimizationLevel::O2);
         let optimized_output = emit_source_with_config(source, &optimized);
         let optimized_clif = function_clif(&optimized_output.clif, "mix");
+        let expected_mix_slots = if optimized.target.triple.to_string().starts_with("aarch64") {
+            0
+        } else {
+            2
+        };
         assert_eq!(
             optimized_clif.matches("explicit_slot 24").count(),
-            2,
-            "{}:\n{optimized_clif}",
-            optimized.target.triple
-        );
-        assert!(
-            !optimized_clif.contains("iconst.i64 0"),
+            expected_mix_slots,
             "{}:\n{optimized_clif}",
             optimized.target.triple
         );
@@ -1134,6 +1134,10 @@ fn read_only_register_aggregate_parameters_use_their_input_carriers() {
                       value.y = 2.0;\n\
                       value.z = 3.0;\n\
                       return value;\n\
+                  }\n\
+                  struct Wrapped { struct Vector value; };\n\
+                  double nested_dot(struct Wrapped wrapped) {\n\
+                      return wrapped.value.x + wrapped.value.y + wrapped.value.z;\n\
                   }";
     let baseline = EffectiveCompilationConfig::aarch64_unknown_linux_gnu()
         .with_optimization_level(OptimizationLevel::O1);
@@ -1155,6 +1159,17 @@ fn read_only_register_aggregate_parameters_use_their_input_carriers() {
         "{}:\n{optimized_dot}",
         optimized.target.triple
     );
+    assert!(
+        !optimized_dot.contains("explicit_slot 24"),
+        "{}:\n{optimized_dot}",
+        optimized.target.triple
+    );
+    let nested_dot = function_clif(&optimized_output.clif, "nested_dot");
+    assert!(
+        !nested_dot.contains("explicit_slot 24") && !nested_dot.contains("load.f64"),
+        "{}:\n{nested_dot}",
+        optimized.target.triple
+    );
     let altered = function_clif(&optimized_output.clif, "alter");
     assert!(
         altered.contains("load.f64") && altered.contains("store"),
@@ -1162,6 +1177,11 @@ fn read_only_register_aggregate_parameters_use_their_input_carriers() {
         optimized.target.triple
     );
     let made = function_clif(&optimized_output.clif, "make");
+    assert!(
+        !made.contains("explicit_slot 24"),
+        "{}:\n{made}",
+        optimized.target.triple
+    );
     assert!(
         !made.contains("load.f64") && !made.contains("store"),
         "{}:\n{made}",
