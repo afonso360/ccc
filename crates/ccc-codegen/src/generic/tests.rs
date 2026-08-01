@@ -973,6 +973,11 @@ fn optimized_aggregate_parameters_use_their_local_storage_as_abi_backing() {
                   }\n\
                   struct Pair pair_relay(struct Pair value) {\n\
                       return pair_identity(value);\n\
+                  }\n\
+                  struct Ray { double a; double b; double c; double d; double e; double f; };\n\
+                  void consume_ray(struct Ray value) {}\n\
+                  void ray_relay(struct Ray value) {\n\
+                      consume_ray(value);\n\
                   }";
     for base in enabled_compilation_configs() {
         let baseline = base.clone().with_optimization_level(OptimizationLevel::O1);
@@ -1020,6 +1025,13 @@ fn optimized_aggregate_parameters_use_their_local_storage_as_abi_backing() {
             pair_relay_clif.matches("explicit_slot 16").count(),
             4,
             "{}:\n{pair_relay_clif}",
+            optimized.target.triple
+        );
+        let ray_relay_clif = function_clif(&optimized_output.clif, "ray_relay");
+        assert_eq!(
+            ray_relay_clif.matches("explicit_slot 48").count(),
+            2,
+            "{}:\n{ray_relay_clif}",
             optimized.target.triple
         );
     }

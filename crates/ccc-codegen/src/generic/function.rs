@@ -489,6 +489,25 @@ fn loop_global_addresses(function: &gir::FullFunction) -> BTreeSet<u32> {
         .collect()
 }
 
+/// Finds snapshots that are consumed exactly once by the enclosing function.
+///
+/// A call may use this backing storage as its indirect by-value argument only
+/// when no later IR operation can observe a callee write through that pointer.
+fn single_use_aggregate_snapshots(function: &gir::FullFunction) -> BTreeSet<gir::ValueId> {
+    let uses = gir::value_use_counts(function);
+    function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match instruction.kind {
+            gir::FullInstructionKind::AggregateSnapshot { .. } => instruction
+                .result
+                .filter(|result| uses[result.0 as usize] == 1),
+            _ => None,
+        })
+        .collect()
+}
+
 fn terminator_successors(terminator: &gir::FullTerminator) -> Vec<gir::BlockId> {
     match terminator {
         gir::FullTerminator::Branch(edge) => vec![edge.target],
@@ -710,6 +729,7 @@ pub(super) fn lower_function(
         }
     }
 
+    let single_use_aggregate_snapshots = single_use_aggregate_snapshots(function);
     let mut state = FunctionState {
         module,
         function,
@@ -723,6 +743,7 @@ pub(super) fn lower_function(
         cached_storage_addresses: HashMap::new(),
         runtime_storage,
         values: vec![None; function.value_types.len()],
+        single_use_aggregate_snapshots,
         loop_global_address_slots,
         lazy_loop_global_addresses,
         sret: None,
@@ -868,6 +889,7 @@ struct FunctionState<'a, 'references, 'object> {
     cached_storage_addresses: HashMap<u32, ir::Value>,
     runtime_storage: HashMap<u32, StackSlot>,
     values: Vec<Option<ir::Value>>,
+    single_use_aggregate_snapshots: BTreeSet<gir::ValueId>,
     loop_global_address_slots: BTreeMap<u32, StackSlot>,
     lazy_loop_global_addresses: BTreeSet<u32>,
     sret: Option<ir::Value>,
@@ -3418,14 +3440,20 @@ impl FunctionState<'_, '_, '_> {
             } else {
                 let padded = align_up_u64(parameter.classified.size, 8)?;
                 // Exact normal carriers can read an already-owned aggregate
-                // value directly. Partial carriers and pointer transports
-                // retain a private ABI stage for their zero-fill and copy semantics.
+                // value directly. A one-use snapshot is also an isolated
+                // private backing for a pointer aggregate transport.
                 let direct_register_source = matches!(
                     self.config.optimization,
                     OptimizationLevel::O2 | OptimizationLevel::O3
                 ) && padded == parameter.classified.size
                     && native_aggregate_parameter_has_full_normal_carriers(plan, parameter)?;
-                let stage = if direct_register_source {
+                let reusable_indirect_snapshot =
+                    matches!(
+                        self.config.optimization,
+                        OptimizationLevel::O2 | OptimizationLevel::O3
+                    ) && self.single_use_aggregate_snapshots.contains(&source_value)
+                        && native_aggregate_parameter_uses_single_pointer_carrier(plan, parameter)?;
+                let stage = if direct_register_source || reusable_indirect_snapshot {
                     self.value(source_value)?
                 } else {
                     let stage = create_stack_backing(builder, padded, parameter.classified.align)?;
@@ -4138,6 +4166,24 @@ fn native_aggregate_parameter_has_full_normal_carriers(
         covered = covered.max(end);
     }
     Ok(covered == parameter.classified.size)
+}
+
+/// Returns whether one carrier passes the aggregate through private pointer storage.
+fn native_aggregate_parameter_uses_single_pointer_carrier(
+    plan: &ccc_abi::NativeBoundaryPlan,
+    parameter: &ccc_abi::NativeParameterPlan,
+) -> Result<bool, CodegenError> {
+    let [index] = parameter.carrier_indices.as_slice() else {
+        return Ok(false);
+    };
+    let carrier = plan
+        .clif_parameters
+        .get(*index as usize)
+        .ok_or_else(|| error("aggregate ABI carrier index is invalid"))?;
+    Ok(matches!(
+        carrier.purpose,
+        ccc_abi::NativePurpose::StructArgument(_) | ccc_abi::NativePurpose::IndirectArgument
+    ))
 }
 
 fn zero_carrier_value(

@@ -134,21 +134,7 @@ fn pass_failure(mut error: IrError, pass: &str) -> IrError {
 /// the ranges alias. Keeping this rewrite adjacent also preserves the
 /// source-read ordering with respect to every other effect.
 fn elide_immediate_aggregate_snapshots(function: &mut FullFunction) -> Result<bool, IrError> {
-    let mut use_counts = vec![0usize; function.value_types.len()];
-    for block in &function.blocks {
-        for instruction in &block.instructions {
-            for operand in instruction_operands(&instruction.kind) {
-                let count = &mut use_counts[operand.0 as usize];
-                *count = count.saturating_add(1);
-            }
-        }
-        if let Some(terminator) = &block.terminator {
-            for operand in terminator_operands(terminator) {
-                let count = &mut use_counts[operand.0 as usize];
-                *count = count.saturating_add(1);
-            }
-        }
-    }
+    let use_counts = super::value_use_counts(function);
     let mut changed = false;
     let mut retained_instructions = Vec::with_capacity(function.blocks.len());
     for block in &mut function.blocks {
