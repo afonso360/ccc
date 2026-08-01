@@ -552,6 +552,48 @@ fn automatic_return_aggregate_snapshots(function: &gir::FullFunction) -> BTreeSe
         .collect()
 }
 
+/// Finds single-use aggregate call results copied immediately into plain storage.
+fn immediate_aggregate_call_result_destinations(
+    function: &gir::FullFunction,
+) -> BTreeMap<gir::InstructionId, gir::ValueId> {
+    let uses = gir::value_use_counts(function);
+    function
+        .blocks
+        .iter()
+        .flat_map(|block| block.instructions.windows(2))
+        .filter_map(|pair| {
+            let call = &pair[0];
+            let copy = &pair[1];
+            let Some(result) = call.result else {
+                return None;
+            };
+            if uses[result.0 as usize] != 1
+                || !matches!(
+                    call.kind,
+                    gir::FullInstructionKind::DirectCall { .. }
+                        | gir::FullInstructionKind::IndirectCall { .. }
+                )
+            {
+                return None;
+            }
+            let gir::FullInstructionKind::AggregateCopy {
+                destination,
+                source,
+                destination_access,
+                source_access,
+                ..
+            } = &copy.kind
+            else {
+                return None;
+            };
+            (result == *source
+                && *destination_access == gir::MemoryAccess::default()
+                && *source_access == gir::MemoryAccess::default())
+            .then_some((call.id, *destination))
+        })
+        .collect()
+}
+
 fn terminator_successors(terminator: &gir::FullTerminator) -> Vec<gir::BlockId> {
     match terminator {
         gir::FullTerminator::Branch(edge) => vec![edge.target],
@@ -791,6 +833,9 @@ pub(super) fn lower_function(
         caller_owned_parameter_backing_enabled: !collect_debug_values,
         single_use_aggregate_snapshots,
         automatic_return_aggregate_snapshots,
+        immediate_aggregate_call_result_destinations: immediate_aggregate_call_result_destinations(
+            function,
+        ),
         loop_global_address_slots,
         lazy_loop_global_addresses,
         sret: None,
@@ -940,6 +985,7 @@ struct FunctionState<'a, 'references, 'object> {
     single_use_aggregate_snapshots: BTreeSet<gir::ValueId>,
     loop_global_address_slots: BTreeMap<u32, StackSlot>,
     automatic_return_aggregate_snapshots: BTreeSet<gir::ValueId>,
+    immediate_aggregate_call_result_destinations: BTreeMap<gir::InstructionId, gir::ValueId>,
     lazy_loop_global_addresses: BTreeSet<u32>,
     sret: Option<ir::Value>,
     variadic_state: Option<ir::Value>,
@@ -3142,7 +3188,7 @@ impl FunctionState<'_, '_, '_> {
                     self.marshal_native_call_arguments(builder, plan, arguments)?;
                 let reference = self.references.direct_function(builder, function)?;
                 let call = builder.ins().call(reference, &arguments);
-                self.finish_native_call(builder, call, plan, result_storage)
+                self.finish_native_call(builder, instruction, call, plan, result_storage)
             }
             ccc_abi::BoundaryPlan::Bridge(plan) => {
                 let reference = self.references.function_address(builder, function)?;
@@ -3169,7 +3215,7 @@ impl FunctionState<'_, '_, '_> {
                 let (arguments, result_storage) =
                     self.marshal_native_call_arguments(builder, plan, arguments)?;
                 let call = builder.ins().call_indirect(signature, callee, &arguments);
-                self.finish_native_call(builder, call, plan, result_storage)
+                self.finish_native_call(builder, instruction, call, plan, result_storage)
             }
             ccc_abi::BoundaryPlan::Bridge(plan) => {
                 self.bridge_call(builder, callee, plan, arguments)
@@ -3591,6 +3637,7 @@ impl FunctionState<'_, '_, '_> {
     fn finish_native_call(
         &self,
         builder: &mut FunctionBuilder<'_>,
+        instruction: gir::InstructionId,
         call: ir::Inst,
         plan: &ccc_abi::NativeBoundaryPlan,
         result_storage: Option<ir::Value>,
@@ -3637,11 +3684,33 @@ impl FunctionState<'_, '_, '_> {
                     ));
                 }
                 let padded = align_up_u64(classified.size, 8)?;
-                let address = create_stack_backing(builder, padded, classified.align)?;
-                if !matches!(
+                let direct_destination = if matches!(
                     self.config.optimization,
                     OptimizationLevel::O2 | OptimizationLevel::O3
-                ) || !native_result_carriers_fully_overwrite_storage(&plan.clif_results, padded)?
+                ) && padded == classified.size
+                    && native_result_carriers_fully_overwrite_storage(
+                        &plan.clif_results,
+                        classified.size,
+                    )? {
+                    self.immediate_aggregate_call_result_destinations
+                        .get(&instruction)
+                        .copied()
+                } else {
+                    None
+                };
+                let address = if let Some(destination) = direct_destination {
+                    self.value(destination)?
+                } else {
+                    create_stack_backing(builder, padded, classified.align)?
+                };
+                if direct_destination.is_none()
+                    && (!matches!(
+                        self.config.optimization,
+                        OptimizationLevel::O2 | OptimizationLevel::O3
+                    ) || !native_result_carriers_fully_overwrite_storage(
+                        &plan.clif_results,
+                        padded,
+                    )?)
                 {
                     zero_memory(builder, address, padded)?;
                 }

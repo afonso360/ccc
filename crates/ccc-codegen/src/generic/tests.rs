@@ -974,6 +974,11 @@ fn optimized_aggregate_parameters_use_their_local_storage_as_abi_backing() {
                   struct Pair pair_relay(struct Pair value) {\n\
                       return pair_identity(value);\n\
                   }\n\
+                  void consume_pair(struct Pair value) {}\n\
+                  void pair_result_relay(struct Pair value) {\n\
+                      struct Pair copy = pair_identity(value);\n\
+                      consume_pair(copy);\n\
+                  }\n\
                   struct Ray { double a; double b; double c; double d; double e; double f; };\n\
                   void consume_ray(struct Ray value) {}\n\
                   void ray_relay(struct Ray value) {\n\
@@ -1040,6 +1045,13 @@ fn optimized_aggregate_parameters_use_their_local_storage_as_abi_backing() {
             pair_relay_clif.matches("explicit_slot 16").count(),
             3,
             "{}:\n{pair_relay_clif}",
+            optimized.target.triple
+        );
+        let pair_result_relay_clif = function_clif(&optimized_output.clif, "pair_result_relay");
+        assert_eq!(
+            pair_result_relay_clif.matches("explicit_slot 16").count(),
+            4,
+            "{}:\n{pair_result_relay_clif}",
             optimized.target.triple
         );
         let ray_relay_clif = function_clif(&optimized_output.clif, "ray_relay");
