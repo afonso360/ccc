@@ -16,8 +16,8 @@ use ccc_sema::generic::{
     Linkage as CLinkage, ObjectDefinitionPolicy, StorageDuration, SymbolBinding, SymbolVisibility,
 };
 use ccc_target::{
-    AbiIdentity, BinaryFormat, EffectiveCompilationConfig, LongDoubleFormat, RuntimeHelperContract,
-    RuntimeHelperValue,
+    AbiIdentity, BinaryFormat, EffectiveCompilationConfig, LongDoubleFormat, OptimizationLevel,
+    RuntimeHelperContract, RuntimeHelperValue,
 };
 use ccc_types::{
     BuiltinType, LayoutShape, QualifiedType, TypeId, TypeKind, TypeQualifiers, TypeStore,

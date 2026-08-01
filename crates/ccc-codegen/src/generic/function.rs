@@ -197,6 +197,14 @@ impl FunctionReferences<'_> {
         Ok(reference)
     }
 
+    fn global_is_thread_local(&self, raw: u32) -> Result<bool, CodegenError> {
+        self.declarations
+            .globals
+            .get(&raw)
+            .map(|declaration| declaration.tls)
+            .ok_or_else(|| error(format!("reference to undeclared data object {raw}")))
+    }
+
     fn string(
         &self,
         builder: &mut FunctionBuilder<'_>,
@@ -389,6 +397,98 @@ fn blocks_in_reverse_postorder(
     Ok(ordered)
 }
 
+fn loop_global_addresses(function: &gir::FullFunction) -> BTreeSet<u32> {
+    let blocks = function
+        .blocks
+        .iter()
+        .map(|block| (block.id.0, block))
+        .collect::<HashMap<_, _>>();
+    let mut reverse = HashMap::<u32, Vec<u32>>::new();
+    for block in &function.blocks {
+        reverse.entry(block.id.0).or_default();
+        for successor in block
+            .terminator
+            .as_ref()
+            .map(terminator_successors)
+            .unwrap_or_default()
+        {
+            if blocks.contains_key(&successor.0) {
+                reverse.entry(successor.0).or_default().push(block.id.0);
+            }
+        }
+    }
+
+    // Kosaraju's two passes identify all cyclic SCCs in O(blocks + edges).
+    // This pass runs for every optimized function, including the large corpus
+    // programs, so avoid one reachability walk per basic block.
+    let mut visited = HashSet::new();
+    let mut finish_order = Vec::with_capacity(function.blocks.len());
+    for block in &function.blocks {
+        if !visited.insert(block.id.0) {
+            continue;
+        }
+        let mut pending = vec![(block.id.0, false)];
+        while let Some((current, expanded)) = pending.pop() {
+            if expanded {
+                finish_order.push(current);
+                continue;
+            }
+            pending.push((current, true));
+            let successors = blocks
+                .get(&current)
+                .and_then(|block| block.terminator.as_ref())
+                .map(terminator_successors)
+                .unwrap_or_default();
+            for successor in successors {
+                if blocks.contains_key(&successor.0) && visited.insert(successor.0) {
+                    pending.push((successor.0, false));
+                }
+            }
+        }
+    }
+
+    let mut assigned = HashSet::new();
+    let mut cyclic_blocks = HashSet::new();
+    while let Some(root) = finish_order.pop() {
+        if !assigned.insert(root) {
+            continue;
+        }
+        let mut component = Vec::new();
+        let mut pending = vec![root];
+        while let Some(current) = pending.pop() {
+            component.push(current);
+            for predecessor in reverse.get(&current).into_iter().flatten() {
+                if assigned.insert(*predecessor) {
+                    pending.push(*predecessor);
+                }
+            }
+        }
+        let self_edge = component.len() == 1
+            && blocks
+                .get(&root)
+                .and_then(|block| block.terminator.as_ref())
+                .is_some_and(|terminator| {
+                    terminator_successors(terminator)
+                        .into_iter()
+                        .any(|successor| successor.0 == root)
+                });
+        if component.len() > 1 || self_edge {
+            cyclic_blocks.extend(component);
+        }
+    }
+
+    function
+        .blocks
+        .iter()
+        .filter(|block| cyclic_blocks.contains(&block.id.0))
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| match &instruction.kind {
+            gir::FullInstructionKind::AddressOfGlobal { global } => Some(global.0),
+            _ => None,
+        })
+        .collect()
+}
+
 fn terminator_successors(terminator: &gir::FullTerminator) -> Vec<gir::BlockId> {
     match terminator {
         gir::FullTerminator::Branch(edge) => vec![edge.target],
@@ -568,6 +668,36 @@ pub(super) fn lower_function(
         }
     }
 
+    let mut loop_global_address_slots = BTreeMap::new();
+    if matches!(
+        config.optimization,
+        OptimizationLevel::O2 | OptimizationLevel::O3
+    ) {
+        let mut globals = Vec::new();
+        for global in loop_global_addresses(function) {
+            if references.global_is_thread_local(global)? {
+                continue;
+            }
+            globals.push(global);
+        }
+        // A cached pointer load replaces a PIC materialization but adds fixed
+        // frame setup and a dependent memory load. Keep the trade focused on
+        // compact, multi-stream loops, where several independent addresses
+        // amortize the setup without adding pressure to control-heavy code.
+        const MIN_GLOBALS: usize = 3;
+        const MAX_BLOCKS: usize = 32;
+        if globals.len() >= MIN_GLOBALS && function.blocks.len() <= MAX_BLOCKS {
+            for global in globals {
+                let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    8,
+                    3,
+                ));
+                loop_global_address_slots.insert(global, slot);
+            }
+        }
+    }
+
     let mut state = FunctionState {
         module,
         function,
@@ -580,6 +710,7 @@ pub(super) fn lower_function(
         storage,
         runtime_storage,
         values: vec![None; function.value_types.len()],
+        loop_global_address_slots,
         sret: None,
         variadic_state: None,
         variadic_frame: None,
@@ -608,6 +739,7 @@ pub(super) fn lower_function(
             let entry_values = builder.block_params(state.block(entry.0)?).to_vec();
             state.initialize_runtime_storage(&mut builder);
             state.bind_entry_parameters(&mut builder, &entry_values)?;
+            state.initialize_loop_global_address_slots(&mut builder)?;
         }
         if collect_debug_values {
             for parameter in &block.parameters {
@@ -721,6 +853,7 @@ struct FunctionState<'a, 'references, 'object> {
     storage: HashMap<u32, StackStorage>,
     runtime_storage: HashMap<u32, StackSlot>,
     values: Vec<Option<ir::Value>>,
+    loop_global_address_slots: BTreeMap<u32, StackSlot>,
     sret: Option<ir::Value>,
     variadic_state: Option<ir::Value>,
     variadic_frame: Option<ir::Value>,
@@ -1041,6 +1174,25 @@ impl FunctionState<'_, '_, '_> {
                 .ins()
                 .store(backend::empty_memory_flags(), zero, state, 8);
         }
+    }
+
+    /// Keeps non-TLS addresses used by a cyclic block in fixed stack slots.
+    ///
+    /// Cranelift may deliberately rematerialize a `symbol_value` at every
+    /// use. A stack-backed cache makes the loop-invariant value explicit,
+    /// avoiding repeated GOT materialization in the loop body.
+    fn initialize_loop_global_address_slots(
+        &self,
+        builder: &mut FunctionBuilder<'_>,
+    ) -> Result<(), CodegenError> {
+        for (global, slot) in &self.loop_global_address_slots {
+            let value = self.materialize_global_address(builder, *global)?;
+            let destination = builder.ins().stack_addr(ir::types::I64, *slot, 0);
+            builder
+                .ins()
+                .store(backend::empty_memory_flags(), value, destination, 0);
+        }
+        Ok(())
     }
 
     fn block(&self, raw: u32) -> Result<ir::Block, CodegenError> {
@@ -2098,6 +2250,23 @@ impl FunctionState<'_, '_, '_> {
     }
 
     fn global_address(
+        &self,
+        builder: &mut FunctionBuilder<'_>,
+        raw: u32,
+    ) -> Result<ir::Value, CodegenError> {
+        if let Some(slot) = self.loop_global_address_slots.get(&raw).copied() {
+            let source = builder.ins().stack_addr(ir::types::I64, slot, 0);
+            return Ok(builder.ins().load(
+                ir::types::I64,
+                backend::empty_memory_flags(),
+                source,
+                0,
+            ));
+        }
+        self.materialize_global_address(builder, raw)
+    }
+
+    fn materialize_global_address(
         &self,
         builder: &mut FunctionBuilder<'_>,
         raw: u32,

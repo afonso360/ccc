@@ -31,6 +31,15 @@ The predefined macro contract follows the same resolved profile.
 define fast-math, strict-aliasing, or inlining macros because those behaviors
 are not part of this contract.
 
+At `-O2` and `-O3`, backend lowering caches non-TLS global addresses in an
+entry-initialized stack slot only for compact multi-stream loops: the function
+must have at most 32 CFG blocks and its cyclic components must reference at
+least three distinct global objects. Cranelift otherwise may rematerialize a
+PIC address in every loop iteration, but caching a single stream adds
+unprofitable pointer-load pressure. This speed-oriented choice is disabled for
+`-O0`, `-O1`, `-Os`, and `-Oz`; TLS is excluded because its address can require
+a dynamic target accessor.
+
 ## CCC-IR ownership
 
 CCC performs only transformations that need the typed C model or make the

@@ -865,6 +865,67 @@ fn emit_source_with_config(source: &str, config: &EffectiveCompilationConfig) ->
 }
 
 #[test]
+fn optimized_loop_global_addresses_use_cached_stack_slots() {
+    let cached_source = "static int left[16];
+                         static int center[16];
+                         static int right[16];
+                  int sum(unsigned count) {
+                      int total = 0;
+                      for (unsigned index = 0; index < count; ++index)
+                          total += left[index & 15u] + center[index & 15u]
+                              + right[index & 15u];
+                      return total;
+                  }";
+    let single_global_source = "static int values[16];
+                                int sum(unsigned count) {
+                                    int total = 0;
+                                    for (unsigned index = 0; index < count; ++index)
+                                        total += values[index & 15u];
+                                    return total;
+                                }";
+    for base in enabled_compilation_configs() {
+        let optimized = base.clone().with_optimization_level(OptimizationLevel::O2);
+        let optimized_output = emit_source_with_config(cached_source, &optimized);
+        let optimized_clif = function_clif(&optimized_output.clif, "sum");
+        assert_eq!(
+            optimized_clif.matches("explicit_slot 8").count(),
+            3,
+            "{}:\n{optimized_clif}",
+            optimized.target.triple
+        );
+        assert_eq!(
+            optimized_clif.matches("symbol_value.i64").count(),
+            3,
+            "{}:\n{optimized_clif}",
+            optimized.target.triple
+        );
+        assert_eq!(
+            optimized_clif.matches("load.i64").count(),
+            3,
+            "{}:\n{optimized_clif}",
+            optimized.target.triple
+        );
+
+        let baseline = base.with_optimization_level(OptimizationLevel::O0);
+        let baseline_output = emit_source_with_config(cached_source, &baseline);
+        let baseline_clif = function_clif(&baseline_output.clif, "sum");
+        assert!(
+            !baseline_clif.contains("explicit_slot 8"),
+            "{}:\n{baseline_clif}",
+            baseline.target.triple
+        );
+
+        let single_global_output = emit_source_with_config(single_global_source, &optimized);
+        let single_global_clif = function_clif(&single_global_output.clif, "sum");
+        assert!(
+            !single_global_clif.contains("explicit_slot 8"),
+            "{}:\n{single_global_clif}",
+            optimized.target.triple
+        );
+    }
+}
+
+#[test]
 fn file_scope_compound_literals_emit_local_data_and_object_relocations() {
     let output = emit_source(
         "struct Pair { int left; int right; };
