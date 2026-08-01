@@ -4686,12 +4686,35 @@ fn zero_memory(
     destination: ir::Value,
     size: u64,
 ) -> Result<(), CodegenError> {
-    let zero = builder.ins().iconst(ir::types::I8, 0);
-    for offset in 0..size {
+    // Zero initialization has no source aliasing or ordered-access constraint,
+    // so use the widest unaligned stores supported by every enabled backend.
+    let zero64 = (size >= 8).then(|| builder.ins().iconst(ir::types::I64, 0));
+    let tail = size % 8;
+    let zero32 = (tail >= 4).then(|| builder.ins().iconst(ir::types::I32, 0));
+    let tail = tail % 4;
+    let zero16 = (tail >= 2).then(|| builder.ins().iconst(ir::types::I16, 0));
+    let zero8 = (tail % 2 == 1).then(|| builder.ins().iconst(ir::types::I8, 0));
+
+    let mut offset = 0;
+    while offset < size {
+        let remaining = size - offset;
+        let (width, zero) = if remaining >= 8 {
+            (
+                8,
+                zero64.expect("eight-byte zero store has a zero constant"),
+            )
+        } else if remaining >= 4 {
+            (4, zero32.expect("four-byte zero store has a zero constant"))
+        } else if remaining >= 2 {
+            (2, zero16.expect("two-byte zero store has a zero constant"))
+        } else {
+            (1, zero8.expect("one-byte zero store has a zero constant"))
+        };
         let address = address_offset(builder, destination, offset)?;
         builder
             .ins()
             .store(backend::empty_memory_flags(), zero, address, 0);
+        offset += width;
     }
     Ok(())
 }

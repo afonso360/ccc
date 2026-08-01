@@ -2750,7 +2750,7 @@ fn complete_abi_plan_and_aggregate_clif_have_exact_snapshots() {
     .unwrap();
     assert_eq!(
         sha256(&output.clif),
-        "844e0312e8c509eec7b7b10861bcfe95620ea327005ec085fe967b0e64351899"
+        "26e52d778c56878529cd4297432dd2753d996d28aaed008f775f8735365bd9c0"
     );
 }
 
