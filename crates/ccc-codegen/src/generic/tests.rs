@@ -963,6 +963,9 @@ fn optimized_aggregate_parameters_use_their_local_storage_as_abi_backing() {
     let source = "struct Vector { double x; double y; double z; };\n\
                   double mix(struct Vector left, struct Vector right) {\n\
                       return left.x + right.y;\n\
+                  }\n\
+                  struct Vector identity(struct Vector value) {\n\
+                      return value;\n\
                   }";
     for base in enabled_compilation_configs() {
         let baseline = base.clone().with_optimization_level(OptimizationLevel::O1);
@@ -992,6 +995,12 @@ fn optimized_aggregate_parameters_use_their_local_storage_as_abi_backing() {
         assert!(
             !optimized_clif.contains("iconst.i64 0"),
             "{}:\n{optimized_clif}",
+            optimized.target.triple
+        );
+        let identity_clif = function_clif(&optimized_output.clif, "identity");
+        assert!(
+            !identity_clif.contains("iconst.i64 0"),
+            "{}:\n{identity_clif}",
             optimized.target.triple
         );
     }

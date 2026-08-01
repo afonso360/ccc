@@ -3418,7 +3418,14 @@ impl FunctionState<'_, '_, '_> {
             } else {
                 let padded = align_up_u64(parameter.classified.size, 8)?;
                 let stage = create_stack_backing(builder, padded, parameter.classified.align)?;
-                zero_memory(builder, stage, padded)?;
+                if padded != parameter.classified.size
+                    || !matches!(
+                        self.config.optimization,
+                        OptimizationLevel::O2 | OptimizationLevel::O3
+                    )
+                {
+                    zero_memory(builder, stage, padded)?;
+                }
                 copy_memory(
                     builder,
                     stage,
@@ -3704,7 +3711,14 @@ impl FunctionState<'_, '_, '_> {
             (ccc_abi::NativeResultPlan::RegisterAggregate { classified, .. }, Some(value)) => {
                 let padded = align_up_u64(classified.size, 8)?;
                 let stage = create_stack_backing(builder, padded, classified.align)?;
-                zero_memory(builder, stage, padded)?;
+                if padded != classified.size
+                    || !matches!(
+                        self.config.optimization,
+                        OptimizationLevel::O2 | OptimizationLevel::O3
+                    )
+                {
+                    zero_memory(builder, stage, padded)?;
+                }
                 copy_memory(
                     builder,
                     stage,
