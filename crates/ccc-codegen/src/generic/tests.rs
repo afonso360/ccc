@@ -983,6 +983,12 @@ fn optimized_aggregate_parameters_use_their_local_storage_as_abi_backing() {
                   struct Triple triple_return(void) {\n\
                       struct Triple value = {1.0, 2.0, 3.0};\n\
                       return value;\n\
+                  }\n\
+                  struct Pair vla_return(int count) {\n\
+                      struct Pair values[count];\n\
+                      values[0].x = 1.0;\n\
+                      values[0].y = 2.0;\n\
+                      return values[0];\n\
                   }";
     for base in enabled_compilation_configs() {
         let baseline = base.clone().with_optimization_level(OptimizationLevel::O1);
@@ -1042,8 +1048,15 @@ fn optimized_aggregate_parameters_use_their_local_storage_as_abi_backing() {
         let triple_return_clif = function_clif(&optimized_output.clif, "triple_return");
         assert_eq!(
             triple_return_clif.matches("explicit_slot 24").count(),
-            2,
+            1,
             "{}:\n{triple_return_clif}",
+            optimized.target.triple
+        );
+        let vla_return_clif = function_clif(&optimized_output.clif, "vla_return");
+        assert_eq!(
+            vla_return_clif.matches("explicit_slot 16").count(),
+            2,
+            "{}:\n{vla_return_clif}",
             optimized.target.triple
         );
     }

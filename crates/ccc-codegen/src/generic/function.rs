@@ -508,6 +508,50 @@ fn single_use_aggregate_snapshots(function: &gir::FullFunction) -> BTreeSet<gir:
         .collect()
 }
 
+/// Finds snapshots that immediately feed a return from ordinary automatic storage.
+///
+/// Such storage remains live through function return, while runtime-sized arena
+/// storage can be released by return lowering and must retain its snapshot.
+fn automatic_return_aggregate_snapshots(function: &gir::FullFunction) -> BTreeSet<gir::ValueId> {
+    let uses = gir::value_use_counts(function);
+    let automatic_addresses = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .filter_map(|instruction| {
+            let gir::FullInstructionKind::AddressOfStorage { storage } = &instruction.kind else {
+                return None;
+            };
+            let address = instruction.result?;
+            function
+                .storage
+                .get(storage.0 as usize)
+                .filter(|storage| storage.location == gir::StorageLocation::Automatic)
+                .map(|_| address)
+        })
+        .collect::<BTreeSet<_>>();
+    function
+        .blocks
+        .iter()
+        .filter_map(|block| {
+            let snapshot = block.instructions.last()?;
+            let gir::FullTerminator::Return(Some(returned)) = block.terminator.as_ref()? else {
+                return None;
+            };
+            let (Some(result), gir::FullInstructionKind::AggregateSnapshot { source, access, .. }) =
+                (snapshot.result, &snapshot.kind)
+            else {
+                return None;
+            };
+            (uses[result.0 as usize] == 1
+                && *access == gir::MemoryAccess::default()
+                && *returned == result
+                && automatic_addresses.contains(source))
+            .then_some(result)
+        })
+        .collect()
+}
+
 fn terminator_successors(terminator: &gir::FullTerminator) -> Vec<gir::BlockId> {
     match terminator {
         gir::FullTerminator::Branch(edge) => vec![edge.target],
@@ -730,6 +774,7 @@ pub(super) fn lower_function(
     }
 
     let single_use_aggregate_snapshots = single_use_aggregate_snapshots(function);
+    let automatic_return_aggregate_snapshots = automatic_return_aggregate_snapshots(function);
     let mut state = FunctionState {
         module,
         function,
@@ -744,6 +789,7 @@ pub(super) fn lower_function(
         runtime_storage,
         values: vec![None; function.value_types.len()],
         single_use_aggregate_snapshots,
+        automatic_return_aggregate_snapshots,
         loop_global_address_slots,
         lazy_loop_global_addresses,
         sret: None,
@@ -891,6 +937,7 @@ struct FunctionState<'a, 'references, 'object> {
     values: Vec<Option<ir::Value>>,
     single_use_aggregate_snapshots: BTreeSet<gir::ValueId>,
     loop_global_address_slots: BTreeMap<u32, StackSlot>,
+    automatic_return_aggregate_snapshots: BTreeSet<gir::ValueId>,
     lazy_loop_global_addresses: BTreeSet<u32>,
     sret: Option<ir::Value>,
     variadic_state: Option<ir::Value>,
@@ -1981,6 +2028,14 @@ impl FunctionState<'_, '_, '_> {
                     access,
                 } => {
                     validate_access(*access)?;
+                    if matches!(
+                        self.config.optimization,
+                        OptimizationLevel::O2 | OptimizationLevel::O3
+                    ) && instruction.result.is_some_and(|result| {
+                        self.automatic_return_aggregate_snapshots.contains(&result)
+                    }) {
+                        return Ok(Some(self.value(*source)?));
+                    }
                     let layout = object_layout(&self.module.types, *object, self.config)?;
                     let snapshot = create_stack_backing(builder, layout.size, layout.align)?;
                     copy_memory(
