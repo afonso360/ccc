@@ -54,6 +54,7 @@ pub enum IntegerExtension {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum NativePurpose {
     Normal,
+    /// An ABI-mandated pointer to a caller-owned aggregate copy.
     StructArgument(u32),
     /// An ABI-mandated pointer to a caller-owned aggregate copy.
     IndirectArgument,

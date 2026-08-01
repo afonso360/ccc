@@ -979,6 +979,10 @@ fn optimized_aggregate_parameters_use_their_local_storage_as_abi_backing() {
                   void ray_relay(struct Ray value) {\n\
                       consume_ray(value);\n\
                   }\n\
+                  void ray_mutate(struct Ray value) {\n\
+                      value.a = 1.0;\n\
+                      consume_ray(value);\n\
+                  }\n\
                   struct Triple { double x; double y; double z; };\n\
                   struct Triple triple_return(void) {\n\
                       struct Triple value = {1.0, 2.0, 3.0};\n\
@@ -1043,6 +1047,19 @@ fn optimized_aggregate_parameters_use_their_local_storage_as_abi_backing() {
             ray_relay_clif.matches("explicit_slot 48").count(),
             2,
             "{}:\n{ray_relay_clif}",
+            optimized.target.triple
+        );
+        assert_eq!(
+            ray_relay_clif.matches("stack_addr.i64").count(),
+            1,
+            "{}:\n{ray_relay_clif}",
+            optimized.target.triple
+        );
+        let ray_mutate_clif = function_clif(&optimized_output.clif, "ray_mutate");
+        assert_eq!(
+            ray_mutate_clif.matches("stack_addr.i64").count(),
+            1,
+            "{}:\n{ray_mutate_clif}",
             optimized.target.triple
         );
         let triple_return_clif = function_clif(&optimized_output.clif, "triple_return");

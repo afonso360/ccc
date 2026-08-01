@@ -788,6 +788,7 @@ pub(super) fn lower_function(
         cached_storage_addresses: HashMap::new(),
         runtime_storage,
         values: vec![None; function.value_types.len()],
+        caller_owned_parameter_backing_enabled: !collect_debug_values,
         single_use_aggregate_snapshots,
         automatic_return_aggregate_snapshots,
         loop_global_address_slots,
@@ -934,6 +935,7 @@ struct FunctionState<'a, 'references, 'object> {
     storage: HashMap<u32, StackStorage>,
     cached_storage_addresses: HashMap<u32, ir::Value>,
     runtime_storage: HashMap<u32, StackSlot>,
+    caller_owned_parameter_backing_enabled: bool,
     values: Vec<Option<ir::Value>>,
     single_use_aggregate_snapshots: BTreeSet<gir::ValueId>,
     loop_global_address_slots: BTreeMap<u32, StackSlot>,
@@ -1388,10 +1390,21 @@ impl FunctionState<'_, '_, '_> {
                 coerce_carrier_value(builder, value, expected, false)?
             } else {
                 let padded = align_up_u64(parameter.classified.size, 8)?;
-                // The typed IR copies each aggregate parameter into its local
-                // storage. At speed profiles, construct a non-padded,
-                // unqualified aggregate directly in that storage so the
-                // following ordinary self-copy can be elided.
+                // Pointer aggregate carriers already designate caller-owned
+                // by-value storage. At speed profiles, use that storage as
+                // the parameter object directly; the typed-IR entry copy then
+                // becomes an ordinary self-assignment.
+                let direct_caller_backing = self.caller_owned_parameter_backing_enabled
+                    && matches!(
+                        self.config.optimization,
+                        OptimizationLevel::O2 | OptimizationLevel::O3
+                    )
+                    && parameter.classified.size == padded
+                    && self.function.parameters[source].ty.qualifiers.is_empty()
+                    && native_aggregate_parameter_uses_single_pointer_carrier(plan, &parameter)?;
+                let caller_storage = direct_caller_backing
+                    .then_some(self.function.parameters[source].storage)
+                    .flatten();
                 let direct_storage = matches!(
                     self.config.optimization,
                     OptimizationLevel::O2 | OptimizationLevel::O3
@@ -1408,62 +1421,84 @@ impl FunctionState<'_, '_, '_> {
                         .copied()
                         .map(|data| (storage.0, data))
                 });
-                let address = if let Some((storage, data)) = direct_storage {
+                let (address, uses_caller_backing) = if let Some(storage) = caller_storage {
+                    let [carrier_index] = parameter.carrier_indices.as_slice() else {
+                        return Err(error("pointer aggregate parameter has multiple carriers"));
+                    };
+                    let incoming_value =
+                        *clif_values.get(*carrier_index as usize).ok_or_else(|| {
+                            error("aggregate ABI carrier is absent from function entry")
+                        })?;
+                    self.cached_storage_addresses
+                        .insert(storage.0, incoming_value);
+                    (incoming_value, true)
+                } else if let Some((storage, data)) = direct_storage {
                     let address = stack_storage_address(builder, data);
                     self.cached_storage_addresses.insert(storage, address);
-                    address
+                    (address, false)
                 } else {
-                    create_stack_backing(builder, padded, parameter.classified.align)?
+                    (
+                        create_stack_backing(builder, padded, parameter.classified.align)?,
+                        false,
+                    )
                 };
-                let fully_overwritten = matches!(
-                    self.config.optimization,
-                    OptimizationLevel::O2 | OptimizationLevel::O3
-                ) && native_aggregate_parameter_fully_overwrites_storage(
-                    plan, &parameter, padded,
-                )?;
-                if !fully_overwritten {
-                    zero_memory(builder, address, padded)?;
-                }
-                for index in &parameter.carrier_indices {
-                    let carrier = plan
-                        .clif_parameters
-                        .get(*index as usize)
-                        .ok_or_else(|| error("aggregate ABI carrier index is invalid"))?;
-                    let incoming_value = *clif_values.get(*index as usize).ok_or_else(|| {
-                        error("aggregate ABI carrier is absent from function entry")
-                    })?;
-                    match carrier.purpose {
-                        ccc_abi::NativePurpose::StructArgument(_) => copy_memory(
-                            builder,
-                            address,
-                            incoming_value,
-                            parameter.classified.size,
-                            gir::MemoryAccess::default(),
-                            gir::MemoryAccess::default(),
-                        )?,
-                        ccc_abi::NativePurpose::IndirectArgument => copy_memory(
-                            builder,
-                            address,
-                            incoming_value,
-                            parameter.classified.size,
-                            gir::MemoryAccess::default(),
-                            gir::MemoryAccess::default(),
-                        )?,
-                        ccc_abi::NativePurpose::Normal => {
-                            let destination =
-                                address_offset(builder, address, carrier.source_offset)?;
-                            builder.ins().store(
-                                backend::empty_memory_flags(),
+                if !uses_caller_backing {
+                    let fully_overwritten = matches!(
+                        self.config.optimization,
+                        OptimizationLevel::O2 | OptimizationLevel::O3
+                    )
+                        && native_aggregate_parameter_fully_overwrites_storage(
+                            plan, &parameter, padded,
+                        )?;
+                    if !fully_overwritten {
+                        zero_memory(builder, address, padded)?;
+                    }
+                    for index in &parameter.carrier_indices {
+                        let carrier = plan
+                            .clif_parameters
+                            .get(*index as usize)
+                            .ok_or_else(|| error("aggregate ABI carrier index is invalid"))?;
+                        let incoming_value =
+                            *clif_values.get(*index as usize).ok_or_else(|| {
+                                error("aggregate ABI carrier is absent from function entry")
+                            })?;
+                        match carrier.purpose {
+                            ccc_abi::NativePurpose::StructArgument(_) => copy_memory(
+                                builder,
+                                address,
                                 incoming_value,
-                                destination,
-                                0,
-                            );
-                        }
-                        ccc_abi::NativePurpose::StructReturn => {
-                            return Err(error("source parameter unexpectedly uses sret purpose"));
-                        }
-                        ccc_abi::NativePurpose::Padding => {
-                            return Err(error("source parameter unexpectedly uses ABI padding"));
+                                parameter.classified.size,
+                                gir::MemoryAccess::default(),
+                                gir::MemoryAccess::default(),
+                            )?,
+                            ccc_abi::NativePurpose::IndirectArgument => copy_memory(
+                                builder,
+                                address,
+                                incoming_value,
+                                parameter.classified.size,
+                                gir::MemoryAccess::default(),
+                                gir::MemoryAccess::default(),
+                            )?,
+                            ccc_abi::NativePurpose::Normal => {
+                                let destination =
+                                    address_offset(builder, address, carrier.source_offset)?;
+                                builder.ins().store(
+                                    backend::empty_memory_flags(),
+                                    incoming_value,
+                                    destination,
+                                    0,
+                                );
+                            }
+                            ccc_abi::NativePurpose::StructReturn => {
+                                return Err(error(
+                                    "source parameter unexpectedly uses sret purpose",
+                                ));
+                            }
+                            ccc_abi::NativePurpose::Padding => {
+                                return Err(error(
+                                    "source parameter unexpectedly uses ABI padding",
+                                ));
+                            }
                         }
                     }
                 }
