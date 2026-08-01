@@ -594,6 +594,209 @@ fn immediate_aggregate_call_result_destinations(
         .collect()
 }
 
+#[derive(Clone, Copy)]
+struct DirectAggregateResultFieldLoad {
+    call: gir::InstructionId,
+    source_offset: u64,
+    clif_type: ir::Type,
+}
+
+/// Finds local aggregate destinations whose only observations are direct plain
+/// field loads after an immediately preceding register-returning call copy.
+fn direct_aggregate_result_field_loads(
+    module: &gir::FullModule,
+    function: &gir::FullFunction,
+    config: &EffectiveCompilationConfig,
+) -> BTreeMap<gir::InstructionId, DirectAggregateResultFieldLoad> {
+    let uses = gir::value_use_counts(function);
+    let automatic_addresses = function
+        .blocks
+        .iter()
+        .flat_map(|block| {
+            block.instructions.iter().filter_map(move |instruction| {
+                let gir::FullInstructionKind::AddressOfStorage { storage } = &instruction.kind
+                else {
+                    return None;
+                };
+                let address = instruction.result?;
+                function
+                    .storage
+                    .get(storage.0 as usize)
+                    .filter(|storage| storage.location == gir::StorageLocation::Automatic)
+                    .map(|_| (address, (block.id, *storage)))
+            })
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut storage_addresses = BTreeMap::<gir::StorageId, Vec<_>>::new();
+    for (&address, &(block, storage)) in &automatic_addresses {
+        storage_addresses
+            .entry(storage)
+            .or_default()
+            .push((block, address));
+    }
+
+    let mut result = BTreeMap::new();
+    'pairs: for block in &function.blocks {
+        for (copy_index, pair) in block.instructions.windows(2).enumerate() {
+            let call = &pair[0];
+            let copy = &pair[1];
+            let Some(call_result) = call.result else {
+                continue;
+            };
+            if uses[call_result.0 as usize] != 1
+                || !matches!(
+                    &call.kind,
+                    gir::FullInstructionKind::DirectCall { .. }
+                        | gir::FullInstructionKind::IndirectCall { .. }
+                )
+            {
+                continue;
+            }
+            let gir::FullInstructionKind::AggregateCopy {
+                destination,
+                source,
+                destination_access,
+                source_access,
+                ..
+            } = &copy.kind
+            else {
+                continue;
+            };
+            if *source != call_result
+                || *destination_access != gir::MemoryAccess::default()
+                || *source_access != gir::MemoryAccess::default()
+            {
+                continue;
+            }
+            let Some(&(destination_block, storage)) = automatic_addresses.get(destination) else {
+                continue;
+            };
+            if destination_block != block.id {
+                continue;
+            }
+            let Some(addresses) = storage_addresses.get(&storage) else {
+                continue;
+            };
+            if !addresses
+                .iter()
+                .all(|(address_block, _)| *address_block == block.id)
+            {
+                continue;
+            }
+
+            let mut expected_address_uses = addresses
+                .iter()
+                .map(|(_, address)| (*address, 0_usize))
+                .collect::<BTreeMap<_, _>>();
+            *expected_address_uses
+                .get_mut(destination)
+                .expect("aggregate copy destination is an automatic address") += 1;
+            let mut fields = BTreeMap::<gir::ValueId, (u64, u64)>::new();
+            for instruction in &block.instructions {
+                let gir::FullInstructionKind::ProjectField {
+                    base,
+                    record,
+                    field_index: record_field_index,
+                    ..
+                } = &instruction.kind
+                else {
+                    continue;
+                };
+                let Some(uses) = expected_address_uses.get_mut(base) else {
+                    continue;
+                };
+                *uses += 1;
+                let Some(field_address) = instruction.result else {
+                    continue 'pairs;
+                };
+                let Ok(layout) = object_layout(&module.types, *record, config) else {
+                    continue 'pairs;
+                };
+                let LayoutShape::Record(record_layout) = layout.shape else {
+                    continue 'pairs;
+                };
+                let Some(field) = record_layout.fields.get(*record_field_index) else {
+                    continue 'pairs;
+                };
+                if field.bitfield.is_some() {
+                    continue 'pairs;
+                }
+                let Some(end) = field.offset.checked_add(field.size) else {
+                    continue 'pairs;
+                };
+                fields.insert(field_address, (field.offset, end));
+            }
+            if expected_address_uses
+                .iter()
+                .any(|(address, expected)| uses[address.0 as usize] != *expected)
+            {
+                continue;
+            }
+
+            let mut loads = BTreeMap::new();
+            for (field_address, (source_offset, end)) in fields {
+                if uses[field_address.0 as usize] != 1 {
+                    continue 'pairs;
+                }
+                let mut matching_load = None;
+                for (load_index, instruction) in block.instructions.iter().enumerate() {
+                    let gir::FullInstructionKind::Load {
+                        address,
+                        object,
+                        access,
+                    } = &instruction.kind
+                    else {
+                        continue;
+                    };
+                    if *address != field_address {
+                        continue;
+                    }
+                    if load_index <= copy_index
+                        || *access != gir::MemoryAccess::default()
+                        || !object.qualifiers.is_empty()
+                    {
+                        continue 'pairs;
+                    }
+                    let Ok(layout) = object_layout(&module.types, *object, config) else {
+                        continue 'pairs;
+                    };
+                    if layout.size != end - source_offset {
+                        continue 'pairs;
+                    }
+                    let Ok(clif_type) = scalar_type(&module.types, *object, config) else {
+                        continue 'pairs;
+                    };
+                    let Some(_) = instruction.result else {
+                        continue 'pairs;
+                    };
+                    if matching_load
+                        .replace((
+                            instruction.id,
+                            DirectAggregateResultFieldLoad {
+                                call: call.id,
+                                source_offset,
+                                clif_type,
+                            },
+                        ))
+                        .is_some()
+                    {
+                        continue 'pairs;
+                    }
+                }
+                let Some((load, descriptor)) = matching_load else {
+                    continue 'pairs;
+                };
+                loads.insert(load, descriptor);
+            }
+            if loads.is_empty() {
+                continue;
+            }
+            result.extend(loads);
+        }
+    }
+    result
+}
+
 fn terminator_successors(terminator: &gir::FullTerminator) -> Vec<gir::BlockId> {
     match terminator {
         gir::FullTerminator::Branch(edge) => vec![edge.target],
@@ -817,6 +1020,9 @@ pub(super) fn lower_function(
 
     let single_use_aggregate_snapshots = single_use_aggregate_snapshots(function);
     let automatic_return_aggregate_snapshots = automatic_return_aggregate_snapshots(function);
+    let direct_aggregate_result_field_loads = (!collect_debug_values)
+        .then(|| direct_aggregate_result_field_loads(module, function, config))
+        .unwrap_or_default();
     let mut state = FunctionState {
         module,
         function,
@@ -836,6 +1042,8 @@ pub(super) fn lower_function(
         immediate_aggregate_call_result_destinations: immediate_aggregate_call_result_destinations(
             function,
         ),
+        direct_aggregate_result_field_loads,
+        direct_aggregate_result_load_values: RefCell::new(BTreeMap::new()),
         loop_global_address_slots,
         lazy_loop_global_addresses,
         sret: None,
@@ -986,6 +1194,9 @@ struct FunctionState<'a, 'references, 'object> {
     loop_global_address_slots: BTreeMap<u32, StackSlot>,
     automatic_return_aggregate_snapshots: BTreeSet<gir::ValueId>,
     immediate_aggregate_call_result_destinations: BTreeMap<gir::InstructionId, gir::ValueId>,
+    direct_aggregate_result_field_loads:
+        BTreeMap<gir::InstructionId, DirectAggregateResultFieldLoad>,
+    direct_aggregate_result_load_values: RefCell<BTreeMap<gir::InstructionId, ir::Value>>,
     lazy_loop_global_addresses: BTreeSet<u32>,
     sret: Option<ir::Value>,
     variadic_state: Option<ir::Value>,
@@ -1908,6 +2119,14 @@ impl FunctionState<'_, '_, '_> {
                     object,
                     access,
                 } => {
+                    if let Some(value) = self
+                        .direct_aggregate_result_load_values
+                        .borrow()
+                        .get(&instruction.id)
+                        .copied()
+                    {
+                        return Ok(Some(value));
+                    }
                     if is_x87_f80(&self.module.types, *object, self.config) {
                         if access.atomic.is_some() {
                             return Err(CodegenError {
@@ -3703,6 +3922,26 @@ impl FunctionState<'_, '_, '_> {
                 } else {
                     create_stack_backing(builder, padded, classified.align)?
                 };
+                let direct_field_load_values = direct_destination
+                    .is_some()
+                    .then(|| {
+                        self.direct_aggregate_result_field_loads
+                            .iter()
+                            .filter(|(_, descriptor)| descriptor.call == instruction)
+                            .map(|(load, descriptor)| {
+                                plan.clif_results.iter().zip(results.iter()).find_map(
+                                    |(carrier, value)| {
+                                        (carrier.source_offset == descriptor.source_offset
+                                            && builder.func.dfg.value_type(*value)
+                                                == descriptor.clif_type)
+                                            .then_some((*load, *value))
+                                    },
+                                )
+                            })
+                            .collect::<Option<Vec<_>>>()
+                    })
+                    .flatten()
+                    .filter(|values| !values.is_empty());
                 if direct_destination.is_none()
                     && (!matches!(
                         self.config.optimization,
@@ -3713,6 +3952,12 @@ impl FunctionState<'_, '_, '_> {
                     )?)
                 {
                     zero_memory(builder, address, padded)?;
+                }
+                if let Some(values) = direct_field_load_values {
+                    self.direct_aggregate_result_load_values
+                        .borrow_mut()
+                        .extend(values);
+                    return Ok(Some(address));
                 }
                 for (carrier, value) in plan.clif_results.iter().zip(results) {
                     let destination = address_offset(builder, address, carrier.source_offset)?;
