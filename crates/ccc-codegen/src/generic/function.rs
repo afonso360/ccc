@@ -3507,7 +3507,13 @@ impl FunctionState<'_, '_, '_> {
                 }
                 let padded = align_up_u64(classified.size, 8)?;
                 let address = create_stack_backing(builder, padded, classified.align)?;
-                zero_memory(builder, address, padded)?;
+                if !matches!(
+                    self.config.optimization,
+                    OptimizationLevel::O2 | OptimizationLevel::O3
+                ) || !native_result_carriers_fully_overwrite_storage(&plan.clif_results, padded)?
+                {
+                    zero_memory(builder, address, padded)?;
+                }
                 for (carrier, value) in plan.clif_results.iter().zip(results) {
                     let destination = address_offset(builder, address, carrier.source_offset)?;
                     builder
@@ -4031,6 +4037,43 @@ fn native_aggregate_parameter_fully_overwrites_storage(
                 return Ok(false);
             }
         }
+    }
+    ranges.sort_unstable();
+    let mut covered = 0;
+    for (start, end) in ranges {
+        if start > covered {
+            return Ok(false);
+        }
+        covered = covered.max(end);
+    }
+    Ok(covered == size)
+}
+
+/// Returns whether result carriers exactly and completely reconstruct storage.
+///
+/// This is intentionally restricted to normal, exact-width carriers. Any
+/// padding, partial carrier, or unexpected ABI transport retains the zero seed.
+fn native_result_carriers_fully_overwrite_storage(
+    carriers: &[ccc_abi::NativeCarrierPlan],
+    size: u64,
+) -> Result<bool, CodegenError> {
+    let mut ranges = Vec::with_capacity(carriers.len());
+    for carrier in carriers {
+        if carrier.purpose != ccc_abi::NativePurpose::Normal {
+            return Ok(false);
+        }
+        let width = u64::from(native_carrier_type(carrier.carrier).bytes());
+        if u64::from(carrier.valid_bytes) != width {
+            return Ok(false);
+        }
+        let end = carrier
+            .source_offset
+            .checked_add(width)
+            .ok_or_else(|| error("aggregate ABI result carrier range overflows"))?;
+        if end > size {
+            return Ok(false);
+        }
+        ranges.push((carrier.source_offset, end));
     }
     ranges.sort_unstable();
     let mut covered = 0;

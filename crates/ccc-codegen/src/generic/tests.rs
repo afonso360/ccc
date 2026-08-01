@@ -966,6 +966,13 @@ fn optimized_aggregate_parameters_use_their_local_storage_as_abi_backing() {
                   }\n\
                   struct Vector identity(struct Vector value) {\n\
                       return value;\n\
+                  }\n\
+                  struct Pair { double x; double y; };\n\
+                  struct Pair pair_identity(struct Pair value) {\n\
+                      return value;\n\
+                  }\n\
+                  struct Pair pair_relay(struct Pair value) {\n\
+                      return pair_identity(value);\n\
                   }";
     for base in enabled_compilation_configs() {
         let baseline = base.clone().with_optimization_level(OptimizationLevel::O1);
@@ -1001,6 +1008,12 @@ fn optimized_aggregate_parameters_use_their_local_storage_as_abi_backing() {
         assert!(
             !identity_clif.contains("iconst.i64 0"),
             "{}:\n{identity_clif}",
+            optimized.target.triple
+        );
+        let pair_relay_clif = function_clif(&optimized_output.clif, "pair_relay");
+        assert!(
+            !pair_relay_clif.contains("iconst.i64 0"),
+            "{}:\n{pair_relay_clif}",
             optimized.target.triple
         );
     }
