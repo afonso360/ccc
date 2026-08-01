@@ -1119,6 +1119,44 @@ fn optimized_aggregate_parameters_use_their_local_storage_as_abi_backing() {
 }
 
 #[test]
+fn read_only_register_aggregate_parameters_use_their_input_carriers() {
+    let source = "struct Vector { double x; double y; double z; };\n\
+                  double dot(struct Vector left, struct Vector right) {\n\
+                      return left.x * right.x + left.y * right.y + left.z * right.z;\n\
+                  }\n\
+                  double alter(struct Vector value) {\n\
+                      value.x = 1.0;\n\
+                      return value.y;\n\
+                  }";
+    let baseline = EffectiveCompilationConfig::aarch64_unknown_linux_gnu()
+        .with_optimization_level(OptimizationLevel::O1);
+    let baseline_output = emit_source_with_config(source, &baseline);
+    let baseline_dot = function_clif(&baseline_output.clif, "dot");
+    assert_eq!(
+        baseline_dot.matches("load.f64").count(),
+        6,
+        "{}:\n{baseline_dot}",
+        baseline.target.triple
+    );
+
+    let optimized = baseline.with_optimization_level(OptimizationLevel::O2);
+    let optimized_output = emit_source_with_config(source, &optimized);
+    let optimized_dot = function_clif(&optimized_output.clif, "dot");
+    assert_eq!(
+        optimized_dot.matches("load.f64").count(),
+        0,
+        "{}:\n{optimized_dot}",
+        optimized.target.triple
+    );
+    let altered = function_clif(&optimized_output.clif, "alter");
+    assert!(
+        altered.contains("load.f64") && altered.contains("store"),
+        "{}:\n{altered}",
+        optimized.target.triple
+    );
+}
+
+#[test]
 fn file_scope_compound_literals_emit_local_data_and_object_relocations() {
     let output = emit_source(
         "struct Pair { int left; int right; };
