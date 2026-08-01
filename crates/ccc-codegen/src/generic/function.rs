@@ -3417,23 +3417,36 @@ impl FunctionState<'_, '_, '_> {
                 *stage
             } else {
                 let padded = align_up_u64(parameter.classified.size, 8)?;
-                let stage = create_stack_backing(builder, padded, parameter.classified.align)?;
-                if padded != parameter.classified.size
-                    || !matches!(
-                        self.config.optimization,
-                        OptimizationLevel::O2 | OptimizationLevel::O3
-                    )
-                {
-                    zero_memory(builder, stage, padded)?;
-                }
-                copy_memory(
-                    builder,
-                    stage,
-                    self.value(source_value)?,
-                    parameter.classified.size,
-                    gir::MemoryAccess::default(),
-                    gir::MemoryAccess::default(),
-                )?;
+                // Exact normal carriers can read an already-owned aggregate
+                // value directly. Partial carriers and pointer transports
+                // retain a private ABI stage for their zero-fill and copy semantics.
+                let direct_register_source = matches!(
+                    self.config.optimization,
+                    OptimizationLevel::O2 | OptimizationLevel::O3
+                ) && padded == parameter.classified.size
+                    && native_aggregate_parameter_has_full_normal_carriers(plan, parameter)?;
+                let stage = if direct_register_source {
+                    self.value(source_value)?
+                } else {
+                    let stage = create_stack_backing(builder, padded, parameter.classified.align)?;
+                    if padded != parameter.classified.size
+                        || !matches!(
+                            self.config.optimization,
+                            OptimizationLevel::O2 | OptimizationLevel::O3
+                        )
+                    {
+                        zero_memory(builder, stage, padded)?;
+                    }
+                    copy_memory(
+                        builder,
+                        stage,
+                        self.value(source_value)?,
+                        parameter.classified.size,
+                        gir::MemoryAccess::default(),
+                        gir::MemoryAccess::default(),
+                    )?;
+                    stage
+                };
                 staged.insert(source_index, stage);
                 stage
             };
@@ -4084,6 +4097,47 @@ fn native_result_carriers_fully_overwrite_storage(
         covered = covered.max(end);
     }
     Ok(covered == size)
+}
+
+/// Returns whether a register aggregate has an exact carrier for every byte.
+///
+/// This is stricter than entry reconstruction: pointer and structured
+/// transports must use a private copy because the callee can mutate it.
+fn native_aggregate_parameter_has_full_normal_carriers(
+    plan: &ccc_abi::NativeBoundaryPlan,
+    parameter: &ccc_abi::NativeParameterPlan,
+) -> Result<bool, CodegenError> {
+    let mut ranges = Vec::with_capacity(parameter.carrier_indices.len());
+    for index in &parameter.carrier_indices {
+        let carrier = plan
+            .clif_parameters
+            .get(*index as usize)
+            .ok_or_else(|| error("aggregate ABI carrier index is invalid"))?;
+        if carrier.purpose != ccc_abi::NativePurpose::Normal {
+            return Ok(false);
+        }
+        let width = u64::from(native_carrier_type(carrier.carrier).bytes());
+        if u64::from(carrier.valid_bytes) != width {
+            return Ok(false);
+        }
+        let end = carrier
+            .source_offset
+            .checked_add(width)
+            .ok_or_else(|| error("aggregate ABI carrier range overflows"))?;
+        if end > parameter.classified.size {
+            return Ok(false);
+        }
+        ranges.push((carrier.source_offset, end));
+    }
+    ranges.sort_unstable();
+    let mut covered = 0;
+    for (start, end) in ranges {
+        if start > covered {
+            return Ok(false);
+        }
+        covered = covered.max(end);
+    }
+    Ok(covered == parameter.classified.size)
 }
 
 fn zero_carrier_value(

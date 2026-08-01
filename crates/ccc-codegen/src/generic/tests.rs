@@ -1016,6 +1016,12 @@ fn optimized_aggregate_parameters_use_their_local_storage_as_abi_backing() {
             "{}:\n{pair_relay_clif}",
             optimized.target.triple
         );
+        assert_eq!(
+            pair_relay_clif.matches("explicit_slot 16").count(),
+            4,
+            "{}:\n{pair_relay_clif}",
+            optimized.target.triple
+        );
     }
 }
 
