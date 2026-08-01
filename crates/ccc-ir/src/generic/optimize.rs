@@ -14,7 +14,7 @@ use super::lower::{compact_values, remap_promoted_local_update_positions};
 use super::verify::{instruction_operands, terminator_operands};
 use super::{
     BlockId, FullEdge, FullFunction, FullInstructionKind, FullModule, FullTerminator, IrError,
-    ScalarConstant, ScalarConversion, UnaryOperation, ValueId, verify_frontend,
+    MemoryAccess, ScalarConstant, ScalarConversion, UnaryOperation, ValueId, verify_frontend,
 };
 
 /// Runs the C-aware cleanup pipeline and validates the IR on both boundaries.
@@ -106,6 +106,8 @@ fn optimize_function(
         changed |= forward_empty_blocks(function)
             .map_err(|error| pass_failure(error, "empty-block forwarding"))?;
         if profile.local_cse {
+            changed |= elide_immediate_aggregate_snapshots(function)
+                .map_err(|error| pass_failure(error, "aggregate snapshot cleanup"))?;
             changed |= cse::eliminate_common_expressions(function)
                 .map_err(|error| pass_failure(error, "local common-expression cleanup"))?;
         }
@@ -123,6 +125,85 @@ fn optimize_function(
 fn pass_failure(mut error: IrError, pass: &str) -> IrError {
     error.message = format!("{pass}: {}", error.message);
     error
+}
+
+/// Collapses an aggregate lvalue snapshot consumed immediately by one copy.
+///
+/// The aggregate copy backend reads all of its source before writing any
+/// destination byte, so it preserves the snapshot's value semantics even when
+/// the ranges alias. Keeping this rewrite adjacent also preserves the
+/// source-read ordering with respect to every other effect.
+fn elide_immediate_aggregate_snapshots(function: &mut FullFunction) -> Result<bool, IrError> {
+    let mut use_counts = vec![0usize; function.value_types.len()];
+    for block in &function.blocks {
+        for instruction in &block.instructions {
+            for operand in instruction_operands(&instruction.kind) {
+                let count = &mut use_counts[operand.0 as usize];
+                *count = count.saturating_add(1);
+            }
+        }
+        if let Some(terminator) = &block.terminator {
+            for operand in terminator_operands(terminator) {
+                let count = &mut use_counts[operand.0 as usize];
+                *count = count.saturating_add(1);
+            }
+        }
+    }
+    let mut changed = false;
+    let mut retained_instructions = Vec::with_capacity(function.blocks.len());
+    for block in &mut function.blocks {
+        let mut pending = std::mem::take(&mut block.instructions)
+            .into_iter()
+            .collect::<VecDeque<_>>();
+        let mut retained = Vec::with_capacity(pending.len());
+        let mut retained_mask = Vec::with_capacity(pending.len());
+        while let Some(snapshot) = pending.pop_front() {
+            let shortcut = match (&snapshot.result, &snapshot.kind) {
+                (
+                    Some(snapshot_result),
+                    FullInstructionKind::AggregateSnapshot { source, access, .. },
+                ) => {
+                    if let Some(copy) = pending.front_mut()
+                        && let FullInstructionKind::AggregateCopy {
+                            source: copy_source,
+                            source_access,
+                            ..
+                        } = &mut copy.kind
+                        && *copy_source == *snapshot_result
+                        && *source_access == MemoryAccess::default()
+                        && use_counts[snapshot_result.0 as usize] == 1
+                    {
+                        *copy_source = *source;
+                        *source_access = *access;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            };
+            if shortcut {
+                retained_mask.push(false);
+                retained.push(
+                    pending
+                        .pop_front()
+                        .expect("aggregate snapshot cleanup lost its adjacent copy"),
+                );
+                retained_mask.push(true);
+                changed = true;
+            } else {
+                retained.push(snapshot);
+                retained_mask.push(true);
+            }
+        }
+        block.instructions = retained;
+        retained_instructions.push(retained_mask);
+    }
+    if changed {
+        remap_promoted_local_update_positions(function, &retained_instructions)?;
+        compact_values(function, &BTreeMap::new())?;
+    }
+    Ok(changed)
 }
 
 fn sparsify_block_parameters(function: &mut FullFunction) -> Result<bool, IrError> {

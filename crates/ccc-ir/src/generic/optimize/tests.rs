@@ -299,3 +299,47 @@ fn dead_loop_carried_ssa_cycles_are_removed_by_liveness() {
     }));
     verify_frontend(&module).unwrap();
 }
+
+#[test]
+fn immediate_aggregate_snapshot_copy_is_elided_at_o2() {
+    let source = "struct Pair { int left; int right; };\n\
+                  void copy(struct Pair *destination, struct Pair *source) {\n\
+                      *destination = *source;\n\
+                  }\n\
+                  struct Pair copy_and_return(struct Pair *destination, struct Pair *source) {\n\
+                      return (*destination = *source);\n\
+                  }";
+    let base = EffectiveCompilationConfig::default();
+    let mut o1 = lower_source(
+        source,
+        &base.clone().with_optimization_level(OptimizationLevel::O1),
+    );
+    let o2_config = base.with_optimization_level(OptimizationLevel::O2);
+    let mut o2 = lower_source(source, &o2_config);
+
+    optimize_frontend_for_config(
+        &mut o1,
+        &EffectiveCompilationConfig::default().with_optimization_level(OptimizationLevel::O1),
+    )
+    .unwrap();
+    optimize_frontend_for_config(&mut o2, &o2_config).unwrap();
+
+    let snapshot_count = |module: &FullModule| {
+        module
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .flat_map(|block| &block.instructions)
+            .filter(|instruction| {
+                matches!(
+                    instruction.kind,
+                    FullInstructionKind::AggregateSnapshot { .. }
+                )
+            })
+            .count()
+    };
+    assert_eq!(snapshot_count(&o1), 2, "{}", dump_frontend_ir(&o1));
+    assert_eq!(snapshot_count(&o2), 1, "{}", dump_frontend_ir(&o2));
+    verify_frontend(&o1).unwrap();
+    verify_frontend(&o2).unwrap();
+}
