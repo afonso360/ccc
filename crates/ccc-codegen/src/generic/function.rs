@@ -489,6 +489,155 @@ fn loop_global_addresses(function: &gir::FullFunction) -> BTreeSet<u32> {
         .collect()
 }
 
+/// Finds direct-definition parameters whose backing storage is only read
+/// through ordinary field projections and plain loads.
+///
+/// The result is intentionally intraprocedural and conservative: a pointer
+/// escape, store, qualified access, or any unaccounted use disqualifies the
+/// parameter. That makes it safe for callers to lend existing backing storage
+/// to one direct call instead of materializing a by-value snapshot.
+fn readonly_aggregate_parameters(
+    module: &gir::FullModule,
+) -> BTreeSet<(ccc_sema::generic::FullFunctionId, usize)> {
+    let mut result = BTreeSet::new();
+    for function in &module.functions {
+        let uses = gir::value_use_counts(function);
+        for (parameter_index, parameter) in function.parameters.iter().enumerate() {
+            let Some(storage) = parameter.storage else {
+                continue;
+            };
+            let mut pointers = function
+                .blocks
+                .iter()
+                .flat_map(|block| &block.instructions)
+                .filter_map(|instruction| match &instruction.kind {
+                    gir::FullInstructionKind::AddressOfStorage {
+                        storage: address_storage,
+                    } if *address_storage == storage => instruction.result,
+                    _ => None,
+                })
+                .collect::<BTreeSet<_>>();
+            if pointers.is_empty() {
+                continue;
+            }
+            loop {
+                let mut changed = false;
+                for instruction in function.blocks.iter().flat_map(|block| &block.instructions) {
+                    let gir::FullInstructionKind::ProjectField { base, .. } = &instruction.kind
+                    else {
+                        continue;
+                    };
+                    if pointers.contains(base) {
+                        let Some(field) = instruction.result else {
+                            pointers.clear();
+                            break;
+                        };
+                        changed |= pointers.insert(field);
+                    }
+                }
+                if pointers.is_empty() || !changed {
+                    break;
+                }
+            }
+            if pointers.is_empty() {
+                continue;
+            }
+            let mut expected_uses = BTreeMap::<gir::ValueId, usize>::new();
+            for instruction in function.blocks.iter().flat_map(|block| &block.instructions) {
+                match &instruction.kind {
+                    gir::FullInstructionKind::ProjectField { base, .. }
+                        if pointers.contains(base) =>
+                    {
+                        *expected_uses.entry(*base).or_default() += 1;
+                    }
+                    gir::FullInstructionKind::AggregateCopy {
+                        destination,
+                        source,
+                        destination_access,
+                        source_access,
+                        ..
+                    } if pointers.contains(destination)
+                        && parameter.incoming == Some(*source)
+                        && *destination_access == gir::MemoryAccess::default()
+                        && *source_access == gir::MemoryAccess::default() =>
+                    {
+                        // The frontend's canonical parameter initialization
+                        // becomes a self-assignment when optimized codegen
+                        // reuses the caller's backing storage.
+                        *expected_uses.entry(*destination).or_default() += 1;
+                    }
+                    gir::FullInstructionKind::Load {
+                        address, access, ..
+                    } if pointers.contains(address) && *access == gir::MemoryAccess::default() => {
+                        *expected_uses.entry(*address).or_default() += 1;
+                    }
+                    _ => {}
+                }
+            }
+            if pointers.iter().all(|pointer| {
+                uses[pointer.0 as usize] == expected_uses.get(pointer).copied().unwrap_or(0)
+            }) {
+                result.insert((function.id, parameter_index));
+            }
+        }
+    }
+    result
+}
+
+/// Finds single-use snapshots whose sole consumer is a direct call parameter
+/// proven read-only by [`readonly_aggregate_parameters`].
+fn readonly_aggregate_argument_snapshots(
+    module: &gir::FullModule,
+    function: &gir::FullFunction,
+) -> BTreeSet<gir::ValueId> {
+    let readonly_parameters = readonly_aggregate_parameters(module);
+    let uses = gir::value_use_counts(function);
+    let mut result = BTreeSet::new();
+    for block in &function.blocks {
+        for (snapshot_index, snapshot) in block.instructions.iter().enumerate() {
+            let (Some(snapshot_value), gir::FullInstructionKind::AggregateSnapshot { access, .. }) =
+                (snapshot.result, &snapshot.kind)
+            else {
+                continue;
+            };
+            if *access != gir::MemoryAccess::default() || uses[snapshot_value.0 as usize] != 1 {
+                continue;
+            }
+            for instruction in &block.instructions[snapshot_index + 1..] {
+                match &instruction.kind {
+                    gir::FullInstructionKind::DirectCall {
+                        function,
+                        arguments,
+                        ..
+                    } => {
+                        if arguments.iter().enumerate().any(|(parameter, argument)| {
+                            *argument == snapshot_value
+                                && readonly_parameters.contains(&(*function, parameter))
+                        }) {
+                            result.insert(snapshot_value);
+                        }
+                        break;
+                    }
+                    gir::FullInstructionKind::Constant(_)
+                    | gir::FullInstructionKind::AddressConstant { .. }
+                    | gir::FullInstructionKind::AddressOfGlobal { .. }
+                    | gir::FullInstructionKind::AddressOfFunction { .. }
+                    | gir::FullInstructionKind::AddressOfString { .. }
+                    | gir::FullInstructionKind::AddressOfStorage { .. }
+                    | gir::FullInstructionKind::ProjectField { .. }
+                    | gir::FullInstructionKind::Convert { .. }
+                    | gir::FullInstructionKind::Unary { .. }
+                    | gir::FullInstructionKind::Binary { .. }
+                    | gir::FullInstructionKind::IntegerIntrinsic { .. }
+                    | gir::FullInstructionKind::CodeLayoutHint(_) => {}
+                    _ => break,
+                }
+            }
+        }
+    }
+    result
+}
+
 /// Finds snapshots that are consumed exactly once by the enclosing function.
 ///
 /// A call may use this backing storage as its indirect by-value argument only
@@ -1019,6 +1168,9 @@ pub(super) fn lower_function(
     }
 
     let single_use_aggregate_snapshots = single_use_aggregate_snapshots(function);
+    let readonly_aggregate_argument_snapshots = (!collect_debug_values)
+        .then(|| readonly_aggregate_argument_snapshots(module, function))
+        .unwrap_or_default();
     let automatic_return_aggregate_snapshots = automatic_return_aggregate_snapshots(function);
     let direct_aggregate_result_field_loads = (!collect_debug_values)
         .then(|| direct_aggregate_result_field_loads(module, function, config))
@@ -1038,6 +1190,7 @@ pub(super) fn lower_function(
         values: vec![None; function.value_types.len()],
         caller_owned_parameter_backing_enabled: !collect_debug_values,
         single_use_aggregate_snapshots,
+        readonly_aggregate_argument_snapshots,
         automatic_return_aggregate_snapshots,
         immediate_aggregate_call_result_destinations: immediate_aggregate_call_result_destinations(
             function,
@@ -1191,6 +1344,7 @@ struct FunctionState<'a, 'references, 'object> {
     caller_owned_parameter_backing_enabled: bool,
     values: Vec<Option<ir::Value>>,
     single_use_aggregate_snapshots: BTreeSet<gir::ValueId>,
+    readonly_aggregate_argument_snapshots: BTreeSet<gir::ValueId>,
     loop_global_address_slots: BTreeMap<u32, StackSlot>,
     automatic_return_aggregate_snapshots: BTreeSet<gir::ValueId>,
     immediate_aggregate_call_result_destinations: BTreeMap<gir::InstructionId, gir::ValueId>,
@@ -2328,6 +2482,14 @@ impl FunctionState<'_, '_, '_> {
                     access,
                 } => {
                     validate_access(*access)?;
+                    if matches!(
+                        self.config.optimization,
+                        OptimizationLevel::O2 | OptimizationLevel::O3
+                    ) && instruction.result.is_some_and(|result| {
+                        self.readonly_aggregate_argument_snapshots.contains(&result)
+                    }) {
+                        return Ok(Some(self.value(*source)?));
+                    }
                     if matches!(
                         self.config.optimization,
                         OptimizationLevel::O2 | OptimizationLevel::O3

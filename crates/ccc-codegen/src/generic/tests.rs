@@ -985,6 +985,10 @@ fn optimized_aggregate_parameters_use_their_local_storage_as_abi_backing() {
                   }\n\
                   struct Ray { double a; double b; double c; double d; double e; double f; };\n\
                   void consume_ray(struct Ray value) {}\n\
+                  void overwrite_ray(struct Ray value) { value.a = 1.0; }\n\
+                  void ray_mutating_relay(struct Ray value) {\n\
+                      overwrite_ray(value);\n\
+                  }\n\
                   void ray_relay(struct Ray value) {\n\
                       consume_ray(value);\n\
                   }\n\
@@ -1054,7 +1058,7 @@ fn optimized_aggregate_parameters_use_their_local_storage_as_abi_backing() {
         let pair_result_relay_clif = function_clif(&optimized_output.clif, "pair_result_relay");
         assert_eq!(
             pair_result_relay_clif.matches("explicit_slot 16").count(),
-            4,
+            3,
             "{}:\n{pair_result_relay_clif}",
             optimized.target.triple
         );
@@ -1067,20 +1071,33 @@ fn optimized_aggregate_parameters_use_their_local_storage_as_abi_backing() {
         let ray_relay_clif = function_clif(&optimized_output.clif, "ray_relay");
         assert_eq!(
             ray_relay_clif.matches("explicit_slot 48").count(),
-            2,
+            1,
             "{}:\n{ray_relay_clif}",
             optimized.target.triple
         );
         assert_eq!(
             ray_relay_clif.matches("stack_addr.i64").count(),
-            1,
+            0,
             "{}:\n{ray_relay_clif}",
+            optimized.target.triple
+        );
+        let ray_mutating_relay_clif = function_clif(&optimized_output.clif, "ray_mutating_relay");
+        assert_eq!(
+            ray_mutating_relay_clif.matches("explicit_slot 48").count(),
+            2,
+            "{}:\n{ray_mutating_relay_clif}",
+            optimized.target.triple
+        );
+        assert_eq!(
+            ray_mutating_relay_clif.matches("stack_addr.i64").count(),
+            1,
+            "{}:\n{ray_mutating_relay_clif}",
             optimized.target.triple
         );
         let ray_mutate_clif = function_clif(&optimized_output.clif, "ray_mutate");
         assert_eq!(
             ray_mutate_clif.matches("stack_addr.i64").count(),
-            1,
+            0,
             "{}:\n{ray_mutate_clif}",
             optimized.target.triple
         );
