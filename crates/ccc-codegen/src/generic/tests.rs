@@ -959,6 +959,35 @@ fn optimized_loop_global_addresses_use_cached_stack_slots() {
 }
 
 #[test]
+fn optimized_aggregate_parameters_use_their_local_storage_as_abi_backing() {
+    let source = "struct Vector { double x; double y; double z; };\n\
+                  double mix(struct Vector left, struct Vector right) {\n\
+                      return left.x + right.y;\n\
+                  }";
+    for base in enabled_compilation_configs() {
+        let baseline = base.clone().with_optimization_level(OptimizationLevel::O1);
+        let baseline_output = emit_source_with_config(source, &baseline);
+        let baseline_clif = function_clif(&baseline_output.clif, "mix");
+        assert_eq!(
+            baseline_clif.matches("explicit_slot 24").count(),
+            4,
+            "{}:\n{baseline_clif}",
+            baseline.target.triple
+        );
+
+        let optimized = base.with_optimization_level(OptimizationLevel::O2);
+        let optimized_output = emit_source_with_config(source, &optimized);
+        let optimized_clif = function_clif(&optimized_output.clif, "mix");
+        assert_eq!(
+            optimized_clif.matches("explicit_slot 24").count(),
+            2,
+            "{}:\n{optimized_clif}",
+            optimized.target.triple
+        );
+    }
+}
+
+#[test]
 fn file_scope_compound_literals_emit_local_data_and_object_relocations() {
     let output = emit_source(
         "struct Pair { int left; int right; };

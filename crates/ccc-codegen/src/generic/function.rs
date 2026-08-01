@@ -720,6 +720,7 @@ pub(super) fn lower_function(
         frontend_config,
         blocks,
         storage,
+        cached_storage_addresses: HashMap::new(),
         runtime_storage,
         values: vec![None; function.value_types.len()],
         loop_global_address_slots,
@@ -864,6 +865,7 @@ struct FunctionState<'a, 'references, 'object> {
     frontend_config: backend::FrontendConfig,
     blocks: HashMap<u32, ir::Block>,
     storage: HashMap<u32, StackStorage>,
+    cached_storage_addresses: HashMap<u32, ir::Value>,
     runtime_storage: HashMap<u32, StackSlot>,
     values: Vec<Option<ir::Value>>,
     loop_global_address_slots: BTreeMap<u32, StackSlot>,
@@ -1317,7 +1319,33 @@ impl FunctionState<'_, '_, '_> {
                 coerce_carrier_value(builder, value, expected, false)?
             } else {
                 let padded = align_up_u64(parameter.classified.size, 8)?;
-                let address = create_stack_backing(builder, padded, parameter.classified.align)?;
+                // The typed IR copies each aggregate parameter into its local
+                // storage. At speed profiles, construct a non-padded,
+                // unqualified aggregate directly in that storage so the
+                // following ordinary self-copy can be elided.
+                let direct_storage = matches!(
+                    self.config.optimization,
+                    OptimizationLevel::O2 | OptimizationLevel::O3
+                )
+                .then_some(self.function.parameters[source].storage)
+                .flatten()
+                .filter(|_| {
+                    parameter.classified.size == padded
+                        && self.function.parameters[source].ty.qualifiers.is_empty()
+                })
+                .and_then(|storage| {
+                    self.storage
+                        .get(&storage.0)
+                        .copied()
+                        .map(|data| (storage.0, data))
+                });
+                let address = if let Some((storage, data)) = direct_storage {
+                    let address = stack_storage_address(builder, data);
+                    self.cached_storage_addresses.insert(storage, address);
+                    address
+                } else {
+                    create_stack_backing(builder, padded, parameter.classified.align)?
+                };
                 zero_memory(builder, address, padded)?;
                 for index in &parameter.carrier_indices {
                     let carrier = plan
@@ -1541,22 +1569,16 @@ impl FunctionState<'_, '_, '_> {
                     )))
                 }
                 I::AddressOfStorage { storage } => {
+                    if let Some(address) = self.cached_storage_addresses.get(&storage.0) {
+                        return Ok(Some(*address));
+                    }
                     let storage = self.storage.get(&storage.0).copied().ok_or_else(|| {
-                    error(format!(
-                        "storage {} is not an automatic stack object; static storage must use a data id",
-                        storage.0
-                    ))
-                })?;
-                    let address = builder.ins().stack_addr(ir::types::I64, storage.slot, 0);
-                    let Some(alignment) = storage.dynamic_alignment else {
-                        return Ok(Some(address));
-                    };
-                    let bias = builder.ins().iconst(ir::types::I64, (alignment - 1) as i64);
-                    let biased = builder.ins().iadd(address, bias);
-                    let mask = builder
-                        .ins()
-                        .iconst(ir::types::I64, alignment.wrapping_neg() as i64);
-                    Ok(Some(builder.ins().band(biased, mask)))
+                        error(format!(
+                            "storage {} is not an automatic stack object; static storage must use a data id",
+                            storage.0
+                        ))
+                    })?;
+                    Ok(Some(stack_storage_address(builder, storage)))
                 }
                 I::RuntimeSize {
                     extents,
@@ -1897,12 +1919,26 @@ impl FunctionState<'_, '_, '_> {
                     source_access,
                     overlap: gir::AggregateOverlap::MayOverlap,
                 } => {
+                    let destination = self.value(*destination)?;
+                    let source = self.value(*source)?;
+                    // Reused parameter storage makes the typed-IR entry copy
+                    // an ordinary self-assignment. Do not elide qualified
+                    // accesses, whose read or write remains observable.
+                    if matches!(
+                        self.config.optimization,
+                        OptimizationLevel::O2 | OptimizationLevel::O3
+                    ) && destination == source
+                        && *destination_access == gir::MemoryAccess::default()
+                        && *source_access == gir::MemoryAccess::default()
+                    {
+                        return Ok(None);
+                    }
                     let size =
                         object_layout(&self.module.types, *destination_object, self.config)?.size;
                     copy_memory(
                         builder,
-                        self.value(*destination)?,
-                        self.value(*source)?,
+                        destination,
+                        source,
                         size,
                         *destination_access,
                         *source_access,
@@ -4303,6 +4339,19 @@ fn create_stack_backing(
         align_shift,
     ));
     Ok(builder.ins().stack_addr(ir::types::I64, slot, 0))
+}
+
+fn stack_storage_address(builder: &mut FunctionBuilder<'_>, storage: StackStorage) -> ir::Value {
+    let address = builder.ins().stack_addr(ir::types::I64, storage.slot, 0);
+    let Some(alignment) = storage.dynamic_alignment else {
+        return address;
+    };
+    let bias = builder.ins().iconst(ir::types::I64, (alignment - 1) as i64);
+    let biased = builder.ins().iadd(address, bias);
+    let mask = builder
+        .ins()
+        .iconst(ir::types::I64, alignment.wrapping_neg() as i64);
+    builder.ins().band(biased, mask)
 }
 
 fn align_up_u64(value: u64, align: u64) -> Result<u64, CodegenError> {
