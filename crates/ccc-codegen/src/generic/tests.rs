@@ -883,6 +883,13 @@ fn optimized_loop_global_addresses_use_cached_stack_slots() {
                                         total += values[index & 15u];
                                     return total;
                                 }";
+    let tls_source = "static _Thread_local int value;
+                      int sum(unsigned count) {
+                          int total = 0;
+                          for (unsigned index = 0; index < count; ++index)
+                              total += value + (int)index;
+                          return total;
+                      }";
     for base in enabled_compilation_configs() {
         let optimized = base.clone().with_optimization_level(OptimizationLevel::O2);
         let optimized_output = emit_source_with_config(cached_source, &optimized);
@@ -920,6 +927,32 @@ fn optimized_loop_global_addresses_use_cached_stack_slots() {
         assert!(
             !single_global_clif.contains("explicit_slot 8"),
             "{}:\n{single_global_clif}",
+            optimized.target.triple
+        );
+
+        let tls_output = emit_source_with_config(tls_source, &optimized);
+        let tls_clif = function_clif(&tls_output.clif, "sum");
+        assert_eq!(
+            tls_clif.matches("explicit_slot 8").count(),
+            1,
+            "{}:\n{tls_clif}",
+            optimized.target.triple
+        );
+        assert_eq!(
+            tls_clif.matches("call fn").count(),
+            1,
+            "{}:\n{tls_clif}",
+            optimized.target.triple
+        );
+        assert_eq!(
+            tls_clif.matches("load.i64").count(),
+            2,
+            "{}:\n{tls_clif}",
+            optimized.target.triple
+        );
+        assert!(
+            tls_clif.find("brif").unwrap() < tls_clif.find("call fn").unwrap(),
+            "{}:\n{tls_clif}",
             optimized.target.triple
         );
     }
@@ -2717,7 +2750,7 @@ fn complete_abi_plan_and_aggregate_clif_have_exact_snapshots() {
     .unwrap();
     assert_eq!(
         sha256(&output.clif),
-        "25ee0eb9b419e2495567f6cba45ca646ab6e0c2f478bd890432fa8b5085fa468"
+        "844e0312e8c509eec7b7b10861bcfe95620ea327005ec085fe967b0e64351899"
     );
 }
 
@@ -3656,21 +3689,23 @@ fn aggregate_copy_loads_complete_source_before_any_destination_write() {
     );
     let clif = function_clif(&output.clif, "copy");
     let lines = clif.lines().map(str::trim).collect::<Vec<_>>();
-    let byte_loads = lines
+    let loads = lines
         .iter()
         .enumerate()
-        .filter_map(|(index, line)| line.contains("load.i8").then_some(index))
+        .filter_map(|(index, line)| line.contains("load.i32").then_some(index))
         .collect::<Vec<_>>();
+    assert_eq!(loads.len(), 2, "{clif}");
+    assert!(!clif.contains("load.i8"), "{clif}");
     let first_store = lines
         .iter()
         .position(|line| line.starts_with("store "))
         .expect("snapshot store");
-    assert!(byte_loads.iter().any(|load| *load < first_store), "{clif}");
+    assert!(loads.iter().any(|load| *load < first_store), "{clif}");
     let final_store = lines
         .iter()
         .rposition(|line| line.starts_with("store "))
         .expect("destination store");
-    let last_load = *byte_loads.last().expect("aggregate byte load");
+    let last_load = *loads.last().expect("aggregate word load");
     assert!(last_load < final_store, "{clif}");
 }
 

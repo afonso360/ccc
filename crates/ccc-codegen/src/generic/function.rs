@@ -669,16 +669,22 @@ pub(super) fn lower_function(
     }
 
     let mut loop_global_address_slots = BTreeMap::new();
+    let mut lazy_loop_global_addresses = BTreeSet::new();
     if matches!(
         config.optimization,
         OptimizationLevel::O2 | OptimizationLevel::O3
     ) {
-        let mut globals = Vec::new();
+        let mut cached_globals = Vec::new();
+        let mut non_tls_globals = Vec::new();
         for global in loop_global_addresses(function) {
             if references.global_is_thread_local(global)? {
-                continue;
+                // A TLS object's address is stable for the active thread. Its
+                // target accessor can be much more expensive than a pointer
+                // reload, so cache every loop-invariant TLS address.
+                cached_globals.push(global);
+            } else {
+                non_tls_globals.push(global);
             }
-            globals.push(global);
         }
         // A cached pointer load replaces a PIC materialization but adds fixed
         // frame setup and a dependent memory load. Keep the trade focused on
@@ -686,14 +692,20 @@ pub(super) fn lower_function(
         // amortize the setup without adding pressure to control-heavy code.
         const MIN_GLOBALS: usize = 3;
         const MAX_BLOCKS: usize = 32;
-        if globals.len() >= MIN_GLOBALS && function.blocks.len() <= MAX_BLOCKS {
-            for global in globals {
+        if non_tls_globals.len() >= MIN_GLOBALS {
+            cached_globals.extend(non_tls_globals);
+        }
+        if !cached_globals.is_empty() && function.blocks.len() <= MAX_BLOCKS {
+            for global in cached_globals {
                 let slot = builder.create_sized_stack_slot(StackSlotData::new(
                     StackSlotKind::ExplicitSlot,
                     8,
                     3,
                 ));
                 loop_global_address_slots.insert(global, slot);
+                if references.global_is_thread_local(global)? {
+                    lazy_loop_global_addresses.insert(global);
+                }
             }
         }
     }
@@ -711,6 +723,7 @@ pub(super) fn lower_function(
         runtime_storage,
         values: vec![None; function.value_types.len()],
         loop_global_address_slots,
+        lazy_loop_global_addresses,
         sret: None,
         variadic_state: None,
         variadic_frame: None,
@@ -854,6 +867,7 @@ struct FunctionState<'a, 'references, 'object> {
     runtime_storage: HashMap<u32, StackSlot>,
     values: Vec<Option<ir::Value>>,
     loop_global_address_slots: BTreeMap<u32, StackSlot>,
+    lazy_loop_global_addresses: BTreeSet<u32>,
     sret: Option<ir::Value>,
     variadic_state: Option<ir::Value>,
     variadic_frame: Option<ir::Value>,
@@ -1176,17 +1190,25 @@ impl FunctionState<'_, '_, '_> {
         }
     }
 
-    /// Keeps non-TLS addresses used by a cyclic block in fixed stack slots.
+    /// Keeps loop-invariant global addresses in fixed stack slots.
     ///
-    /// Cranelift may deliberately rematerialize a `symbol_value` at every
-    /// use. A stack-backed cache makes the loop-invariant value explicit,
-    /// avoiding repeated GOT materialization in the loop body.
+    /// Cranelift may deliberately rematerialize a `symbol_value`, and TLS
+    /// accesses use a generated target accessor, at every use. A stack-backed
+    /// cache makes the loop-invariant value explicit, avoiding repeated
+    /// materialization or accessor calls in the loop body. TLS slots are
+    /// resolved lazily so a zero-trip loop does not acquire an address.
     fn initialize_loop_global_address_slots(
         &self,
         builder: &mut FunctionBuilder<'_>,
     ) -> Result<(), CodegenError> {
+        let zero = (!self.lazy_loop_global_addresses.is_empty())
+            .then(|| builder.ins().iconst(ir::types::I64, 0));
         for (global, slot) in &self.loop_global_address_slots {
-            let value = self.materialize_global_address(builder, *global)?;
+            let value = if self.lazy_loop_global_addresses.contains(global) {
+                zero.expect("lazy TLS address cache has a null pointer constant")
+            } else {
+                self.materialize_global_address(builder, *global)?
+            };
             let destination = builder.ins().stack_addr(ir::types::I64, *slot, 0);
             builder
                 .ins()
@@ -2255,15 +2277,40 @@ impl FunctionState<'_, '_, '_> {
         raw: u32,
     ) -> Result<ir::Value, CodegenError> {
         if let Some(slot) = self.loop_global_address_slots.get(&raw).copied() {
-            let source = builder.ins().stack_addr(ir::types::I64, slot, 0);
-            return Ok(builder.ins().load(
-                ir::types::I64,
-                backend::empty_memory_flags(),
-                source,
-                0,
-            ));
+            return self.cached_global_address(builder, raw, slot);
         }
         self.materialize_global_address(builder, raw)
+    }
+
+    fn cached_global_address(
+        &self,
+        builder: &mut FunctionBuilder<'_>,
+        raw: u32,
+        slot: StackSlot,
+    ) -> Result<ir::Value, CodegenError> {
+        let source = builder.ins().stack_addr(ir::types::I64, slot, 0);
+        if self.lazy_loop_global_addresses.contains(&raw) {
+            let cached =
+                builder
+                    .ins()
+                    .load(ir::types::I64, backend::empty_memory_flags(), source, 0);
+            let initialized = builder.ins().icmp_imm_s(IntCC::NotEqual, cached, 0);
+            let initialize = builder.create_block();
+            let ready = builder.create_block();
+            builder.ins().brif(initialized, ready, &[], initialize, &[]);
+
+            builder.switch_to_block(initialize);
+            let value = self.materialize_global_address(builder, raw)?;
+            builder
+                .ins()
+                .store(backend::empty_memory_flags(), value, source, 0);
+            builder.ins().jump(ready, &[]);
+
+            builder.switch_to_block(ready);
+        }
+        Ok(builder
+            .ins()
+            .load(ir::types::I64, backend::empty_memory_flags(), source, 0))
     }
 
     fn materialize_global_address(
@@ -4664,14 +4711,31 @@ fn copy_memory(
     validate_access(source_access)?;
     let size = usize::try_from(size)
         .map_err(|_| error("aggregate copy is too large for function lowering"))?;
-    let mut bytes = Vec::with_capacity(size);
-    for offset in 0..size {
-        let address = address_offset(builder, source, offset as u64)?;
-        bytes.push(lower_load(builder, address, ir::types::I8, source_access)?);
+    let plain = destination_access == gir::MemoryAccess::default()
+        && source_access == gir::MemoryAccess::default();
+    let mut chunks = Vec::with_capacity(size);
+    let mut offset = 0;
+    while offset < size {
+        let (width, ty) = if plain && size - offset >= 8 {
+            (8, ir::types::I64)
+        } else if plain && size - offset >= 4 {
+            (4, ir::types::I32)
+        } else if plain && size - offset >= 2 {
+            (2, ir::types::I16)
+        } else {
+            (1, ir::types::I8)
+        };
+        chunks.push((offset, ty));
+        offset += width;
     }
-    for (offset, byte) in bytes.into_iter().enumerate() {
+    let mut values = Vec::with_capacity(chunks.len());
+    for (offset, ty) in &chunks {
+        let address = address_offset(builder, source, *offset as u64)?;
+        values.push(lower_load(builder, address, *ty, source_access)?);
+    }
+    for ((offset, _), value) in chunks.into_iter().zip(values) {
         let address = address_offset(builder, destination, offset as u64)?;
-        lower_store(builder, address, byte, destination_access)?;
+        lower_store(builder, address, value, destination_access)?;
     }
     Ok(())
 }

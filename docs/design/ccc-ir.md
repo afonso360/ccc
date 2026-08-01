@@ -33,10 +33,12 @@ separate immutable [module ABI plan](abi-and-varargs.md#module-abi-plan).
   its source once; `AggregateCopy` has C assignment semantics and remains
   correct when source and destination are identical or overlap through
   aliasing. `AggregateProject` derives a verifier-bounded field/index address
-  into owned storage, including array decay from an aggregate rvalue. Lowering
-  may use loads/stores, a temporary, `memmove`, or a proven-nonoverlapping
-  `memcpy`; it cannot blindly call `memcpy`. Volatile aggregate accesses are
-  expanded into ordered volatile accesses of the required width.
+  into owned storage, including array decay from an aggregate rvalue. Ordinary
+  fixed-size copies may combine bytes into unaligned native-width loads/stores,
+  but snapshot every source chunk before any destination store. Lowering may
+  also use a temporary, `memmove`, or a proven-nonoverlapping `memcpy`; it
+  cannot blindly call `memcpy`. Volatile aggregate accesses are expanded into
+  ordered volatile accesses of the required width.
 - **Variadic operations.** `VaStart`, `VaArg`, `VaCopy`, and `VaEnd` are
   ABI-neutral effectful instructions. `VaArg` records the requested canonical
   type; its immutable target fetch plan and control-flow expansion belong to

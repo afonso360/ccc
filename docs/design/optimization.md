@@ -31,14 +31,17 @@ The predefined macro contract follows the same resolved profile.
 define fast-math, strict-aliasing, or inlining macros because those behaviors
 are not part of this contract.
 
-At `-O2` and `-O3`, backend lowering caches non-TLS global addresses in an
-entry-initialized stack slot only for compact multi-stream loops: the function
-must have at most 32 CFG blocks and its cyclic components must reference at
-least three distinct global objects. Cranelift otherwise may rematerialize a
-PIC address in every loop iteration, but caching a single stream adds
-unprofitable pointer-load pressure. This speed-oriented choice is disabled for
-`-O0`, `-O1`, `-Os`, and `-Oz`; TLS is excluded because its address can require
-a dynamic target accessor.
+At `-O2` and `-O3`, backend lowering caches loop-invariant global addresses in
+a fixed stack slot only in functions with at most 32 CFG blocks.
+For non-TLS objects, cyclic components must reference at least three distinct
+global objects: Cranelift otherwise may rematerialize a PIC address in every
+loop iteration, but caching a single stream adds unprofitable pointer-load
+pressure. Each TLS object referenced in a cyclic component is also cached,
+because its address is stable for the active thread and avoiding repeated
+generated target-accessor calls amortizes the setup. This speed-oriented choice
+is disabled for `-O0`, `-O1`, `-Os`, and `-Oz`. TLS slots start null and
+resolve on their first executed access, so a zero-trip loop does not acquire a
+TLS address.
 
 ## CCC-IR ownership
 
