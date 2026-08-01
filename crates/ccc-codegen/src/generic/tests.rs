@@ -978,6 +978,11 @@ fn optimized_aggregate_parameters_use_their_local_storage_as_abi_backing() {
                   void consume_ray(struct Ray value) {}\n\
                   void ray_relay(struct Ray value) {\n\
                       consume_ray(value);\n\
+                  }\n\
+                  struct Triple { double x; double y; double z; };\n\
+                  struct Triple triple_return(void) {\n\
+                      struct Triple value = {1.0, 2.0, 3.0};\n\
+                      return value;\n\
                   }";
     for base in enabled_compilation_configs() {
         let baseline = base.clone().with_optimization_level(OptimizationLevel::O1);
@@ -1023,7 +1028,7 @@ fn optimized_aggregate_parameters_use_their_local_storage_as_abi_backing() {
         );
         assert_eq!(
             pair_relay_clif.matches("explicit_slot 16").count(),
-            4,
+            3,
             "{}:\n{pair_relay_clif}",
             optimized.target.triple
         );
@@ -1032,6 +1037,13 @@ fn optimized_aggregate_parameters_use_their_local_storage_as_abi_backing() {
             ray_relay_clif.matches("explicit_slot 48").count(),
             2,
             "{}:\n{ray_relay_clif}",
+            optimized.target.triple
+        );
+        let triple_return_clif = function_clif(&optimized_output.clif, "triple_return");
+        assert_eq!(
+            triple_return_clif.matches("explicit_slot 24").count(),
+            2,
+            "{}:\n{triple_return_clif}",
             optimized.target.triple
         );
     }

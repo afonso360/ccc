@@ -3756,24 +3756,40 @@ impl FunctionState<'_, '_, '_> {
                 builder.ins().return_(&[value]);
             }
             (ccc_abi::NativeResultPlan::RegisterAggregate { classified, .. }, Some(value)) => {
+                // Exact, full-width carriers can read the return snapshot
                 let padded = align_up_u64(classified.size, 8)?;
-                let stage = create_stack_backing(builder, padded, classified.align)?;
-                if padded != classified.size
-                    || !matches!(
-                        self.config.optimization,
-                        OptimizationLevel::O2 | OptimizationLevel::O3
-                    )
-                {
-                    zero_memory(builder, stage, padded)?;
-                }
-                copy_memory(
-                    builder,
-                    stage,
-                    self.value(value)?,
-                    classified.size,
-                    gir::MemoryAccess::default(),
-                    gir::MemoryAccess::default(),
-                )?;
+                // directly. Partial carriers retain a private, zero-padded
+                // stage so that each ABI byte has its required value.
+                let direct_return_source = matches!(
+                    self.config.optimization,
+                    OptimizationLevel::O2 | OptimizationLevel::O3
+                ) && padded == classified.size
+                    && native_result_carriers_fully_overwrite_storage(
+                        &plan.clif_results,
+                        classified.size,
+                    )?;
+                let stage = if direct_return_source {
+                    self.value(value)?
+                } else {
+                    let stage = create_stack_backing(builder, padded, classified.align)?;
+                    if padded != classified.size
+                        || !matches!(
+                            self.config.optimization,
+                            OptimizationLevel::O2 | OptimizationLevel::O3
+                        )
+                    {
+                        zero_memory(builder, stage, padded)?;
+                    }
+                    copy_memory(
+                        builder,
+                        stage,
+                        self.value(value)?,
+                        classified.size,
+                        gir::MemoryAccess::default(),
+                        gir::MemoryAccess::default(),
+                    )?;
+                    stage
+                };
                 let mut results = Vec::with_capacity(plan.clif_results.len());
                 for carrier in &plan.clif_results {
                     let source = address_offset(builder, stage, carrier.source_offset)?;
