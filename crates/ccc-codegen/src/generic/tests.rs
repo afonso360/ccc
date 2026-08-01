@@ -1170,6 +1170,51 @@ fn read_only_register_aggregate_parameters_use_their_input_carriers() {
 }
 
 #[test]
+fn aggregate_result_fields_forward_across_a_single_successor() {
+    let source = "struct Vector { double x; double y; double z; };\n\
+                  static struct Vector output;\n\
+                  struct Vector combine(struct Vector left, struct Vector right) {\n\
+                      struct Vector value;\n\
+                      value.x = left.x + right.x;\n\
+                      value.y = left.y + right.y;\n\
+                      value.z = left.z + right.z;\n\
+                      return value;\n\
+                  }\n\
+                  double copy_then_measure(struct Vector left, struct Vector right) {\n\
+                      output = combine(left, right);\n\
+                      goto consume;\n\
+                  consume:\n\
+                      return output.x * output.x + output.y * output.y + output.z * output.z;\n\
+                  }";
+    let baseline = EffectiveCompilationConfig::aarch64_unknown_linux_gnu()
+        .with_optimization_level(OptimizationLevel::O1);
+    let baseline_output = emit_source_with_config(source, &baseline);
+    let baseline_consumer = function_clif(&baseline_output.clif, "copy_then_measure");
+    assert!(
+        baseline_consumer.matches("load.f64").count() >= 2,
+        "{}:\\n{baseline_consumer}",
+        baseline.target.triple
+    );
+
+    let optimized = baseline.with_optimization_level(OptimizationLevel::O2);
+    let optimized_output = emit_source_with_config(source, &optimized);
+    let optimized_consumer = function_clif(&optimized_output.clif, "copy_then_measure");
+    let (_, optimized_successor) = optimized_consumer
+        .split_once("block0:")
+        .expect("straight-line successor block");
+    assert!(
+        !optimized_successor.contains("load.f64"),
+        "{}:\\n{optimized_consumer}",
+        optimized.target.triple
+    );
+    assert!(
+        optimized_consumer.matches("store ").count() >= 3,
+        "{}:\\n{optimized_consumer}",
+        optimized.target.triple
+    );
+}
+
+#[test]
 fn file_scope_compound_literals_emit_local_data_and_object_relocations() {
     let output = emit_source(
         "struct Pair { int left; int right; };
