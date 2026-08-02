@@ -112,6 +112,159 @@ fn standard_sqrt_declarations_use_intrinsics_only_for_proven_arguments_at_o2() {
 }
 
 #[test]
+fn standard_floating_libcalls_use_native_instructions_only_at_o2_or_o3() {
+    let source = "double fabs(double); float fabsf(float);
+                  double copysign(double, double); float copysignf(float, float);
+                  double ceil(double); float ceilf(float);
+                  double floor(double); float floorf(float);
+                  double trunc(double); float truncf(float);
+                  double abs64(double value) { return fabs(value); }
+                  float abs32(float value) { return fabsf(value); }
+                  double sign64(double value, double sign) { return copysign(value, sign); }
+                  float sign32(float value, float sign) { return copysignf(value, sign); }
+                  double ceil64(double value) { return ceil(value); }
+                  float ceil32(float value) { return ceilf(value); }
+                  double floor64(double value) { return floor(value); }
+                  float floor32(float value) { return floorf(value); }
+                  double trunc64(double value) { return trunc(value); }
+                  float trunc32(float value) { return truncf(value); }";
+    let functions = [
+        ("abs64", "fabs", true),
+        ("abs32", "fabs", true),
+        ("sign64", "fcopysign", true),
+        ("sign32", "fcopysign", true),
+        ("ceil64", "ceil", false),
+        ("ceil32", "ceil", false),
+        ("floor64", "floor", false),
+        ("floor32", "floor", false),
+        ("trunc64", "trunc", false),
+        ("trunc32", "trunc", false),
+    ];
+    for target in enabled_compilation_configs() {
+        let target_supports_sign = matches!(
+            target.target.triple.architecture,
+            Architecture::X86_64 | Architecture::Aarch64(_) | Architecture::Riscv64(_)
+        );
+        let target_supports_rounding =
+            matches!(target.target.triple.architecture, Architecture::Aarch64(_));
+        for level in [
+            OptimizationLevel::O0,
+            OptimizationLevel::O1,
+            OptimizationLevel::O2,
+            OptimizationLevel::O3,
+            OptimizationLevel::Size,
+            OptimizationLevel::SizeMin,
+        ] {
+            let config = target.clone().with_optimization_level(level);
+            let output = emit_source_with_config(source, &config);
+            for (function, opcode, sign_operation) in functions {
+                let expected_native =
+                    (if sign_operation {
+                        target_supports_sign
+                    } else {
+                        target_supports_rounding
+                    }) && matches!(level, OptimizationLevel::O2 | OptimizationLevel::O3);
+                let clif = function_clif(&output.clif, function);
+                assert_eq!(
+                    clif.contains(&format!("= {opcode}")),
+                    expected_native,
+                    "{} {level:?}:\n{clif}",
+                    config.target.triple
+                );
+                assert_eq!(
+                    clif.matches("call fn").count(),
+                    usize::from(!expected_native),
+                    "{}",
+                    clif
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn standard_floating_libcalls_require_exact_declarations_and_default_effects() {
+    let config =
+        EffectiveCompilationConfig::default().with_optimization_level(OptimizationLevel::O2);
+    let native_available = matches!(
+        config.target.triple.architecture,
+        Architecture::X86_64 | Architecture::Aarch64(_) | Architecture::Riscv64(_)
+    );
+    let output = emit_source_with_config(
+        "double fabs(double);\n double exact(double value) { return fabs(value); }",
+        &config,
+    );
+    let exact = function_clif(&output.clif, "exact");
+    assert_eq!(exact.contains("= fabs"), native_available, "{exact}");
+    for source in [
+        "double fabs(float);\n double call(double value) { return fabs((float)value); }",
+        "double fabs(double, ...);\n double call(double value) { return fabs(value, 0); }",
+        "double fabs(double value) { return value; }\n double call(double value) { return fabs(value); }",
+        "double fabs(double) __attribute__((visibility(\"hidden\")));\n double call(double value) { return fabs(value); }",
+    ] {
+        let output = emit_source_with_config(source, &config);
+        let function = "call";
+        let clif = function_clif(&output.clif, function);
+        assert!(!clif.contains("= fabs"), "{clif}");
+        assert_eq!(clif.matches("call fn").count(), 1, "{clif}");
+    }
+
+    let mut effects_module = lower_source_with_config(
+        "double fabs(double);\n double effects(double value) { return fabs(value); }",
+        &config,
+    );
+    let call = effects_module
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "effects")
+        .unwrap()
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match &mut instruction.kind {
+            gir::FullInstructionKind::DirectCall { effects, .. } => Some(effects),
+            _ => None,
+        })
+        .unwrap();
+    call.reads_memory = false;
+    let output = emit(
+        &effects_module,
+        &config,
+        Options {
+            emit_clif: true,
+            debug_info: None,
+        },
+    )
+    .unwrap();
+    let clif = function_clif(&output.clif, "effects");
+    assert!(!clif.contains("= fabs"), "{clif}");
+    assert_eq!(clif.matches("call fn").count(), 1, "{clif}");
+
+    let mut exact_symbol_module = lower_source_with_config(
+        "double fabs(double);\n double exact_symbol(double value) { return fabs(value); }",
+        &config,
+    );
+    exact_symbol_module
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "fabs")
+        .unwrap()
+        .symbol_name_is_exact = true;
+    let output = emit(
+        &exact_symbol_module,
+        &config,
+        Options {
+            emit_clif: true,
+            debug_info: None,
+        },
+    )
+    .unwrap();
+    let clif = function_clif(&output.clif, "exact_symbol");
+    assert!(!clif.contains("= fabs"), "{clif}");
+    assert_eq!(clif.matches("call fn").count(), 1, "{clif}");
+}
+
+#[test]
 fn sqrt_intrinsic_metadata_gates_and_entry_backedges_are_conservative() {
     let config =
         EffectiveCompilationConfig::default().with_optimization_level(OptimizationLevel::O2);

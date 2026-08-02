@@ -1774,23 +1774,133 @@ fn direct_aggregate_result_successor_field_loads(
     result
 }
 
-fn standard_sqrt_call_type(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StandardLibcallOperation {
+    Fabs,
+    Copysign,
+    Ceil,
+    Floor,
+    Trunc,
+    Sqrt,
+}
+
+#[derive(Clone, Copy)]
+struct StandardLibcallSpec {
+    source_name: &'static str,
+    symbol_name: &'static str,
+    arity: usize,
+    scalar_type: TypeId,
+    carrier_type: ir::Type,
+    operation: StandardLibcallOperation,
+}
+
+const STANDARD_LIBCALLS: &[StandardLibcallSpec] = &[
+    StandardLibcallSpec {
+        source_name: "fabs",
+        symbol_name: "fabs",
+        arity: 1,
+        scalar_type: TypeId::DOUBLE,
+        carrier_type: ir::types::F64,
+        operation: StandardLibcallOperation::Fabs,
+    },
+    StandardLibcallSpec {
+        source_name: "fabsf",
+        symbol_name: "fabsf",
+        arity: 1,
+        scalar_type: TypeId::FLOAT,
+        carrier_type: ir::types::F32,
+        operation: StandardLibcallOperation::Fabs,
+    },
+    StandardLibcallSpec {
+        source_name: "copysign",
+        symbol_name: "copysign",
+        arity: 2,
+        scalar_type: TypeId::DOUBLE,
+        carrier_type: ir::types::F64,
+        operation: StandardLibcallOperation::Copysign,
+    },
+    StandardLibcallSpec {
+        source_name: "copysignf",
+        symbol_name: "copysignf",
+        arity: 2,
+        scalar_type: TypeId::FLOAT,
+        carrier_type: ir::types::F32,
+        operation: StandardLibcallOperation::Copysign,
+    },
+    StandardLibcallSpec {
+        source_name: "ceil",
+        symbol_name: "ceil",
+        arity: 1,
+        scalar_type: TypeId::DOUBLE,
+        carrier_type: ir::types::F64,
+        operation: StandardLibcallOperation::Ceil,
+    },
+    StandardLibcallSpec {
+        source_name: "ceilf",
+        symbol_name: "ceilf",
+        arity: 1,
+        scalar_type: TypeId::FLOAT,
+        carrier_type: ir::types::F32,
+        operation: StandardLibcallOperation::Ceil,
+    },
+    StandardLibcallSpec {
+        source_name: "floor",
+        symbol_name: "floor",
+        arity: 1,
+        scalar_type: TypeId::DOUBLE,
+        carrier_type: ir::types::F64,
+        operation: StandardLibcallOperation::Floor,
+    },
+    StandardLibcallSpec {
+        source_name: "floorf",
+        symbol_name: "floorf",
+        arity: 1,
+        scalar_type: TypeId::FLOAT,
+        carrier_type: ir::types::F32,
+        operation: StandardLibcallOperation::Floor,
+    },
+    StandardLibcallSpec {
+        source_name: "trunc",
+        symbol_name: "trunc",
+        arity: 1,
+        scalar_type: TypeId::DOUBLE,
+        carrier_type: ir::types::F64,
+        operation: StandardLibcallOperation::Trunc,
+    },
+    StandardLibcallSpec {
+        source_name: "truncf",
+        symbol_name: "truncf",
+        arity: 1,
+        scalar_type: TypeId::FLOAT,
+        carrier_type: ir::types::F32,
+        operation: StandardLibcallOperation::Trunc,
+    },
+    StandardLibcallSpec {
+        source_name: "sqrt",
+        symbol_name: "sqrt",
+        arity: 1,
+        scalar_type: TypeId::DOUBLE,
+        carrier_type: ir::types::F64,
+        operation: StandardLibcallOperation::Sqrt,
+    },
+    StandardLibcallSpec {
+        source_name: "sqrtf",
+        symbol_name: "sqrtf",
+        arity: 1,
+        scalar_type: TypeId::FLOAT,
+        carrier_type: ir::types::F32,
+        operation: StandardLibcallOperation::Sqrt,
+    },
+];
+
+fn recognized_standard_libcall(
     module: &gir::FullModule,
-    config: &EffectiveCompilationConfig,
     function: u32,
     signature: TypeId,
     arguments: &[gir::ValueId],
     effects: gir::CallEffects,
-) -> Option<ir::Type> {
-    if !matches!(
-        config.target.triple.architecture,
-        ccc_target::Architecture::X86_64 | ccc_target::Architecture::Aarch64(_)
-    ) || !matches!(
-        config.optimization,
-        OptimizationLevel::O2 | OptimizationLevel::O3
-    ) || arguments.len() != 1
-        || effects != gir::CallEffects::default()
-    {
+) -> Option<StandardLibcallSpec> {
+    if effects != gir::CallEffects::default() {
         return None;
     }
     let declaration = module
@@ -1807,21 +1917,74 @@ fn standard_sqrt_call_type(
     {
         return None;
     }
-    let (source_name, source_type, clif_type) = match declaration.name.as_str() {
-        "sqrt" => ("sqrt", TypeId::DOUBLE, ir::types::F64),
-        "sqrtf" => ("sqrtf", TypeId::FLOAT, ir::types::F32),
-        _ => return None,
-    };
-    if declaration.symbol_name != source_name {
+    let spec = STANDARD_LIBCALLS
+        .iter()
+        .copied()
+        .find(|spec| declaration.name == spec.source_name && arguments.len() == spec.arity)?;
+    if declaration.symbol_name != spec.symbol_name {
         return None;
     }
     let signature = module.types.function_signature(signature)?;
     let ccc_types::FunctionParameters::Prototype(parameters) = signature.parameters else {
         return None;
     };
-    let expected = QualifiedType::unqualified(source_type);
-    (!signature.variadic && signature.result == expected && parameters.as_slice() == [expected])
-        .then_some(clif_type)
+    let expected = QualifiedType::unqualified(spec.scalar_type);
+    (!signature.variadic
+        && signature.result == expected
+        && parameters
+            .iter()
+            .copied()
+            .eq(std::iter::repeat_n(expected, spec.arity)))
+    .then_some(spec)
+}
+
+fn standard_libcall_is_native_eligible(
+    operation: StandardLibcallOperation,
+    config: &EffectiveCompilationConfig,
+) -> bool {
+    if !matches!(
+        config.optimization,
+        OptimizationLevel::O2 | OptimizationLevel::O3
+    ) {
+        return false;
+    }
+    match operation {
+        StandardLibcallOperation::Fabs | StandardLibcallOperation::Copysign => matches!(
+            config.target.triple.architecture,
+            ccc_target::Architecture::X86_64
+                | ccc_target::Architecture::Aarch64(_)
+                | ccc_target::Architecture::Riscv64(_)
+        ),
+        // x86 needs an SSE4.1 feature gate that CCC does not currently
+        // configure, and pinned Cranelift's RISC-V conversion sequence can
+        // raise Invalid for a quiet NaN. Keep these calls until their target
+        // contracts can be enabled and tested explicitly.
+        StandardLibcallOperation::Ceil
+        | StandardLibcallOperation::Floor
+        | StandardLibcallOperation::Trunc => matches!(
+            config.target.triple.architecture,
+            ccc_target::Architecture::Aarch64(_)
+        ),
+        // Preserve sqrt's existing proof and target gates.
+        StandardLibcallOperation::Sqrt => matches!(
+            config.target.triple.architecture,
+            ccc_target::Architecture::X86_64 | ccc_target::Architecture::Aarch64(_)
+        ),
+    }
+}
+
+fn standard_sqrt_call_type(
+    module: &gir::FullModule,
+    config: &EffectiveCompilationConfig,
+    function: u32,
+    signature: TypeId,
+    arguments: &[gir::ValueId],
+    effects: gir::CallEffects,
+) -> Option<ir::Type> {
+    let spec = recognized_standard_libcall(module, function, signature, arguments, effects)?;
+    (spec.operation == StandardLibcallOperation::Sqrt
+        && standard_libcall_is_native_eligible(spec.operation, config))
+    .then_some(spec.carrier_type)
 }
 
 fn value_is_nonnegative_or_nan(
@@ -4841,23 +5004,47 @@ impl FunctionState<'_, '_, '_> {
         Ok(())
     }
 
-    /// Recognizes undeclared-body standard square-root calls whose exact C
-    /// signatures permit a proof-gated hardware instruction.
-    fn standard_sqrt_type(
+    /// Recognizes exact undeclared-body standard libcalls eligible for native
+    /// instructions. Operation-specific safety gates remain outside the table.
+    fn standard_native_libcall(
         &self,
         function: u32,
         signature: TypeId,
         arguments: &[gir::ValueId],
         effects: gir::CallEffects,
-    ) -> Option<ir::Type> {
-        standard_sqrt_call_type(
-            self.module,
-            self.config,
-            function,
-            signature,
-            arguments,
-            effects,
-        )
+    ) -> Option<StandardLibcallSpec> {
+        let spec =
+            recognized_standard_libcall(self.module, function, signature, arguments, effects)?;
+        standard_libcall_is_native_eligible(spec.operation, self.config).then_some(spec)
+    }
+
+    fn native_standard_libcall(
+        &self,
+        builder: &mut FunctionBuilder<'_>,
+        spec: StandardLibcallSpec,
+        arguments: &[gir::ValueId],
+    ) -> Result<ir::Value, CodegenError> {
+        let arguments = arguments
+            .iter()
+            .map(|argument| self.value(*argument))
+            .collect::<Result<Vec<_>, _>>()?;
+        if arguments.len() != spec.arity
+            || arguments
+                .iter()
+                .any(|argument| builder.func.dfg.value_type(*argument) != spec.carrier_type)
+        {
+            return Err(error("native standard libcall has the wrong carrier type"));
+        }
+        Ok(match spec.operation {
+            StandardLibcallOperation::Fabs => builder.ins().fabs(arguments[0]),
+            StandardLibcallOperation::Copysign => {
+                builder.ins().fcopysign(arguments[0], arguments[1])
+            }
+            StandardLibcallOperation::Ceil => builder.ins().ceil(arguments[0]),
+            StandardLibcallOperation::Floor => builder.ins().floor(arguments[0]),
+            StandardLibcallOperation::Trunc => builder.ins().trunc(arguments[0]),
+            StandardLibcallOperation::Sqrt => builder.ins().sqrt(arguments[0]),
+        })
     }
 
     fn native_direct_call(
@@ -4888,17 +5075,26 @@ impl FunctionState<'_, '_, '_> {
         let boundary = self.call_boundary(instruction, signature, arguments, variadic_boundary)?;
         match boundary {
             ccc_abi::BoundaryPlan::Native(plan) => {
-                if let Some(ty) = self.standard_sqrt_type(function, signature, arguments, effects)
-                    && self.proven_nonnegative_sqrt_calls.contains(&instruction)
+                if let Some(spec) =
+                    self.standard_native_libcall(function, signature, arguments, effects)
                 {
-                    let argument = self.value(arguments[0])?;
-                    if builder.func.dfg.value_type(argument) != ty {
-                        return Err(error("proven standard sqrt has the wrong carrier type"));
+                    match spec.operation {
+                        StandardLibcallOperation::Sqrt
+                            if self.proven_nonnegative_sqrt_calls.contains(&instruction) =>
+                        {
+                            return self
+                                .native_standard_libcall(builder, spec, arguments)
+                                .map(Some);
+                        }
+                        StandardLibcallOperation::Sqrt => {}
+                        _ => {
+                            return self
+                                .native_standard_libcall(builder, spec, arguments)
+                                .map(Some);
+                        }
                     }
-                    Ok(Some(builder.ins().sqrt(argument)))
-                } else {
-                    self.native_direct_call(builder, instruction, function, arguments, plan)
                 }
+                self.native_direct_call(builder, instruction, function, arguments, plan)
             }
             ccc_abi::BoundaryPlan::Bridge(plan) => {
                 let reference = self.references.function_address(builder, function)?;

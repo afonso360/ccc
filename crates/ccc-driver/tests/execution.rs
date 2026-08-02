@@ -121,6 +121,38 @@ fn optimized_sqrt_matches_libm_fenv_and_errno() {
 #[cfg(any(
     all(target_arch = "x86_64", target_os = "linux"),
     all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "macos"),
+    all(target_arch = "riscv64", target_os = "linux")
+))]
+#[test]
+fn optimized_native_libcalls_match_libm_fenv_and_errno() {
+    let directory =
+        support::TestWorkspace::new("execution", "native-libcalls-fenv").retain_on_failure();
+    let executable = directory.join("native-libcalls-fenv");
+    let compilation = support::ccc_command()
+        .arg("-O2")
+        .arg(fixture("native_libcalls_fenv.c"))
+        .arg("-lm")
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .unwrap();
+    directory.assert_command_success(
+        "compile the optimized native libcall fenv fixture with CCC",
+        &compilation,
+    );
+    let execution = Command::new(&executable).output().unwrap();
+    assert_eq!(
+        execution.status.code(),
+        Some(0),
+        "native libcall fenv fixture failed: {}",
+        String::from_utf8_lossy(&execution.stderr)
+    );
+}
+
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "linux"),
     all(target_arch = "riscv64", target_os = "linux"),
     all(target_arch = "aarch64", target_os = "macos")
 ))]
