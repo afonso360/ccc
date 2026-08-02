@@ -26,7 +26,7 @@ import tomllib
 from typing import Iterable
 
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 MANIFEST_SCHEMA_VERSION = 1
 WORKLOAD_KINDS = ("compression", "lua")
 RUN_FIELDS = (
@@ -57,7 +57,6 @@ SUMMARY_FIELDS = (
     "median_system_seconds",
     "median_peak_rss_bytes",
     "throughput_mib_per_second",
-    "validation_sha256",
 )
 ARTIFACT_FIELDS = (
     "benchmark",
@@ -69,7 +68,7 @@ ARTIFACT_FIELDS = (
 
 
 class BenchmarkError(Exception):
-    """An actionable benchmark setup, validation, or measurement failure."""
+    """An actionable benchmark setup or measurement failure."""
 
 
 @dataclass(frozen=True)
@@ -236,67 +235,80 @@ def parse_programs(
     return programs
 
 
+def parse_case_paths(
+    values: list[str],
+    *,
+    label: str,
+    allowed: set[str],
+) -> dict[str, Path]:
+    paths: dict[str, Path] = {}
+    for value in values:
+        name, separator, raw_path = value.partition("=")
+        if not separator or not name or not raw_path:
+            raise BenchmarkError(f"{label} entries must have the form CASE=PATH")
+        if name not in allowed:
+            raise BenchmarkError(f"{label} names an unselected or unknown case {name!r}")
+        if name in paths:
+            raise BenchmarkError(f"{label} names {name!r} more than once")
+        paths[name] = Path(raw_path)
+    return paths
+
+
 def parse_arguments(case_names: tuple[str, ...]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Measure deterministic large workloads with already-built "
-            "real-program executables. It never builds or tests those programs."
+            "Measure deterministic timing workloads with already-built real-program "
+            "executables. This runner never validates program correctness."
         )
     )
+    parser.add_argument("--output", type=Path, required=True, help="new or empty result directory")
     parser.add_argument(
-        "--output",
-        type=Path,
-        required=True,
-        help="new or empty result directory",
+        "--cases", default=",".join(case_names), help="comma-separated cases (default: all)"
     )
     parser.add_argument(
-        "--cases",
-        default=",".join(case_names),
-        help="comma-separated cases (default: all)",
+        "--operations",
+        default="compression,decompression,interpreter",
+        help="comma-separated timing operations (default: all applicable)",
     )
     parser.add_argument(
         "--program",
         action="append",
         default=[],
         metavar="CASE=PATH",
-        help=(
-            "CCC-built executable for a selected case; repeat for every case "
-            "(use --program=CASE=PATH for paths beginning with '-')"
-        ),
+        help="CCC-built executable for a selected case; repeat for every selected case",
+    )
+    parser.add_argument(
+        "--decompression-input",
+        action="append",
+        default=[],
+        metavar="CASE=PATH",
+        help="required pre-existing compressed fixture for each selected compression case when decompression is timed",
     )
     parser.add_argument(
         "--input-mebibytes",
         type=positive,
         default=32,
-        help="deterministic compression-input size in MiB (default: 32)",
+        help="declared deterministic compression-input size in MiB (default: 32)",
     )
-    parser.add_argument(
-        "--warmups",
-        type=nonnegative,
-        default=1,
-        help="untimed workload warmups (default: 1)",
-    )
-    parser.add_argument(
-        "--samples",
-        type=positive,
-        default=5,
-        help="measured workload samples (default: 5)",
-    )
+    parser.add_argument("--warmups", type=nonnegative, default=1, help="untimed workload warmups (default: 1)")
+    parser.add_argument("--samples", type=positive, default=5, help="measured workload samples (default: 5)")
     arguments = parser.parse_args()
     try:
-        arguments.cases = comma_separated(
-            arguments.cases,
-            label="--cases",
-            allowed=case_names,
+        arguments.cases = comma_separated(arguments.cases, label="--cases", allowed=case_names)
+        arguments.operations = comma_separated(
+            arguments.operations,
+            label="--operations",
+            allowed=("compression", "decompression", "interpreter"),
         )
-        arguments.programs = parse_programs(
-            arguments.program,
-            selected=set(arguments.cases),
+        arguments.programs = parse_programs(arguments.program, selected=set(arguments.cases))
+        arguments.decompression_inputs = parse_case_paths(
+            arguments.decompression_input,
+            label="--decompression-input",
+            allowed=set(arguments.cases),
         )
     except BenchmarkError as error:
         parser.error(str(error))
     return arguments
-
 
 def resolve_executable(path: Path, *, label: str) -> Path:
     try:
@@ -442,13 +454,13 @@ def write_large_input(path: Path, mebibytes: int) -> tuple[int, str]:
 
 
 def write_lua_workload(path: Path) -> tuple[int, str]:
-    source = """-- Generated by benchmarks/real-world/run.py; deterministic by design.
+    source = """-- Generated by benchmarks/real-world/run.py; deterministic timing workload.
 local modulus = 4294967296
 local slot_count = 2048
 local rounds = 512
 local inner_count = 4096
 local state = 0x51f15e5d
-local checksum = 0x243f6a88
+local accumulator = 0x243f6a88
 local slots = {}
 
 for index = 1, slot_count do
@@ -461,20 +473,18 @@ for round_number = 1, rounds do
     local slot = (state % slot_count) + 1
     local value = (slots[slot] + (state % 65536) + index + round_number) % modulus
     slots[slot] = value
-    checksum = (checksum + value) % modulus
+    accumulator = (accumulator + value) % modulus
   end
 
   for index = 1, slot_count do
     local value = slots[index]
-    checksum = (checksum ~ (value + index * 0x9e3779b9)) % modulus
-    checksum = ((checksum << 7) | (checksum >> 25)) % modulus
+    accumulator = (accumulator ~ (value + index * 0x9e3779b9)) % modulus
+    accumulator = ((accumulator << 7) | (accumulator >> 25)) % modulus
     slots[index] = (value * 33 + round_number + index) % modulus
   end
 end
 
-if (checksum ~ state) ~= 0x9bbfd5c9 then
-  error("Lua workload checksum mismatch")
-end
+state = accumulator ~ state
 """
     path.write_text(source, encoding="utf-8")
     return 512 * (4096 + 2048), sha256(path)
@@ -492,83 +502,6 @@ def ensure_success(
             f"{case.name} {operation} failed with status {timing['exit_status']}; "
             f"see {stderr}"
         )
-
-
-def validate_compression(
-    case: Case,
-    executable: Path,
-    input_path: Path,
-    input_digest: str,
-    directory: Path,
-    environment: dict[str, str],
-    commands: object,
-) -> tuple[Path, str]:
-    compressed = directory / "validation.compressed"
-    decompressed = directory / "validation.decompressed"
-    compress_command = [
-        os.fspath(executable),
-        *case.compression_arguments,
-        os.fspath(input_path),
-    ]
-    compress_stderr = directory / "validation-compress.stderr.txt"
-    record_command(
-        commands,
-        case=case,
-        kind="validate-compression",
-        command=compress_command,
-    )
-    timing = measured_run(
-        compress_command,
-        stdout=compressed,
-        stderr=compress_stderr,
-        environment=environment,
-    )
-    write_json(directory / "validation-compress.json", timing)
-    ensure_success(
-        timing,
-        case=case,
-        operation="validation compression",
-        stderr=compress_stderr,
-    )
-    if compressed.stat().st_size == 0:
-        raise BenchmarkError(f"{case.name} validation did not produce compressed output")
-
-    decompress_command = [
-        os.fspath(executable),
-        *case.decompression_arguments,
-        os.fspath(compressed),
-    ]
-    decompress_stderr = directory / "validation-decompress.stderr.txt"
-    record_command(
-        commands,
-        case=case,
-        kind="validate-decompression",
-        command=decompress_command,
-    )
-    timing = measured_run(
-        decompress_command,
-        stdout=decompressed,
-        stderr=decompress_stderr,
-        environment=environment,
-    )
-    write_json(directory / "validation-decompress.json", timing)
-    ensure_success(
-        timing,
-        case=case,
-        operation="validation decompression",
-        stderr=decompress_stderr,
-    )
-    if decompressed.stat().st_size != input_path.stat().st_size:
-        raise BenchmarkError(
-            f"{case.name} decompression produced {decompressed.stat().st_size} bytes; "
-            f"expected {input_path.stat().st_size}"
-        )
-    digest = sha256(decompressed)
-    if digest != input_digest:
-        raise BenchmarkError(
-            f"{case.name} validation checksum mismatch: {digest} != {input_digest}"
-        )
-    return compressed, sha256(compressed)
 
 
 def run_samples(
@@ -601,10 +534,7 @@ def run_samples(
                 stderr=stderr,
                 environment=environment,
             )
-            write_json(
-                directory / f"{operation}-{phase}-{iteration:03d}.json",
-                timing,
-            )
+            write_json(directory / f"{operation}-{phase}-{iteration:03d}.json", timing)
             ensure_success(
                 timing,
                 case=case,
@@ -625,154 +555,130 @@ def artifact(path: Path, *, benchmark: str, kind: str, output: Path) -> dict[str
     }
 
 
+def external_artifact(path: Path, *, benchmark: str, kind: str) -> dict[str, object]:
+    return {
+        "benchmark": benchmark,
+        "kind": kind,
+        "path": os.fspath(path),
+        "file_bytes": path.stat().st_size,
+        "sha256": sha256(path),
+    }
+
+
+def applicable_operations(case: Case, selected: list[str]) -> tuple[str, ...]:
+    allowed = ("compression", "decompression") if case.workload == "compression" else ("interpreter",)
+    return tuple(operation for operation in selected if operation in allowed)
+
+
+def resolve_fixture(path: Path, *, case: Case) -> Path:
+    try:
+        resolved = path.expanduser().resolve(strict=True)
+    except OSError as error:
+        raise BenchmarkError(f"{case.name} decompression fixture does not exist: {path}") from error
+    if not resolved.is_file():
+        raise BenchmarkError(f"{case.name} decompression fixture is not a regular file: {resolved}")
+    return resolved
+
+
 def run(arguments: argparse.Namespace, cases: list[Case]) -> Path:
     output = prepare_output(arguments.output)
     selected = [case for case in cases if case.name in arguments.cases]
     programs = {
-        case.name: resolve_executable(
-            arguments.programs[case.name], label=f"{case.name} program"
-        )
+        case.name: resolve_executable(arguments.programs[case.name], label=f"{case.name} program")
         for case in selected
     }
+    case_by_name = {case.name: case for case in selected}
+    for name in arguments.decompression_inputs:
+        if case_by_name[name].workload != "compression":
+            raise BenchmarkError(f"--decompression-input is only valid for compression case {name!r}")
+    compression_cases = [case for case in selected if case.workload == "compression"]
+    if "decompression" in arguments.operations:
+        missing = [case.name for case in compression_cases if case.name not in arguments.decompression_inputs]
+        if missing:
+            raise BenchmarkError(
+                "--decompression-input is required for every selected compression case when decompression is requested; missing "
+                + ", ".join(missing)
+            )
+    fixtures = {
+        case.name: resolve_fixture(arguments.decompression_inputs[case.name], case=case)
+        for case in compression_cases
+        if case.name in arguments.decompression_inputs
+    }
+    if not any(applicable_operations(case, arguments.operations) for case in selected):
+        raise BenchmarkError("--operations selects no operation applicable to the selected cases")
+
     environment = os.environ.copy()
     environment["LC_ALL"] = "C"
-
     inputs = output / "inputs"
     workloads = output / "workloads"
     inputs.mkdir()
     workloads.mkdir()
-    large_input = inputs / "mixed-input.bin"
-    input_bytes, input_digest = write_large_input(
-        large_input, arguments.input_mebibytes
+    declared_input_bytes = arguments.input_mebibytes * 1024 * 1024
+    needs_compression_input = any(
+        "compression" in applicable_operations(case, arguments.operations)
+        for case in compression_cases
     )
-    lua_workload = inputs / "interpreter-workload.lua"
-    lua_work_units, lua_digest = write_lua_workload(lua_workload)
+    large_input: Path | None = None
+    input_digest: str | None = None
+    if needs_compression_input:
+        large_input = inputs / "mixed-input.bin"
+        input_bytes, input_digest = write_large_input(large_input, arguments.input_mebibytes)
+        if input_bytes != declared_input_bytes:
+            raise BenchmarkError("generated compression input has an unexpected byte count")
+    lua_cases = [case for case in selected if case.workload == "lua"]
+    needs_interpreter = any(
+        "interpreter" in applicable_operations(case, arguments.operations) for case in lua_cases
+    )
+    lua_workload: Path | None = None
+    lua_work_units = 0
+    lua_digest: str | None = None
+    if needs_interpreter:
+        lua_workload = inputs / "interpreter-workload.lua"
+        lua_work_units, lua_digest = write_lua_workload(lua_workload)
 
-    artifacts = [
-        artifact(large_input, benchmark="shared", kind="compression-input", output=output),
-        artifact(lua_workload, benchmark="lua", kind="interpreter-workload", output=output),
-    ]
+    artifacts: list[dict[str, object]] = []
+    if large_input is not None:
+        artifacts.append(artifact(large_input, benchmark="shared", kind="compression-input", output=output))
+    if lua_workload is not None:
+        artifacts.append(artifact(lua_workload, benchmark="lua", kind="interpreter-workload", output=output))
     for case in selected:
-        artifacts.append(
-            {
-                "benchmark": case.name,
-                "kind": "program",
-                "path": os.fspath(programs[case.name]),
-                "file_bytes": programs[case.name].stat().st_size,
-                "sha256": sha256(programs[case.name]),
-            }
-        )
+        artifacts.append(external_artifact(programs[case.name], benchmark=case.name, kind="program"))
+    for case in compression_cases:
+        if case.name in fixtures:
+            artifacts.append(external_artifact(fixtures[case.name], benchmark=case.name, kind="decompression-fixture"))
 
     measurements: list[Measurement] = []
-    validation_hashes: dict[tuple[str, str], str] = {}
     with (
         (output / "commands.jsonl").open("w", encoding="utf-8") as commands,
-        (output / "run-times.tsv").open("w", encoding="utf-8", newline="")
-        as runs_file,
-        (output / "artifacts.tsv").open("w", encoding="utf-8", newline="")
-        as artifacts_file,
+        (output / "run-times.tsv").open("w", encoding="utf-8", newline="") as runs_file,
+        (output / "artifacts.tsv").open("w", encoding="utf-8", newline="") as artifacts_file,
     ):
-        run_writer = csv.DictWriter(
-            runs_file, fieldnames=RUN_FIELDS, delimiter="\t", lineterminator="\n"
-        )
-        artifact_writer = csv.DictWriter(
-            artifacts_file,
-            fieldnames=ARTIFACT_FIELDS,
-            delimiter="\t",
-            lineterminator="\n",
-        )
+        run_writer = csv.DictWriter(runs_file, fieldnames=RUN_FIELDS, delimiter="\t", lineterminator="\n")
+        artifact_writer = csv.DictWriter(artifacts_file, fieldnames=ARTIFACT_FIELDS, delimiter="\t", lineterminator="\n")
         run_writer.writeheader()
         artifact_writer.writeheader()
         for value in artifacts:
             artifact_writer.writerow(value)
 
         for case in selected:
-            executable = programs[case.name]
             directory = workloads / case.name
             directory.mkdir()
-            if case.workload == "compression":
-                compressed, compressed_digest = validate_compression(
-                    case,
-                    executable,
-                    large_input,
-                    input_digest,
-                    directory,
-                    environment,
-                    commands,
-                )
-                decompressed = directory / "validation.decompressed"
-                compression_artifact = artifact(
-                    compressed,
-                    benchmark=case.name,
-                    kind="validation-compressed",
-                    output=output,
-                )
-                decompression_artifact = artifact(
-                    decompressed,
-                    benchmark=case.name,
-                    kind="validation-decompressed",
-                    output=output,
-                )
-                artifact_writer.writerow(compression_artifact)
-                artifact_writer.writerow(decompression_artifact)
-                validation_hashes[(case.name, "compression")] = compressed_digest
-                validation_hashes[(case.name, "decompression")] = input_digest
+            executable = programs[case.name]
+            for operation in applicable_operations(case, arguments.operations):
+                if operation == "compression":
+                    if large_input is None:
+                        raise BenchmarkError("compression input was not generated")
+                    command = [os.fspath(executable), *case.compression_arguments, os.fspath(large_input)]
+                elif operation == "decompression":
+                    command = [os.fspath(executable), *case.decompression_arguments, os.fspath(fixtures[case.name])]
+                else:
+                    if lua_workload is None:
+                        raise BenchmarkError("interpreter workload was not generated")
+                    command = [os.fspath(executable), os.fspath(lua_workload)]
                 measurements.extend(
                     run_samples(
                         case,
-                        "compression",
-                        [
-                            os.fspath(executable),
-                            *case.compression_arguments,
-                            os.fspath(large_input),
-                        ],
-                        warmups=arguments.warmups,
-                        samples=arguments.samples,
-                        directory=directory,
-                        environment=environment,
-                        commands=commands,
-                    )
-                )
-                measurements.extend(
-                    run_samples(
-                        case,
-                        "decompression",
-                        [
-                            os.fspath(executable),
-                            *case.decompression_arguments,
-                            os.fspath(compressed),
-                        ],
-                        warmups=arguments.warmups,
-                        samples=arguments.samples,
-                        directory=directory,
-                        environment=environment,
-                        commands=commands,
-                    )
-                )
-            else:
-                command = [os.fspath(executable), os.fspath(lua_workload)]
-                validation_stderr = directory / "validation.stderr.txt"
-                record_command(
-                    commands, case=case, kind="validate-interpreter", command=command
-                )
-                timing = measured_run(
-                    command,
-                    stdout=Path(os.devnull),
-                    stderr=validation_stderr,
-                    environment=environment,
-                )
-                write_json(directory / "validation.json", timing)
-                ensure_success(
-                    timing,
-                    case=case,
-                    operation="interpreter validation",
-                    stderr=validation_stderr,
-                )
-                validation_hashes[(case.name, "interpreter")] = lua_digest
-                measurements.extend(
-                    run_samples(
-                        case,
-                        "interpreter",
+                        operation,
                         command,
                         warmups=arguments.warmups,
                         samples=arguments.samples,
@@ -795,20 +701,10 @@ def run(arguments: argparse.Namespace, cases: list[Case]) -> Path:
             )
 
     with (output / "summary.tsv").open("w", encoding="utf-8", newline="") as file:
-        writer = csv.DictWriter(
-            file,
-            fieldnames=SUMMARY_FIELDS,
-            delimiter="\t",
-            lineterminator="\n",
-        )
+        writer = csv.DictWriter(file, fieldnames=SUMMARY_FIELDS, delimiter="\t", lineterminator="\n")
         writer.writeheader()
         for case in selected:
-            operations = (
-                ("compression", "decompression")
-                if case.workload == "compression"
-                else ("interpreter",)
-            )
-            for operation in operations:
+            for operation in applicable_operations(case, arguments.operations):
                 samples = [
                     measurement
                     for measurement in measurements
@@ -817,19 +713,14 @@ def run(arguments: argparse.Namespace, cases: list[Case]) -> Path:
                     and measurement.phase == "sample"
                 ]
                 if len(samples) != arguments.samples:
-                    raise BenchmarkError(
-                        f"{case.name} {operation} retained {len(samples)} samples; "
-                        f"expected {arguments.samples}"
-                    )
+                    raise BenchmarkError(f"{case.name} {operation} retained {len(samples)} samples; expected {arguments.samples}")
                 wall = [float(sample.timing["wall_seconds"]) for sample in samples]
                 user = [float(sample.timing["user_seconds"]) for sample in samples]
                 system = [float(sample.timing["system_seconds"]) for sample in samples]
                 rss = [int(sample.timing["peak_rss_bytes"]) for sample in samples]
                 byte_workload = case.workload == "compression"
-                work_count = input_bytes if byte_workload else lua_work_units
-                bytes_per_second = (
-                    input_bytes / statistics.median(wall) if byte_workload else None
-                )
+                work_count = declared_input_bytes if byte_workload else lua_work_units
+                bytes_per_second = declared_input_bytes / statistics.median(wall) if byte_workload else None
                 writer.writerow(
                     {
                         "benchmark": case.name,
@@ -837,7 +728,7 @@ def run(arguments: argparse.Namespace, cases: list[Case]) -> Path:
                         "operation": operation,
                         "work_unit": case.work_unit,
                         "work_count": work_count,
-                        "input_bytes": input_bytes if byte_workload else 0,
+                        "input_bytes": declared_input_bytes if byte_workload else 0,
                         "warmups": arguments.warmups,
                         "samples": arguments.samples,
                         "median_wall_seconds": f"{statistics.median(wall):.9f}",
@@ -846,12 +737,7 @@ def run(arguments: argparse.Namespace, cases: list[Case]) -> Path:
                         "median_user_seconds": f"{statistics.median(user):.9f}",
                         "median_system_seconds": f"{statistics.median(system):.9f}",
                         "median_peak_rss_bytes": int(statistics.median(rss)),
-                        "throughput_mib_per_second": (
-                            f"{bytes_per_second / (1024 * 1024):.6f}"
-                            if bytes_per_second is not None
-                            else ""
-                        ),
-                        "validation_sha256": validation_hashes[(case.name, operation)],
+                        "throughput_mib_per_second": f"{bytes_per_second / (1024 * 1024):.6f}" if bytes_per_second is not None else "",
                     }
                 )
 
@@ -860,28 +746,28 @@ def run(arguments: argparse.Namespace, cases: list[Case]) -> Path:
         {
             "format_version": FORMAT_VERSION,
             "created_at": datetime.now(timezone.utc).isoformat(),
-            "host": {
-                "system": platform.system(),
-                "machine": platform.machine(),
-                "release": platform.release(),
+            "host": {"system": platform.system(), "machine": platform.machine(), "release": platform.release()},
+            "operations": arguments.operations,
+            "declared_generated_input_bytes": declared_input_bytes,
+            "generated_input": (
+                {"path": os.fspath(large_input.relative_to(output)), "bytes": declared_input_bytes, "sha256": input_digest}
+                if large_input is not None
+                else None
+            ),
+            "decompression_fixtures": {
+                case.name: {"path": os.fspath(fixtures[case.name]), "bytes": fixtures[case.name].stat().st_size, "sha256": sha256(fixtures[case.name])}
+                for case in compression_cases
+                if case.name in fixtures
             },
-            "input": {
-                "path": os.fspath(large_input.relative_to(output)),
-                "bytes": input_bytes,
-                "sha256": input_digest,
-            },
-            "lua_workload": {
-                "path": os.fspath(lua_workload.relative_to(output)),
-                "work_units": lua_work_units,
-                "sha256": lua_digest,
-            },
+            "lua_workload": (
+                {"path": os.fspath(lua_workload.relative_to(output)), "work_units": lua_work_units, "sha256": lua_digest}
+                if lua_workload is not None
+                else None
+            ),
             "warmups": arguments.warmups,
             "samples": arguments.samples,
             "programs": {
-                case.name: {
-                    "path": os.fspath(programs[case.name]),
-                    "sha256": sha256(programs[case.name]),
-                }
+                case.name: {"path": os.fspath(programs[case.name]), "sha256": sha256(programs[case.name])}
                 for case in selected
             },
         },
