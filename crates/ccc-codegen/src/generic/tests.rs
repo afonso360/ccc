@@ -4,7 +4,7 @@ use ccc_pp::{PpItem, lex};
 use ccc_sema::generic::analyze_frontend;
 use ccc_session::SourceMap;
 use ccc_syntax::frontend as syntax;
-use ccc_target::{OptimizationLevel, enabled_compilation_configs};
+use ccc_target::{Architecture, OptimizationLevel, enabled_compilation_configs};
 use object::read::macho::Nlist as _;
 use object::{
     Object as _, ObjectSection as _, ObjectSymbol as _, RelocationEncoding, RelocationFlags,
@@ -50,6 +50,198 @@ fn lower_source_with_map(
 
 fn lower_source(source: &str) -> gir::FullModule {
     lower_source_with_config(source, &EffectiveCompilationConfig::default())
+}
+
+#[test]
+fn standard_sqrt_declarations_use_intrinsics_only_for_proven_arguments_at_o2() {
+    let source = "double sqrt(double);
+                  float sqrtf(float);
+                  double root(double value) { return sqrt(value * value); }
+                  float rootf(float value) { return sqrtf(value * value); }
+                  double guarded(double value) {
+                      if (value < 0.0) return 0.0;
+                      return sqrt(value);
+                  }
+                  double unproven(double value) { return sqrt(value); }";
+    let defined_source = "double sqrt(double value) { return value + 1.0; }
+                          double custom_root(double value) { return sqrt(value * value); }";
+    for target in enabled_compilation_configs() {
+        let o1 = target
+            .clone()
+            .with_optimization_level(OptimizationLevel::O1);
+        let o1_output = emit_source_with_config(source, &o1);
+        for function in ["root", "rootf", "guarded"] {
+            let clif = function_clif(&o1_output.clif, function);
+            assert!(!clif.contains("= sqrt"), "{} O1:\n{clif}", o1.target.triple);
+            assert_eq!(clif.matches("call fn").count(), 1, "{clif}");
+        }
+
+        let o2 = target.with_optimization_level(OptimizationLevel::O2);
+        let o2_output = emit_source_with_config(source, &o2);
+        let native_sqrt_honors_rounding = matches!(
+            o2.target.triple.architecture,
+            Architecture::X86_64 | Architecture::Aarch64(_)
+        );
+        for function in ["root", "rootf", "guarded"] {
+            let clif = function_clif(&o2_output.clif, function);
+            assert_eq!(
+                clif.contains("= sqrt"),
+                native_sqrt_honors_rounding,
+                "{} O2:\n{clif}",
+                o2.target.triple
+            );
+            assert_eq!(
+                clif.matches("call fn").count(),
+                usize::from(!native_sqrt_honors_rounding),
+                "{clif}"
+            );
+        }
+        let unproven = function_clif(&o2_output.clif, "unproven");
+        assert!(
+            !unproven.contains("= sqrt"),
+            "{}:\n{unproven}",
+            o2.target.triple
+        );
+        assert_eq!(unproven.matches("call fn").count(), 1, "{unproven}");
+
+        let defined = emit_source_with_config(defined_source, &o2);
+        let clif = function_clif(&defined.clif, "custom_root");
+        assert!(!clif.contains("= sqrt"), "{}:\n{clif}", o2.target.triple);
+        assert_eq!(clif.matches("call fn").count(), 1, "{clif}");
+    }
+}
+
+#[test]
+fn sqrt_intrinsic_metadata_gates_and_entry_backedges_are_conservative() {
+    let config =
+        EffectiveCompilationConfig::default().with_optimization_level(OptimizationLevel::O2);
+    let hidden = emit_source_with_config(
+        "double sqrt(double) __attribute__((visibility(\"hidden\")));\n\
+         double hidden_root(double value) { return sqrt(value * value); }",
+        &config,
+    );
+    let hidden_clif = function_clif(&hidden.clif, "hidden_root");
+    assert!(!hidden_clif.contains("= sqrt"), "{hidden_clif}");
+    assert_eq!(hidden_clif.matches("call fn").count(), 1, "{hidden_clif}");
+
+    let mut effects_module = lower_source_with_config(
+        "double sqrt(double);\n\
+         double effects_root(double value) { return sqrt(value * value); }",
+        &config,
+    );
+    let effects_call = effects_module
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "effects_root")
+        .unwrap()
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.instructions)
+        .find_map(|instruction| match &mut instruction.kind {
+            gir::FullInstructionKind::DirectCall { effects, .. } => Some(effects),
+            _ => None,
+        })
+        .unwrap();
+    effects_call.reads_memory = false;
+    gir::verify_frontend(&effects_module).unwrap();
+    let effects = emit(
+        &effects_module,
+        &config,
+        Options {
+            emit_clif: true,
+            debug_info: None,
+        },
+    )
+    .unwrap();
+    let effects_clif = function_clif(&effects.clif, "effects_root");
+    assert!(!effects_clif.contains("= sqrt"), "{effects_clif}");
+    assert_eq!(effects_clif.matches("call fn").count(), 1, "{effects_clif}");
+
+    let mut entry_backedge = lower_source_with_config(
+        "double sqrt(double);\n\
+         double entry_backedge(double value) {\n\
+             if (value < 0.0) return 0.0;\n\
+             return sqrt(value);\n\
+         }",
+        &config,
+    );
+    let function = entry_backedge
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "entry_backedge")
+        .unwrap();
+    let entry = function.entry.unwrap();
+    let entry_index = entry.0 as usize;
+    let entry_value = function.blocks[entry_index].parameters[0];
+    let call_block_index = function
+        .blocks
+        .iter()
+        .position(|block| {
+            block.instructions.iter().any(|instruction| {
+                matches!(
+                    instruction.kind,
+                    gir::FullInstructionKind::DirectCall { .. }
+                )
+            })
+        })
+        .unwrap();
+    assert_ne!(call_block_index, entry_index);
+    let call_instruction_index = function.blocks[call_block_index]
+        .instructions
+        .iter()
+        .position(|instruction| {
+            matches!(
+                instruction.kind,
+                gir::FullInstructionKind::DirectCall { .. }
+            )
+        })
+        .unwrap();
+    let mut call = function.blocks[call_block_index]
+        .instructions
+        .remove(call_instruction_index);
+    let gir::FullInstructionKind::DirectCall { arguments, .. } = &mut call.kind else {
+        unreachable!();
+    };
+    arguments[0] = entry_value;
+    let forwarded_value = function.blocks[call_block_index].parameters[0];
+    function.blocks[call_block_index].terminator =
+        Some(gir::FullTerminator::Branch(gir::FullEdge {
+            target: entry,
+            arguments: vec![forwarded_value],
+        }));
+    let call_id = call.id;
+    function.blocks[entry_index].instructions.push(call);
+    gir::verify_frontend(&entry_backedge).unwrap();
+    let function = entry_backedge
+        .functions
+        .iter()
+        .find(|function| function.name == "entry_backedge")
+        .unwrap();
+    let proof = super::function::proven_nonnegative_sqrt_calls(&entry_backedge, function, &config);
+    assert!(
+        !proof.contains(&call_id),
+        "the entry-backedge must not prove a guard that does not dominate the initial entry"
+    );
+}
+
+#[test]
+fn sqrt_proof_shared_add_dag_is_memoized() {
+    let config =
+        EffectiveCompilationConfig::default().with_optimization_level(OptimizationLevel::O2);
+    let mut source = String::from(
+        "double sqrt(double);\n\
+         double shared_add_dag(double value) {\n\
+             value = value * value;\n",
+    );
+    for _ in 0..48 {
+        source.push_str("value = value + value;\n");
+    }
+    source.push_str("return sqrt(value); }");
+
+    let output = emit_source_with_config(&source, &config);
+    let clif = function_clif(&output.clif, "shared_add_dag");
+    assert!(clif.contains("= sqrt"), "{clif}");
+    assert_eq!(clif.matches("call fn").count(), 0, "{clif}");
 }
 
 #[test]

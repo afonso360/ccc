@@ -1643,6 +1643,323 @@ fn direct_aggregate_result_successor_field_loads(
     result
 }
 
+fn standard_sqrt_call_type(
+    module: &gir::FullModule,
+    config: &EffectiveCompilationConfig,
+    function: u32,
+    signature: TypeId,
+    arguments: &[gir::ValueId],
+    effects: gir::CallEffects,
+) -> Option<ir::Type> {
+    if !matches!(
+        config.target.triple.architecture,
+        ccc_target::Architecture::X86_64 | ccc_target::Architecture::Aarch64(_)
+    ) || !matches!(
+        config.optimization,
+        OptimizationLevel::O2 | OptimizationLevel::O3
+    ) || arguments.len() != 1
+        || effects != gir::CallEffects::default()
+    {
+        return None;
+    }
+    let declaration = module
+        .functions
+        .iter()
+        .find(|candidate| candidate.id.0 == function)?;
+    if declaration.entry.is_some()
+        || declaration.linkage != CLinkage::External
+        || declaration.binding != SymbolBinding::Strong
+        || declaration.visibility != SymbolVisibility::Default
+        || declaration.symbol_name_is_exact
+        || declaration.signature != signature
+        || declaration.properties != Default::default()
+    {
+        return None;
+    }
+    let (source_name, source_type, clif_type) = match declaration.name.as_str() {
+        "sqrt" => ("sqrt", TypeId::DOUBLE, ir::types::F64),
+        "sqrtf" => ("sqrtf", TypeId::FLOAT, ir::types::F32),
+        _ => return None,
+    };
+    if declaration.symbol_name != source_name {
+        return None;
+    }
+    let signature = module.types.function_signature(signature)?;
+    let ccc_types::FunctionParameters::Prototype(parameters) = signature.parameters else {
+        return None;
+    };
+    let expected = QualifiedType::unqualified(source_type);
+    (!signature.variadic && signature.result == expected && parameters.as_slice() == [expected])
+        .then_some(clif_type)
+}
+
+fn value_is_nonnegative_or_nan(
+    types: &TypeStore,
+    function: &gir::FullFunction,
+    definitions: &[Option<&gir::FullInstruction>],
+    value: gir::ValueId,
+    visiting: &mut BTreeSet<gir::ValueId>,
+    memo: &mut BTreeMap<gir::ValueId, bool>,
+) -> bool {
+    if let Some(result) = memo.get(&value) {
+        return *result;
+    }
+    if !function
+        .value_types
+        .get(value.0 as usize)
+        .and_then(|ty| types.builtin_type(*ty))
+        .is_some_and(BuiltinType::is_floating)
+        || !visiting.insert(value)
+    {
+        return false;
+    }
+    let result = match definitions.get(value.0 as usize).copied().flatten() {
+        Some(gir::FullInstruction {
+            kind: gir::FullInstructionKind::Constant(gir::ScalarConstant::Floating(value)),
+            ..
+        }) => value.is_nan() || *value >= 0.0,
+        Some(gir::FullInstruction {
+            kind:
+                gir::FullInstructionKind::Binary {
+                    operator: gir::BinaryOperation::Multiply,
+                    left,
+                    right,
+                },
+            ..
+        }) => left == right,
+        Some(gir::FullInstruction {
+            kind:
+                gir::FullInstructionKind::Binary {
+                    operator: gir::BinaryOperation::Add,
+                    left,
+                    right,
+                },
+            ..
+        }) => {
+            value_is_nonnegative_or_nan(types, function, definitions, *left, visiting, memo)
+                && value_is_nonnegative_or_nan(types, function, definitions, *right, visiting, memo)
+        }
+        Some(gir::FullInstruction {
+            kind:
+                gir::FullInstructionKind::Unary {
+                    operator: gir::UnaryOperation::Plus,
+                    operand,
+                },
+            ..
+        }) => value_is_nonnegative_or_nan(types, function, definitions, *operand, visiting, memo),
+        Some(gir::FullInstruction {
+            kind:
+                gir::FullInstructionKind::Convert {
+                    kind: gir::ScalarConversion::FloatingConversion,
+                    operand,
+                    ..
+                },
+            ..
+        }) => value_is_nonnegative_or_nan(types, function, definitions, *operand, visiting, memo),
+        _ => false,
+    };
+    visiting.remove(&value);
+    memo.insert(value, result);
+    result
+}
+
+fn value_is_floating_zero(
+    definitions: &[Option<&gir::FullInstruction>],
+    value: gir::ValueId,
+) -> bool {
+    matches!(
+        definitions.get(value.0 as usize).copied().flatten(),
+        Some(gir::FullInstruction {
+            kind: gir::FullInstructionKind::Constant(gir::ScalarConstant::Floating(value)),
+            ..
+        }) if *value == 0.0
+    )
+}
+
+fn false_edge_proves_nonnegative_or_nan(
+    definitions: &[Option<&gir::FullInstruction>],
+    condition: gir::ValueId,
+    value: gir::ValueId,
+) -> bool {
+    let condition = match definitions.get(condition.0 as usize).copied().flatten() {
+        Some(gir::FullInstruction {
+            kind:
+                gir::FullInstructionKind::Convert {
+                    kind: gir::ScalarConversion::ToBoolean,
+                    operand,
+                    ..
+                },
+            ..
+        }) => *operand,
+        _ => condition,
+    };
+    matches!(
+        definitions.get(condition.0 as usize).copied().flatten(),
+        Some(gir::FullInstruction {
+            kind:
+                gir::FullInstructionKind::Binary {
+                    operator: gir::BinaryOperation::Less,
+                    left,
+                    right,
+                },
+            ..
+        }) if *left == value && value_is_floating_zero(definitions, *right)
+    ) || matches!(
+        definitions.get(condition.0 as usize).copied().flatten(),
+        Some(gir::FullInstruction {
+            kind:
+                gir::FullInstructionKind::Binary {
+                    operator: gir::BinaryOperation::Greater,
+                    left,
+                    right,
+                },
+            ..
+        }) if *right == value && value_is_floating_zero(definitions, *left)
+    )
+}
+
+fn incoming_edge_value(
+    block: &gir::FullBlock,
+    edge: &gir::FullEdge,
+    value: gir::ValueId,
+) -> Option<gir::ValueId> {
+    block
+        .parameters
+        .iter()
+        .position(|parameter| *parameter == value)
+        .map_or(Some(value), |index| edge.arguments.get(index).copied())
+}
+
+fn negative_rejection_dominates_call(
+    function: &gir::FullFunction,
+    definitions: &[Option<&gir::FullInstruction>],
+    predecessors: &BTreeMap<gir::BlockId, Vec<gir::BlockId>>,
+    mut block: gir::BlockId,
+    mut value: gir::ValueId,
+) -> bool {
+    let mut visited = BTreeSet::new();
+    while visited.insert(block) {
+        if Some(block) == function.entry {
+            return false;
+        }
+        let Some([predecessor]) = predecessors.get(&block).map(Vec::as_slice) else {
+            return false;
+        };
+        let Some(current) = function
+            .blocks
+            .iter()
+            .find(|candidate| candidate.id == block)
+        else {
+            return false;
+        };
+        let Some(predecessor) = function
+            .blocks
+            .iter()
+            .find(|candidate| candidate.id == *predecessor)
+        else {
+            return false;
+        };
+        match predecessor.terminator.as_ref() {
+            Some(gir::FullTerminator::Conditional {
+                condition,
+                else_edge,
+                ..
+            }) if else_edge.target == block => {
+                let Some(value) = incoming_edge_value(current, else_edge, value) else {
+                    return false;
+                };
+                return false_edge_proves_nonnegative_or_nan(definitions, *condition, value);
+            }
+            Some(gir::FullTerminator::Branch(edge))
+                if edge.target == block && predecessor.instructions.is_empty() =>
+            {
+                let Some(incoming) = incoming_edge_value(current, edge, value) else {
+                    return false;
+                };
+                value = incoming;
+                block = predecessor.id;
+            }
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// Finds call arguments that are nonnegative or NaN from their expression, or
+/// from the false edge of an immediately dominating negative-value rejection.
+pub(super) fn proven_nonnegative_sqrt_calls(
+    module: &gir::FullModule,
+    function: &gir::FullFunction,
+    config: &EffectiveCompilationConfig,
+) -> BTreeSet<gir::InstructionId> {
+    let eligible = function
+        .blocks
+        .iter()
+        .flat_map(|block| {
+            block
+                .instructions
+                .iter()
+                .map(move |instruction| (block.id, instruction))
+        })
+        .filter_map(|(block, instruction)| {
+            let gir::FullInstructionKind::DirectCall {
+                function,
+                signature,
+                arguments,
+                effects,
+                ..
+            } = &instruction.kind
+            else {
+                return None;
+            };
+            standard_sqrt_call_type(module, config, function.0, *signature, arguments, *effects)
+                .map(|_| (block, instruction.id, arguments[0]))
+        })
+        .collect::<Vec<_>>();
+    if eligible.is_empty() {
+        return BTreeSet::new();
+    }
+
+    let mut definitions = vec![None; function.value_types.len()];
+    for instruction in function.blocks.iter().flat_map(|block| &block.instructions) {
+        if let Some(value) = instruction.result {
+            definitions[value.0 as usize] = Some(instruction);
+        }
+    }
+    let mut predecessors = BTreeMap::<gir::BlockId, Vec<gir::BlockId>>::new();
+    for block in &function.blocks {
+        if let Some(terminator) = block.terminator.as_ref() {
+            for successor in terminator_successors(terminator) {
+                predecessors.entry(successor).or_default().push(block.id);
+            }
+        }
+    }
+
+    let mut result = BTreeSet::new();
+    let mut memo = BTreeMap::new();
+    for (block, instruction, argument) in eligible {
+        let structural = value_is_nonnegative_or_nan(
+            &module.types,
+            function,
+            &definitions,
+            argument,
+            &mut BTreeSet::new(),
+            &mut memo,
+        );
+        let edge = negative_rejection_dominates_call(
+            function,
+            &definitions,
+            &predecessors,
+            block,
+            argument,
+        );
+        if structural || edge {
+            result.insert(instruction);
+        }
+    }
+    result
+}
+
 fn terminator_successors(terminator: &gir::FullTerminator) -> Vec<gir::BlockId> {
     match terminator {
         gir::FullTerminator::Branch(edge) => vec![edge.target],
@@ -1927,6 +2244,7 @@ pub(super) fn lower_function(
         cached_storage_addresses: HashMap::new(),
         runtime_storage,
         values: vec![None; function.value_types.len()],
+        proven_nonnegative_sqrt_calls: proven_nonnegative_sqrt_calls(module, function, config),
         caller_owned_parameter_backing_enabled: !collect_debug_values,
         single_use_aggregate_snapshots,
         readonly_aggregate_argument_snapshots,
@@ -2086,6 +2404,7 @@ struct FunctionState<'a, 'references, 'object> {
     runtime_storage: HashMap<u32, StackSlot>,
     caller_owned_parameter_backing_enabled: bool,
     values: Vec<Option<ir::Value>>,
+    proven_nonnegative_sqrt_calls: BTreeSet<gir::InstructionId>,
     single_use_aggregate_snapshots: BTreeSet<gir::ValueId>,
     readonly_aggregate_argument_snapshots: BTreeSet<gir::ValueId>,
     loop_global_address_slots: BTreeMap<u32, StackSlot>,
@@ -3543,7 +3862,7 @@ impl FunctionState<'_, '_, '_> {
                     signature,
                     arguments,
                     variadic_boundary,
-                    effects: _,
+                    effects,
                 } => self.direct_call(
                     builder,
                     instruction.id,
@@ -3551,6 +3870,7 @@ impl FunctionState<'_, '_, '_> {
                     *signature,
                     arguments,
                     *variadic_boundary,
+                    *effects,
                 ),
                 I::IndirectCall {
                     callee,
@@ -4360,6 +4680,40 @@ impl FunctionState<'_, '_, '_> {
         Ok(())
     }
 
+    /// Recognizes undeclared-body standard square-root calls whose exact C
+    /// signatures permit a proof-gated hardware instruction.
+    fn standard_sqrt_type(
+        &self,
+        function: u32,
+        signature: TypeId,
+        arguments: &[gir::ValueId],
+        effects: gir::CallEffects,
+    ) -> Option<ir::Type> {
+        standard_sqrt_call_type(
+            self.module,
+            self.config,
+            function,
+            signature,
+            arguments,
+            effects,
+        )
+    }
+
+    fn native_direct_call(
+        &self,
+        builder: &mut FunctionBuilder<'_>,
+        instruction: gir::InstructionId,
+        function: u32,
+        arguments: &[gir::ValueId],
+        plan: &ccc_abi::NativeBoundaryPlan,
+    ) -> Result<Option<ir::Value>, CodegenError> {
+        let (arguments, result_storage) =
+            self.marshal_native_call_arguments(builder, plan, arguments)?;
+        let reference = self.references.direct_function(builder, function)?;
+        let call = builder.ins().call(reference, &arguments);
+        self.finish_native_call(builder, instruction, call, plan, result_storage)
+    }
+
     fn direct_call(
         &self,
         builder: &mut FunctionBuilder<'_>,
@@ -4368,15 +4722,22 @@ impl FunctionState<'_, '_, '_> {
         signature: TypeId,
         arguments: &[gir::ValueId],
         variadic_boundary: usize,
+        effects: gir::CallEffects,
     ) -> Result<Option<ir::Value>, CodegenError> {
         let boundary = self.call_boundary(instruction, signature, arguments, variadic_boundary)?;
         match boundary {
             ccc_abi::BoundaryPlan::Native(plan) => {
-                let (arguments, result_storage) =
-                    self.marshal_native_call_arguments(builder, plan, arguments)?;
-                let reference = self.references.direct_function(builder, function)?;
-                let call = builder.ins().call(reference, &arguments);
-                self.finish_native_call(builder, instruction, call, plan, result_storage)
+                if let Some(ty) = self.standard_sqrt_type(function, signature, arguments, effects)
+                    && self.proven_nonnegative_sqrt_calls.contains(&instruction)
+                {
+                    let argument = self.value(arguments[0])?;
+                    if builder.func.dfg.value_type(argument) != ty {
+                        return Err(error("proven standard sqrt has the wrong carrier type"));
+                    }
+                    Ok(Some(builder.ins().sqrt(argument)))
+                } else {
+                    self.native_direct_call(builder, instruction, function, arguments, plan)
+                }
             }
             ccc_abi::BoundaryPlan::Bridge(plan) => {
                 let reference = self.references.function_address(builder, function)?;

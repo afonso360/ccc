@@ -91,6 +91,36 @@ fn host_default_emits_a_native_relocatable_object() {
 #[cfg(any(
     all(target_arch = "x86_64", target_os = "linux"),
     all(target_arch = "aarch64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "macos")
+))]
+#[test]
+fn optimized_sqrt_matches_libm_fenv_and_errno() {
+    let directory = support::TestWorkspace::new("execution", "sqrt-fenv").retain_on_failure();
+    let executable = directory.join("sqrt-fenv");
+    let compilation = support::ccc_command()
+        .arg("-O2")
+        .arg(fixture("sqrt_fenv.c"))
+        .arg("-lm")
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .unwrap();
+    directory.assert_command_success(
+        "compile the optimized sqrt fenv fixture with CCC",
+        &compilation,
+    );
+    let execution = Command::new(&executable).output().unwrap();
+    assert_eq!(
+        execution.status.code(),
+        Some(0),
+        "sqrt fenv fixture failed: {}",
+        String::from_utf8_lossy(&execution.stderr)
+    );
+}
+
+#[cfg(any(
+    all(target_arch = "x86_64", target_os = "linux"),
+    all(target_arch = "aarch64", target_os = "linux"),
     all(target_arch = "riscv64", target_os = "linux"),
     all(target_arch = "aarch64", target_os = "macos")
 ))]
