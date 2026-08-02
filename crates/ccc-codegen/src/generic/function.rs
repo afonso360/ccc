@@ -638,6 +638,105 @@ fn readonly_aggregate_argument_snapshots(
     result
 }
 
+#[derive(Clone, Copy)]
+struct ExtendingIntegerLoad {
+    destination: ir::Type,
+    conversion: gir::InstructionId,
+    signed: bool,
+}
+
+/// Finds one-use, ordinary narrow integer loads whose only consumer widens
+/// them with an integer promotion or conversion. Debug and ordered loads stay
+/// explicit so their original value boundaries and memory behavior remain.
+fn extending_integer_loads(
+    module: &gir::FullModule,
+    function: &gir::FullFunction,
+    config: &EffectiveCompilationConfig,
+) -> BTreeMap<gir::InstructionId, ExtendingIntegerLoad> {
+    let uses = gir::value_use_counts(function);
+    let mut definitions = BTreeMap::new();
+    for instruction in function.blocks.iter().flat_map(|block| &block.instructions) {
+        if let Some(result) = instruction.result {
+            definitions.insert(result, instruction);
+        }
+    }
+    let mut result = BTreeMap::new();
+    for conversion in function.blocks.iter().flat_map(|block| &block.instructions) {
+        let gir::FullInstructionKind::Convert {
+            kind: gir::ScalarConversion::IntegerPromotion | gir::ScalarConversion::IntegerConversion,
+            operand,
+            from,
+            to,
+        } = &conversion.kind
+        else {
+            continue;
+        };
+        let Some(load) = definitions.get(operand).copied() else {
+            continue;
+        };
+        let gir::FullInstructionKind::Load { object, access, .. } = &load.kind else {
+            continue;
+        };
+        if uses[operand.0 as usize] != 1
+            || *access != gir::MemoryAccess::default()
+            || !module.types.is_integer(object.ty)
+            || object.ty != from.ty
+        {
+            continue;
+        }
+        let (Ok(source), Ok(destination), Ok(signed)) = (
+            scalar_type(&module.types, *object, config),
+            scalar_type(&module.types, *to, config),
+            is_signed(&module.types, *from, config),
+        ) else {
+            continue;
+        };
+        if !matches!(source, ir::types::I8 | ir::types::I16)
+            || !matches!(
+                destination,
+                ir::types::I16 | ir::types::I32 | ir::types::I64
+            )
+            || destination.bits() <= source.bits()
+        {
+            continue;
+        }
+        result.insert(
+            load.id,
+            ExtendingIntegerLoad {
+                conversion: conversion.id,
+                destination,
+                signed,
+            },
+        );
+    }
+    result
+}
+
+/// Emits a narrow integer load directly in the conversion destination type.
+fn lower_extending_integer_load(
+    builder: &mut FunctionBuilder<'_>,
+    address: ir::Value,
+    source: ir::Type,
+    extension: ExtendingIntegerLoad,
+) -> ir::Value {
+    let flags = backend::empty_memory_flags();
+    match (source, extension.signed) {
+        (ir::types::I8, true) => builder
+            .ins()
+            .sload8(extension.destination, flags, address, 0),
+        (ir::types::I8, false) => builder
+            .ins()
+            .uload8(extension.destination, flags, address, 0),
+        (ir::types::I16, true) => builder
+            .ins()
+            .sload16(extension.destination, flags, address, 0),
+        (ir::types::I16, false) => builder
+            .ins()
+            .uload16(extension.destination, flags, address, 0),
+        _ => unreachable!("extending-load preanalysis only records I8/I16 sources"),
+    }
+}
+
 /// Finds snapshots that are consumed exactly once by the enclosing function.
 ///
 /// A call may use this backing storage as its indirect by-value argument only
@@ -2222,6 +2321,17 @@ pub(super) fn lower_function(
     let readonly_aggregate_argument_snapshots = (!collect_debug_values)
         .then(|| readonly_aggregate_argument_snapshots(module, function))
         .unwrap_or_default();
+    let extending_integer_loads = (!collect_debug_values
+        && matches!(
+            config.optimization,
+            OptimizationLevel::O2 | OptimizationLevel::O3
+        ))
+    .then(|| extending_integer_loads(module, function, config))
+    .unwrap_or_default();
+    let extending_integer_conversions = extending_integer_loads
+        .values()
+        .map(|extension| extension.conversion)
+        .collect::<BTreeSet<_>>();
     let automatic_return_aggregate_snapshots = automatic_return_aggregate_snapshots(function);
     let mut direct_aggregate_result_field_loads = (!collect_debug_values)
         .then(|| direct_aggregate_result_field_loads(module, function, config))
@@ -2248,6 +2358,8 @@ pub(super) fn lower_function(
         caller_owned_parameter_backing_enabled: !collect_debug_values,
         single_use_aggregate_snapshots,
         readonly_aggregate_argument_snapshots,
+        extending_integer_loads,
+        extending_integer_conversions,
         automatic_return_aggregate_snapshots,
         immediate_aggregate_call_result_destinations: immediate_aggregate_call_result_destinations(
             function,
@@ -2407,6 +2519,8 @@ struct FunctionState<'a, 'references, 'object> {
     proven_nonnegative_sqrt_calls: BTreeSet<gir::InstructionId>,
     single_use_aggregate_snapshots: BTreeSet<gir::ValueId>,
     readonly_aggregate_argument_snapshots: BTreeSet<gir::ValueId>,
+    extending_integer_loads: BTreeMap<gir::InstructionId, ExtendingIntegerLoad>,
+    extending_integer_conversions: BTreeSet<gir::InstructionId>,
     loop_global_address_slots: BTreeMap<u32, StackSlot>,
     automatic_return_aggregate_snapshots: BTreeSet<gir::ValueId>,
     immediate_aggregate_call_result_destinations: BTreeMap<gir::InstructionId, gir::ValueId>,
@@ -3400,6 +3514,15 @@ impl FunctionState<'_, '_, '_> {
                     {
                         return Ok(Some(value));
                     }
+                    if let Some(extension) = self.extending_integer_loads.get(&instruction.id) {
+                        let source = scalar_type(&self.module.types, *object, self.config)?;
+                        return Ok(Some(lower_extending_integer_load(
+                            builder,
+                            self.value(*address)?,
+                            source,
+                            *extension,
+                        )));
+                    }
                     if is_x87_f80(&self.module.types, *object, self.config) {
                         if access.atomic.is_some() {
                             return Err(CodegenError {
@@ -3652,6 +3775,9 @@ impl FunctionState<'_, '_, '_> {
                     from,
                     to,
                 } => {
+                    if self.extending_integer_conversions.contains(&instruction.id) {
+                        return Ok(Some(self.value(*operand)?));
+                    }
                     if is_x87_f80(&self.module.types, *from, self.config)
                         || is_x87_f80(&self.module.types, *to, self.config)
                     {

@@ -1382,6 +1382,121 @@ fn read_only_register_aggregate_parameters_use_their_input_carriers() {
 }
 
 #[test]
+fn narrow_integer_load_promotions_use_extending_loads_only_at_o2_and_o3() {
+    let source = "int signed_byte(const signed char *value) { return *value; }\n\
+                  int unsigned_byte(const unsigned char *value) { return *value; }\n\
+                  int signed_short(const short *value) { return *value; }\n\
+                  int unsigned_short(const unsigned short *value) { return *value; }\n\
+                  long signed_byte_long(const signed char *value) { return *value; }\n\
+                  unsigned long unsigned_short_long(const unsigned short *value) { return *value; }\n\
+                  short signed_byte_short(const signed char *value) { return (short)*value; }\n\
+                  long plain_char_long(const char *value) { return *value; }";
+    let functions = [
+        "signed_byte",
+        "unsigned_byte",
+        "signed_short",
+        "unsigned_short",
+        "signed_byte_long",
+        "unsigned_short_long",
+        "signed_byte_short",
+        "plain_char_long",
+    ];
+    for base in enabled_compilation_configs() {
+        let o1 = base.clone().with_optimization_level(OptimizationLevel::O1);
+        let o1_output = emit_source_with_config(source, &o1);
+        for function in functions {
+            let clif = function_clif(&o1_output.clif, function);
+            assert!(clif.contains("load.i"), "{} O1:\n{clif}", o1.target.triple);
+            assert!(clif.contains("extend"), "{} O1:\n{clif}", o1.target.triple);
+        }
+        for level in [OptimizationLevel::O2, OptimizationLevel::O3] {
+            let config = base.clone().with_optimization_level(level);
+            let output = emit_source_with_config(source, &config);
+            let plain_char = if config.target.data_layout.char_is_signed {
+                "sload8.i64"
+            } else {
+                "uload8.i64"
+            };
+            for (function, extending) in [
+                ("signed_byte", "sload8.i32"),
+                ("unsigned_byte", "uload8.i32"),
+                ("signed_short", "sload16.i32"),
+                ("unsigned_short", "uload16.i32"),
+                ("signed_byte_long", "sload8.i64"),
+                ("unsigned_short_long", "uload16.i64"),
+                ("signed_byte_short", "sload8.i16"),
+                ("plain_char_long", plain_char),
+            ] {
+                let clif = function_clif(&output.clif, function);
+                assert!(
+                    clif.contains(extending),
+                    "{} {} expected {extending}:\n{clif}",
+                    config.target.triple,
+                    level.flag()
+                );
+                assert!(
+                    !clif.contains("extend"),
+                    "{} {}:\n{clif}",
+                    config.target.triple,
+                    level.flag()
+                );
+            }
+        }
+    }
+}
+#[test]
+fn volatile_narrow_integer_load_promotions_remain_separate() {
+    let source = "int volatile_byte(const volatile signed char *value) { return *value; }\n\
+                  int volatile_short(const volatile unsigned short *value) { return *value; }";
+    for base in enabled_compilation_configs() {
+        let config = base.with_optimization_level(OptimizationLevel::O2);
+        let output = emit_source_with_config(source, &config);
+        for function in ["volatile_byte", "volatile_short"] {
+            let clif = function_clif(&output.clif, function);
+            assert!(
+                clif.contains("load.i") && clif.contains("extend"),
+                "{}:\n{clif}",
+                config.target.triple
+            );
+            assert!(
+                !clif.contains("sload") && !clif.contains("uload"),
+                "{}:\n{clif}",
+                config.target.triple
+            );
+        }
+    }
+}
+
+#[test]
+fn reused_narrow_integer_loads_remain_separate() {
+    let source = "int reused_byte(const signed char *value) {\n\
+                      signed char loaded = *value;\n\
+                      return loaded + loaded;\n\
+                  }\n\
+                  int reused_short(const unsigned short *value) {\n\
+                      unsigned short loaded = *value;\n\
+                      return loaded + loaded;\n\
+                  }";
+    for base in enabled_compilation_configs() {
+        let config = base.with_optimization_level(OptimizationLevel::O2);
+        let output = emit_source_with_config(source, &config);
+        for function in ["reused_byte", "reused_short"] {
+            let clif = function_clif(&output.clif, function);
+            assert!(
+                clif.contains("load.i") && clif.contains("extend"),
+                "{}:\n{clif}",
+                config.target.triple
+            );
+            assert!(
+                !clif.contains("sload") && !clif.contains("uload"),
+                "{}:\n{clif}",
+                config.target.triple
+            );
+        }
+    }
+}
+
+#[test]
 fn aggregate_result_fields_forward_across_a_single_successor() {
     let source = "struct Vector { double x; double y; double z; };\n\
                   static struct Vector output;\n\
