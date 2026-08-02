@@ -1445,6 +1445,63 @@ fn narrow_integer_load_promotions_use_extending_loads_only_at_o2_and_o3() {
     }
 }
 #[test]
+fn aggregate_forwarding_exclusions_block_extending_load_selection() {
+    let module = lower_source("int promoted(const signed char *value) { return *value; }");
+    let function = module
+        .functions
+        .iter()
+        .find(|function| function.name == "promoted")
+        .unwrap();
+    let load = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .find(|instruction| matches!(instruction.kind, gir::FullInstructionKind::Load { .. }))
+        .unwrap();
+    let load_value = load.result.unwrap();
+    let conversion = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .find(|instruction| {
+            matches!(
+                instruction.kind,
+                gir::FullInstructionKind::Convert { operand, .. } if operand == load_value
+            )
+        })
+        .unwrap();
+    let config =
+        EffectiveCompilationConfig::default().with_optimization_level(OptimizationLevel::O2);
+
+    let selected = super::function::extending_integer_loads(
+        &module,
+        function,
+        &config,
+        &super::function::extending_load_exclusions(
+            std::iter::empty::<gir::InstructionId>(),
+            std::iter::empty::<gir::InstructionId>(),
+        ),
+    );
+    assert!(selected.loads.contains_key(&load.id));
+    assert_eq!(selected.conversions, BTreeSet::from([conversion.id]));
+
+    for exclusions in [
+        super::function::extending_load_exclusions(
+            [load.id],
+            std::iter::empty::<gir::InstructionId>(),
+        ),
+        super::function::extending_load_exclusions(
+            std::iter::empty::<gir::InstructionId>(),
+            [load.id],
+        ),
+    ] {
+        let blocked =
+            super::function::extending_integer_loads(&module, function, &config, &exclusions);
+        assert!(!blocked.loads.contains_key(&load.id));
+        assert!(!blocked.conversions.contains(&conversion.id));
+    }
+}
+#[test]
 fn volatile_narrow_integer_load_promotions_remain_separate() {
     let source = "int volatile_byte(const volatile signed char *value) { return *value; }\n\
                   int volatile_short(const volatile unsigned short *value) { return *value; }";
@@ -1468,7 +1525,7 @@ fn volatile_narrow_integer_load_promotions_remain_separate() {
 }
 
 #[test]
-fn reused_narrow_integer_loads_remain_separate() {
+fn identical_narrow_integer_conversions_share_one_extending_load_across_blocks() {
     let source = "int reused_byte(const signed char *value) {\n\
                       signed char loaded = *value;\n\
                       return loaded + loaded;\n\
@@ -1476,11 +1533,180 @@ fn reused_narrow_integer_loads_remain_separate() {
                   int reused_short(const unsigned short *value) {\n\
                       unsigned short loaded = *value;\n\
                       return loaded + loaded;\n\
+                  }\n\
+                  int ordered(const unsigned char *left, const unsigned char *right) {\n\
+                      unsigned char x = *left;\n\
+                      unsigned char y = *right;\n\
+                      if (x != y) return x > y;\n\
+                      return 0;\n\
                   }";
     for base in enabled_compilation_configs() {
         let config = base.with_optimization_level(OptimizationLevel::O2);
         let output = emit_source_with_config(source, &config);
-        for function in ["reused_byte", "reused_short"] {
+        for (function, extending) in [
+            ("reused_byte", "sload8.i32"),
+            ("reused_short", "uload16.i32"),
+        ] {
+            let clif = function_clif(&output.clif, function);
+            assert!(
+                clif.contains(extending),
+                "{}:\n{clif}",
+                config.target.triple
+            );
+            assert!(
+                !clif.contains("extend"),
+                "{}:\n{clif}",
+                config.target.triple
+            );
+        }
+        let ordered = function_clif(&output.clif, "ordered");
+        assert!(
+            !ordered.contains("uload8.i32")
+                && ordered.contains("load.i8")
+                && ordered.contains("uextend.i32"),
+            "{}:\n{ordered}",
+            config.target.triple
+        );
+    }
+}
+
+#[test]
+fn dominating_narrow_load_fuses_identical_conversions_in_separate_blocks() {
+    let mut module = lower_source(
+        "int cross_block(const unsigned char *value, unsigned char alternate, int condition) {\n\
+             unsigned char loaded = *value;\n\
+             if (condition) return loaded > alternate;\n\
+             return loaded != alternate;\n\
+         }",
+    );
+    let function = module
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "cross_block")
+        .unwrap();
+    let entry = function.entry.unwrap();
+    let load = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instructions)
+        .find(|instruction| matches!(instruction.kind, gir::FullInstructionKind::Load { .. }))
+        .unwrap();
+    let load_id = load.id;
+    let load_value = load.result.unwrap();
+    let (then_target, else_target) = {
+        let entry_block = function
+            .blocks
+            .iter_mut()
+            .find(|block| block.id == entry)
+            .unwrap();
+        let alternate = entry_block.parameters[1];
+        let gir::FullTerminator::Conditional {
+            then_edge,
+            else_edge,
+            ..
+        } = entry_block.terminator.as_mut().unwrap()
+        else {
+            unreachable!();
+        };
+        assert_eq!(*then_edge.arguments.last().unwrap(), load_value);
+        assert_eq!(*else_edge.arguments.last().unwrap(), load_value);
+        *then_edge.arguments.last_mut().unwrap() = alternate;
+        *else_edge.arguments.last_mut().unwrap() = alternate;
+        (then_edge.target, else_edge.target)
+    };
+    let mut forwarded_parameters = [then_target, else_target]
+        .into_iter()
+        .map(|target| {
+            function
+                .blocks
+                .iter()
+                .find(|block| block.id == target)
+                .unwrap()
+                .parameters
+                .last()
+                .copied()
+                .unwrap()
+        })
+        .collect::<BTreeSet<_>>();
+    let bridge_target = {
+        let bridge = function
+            .blocks
+            .iter_mut()
+            .find(|block| matches!(block.terminator, Some(gir::FullTerminator::Branch(_))))
+            .unwrap();
+        let alternate = bridge.parameters[1];
+        let gir::FullTerminator::Branch(edge) = bridge.terminator.as_mut().unwrap() else {
+            unreachable!();
+        };
+        assert!(forwarded_parameters.contains(edge.arguments.last().unwrap()));
+        *edge.arguments.last_mut().unwrap() = alternate;
+        edge.target
+    };
+    forwarded_parameters.insert(
+        function
+            .blocks
+            .iter()
+            .find(|block| block.id == bridge_target)
+            .unwrap()
+            .parameters
+            .last()
+            .copied()
+            .unwrap(),
+    );
+    assert_eq!(forwarded_parameters.len(), 3);
+    for instruction in function
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.instructions)
+    {
+        if let gir::FullInstructionKind::Convert { operand, .. } = &mut instruction.kind
+            && forwarded_parameters.contains(operand)
+        {
+            *operand = load_value;
+        }
+    }
+    gir::verify_frontend(&module).unwrap();
+
+    let function = module
+        .functions
+        .iter()
+        .find(|function| function.name == "cross_block")
+        .unwrap();
+    let config =
+        EffectiveCompilationConfig::default().with_optimization_level(OptimizationLevel::O2);
+    let selected =
+        super::function::extending_integer_loads(&module, function, &config, &BTreeSet::new());
+    assert_eq!(
+        selected.loads.keys().copied().collect::<BTreeSet<_>>(),
+        BTreeSet::from([load_id])
+    );
+    assert_eq!(
+        selected.conversions.len(),
+        2,
+        "{}",
+        gir::dump_frontend_ir(&module)
+    );
+}
+
+#[test]
+fn mixed_narrow_integer_uses_remain_separate() {
+    let source = "long mixed_destination(const signed char *value) {\n\
+                      signed char loaded = *value;\n\
+                      return (int)loaded + (long)loaded;\n\
+                  }\n\
+                  unsigned int mixed_signedness(const unsigned char *value) {\n\
+                      unsigned char loaded = *value;\n\
+                      return (int)loaded + (unsigned int)loaded;\n\
+                  }\n\
+                  int direct_condition(const signed char *value) {\n\
+                      signed char loaded = *value;\n\
+                      if (loaded) return (int)loaded;\n\
+                      return 0;\n\
+                  }";
+    for base in enabled_compilation_configs() {
+        let config = base.with_optimization_level(OptimizationLevel::O2);
+        let output = emit_source_with_config(source, &config);
+        for function in ["mixed_destination", "mixed_signedness", "direct_condition"] {
             let clif = function_clif(&output.clif, function);
             assert!(
                 clif.contains("load.i") && clif.contains("extend"),

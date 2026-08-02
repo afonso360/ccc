@@ -639,48 +639,79 @@ fn readonly_aggregate_argument_snapshots(
 }
 
 #[derive(Clone, Copy)]
-struct ExtendingIntegerLoad {
+pub(super) struct ExtendingIntegerLoad {
     destination: ir::Type,
-    conversion: gir::InstructionId,
     signed: bool,
 }
 
-/// Finds one-use, ordinary narrow integer loads whose only consumer widens
-/// them with an integer promotion or conversion. Debug and ordered loads stay
-/// explicit so their original value boundaries and memory behavior remain.
-fn extending_integer_loads(
+#[derive(Default)]
+pub(super) struct ExtendingIntegerLoads {
+    pub(super) loads: BTreeMap<gir::InstructionId, ExtendingIntegerLoad>,
+    pub(super) conversions: BTreeSet<gir::InstructionId>,
+}
+
+/// Returns every load already replaced by aggregate carrier forwarding.
+///
+/// Direct aggregate parameter and result forwarding can supply a load result
+/// without materializing that load. Extending-load fusion must not also bypass
+/// its conversion, even though current ABI layout gates can make a natural
+/// narrow-field overlap target-dependent.
+pub(super) fn extending_load_exclusions(
+    parameter_loads: impl IntoIterator<Item = gir::InstructionId>,
+    result_loads: impl IntoIterator<Item = gir::InstructionId>,
+) -> BTreeSet<gir::InstructionId> {
+    parameter_loads.into_iter().chain(result_loads).collect()
+}
+
+/// Finds ordinary narrow integer loads whose every use widens them with the
+/// same integer promotion or conversion. Debug and ordered loads stay explicit
+/// so their original value boundaries and memory behavior remain.
+pub(super) fn extending_integer_loads(
     module: &gir::FullModule,
     function: &gir::FullFunction,
     config: &EffectiveCompilationConfig,
-) -> BTreeMap<gir::InstructionId, ExtendingIntegerLoad> {
+    excluded_loads: &BTreeSet<gir::InstructionId>,
+) -> ExtendingIntegerLoads {
     let uses = gir::value_use_counts(function);
-    let mut definitions = BTreeMap::new();
+    let mut conversion_uses =
+        BTreeMap::<gir::ValueId, Vec<(gir::InstructionId, QualifiedType, QualifiedType)>>::new();
     for instruction in function.blocks.iter().flat_map(|block| &block.instructions) {
-        if let Some(result) = instruction.result {
-            definitions.insert(result, instruction);
-        }
-    }
-    let mut result = BTreeMap::new();
-    for conversion in function.blocks.iter().flat_map(|block| &block.instructions) {
         let gir::FullInstructionKind::Convert {
             kind: gir::ScalarConversion::IntegerPromotion | gir::ScalarConversion::IntegerConversion,
             operand,
             from,
             to,
-        } = &conversion.kind
+        } = &instruction.kind
         else {
             continue;
         };
-        let Some(load) = definitions.get(operand).copied() else {
+        conversion_uses
+            .entry(*operand)
+            .or_default()
+            .push((instruction.id, *from, *to));
+    }
+
+    let mut result = ExtendingIntegerLoads::default();
+    for load in function.blocks.iter().flat_map(|block| &block.instructions) {
+        let (Some(value), gir::FullInstructionKind::Load { object, access, .. }) =
+            (load.result, &load.kind)
+        else {
             continue;
         };
-        let gir::FullInstructionKind::Load { object, access, .. } = &load.kind else {
+        let Some(users) = conversion_uses.get(&value) else {
             continue;
         };
-        if uses[operand.0 as usize] != 1
+        let Some((_, from, to)) = users.first() else {
+            continue;
+        };
+        if excluded_loads.contains(&load.id)
+            || uses[value.0 as usize] != users.len()
             || *access != gir::MemoryAccess::default()
             || !module.types.is_integer(object.ty)
             || object.ty != from.ty
+            || users.iter().any(|(_, candidate_from, candidate_to)| {
+                candidate_from != from || candidate_to != to
+            })
         {
             continue;
         }
@@ -700,18 +731,19 @@ fn extending_integer_loads(
         {
             continue;
         }
-        result.insert(
+        result.loads.insert(
             load.id,
             ExtendingIntegerLoad {
-                conversion: conversion.id,
                 destination,
                 signed,
             },
         );
+        result
+            .conversions
+            .extend(users.iter().map(|(instruction, _, _)| *instruction));
     }
     result
 }
-
 /// Emits a narrow integer load directly in the conversion destination type.
 fn lower_extending_integer_load(
     builder: &mut FunctionBuilder<'_>,
@@ -2321,17 +2353,6 @@ pub(super) fn lower_function(
     let readonly_aggregate_argument_snapshots = (!collect_debug_values)
         .then(|| readonly_aggregate_argument_snapshots(module, function))
         .unwrap_or_default();
-    let extending_integer_loads = (!collect_debug_values
-        && matches!(
-            config.optimization,
-            OptimizationLevel::O2 | OptimizationLevel::O3
-        ))
-    .then(|| extending_integer_loads(module, function, config))
-    .unwrap_or_default();
-    let extending_integer_conversions = extending_integer_loads
-        .values()
-        .map(|extension| extension.conversion)
-        .collect::<BTreeSet<_>>();
     let automatic_return_aggregate_snapshots = automatic_return_aggregate_snapshots(function);
     let mut direct_aggregate_result_field_loads = (!collect_debug_values)
         .then(|| direct_aggregate_result_field_loads(module, function, config))
@@ -2341,6 +2362,20 @@ pub(super) fn lower_function(
             module, function, config,
         ));
     }
+    let excluded_extending_loads = extending_load_exclusions(
+        direct_aggregate_parameter_field_loads.keys().copied(),
+        direct_aggregate_result_field_loads.keys().copied(),
+    );
+    let ExtendingIntegerLoads {
+        loads: extending_integer_loads,
+        conversions: extending_integer_conversions,
+    } = (!collect_debug_values
+        && matches!(
+            config.optimization,
+            OptimizationLevel::O2 | OptimizationLevel::O3
+        ))
+    .then(|| extending_integer_loads(module, function, config, &excluded_extending_loads))
+    .unwrap_or_default();
     let mut state = FunctionState {
         module,
         function,
