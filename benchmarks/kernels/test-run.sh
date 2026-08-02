@@ -291,7 +291,10 @@ if len(object_arguments) == 1 and "-o" in sys.argv:
     exit_status = int(os.environ.get("FAKE_PROGRAM_EXIT", "0"))
     output.write_text(
         "#!/usr/bin/env python3\n"
+        "import os\n"
         "import sys\n"
+        "if os.environ.get('FAKE_PROGRAM_OUTPUT'):\n"
+        "    print(os.environ['FAKE_PROGRAM_OUTPUT'])\n"
         f"sys.exit({exit_status})\n",
         encoding="utf-8",
     )
@@ -376,14 +379,33 @@ grep -Fq $'direct-call\tO2\tfinal-object\t' \
   "$performance_results/artifacts.tsv"
 grep -Fq $'direct-call\tO2\texecutable\t' \
   "$performance_results/artifacts.tsv"
-grep -Fq '"format_version":3' "$performance_results/environment.json"
+grep -Fq '"format_version":4' "$performance_results/environment.json"
 grep -Fq '"mode":"performance"' "$performance_results/environment.json"
 grep -Fq '"kind":"link"' "$performance_results/commands.jsonl"
-grep -Fq '"phase":"validation"' "$performance_results/commands.jsonl"
+if grep -Fq '"phase":"validation"' "$performance_results/commands.jsonl" \
+  || grep -Fq $'\tvalidation\t' "$performance_results/run-times.tsv" \
+  || grep -Fq 'validation_wall_seconds' "$performance_results/summary.tsv"; then
+  echo "performance mode unexpectedly recorded validation" >&2
+  exit 1
+fi
 [[ "$(grep -c $'\tsample\t' "$performance_results/run-times.tsv")" == \
   "$performance_sample_count" ]]
 [[ "$(find "$performance_results/raw" -name 'compile-sample-*.o' |
   wc -l | tr -d '[:space:]')" == "$performance_sample_count" ]]
+
+performance_output_results="$temporary_directory/performance-output"
+FAKE_TARGET="$native_target" FAKE_PROGRAM_OUTPUT=performance-output \
+  "$script_directory/run.py" \
+  --ccc "$fake_ccc" \
+  --output "$performance_output_results" \
+  --mode performance \
+  --cases direct-call \
+  --profiles O0 \
+  --compile-samples 1 \
+  --run-warmups 0 \
+  --run-samples 1
+grep -Fxq performance-output \
+  "$performance_output_results/raw/direct-call/O0/run-sample-001.stdout.txt"
 
 object_results="$temporary_directory/object"
 FAKE_TARGET="$native_target" "$script_directory/run.py" \
@@ -471,3 +493,4 @@ help_output=$("$script_directory/run.py" --help)
 [[ "$help_output" == *"--mode"* ]]
 [[ "$help_output" == *"--runner-arg"* ]]
 [[ "$help_output" == *"--compile-samples"* ]]
+[[ "$help_output" == *"does not establish correctness (default: performance)"* ]]

@@ -1,7 +1,9 @@
 # CCC defined-behavior kernel benchmarks
 
-This suite measures small executable workloads with fixed work counts and
-built-in correctness checks. The current scalar, control-flow, memory, and ABI
+This suite measures small executable workloads with fixed work counts. The
+programs include built-in correctness checks for the explicit correctness mode;
+performance measurements do not establish or compare correctness. The current
+scalar, control-flow, memory, and ABI
 slice covers direct calls and inlining, an unsigned-integer loop, exact
 binary32/binary64 loops, data-dependent branches plus a dense switch, indexed
 loads/stores, aggregate copies, thread-local access, C11 atomics, and a
@@ -61,15 +63,16 @@ borders while alternating its two distinct image buffers.
 
 - `object` compiles each kernel and records structural statistics for any
   enabled target. It does not require a linker or runnable target.
-- `correctness` additionally links and executes each profile once. A
-  non-native target requires an explicit `--runner`.
-- `performance` requires the compiler's selected target to match the native
-  host, rejects emulated runners, performs a validation execution first, and
-  then records warmups and repeated samples.
+- `correctness` is an explicit opt-in path that links and executes each profile
+  once. A non-native target requires an explicit `--runner`.
+- `performance` is the default benchmark mode. It requires the compiler's
+  selected target to match the native host, rejects emulated runners, and runs
+  only warmups and timed samples. It never performs a validation phase,
+  establishes correctness, or compares benchmark-program output.
 
-Every execution must exit zero without writing stdout or stderr. The runner
-retains failed command output and timing evidence instead of accepting a fast
-incorrect result.
+Correctness executions must exit zero without writing stdout or stderr.
+Performance records stdout and stderr only as raw evidence; it does not compare
+their contents, and a nonzero exit remains an operational failure.
 
 ## Running
 
@@ -114,13 +117,13 @@ only native `performance` results as comparison-ready.
 
 ## Results
 
-The result directory uses format version 3:
+The result directory uses format version 4:
 
 | Path | Contents |
 | --- | --- |
 | `summary.tsv` | Per-kernel/profile compile, link, runtime, structural, primary-object, final-object, and executable summary. |
 | `build-times.tsv` | Raw compile and link resource measurements. |
-| `run-times.tsv` | Validation, warmup, and runtime-sample measurements. |
+| `run-times.tsv` | Correctness validation, or performance warmup and runtime-sample measurements. |
 | `codegen-stats.tsv` | Complete normalized `--emit=codegen-stats` stream. |
 | `artifacts.tsv` | Final-object and executable byte sizes and hashes. |
 | `manifest.tsv` | Fixed work/result contract and copied-source identities. |
@@ -128,9 +131,10 @@ The result directory uses format version 3:
 | `commands.jsonl` | Exact command argument vectors in execution order. |
 | `raw/` | Objects, executables, command output, timing JSON, and raw stats. |
 
-Compile samples must produce identical final-object hashes. Runtime summaries
-exclude validation and warmup executions. `runtime_ns_per_work_unit` is useful
-only for comparing the same kernel and fixed work contract.
+Compile samples must produce identical final-object hashes. Performance results
+contain warmup and sample executions only; they do not establish correctness or
+compare program output. `runtime_ns_per_work_unit` is useful only for comparing
+the same kernel and fixed work contract.
 The runner accepts only the complete codegen-stat schema in its stable row
 order. Schema version 3 includes allocated-but-unreferenced CLIF signatures,
 external functions, and global values so inlining residue can be correlated

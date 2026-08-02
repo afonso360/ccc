@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-
-"""Compile, link, validate, and measure defined-behavior CCC kernels."""
+"""Compile, optionally validate, and measure defined-behavior CCC kernels."""
 
 from __future__ import annotations
 
@@ -25,7 +24,7 @@ import tomllib
 from typing import Iterable
 
 
-FORMAT_VERSION = 3
+FORMAT_VERSION = 4
 MANIFEST_SCHEMA_VERSION = 1
 CODEGEN_STATS_SCHEMA_VERSION = 3
 CODEGEN_STATS_METRICS = (
@@ -148,7 +147,6 @@ SUMMARY_FIELDS = (
     "compile_max_wall_seconds",
     "compile_median_peak_rss_bytes",
     "link_wall_seconds",
-    "validation_wall_seconds",
     "runtime_samples",
     "runtime_median_wall_seconds",
     "runtime_min_wall_seconds",
@@ -266,7 +264,7 @@ def parse_arguments(case_names: tuple[str, ...]) -> argparse.Namespace:
     benchmark_directory = Path(__file__).resolve().parent
     repository = benchmark_directory.parents[1]
     parser = argparse.ArgumentParser(
-        description=("Compile and measure self-validating, fixed-work CCC kernels.")
+        description="Compile fixed-work CCC kernels for object, correctness, or performance evidence."
     )
     parser.add_argument(
         "--ccc",
@@ -282,8 +280,11 @@ def parse_arguments(case_names: tuple[str, ...]) -> argparse.Namespace:
     parser.add_argument(
         "--mode",
         choices=("object", "correctness", "performance"),
-        default="correctness",
-        help="evidence mode (default: correctness)",
+        default="performance",
+        help=(
+            "execution mode; performance measures only and does not establish correctness "
+            "(default: performance)"
+        ),
     )
     parser.add_argument(
         "--profiles",
@@ -930,12 +931,6 @@ def write_summary(
                     if (invocation.case.name, invocation.profile) == key
                     and invocation.stage == "link"
                 ]
-                validations = [
-                    invocation
-                    for invocation in runs
-                    if (invocation.case.name, invocation.profile) == key
-                    and invocation.phase == "validation"
-                ]
                 samples = [
                     invocation
                     for invocation in runs
@@ -985,11 +980,6 @@ def write_summary(
                     "link_wall_seconds": (
                         format_seconds(float(links[0].timing["wall_seconds"]))
                         if links
-                        else ""
-                    ),
-                    "validation_wall_seconds": (
-                        format_seconds(float(validations[0].timing["wall_seconds"]))
-                        if validations
                         else ""
                     ),
                     "runtime_samples": len(samples),
@@ -1423,14 +1413,14 @@ def run(arguments: argparse.Namespace, manifest_path: Path) -> Path:
                 artifacts_file.flush()
 
                 execution_command = [*runner_prefix, os.fspath(executable)]
-                phases = [("validation", 1)]
-                if arguments.mode == "performance":
-                    phases.extend(
-                        (
-                            ("warmup", arguments.run_warmups),
-                            ("sample", arguments.run_samples),
-                        )
-                    )
+                phases = (
+                    [("validation", 1)]
+                    if arguments.mode == "correctness"
+                    else [
+                        ("warmup", arguments.run_warmups),
+                        ("sample", arguments.run_samples),
+                    ]
+                )
                 for phase, count in phases:
                     for iteration in range(1, count + 1):
                         stem = f"run-{phase}-{iteration:03d}"
@@ -1474,7 +1464,9 @@ def run(arguments: argparse.Namespace, manifest_path: Path) -> Path:
                                 f"{case.name} at -{profile} {phase} failed "
                                 f"with status {timing['exit_status']}; see {stderr}"
                             )
-                        if stdout.stat().st_size != 0 or stderr.stat().st_size != 0:
+                        if arguments.mode == "correctness" and (
+                            stdout.stat().st_size != 0 or stderr.stat().st_size != 0
+                        ):
                             raise BenchmarkError(
                                 f"{case.name} at -{profile} {phase} produced "
                                 "unexpected output"
